@@ -105,3 +105,19 @@ def test_port_in_use_exits_non_zero_with_json_only(secrets_dir: Path) -> None:
     assert lines
     assert all(json.loads(line) for line in lines)  # JSON only
     assert json.loads(lines[-1])["event"] == "startup_failed"
+
+
+def test_unknown_registry_key_is_not_echoed(secrets_dir: Path) -> None:
+    # Spec 080 §9.7 `reason` rule: an unknown key typed by the operator (here an address) never reaches the log.
+    data = json.loads((secrets_dir / "accounts.json").read_text())
+    data["accounts"][0]["sentinel-7q@example.org"] = True
+    (secrets_dir / "accounts.json").write_text(json.dumps(data))
+    process = start(secrets_dir, free_port(), free_port())
+    output, _ = process.communicate(timeout=15)
+    assert process.returncode == 2
+    assert "sentinel" not in output.lower()
+    assert "@" not in output
+    events = [json.loads(line) for line in output.splitlines()]
+    failed = [e for e in events if e["event"] == "startup_failed"]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "accounts.json is invalid: accounts.0.<unknown key> x1: extra_forbidden"

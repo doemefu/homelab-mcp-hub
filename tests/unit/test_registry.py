@@ -104,6 +104,24 @@ def test_error_message_never_contains_input_values(tmp_path: Path) -> None:
     assert "accounts.0.label" in str(info.value)
 
 
+def test_unknown_keys_are_not_echoed(tmp_path: Path) -> None:
+    # An operator may paste an address or other private text as a key by mistake; only a placeholder is reported.
+    data = example()
+    data["accounts"][0]["sentinel@example.org"] = True
+    data["accounts"][0]["mail"]["sentinel-key-2"] = 1
+    data["sentinel-top"] = 1
+    with pytest.raises(RegistryError) as info:
+        load_registry(write(tmp_path, data))
+    message = str(info.value)
+    assert "sentinel" not in message
+    parts = set(message.removeprefix("accounts.json is invalid: ").split("; "))
+    assert parts == {
+        "accounts.0.<unknown key> x1: extra_forbidden",
+        "accounts.0.mail.imap.<unknown key> x1: extra_forbidden",
+        "<unknown key> x1: extra_forbidden",
+    }
+
+
 def test_missing_or_unparsable_file(tmp_path: Path) -> None:
     with pytest.raises(RegistryError):
         load_registry(tmp_path / "absent.json")

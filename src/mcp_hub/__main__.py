@@ -15,6 +15,8 @@ from mcp_hub.logging import configure_logging, log_event
 from mcp_hub.registry import RegistryError, load_registry
 
 _log = logging.getLogger("mcp_hub.main")
+# `reason` catalogue entry for start-up failures outside the configuration and registry checks (spec 080 §9.7).
+UNEXPECTED_ERROR = "unexpected_error"
 
 
 def _listen(port: int) -> socket.socket:
@@ -38,6 +40,9 @@ def main(env: Mapping[str, str] | None = None) -> int:
     except (ConfigError, RegistryError) as exc:
         log_event(_log, logging.ERROR, "startup_failed", reason=str(exc))
         return 2
+    except Exception as exc:  # third-party message text is uncontrolled: log the class name only
+        log_event(_log, logging.ERROR, "startup_failed", reason=UNEXPECTED_ERROR, exception=type(exc).__name__)
+        return 2
     try:
         hub = create_app(settings, registry)
         config = uvicorn.Config(
@@ -56,7 +61,7 @@ def main(env: Mapping[str, str] | None = None) -> int:
             signal.signal(sig, _exit_cleanly)
         server.run(sockets=sockets)
     except Exception as exc:  # third-party message text is uncontrolled: log the class name only
-        log_event(_log, logging.ERROR, "startup_failed", exception=type(exc).__name__)
+        log_event(_log, logging.ERROR, "startup_failed", reason=UNEXPECTED_ERROR, exception=type(exc).__name__)
         return 2
     if not server.started:  # uvicorn returns normally when lifespan startup fails
         log_event(_log, logging.ERROR, "startup_failed", reason="lifespan startup failed")

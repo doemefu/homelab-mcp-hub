@@ -159,11 +159,23 @@ def load_registry(path: Path) -> Registry:
     try:
         return Registry.model_validate_json(raw)
     except ValidationError as exc:
-        problems = "; ".join(
-            f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['type']}"
-            for err in exc.errors(include_input=False, include_url=False, include_context=False)
-        )
-        raise RegistryError(f"accounts.json is invalid: {problems}") from None
+        raise RegistryError(f"accounts.json is invalid: {_describe(exc)}") from None
+
+
+def _describe(exc: ValidationError) -> str:
+    """Schema paths and error types only. Unknown keys are operator-typed text, so they are never echoed (§9.7)."""
+    problems: list[str] = []
+    unknown: dict[str, int] = {}
+    for err in exc.errors(include_input=False, include_url=False, include_context=False):
+        if err["type"] == "extra_forbidden":
+            parent = ".".join(str(p) for p in err["loc"][:-1])
+            unknown[parent] = unknown.get(parent, 0) + 1
+            continue
+        problems.append(f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['type']}")
+    for parent, count in unknown.items():
+        location = f"{parent}.<unknown key>" if parent else "<unknown key>"
+        problems.append(f"{location} x{count}: extra_forbidden")
+    return "; ".join(problems)
 
 
 def select_accounts(registry: Registry, capability: Capability, account: str | None) -> list[Account]:
