@@ -7,7 +7,7 @@ Toolchain: local uv (0.12.17 at bootstrap; CI and image pin 0.12.19), Python 3.1
 uv sync --locked                          # create .venv from uv.lock (fails if the lock is stale)
 uv run pytest                             # all tests (unit, contract, integration)
 uv run pytest tests/contract -v           # gate G6 contract tests only
-uv run pytest tests/unit/test_auth.py::test_name -v
+uv run pytest tests/unit/test_verifier.py::test_name -v
 uv run ruff check && uv run ruff format --check
 uv run mypy --strict src
 PYTHONPATH=src uv run python -m mcp_hub  # run locally; needs HUB_SECRETS_DIR with accounts.json + allowed-subjects

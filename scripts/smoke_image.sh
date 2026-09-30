@@ -14,7 +14,12 @@ cleanup() {
   echo "smoke work dir left for inspection: $WORK"
 }
 trap cleanup EXIT
-fail() { echo "FAIL: $*" >&2; docker logs "hub-$$" >&2 || true; exit 1; }
+fail() {
+  echo "FAIL: $*" >&2
+  echo "clocks: host $(date -u +%FT%TZ) container $(docker exec "hub-$$" date -u +%FT%TZ 2>/dev/null || echo n/a)" >&2
+  docker logs "hub-$$" >&2 || true
+  exit 1
+}
 
 (cd "$ROOT" && uv run python scripts/dev_token.py init --dir "$WORK")
 docker network create --label org.furchert.homelab.workpackage=mcp-hub-wp5a "$NET" >/dev/null

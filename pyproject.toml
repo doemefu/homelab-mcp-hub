@@ -3,6 +3,7 @@ name = "mcp-hub"
 version = "0.1.0"
 description = "Read-only MCP hub for the owner's mail and calendars (doemefu homelab)"
 requires-python = "==3.13.*"
+license = "MIT"
 dependencies = [
     "mcp==2.2.0",
     "uvicorn==0.54.0",
