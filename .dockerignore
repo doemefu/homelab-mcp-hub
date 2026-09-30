@@ -1,0 +1,12 @@
+.git
+.github
+.claude
+.venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+k8s
+scripts
+tests
+.local
+*.md
