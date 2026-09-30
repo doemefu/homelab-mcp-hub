@@ -222,3 +222,19 @@ def test_jwks_outage_gives_401_and_recovers(
         jwks_server.expect_request("/jwks-7f3a.json").respond_with_json(jwks(key))
         clock.advance(60)
         assert modern(c, tokens.mint(), "tools/list").status_code == 200
+
+
+def test_list_accounts_output_and_annotations(client: TestClient, tokens: TokenFactory) -> None:
+    token = tokens.mint()
+    tool = body(modern(client, token, "tools/list"))["result"]["tools"][0]
+    assert tool["annotations"] == {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+        "title": "List accounts",
+    }
+    result = body(
+        modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
+    )["result"]
+    assert [a["id"] for a in result["structuredContent"]["accounts"]] == ["icloud", "gmail", "outlook", "uzh"]
