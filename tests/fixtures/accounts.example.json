@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": "icloud", "label": "iCloud", "provider": "icloud", "enabled": true,
+      "capabilities": { "mail": true, "calendar": true },
+      "mail": {
+        "protocol": "imap", "host": "imap.mail.me.com", "port": 993,
+        "username_ref": "icloud-username", "password_ref": "icloud-app-password", "inbox": "INBOX"
+      },
+      "calendar": {
+        "protocol": "caldav", "url": "https://caldav.icloud.com/",
+        "username_ref": "icloud-username", "password_ref": "icloud-app-password",
+        "include_calendars": "all"
+      }
+    },
+    {
+      "id": "gmail", "label": "Gmail", "provider": "google", "enabled": true,
+      "capabilities": { "mail": true, "calendar": false },
+      "mail": {
+        "protocol": "imap", "host": "imap.gmail.com", "port": 993,
+        "username_ref": "gmail-username", "password_ref": "gmail-app-password", "inbox": "INBOX"
+      }
+    },
+    {
+      "id": "outlook", "label": "Outlook.com", "provider": "microsoft", "enabled": true,
+      "capabilities": { "mail": true, "calendar": false },
+      "graph": { "tenant": "consumers", "client_id_ref": "outlook-ms-client-id", "scopes": ["Mail.Read", "offline_access"] },
+      "mail": { "protocol": "graph" }
+    },
+    {
+      "id": "uzh", "label": "University", "provider": "microsoft-org", "enabled": false,
+      "capabilities": { "mail": true, "calendar": true },
+      "graph": { "tenant": "organizations", "client_id_ref": "uzh-ms-client-id", "scopes": ["Mail.Read", "Calendars.Read", "offline_access"] },
+      "mail": { "protocol": "graph" },
+      "calendar": { "protocol": "graph" }
+    }
+  ]
+}
