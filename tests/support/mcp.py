@@ -7,6 +7,8 @@ from starlette.testclient import TestClient
 MODERN = "2026-07-28"
 HANDSHAKE = "2025-11-25"
 ACCEPT = "application/json, text/event-stream"
+METADATA_URL = "https://mcp.furchert.ch/.well-known/oauth-protected-resource/mcp"
+SCOPE_PARAM = 'scope="mail:read calendar:read"'
 META = {
     "io.modelcontextprotocol/protocolVersion": MODERN,
     "io.modelcontextprotocol/clientCapabilities": {},
@@ -26,7 +28,7 @@ def modern(
     name: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> httpx2.Response:
-    """One stateless 2026-07-28 request as claude.ai sends it (research S7)."""
+    """One stateless 2026-07-28 request as claude.ai sends it (spec 080 §10.3 wire format)."""
     h = (
         {"Accept": ACCEPT, "Content-Type": "application/json", "MCP-Protocol-Version": MODERN, "Mcp-Method": method}
         | auth(token)
@@ -63,3 +65,15 @@ def body(response: httpx2.Response) -> dict[str, Any]:
                 return json.loads(line[6:])  # type: ignore[no-any-return]
         raise AssertionError("no data line in SSE response")
     return response.json()  # type: ignore[no-any-return]
+
+
+def assert_challenge(response: httpx2.Response, status: int = 401) -> None:
+    """The Bearer challenge of spec 080 §4.4, with the scope parameter exactly once."""
+    assert response.status_code == status
+    challenge = response.headers["www-authenticate"]
+    assert challenge.startswith("Bearer ")
+    assert f'resource_metadata="{METADATA_URL}"' in challenge
+    assert challenge.count(SCOPE_PARAM) == 1
+    if status == 401:
+        assert 'error="invalid_token"' in challenge
+        assert 'error_description="Authentication required"' in challenge

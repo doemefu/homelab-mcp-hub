@@ -30,14 +30,23 @@ ALLOWED_CHECKS = {
 }
 
 
+# pytest-httpserver's own request log (the test JWKS server, not the hub).
+TEST_INFRASTRUCTURE_LOGGERS = frozenset({"werkzeug"})
+
+
 class Capture(logging.Handler):
+    """Keeps the formatted lines and the raw records, so a regression of the logger pins is visible even though
+    JsonFormatter masks third-party message text."""
+
     def __init__(self) -> None:
         super().__init__()
         self.setFormatter(JsonFormatter())
         self.lines: list[str] = []
+        self.raw: list[tuple[str, int, str]] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.lines.append(self.format(record))
+        self.raw.append((record.name, record.levelno, record.getMessage()))
 
 
 @pytest.fixture
@@ -67,6 +76,16 @@ def test_logs_contain_check_names_and_no_forbidden_data(
     modern(client, minted[0], "tools/list", headers={"Host": "evil.example.org"})
     modern(client, minted[0], "tools/list", headers={"Origin": "https://evil.example.org"})
     modern(client, None, "tools/list", headers={"Authorization": "Bearer raw-sentinel-token"})
+
+    raw = [(name, level, message) for name, level, message in captured.raw if name not in TEST_INFRASTRUCTURE_LOGGERS]
+    raw_text = "\n".join(message for _, _, message in raw)
+    # The SDK logs raw Host/Origin values at WARNING; its logger is pinned at ERROR (spec 080 §9.7).
+    assert not [r for r in raw if r[0].startswith("mcp.server.transport_security") and r[1] < logging.ERROR]
+    assert not [r for r in raw if not r[0].startswith("mcp_hub") and r[1] < logging.WARNING]
+    for forbidden in ("raw-sentinel-token", "Bearer", "evil.example.org", "/jwks-7f3a", "HTTP Request", "@"):
+        assert forbidden not in raw_text, forbidden
+    for token in minted:
+        assert token not in raw_text
 
     text = "\n".join(captured.lines)
     for token in minted:

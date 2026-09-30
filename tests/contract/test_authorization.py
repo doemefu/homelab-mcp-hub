@@ -4,7 +4,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-import httpx2
 import pytest
 from pytest_httpserver import HTTPServer
 from starlette.testclient import TestClient
@@ -12,22 +11,8 @@ from starlette.testclient import TestClient
 from mcp_hub.app import HubApp
 from tests.support.clock import FakeClock
 from tests.support.keys import TestKey, jwks
-from tests.support.mcp import HANDSHAKE, body, initialize, modern
+from tests.support.mcp import HANDSHAKE, assert_challenge, body, initialize, modern
 from tests.support.tokens import TokenFactory
-
-METADATA_URL = "https://mcp.furchert.ch/.well-known/oauth-protected-resource/mcp"
-SCOPE_PARAM = 'scope="mail:read calendar:read"'
-
-
-def assert_challenge(response: httpx2.Response, status: int = 401) -> None:
-    assert response.status_code == status
-    challenge = response.headers["www-authenticate"]
-    assert challenge.startswith("Bearer ")
-    assert f'resource_metadata="{METADATA_URL}"' in challenge
-    assert challenge.count(SCOPE_PARAM) == 1
-    if status == 401:
-        assert 'error="invalid_token"' in challenge
-        assert 'error_description="Authentication required"' in challenge
 
 
 def test_no_token_returns_401_with_challenge(client: TestClient) -> None:
@@ -214,7 +199,7 @@ def test_jwks_outage_gives_401_and_recovers(
 ) -> None:
     jwks_server.clear()
     jwks_server.expect_request("/jwks-7f3a.json").respond_with_data("down", status=503)
-    # One client, one lifespan run: the SDK session manager refuses a second run() (research U9). The
+    # One client, one lifespan run: the SDK session manager refuses a second run(). The
     # dispatcher routes the absolute 127.0.0.1:8084 URL to the internal app (scope["server"] from the request URL).
     with TestClient(hub.asgi, base_url="https://mcp.furchert.ch") as c:
         assert_challenge(modern(c, tokens.mint(), "tools/list"))

@@ -1,6 +1,6 @@
 from starlette.testclient import TestClient
 
-from tests.support.mcp import modern
+from tests.support.mcp import assert_challenge, modern
 from tests.support.tokens import TokenFactory
 
 
@@ -9,7 +9,8 @@ def test_wrong_host_with_valid_token_gets_421(client: TestClient, tokens: TokenF
 
 
 def test_wrong_host_without_token_gets_401(client: TestClient) -> None:
-    assert modern(client, None, "tools/list", headers={"Host": "evil.example.org"}).status_code == 401
+    # Authentication runs before the Host check (spec 080 §4.4): the full challenge, not a 421.
+    assert_challenge(modern(client, None, "tools/list", headers={"Host": "evil.example.org"}))
 
 
 def test_disallowed_origin_gets_403_without_challenge(client: TestClient, tokens: TokenFactory) -> None:
