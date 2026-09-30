@@ -1,6 +1,11 @@
 name: CodeQL
 
 on:
+  # Push to main keeps the default-branch baseline current for the ruleset's CodeQL rule; Flux tag commits
+  # only touch k8s/ and are skipped.
+  push:
+    branches: ["main"]
+    paths-ignore: ['k8s/**']
   pull_request:
     branches: ["main"]
   schedule:
