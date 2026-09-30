@@ -202,8 +202,9 @@ def test_unknown_kid_refetch_throttled(
     ids=["empty", "no-token", "double-space", "not-base64", "header-array", "basic", "huge"],
 )
 def test_malformed_bearer_values_get_401(client: TestClient, value: str) -> None:
-    # In-process (no HTTP server): "huge" proves the verifier path. Through uvicorn, headers above its ~16 KiB limit
-    # get 400 from the HTTP server before the app runs; scripts/smoke_image.sh covers 8 KiB -> 401 and 32 KiB -> 400.
+    # In-process (no HTTP server): "huge" deterministically proves the 401 path. Through uvicorn, headers above about
+    # 16 KiB get 400 from the HTTP server or reach the app (401), depending on TCP segmentation (spec §10.3, D53);
+    # scripts/smoke_image.sh covers 8 KiB -> 401 and 32 KiB -> 400 or 401 with the challenge, never 2xx.
     response = modern(client, None, "tools/list", headers={"Authorization": value})
     assert_challenge(response)
 

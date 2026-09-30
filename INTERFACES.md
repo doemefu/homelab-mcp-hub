@@ -33,7 +33,7 @@ The root form `/.well-known/oauth-protected-resource` answers 404.
 | 403 | Valid token that lacks one or both required scopes | `Bearer error="insufficient_scope", error_description="Required scope: …", resource_metadata="…", scope="mail:read calendar:read"` |
 | 421 | Valid token, `Host` is not `mcp.furchert.ch` | none |
 | 403 | Valid token, `Origin` present and not `https://claude.ai` or `https://claude.com` | none |
-| 400 | Request headers exceed the HTTP server's limit (about 16 KiB, for example an oversized bearer value); answered by the HTTP server before the application runs, never 2xx | none |
+| 400 or 401 | Request headers above about 16 KiB (for example an oversized bearer value): 400 from the HTTP server when the header block arrives in several reads, otherwise 401 with the challenge from the hub; never 2xx | 401: the challenge above |
 
 The hub appends `scope="mail:read calendar:read"` exactly once to every Bearer challenge. The error description never reveals which check failed. Authentication runs before the `Host`/`Origin` checks, so without a valid token every request gets the 401.
 
@@ -64,7 +64,7 @@ A `role` claim is ignored.
 |-----|------|
 | No token | `tests/contract/test_authorization.py::test_no_token_returns_401_with_challenge` |
 | No token, 2025-11-25 probe | `test_no_token_handshake_probe_returns_same_challenge` |
-| Malformed `Authorization` values | `test_malformed_bearer_values_get_401` (in-process, incl. 100 KiB); `scripts/smoke_image.sh` (8 KiB → 401, 32 KiB → 400) |
+| Malformed `Authorization` values | `test_malformed_bearer_values_get_401` (in-process, incl. 100 KiB); `scripts/smoke_image.sh` (8 KiB → 401 with challenge; 32 KiB → 400 or 401 with challenge, never 2xx) |
 | Metadata / root path | `test_protected_resource_metadata`, `test_root_metadata_path_is_not_served` |
 | Valid token, 2026-07-28 | `test_valid_token_modern_protocol_list_and_call` |
 | Valid token, 2025-11-25 | `test_valid_token_handshake_protocol_initialize_then_list` |

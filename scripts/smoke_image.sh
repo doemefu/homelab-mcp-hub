@@ -61,9 +61,15 @@ grep -qi 'scope="mail:read calendar:read"' "$WORK/headers" || fail "403 scope pa
 # Large garbage bearer below the HTTP server's header limit -> real verifier -> 401 with the challenge.
 [ "$(mcp "$(printf 'a%.0s' $(seq 1 8192))")" = "401" ] || fail "8 KiB bearer"
 grep -qi 'scope="mail:read calendar:read"' "$WORK/headers" || fail "8 KiB bearer challenge"
-# Above uvicorn's ~16 KiB header limit the HTTP server answers 400 before the app runs: accepted fail-closed
-# outcome (spec 080 §10.3); it must never be 2xx.
-[ "$(mcp "$(printf 'a%.0s' $(seq 1 32768))")" = "400" ] || fail "32 KiB bearer not rejected with 400"
+# Above ~16 KiB of headers the outcome depends on TCP segmentation (spec 080 §10.3, D53): the HTTP server answers
+# 400 when the header block arrives in several reads, otherwise the app answers 401 with the challenge.
+# Either is fail-closed; anything else (2xx, 5xx, connection reset) fails the check.
+BIG="$(mcp "$(printf 'a%.0s' $(seq 1 32768))" || true)"
+case "$BIG" in
+  400) ;;
+  401) grep -qi 'scope="mail:read calendar:read"' "$WORK/headers" || fail "32 KiB bearer 401 without challenge" ;;
+  *) fail "32 KiB bearer got '$BIG' (expected 400 or 401 with challenge)" ;;
+esac
 LOGS="$(docker logs "hub-$$" 2>&1)"
 ! grep -q "$VALID" <<<"$LOGS" || fail "token in logs"
 ! grep -q 'HTTP Request' <<<"$LOGS" || fail "httpx2 request line in logs"
