@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Worktree-local toolchain state (uv cache, env.sh, TMPDIR; see CONTRIBUTING.md)
+/.local/
+
+# Environment and keys (never commit)
+.env
+.env.*
+*.pem
+
+### Claude Code ###
+# agents/, rules/, CLAUDE.md are tracked; memory, worklogs and worktrees are local-only.
+.claude/settings.json
+.claude/settings.local.json
+.claude/**/.DS_Store
+/.claude/memory/
+/.claude/worklogs/
+/.claude/worktrees/

@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-hub
+  namespace: apps
+  labels:
+    app: mcp-hub
+spec:
+  replicas: 1
+  # Single writer for token rotation and in-memory 2025-11-25 sessions (spec 080 §9.6).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mcp-hub
+  template:
+    metadata:
+      labels:
+        app: mcp-hub
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false  # no *_SERVICE_HOST/*_PORT variables that could collide with HUB_* settings
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp-hub
+          # Image tag is managed by Flux image automation. The initial tag is a placeholder that was never
+          # built (data-service bootstrap pattern): Flux replaces it once doemefu/homelab#177 wires cluster/apps/mcp-hub/.
+          image: ghcr.io/doemefu/homelab-mcp-hub:main-20260928T000000 # {"$imagepolicy": "flux-system:mcp-hub"}
+          ports:
+            - name: mcp
+              containerPort: 8083
+            - name: internal
+              containerPort: 8084
+          env:
+            - name: HUB_PUBLIC_HOST
+              value: "mcp.furchert.ch"
+            - name: HUB_RESOURCE
+              value: "https://mcp.furchert.ch/mcp"
+            - name: HUB_PORT
+              value: "8083"
+            - name: HUB_INTERNAL_PORT
+              value: "8084"
+            - name: AUTH_ISSUER
+              value: "https://auth.furchert.ch"
+            - name: AUTH_JWKS_URL
+              value: "http://auth-service.apps.svc.cluster.local:8080/oauth2/jwks"
+            - name: AUTH_EXPECTED_CLIENT_ID
+              value: "claude-mcp-hub"
+            - name: AUTH_CLOCK_SKEW_SECONDS
+              value: "60"
+            - name: HUB_SECRETS_DIR
+              value: "/etc/mcp-hub/secrets"
+            - name: HUB_DEFAULT_TIMEZONE
+              value: "Europe/Zurich"
+            - name: LOG_LEVEL
+              value: "INFO"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # ESTIMATES (spec 080 §9.6); confirm with kubectl top after deploy.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: internal
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: internal
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: internal
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: secrets
+              mountPath: /etc/mcp-hub/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Secret mcp-hub-secrets is written by playbook 59 in the homelab repo (spec 080 §7.1, §9.5).
+        # Mounted as a whole volume (never subPath) so allowlist changes reach the pod.
+        - name: secrets
+          secret:
+            secretName: mcp-hub-secrets
+            defaultMode: 0400
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

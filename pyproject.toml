@@ -1,0 +1,53 @@
+[project]
+name = "mcp-hub"
+version = "0.1.0"
+description = "Read-only MCP hub for the owner's mail and calendars (doemefu homelab)"
+requires-python = "==3.13.*"
+license = "MIT"
+dependencies = [
+    "mcp==2.2.0",
+    "uvicorn==0.54.0",
+    "starlette==1.7.0",
+    "pydantic==2.13.5",
+    "pyjwt[crypto]==2.15.0",
+    "httpx2==2.13.1",
+    "anyio==4.15.1",
+    "tzdata==2026.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.9",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-httpserver==1.1.5",
+    # Imported directly by tests/support/keys.py and scripts/dev_token.py (approved in spec 080 §9.3).
+    "cryptography==50.0.1",
+]
+
+[tool.uv]
+# No build backend (it would be a dependency outside spec 080 §9.3): sources run from src/ via PYTHONPATH.
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "SIM", "RUF", "ASYNC", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S603"]
+"scripts/**" = ["S105", "S106", "S603", "S607"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: starts the hub as a subprocess"]
