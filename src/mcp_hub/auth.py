@@ -104,7 +104,7 @@ class HubTokenVerifier:
             token=token,
             client_id=self._client_id,
             scopes=scopes,
-            # The SDK re-checks expires_at against the wall clock without leeway (research S2, K1).
+            # The SDK re-checks expires_at against the wall clock without leeway (spec 080 §4.3 row 6).
             expires_at=int(claims["exp"]) + self._leeway,
             resource=self._resource,
             subject=subject,

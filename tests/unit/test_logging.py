@@ -16,7 +16,7 @@ def test_third_party_loggers_are_capped_even_at_debug() -> None:
     assert logging.getLogger("mcp_hub").level == logging.DEBUG
     for name in THIRD_PARTY:
         assert logging.getLogger(name).level == logging.WARNING, name
-    # SDK WARNING lines carry raw Host/Origin values (research S5).
+    # SDK WARNING lines carry raw Host/Origin values (spec 080 §9.7).
     assert logging.getLogger("mcp.server.transport_security").level == logging.ERROR
 
 
@@ -24,7 +24,7 @@ def test_levels_survive_sdk_basic_config() -> None:
     from mcp.server.mcpserver import MCPServer
 
     configure_logging("INFO")
-    MCPServer(name="probe")  # calls logging.basicConfig(level="INFO") (research S6)
+    MCPServer(name="probe")  # calls logging.basicConfig(level="INFO") (spec 080 §9.7)
     apply_logger_levels("INFO")
     assert logging.getLogger().level == logging.WARNING
     assert len(logging.getLogger().handlers) == 1

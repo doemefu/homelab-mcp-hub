@@ -39,7 +39,21 @@ kubectl -n apps delete pod -l app=mcp-hub
 
 An invalid registry makes the new pod exit with code 2 and one `startup_failed` line (it restarts until the registry is fixed).
 
-**Kill switch** (spec §4.6 L2 step 1): write an empty `allowed-subjects` into `mcp-hub-secrets`, then delete the hub pod (command above). Target: at most 2 minutes from the patch to the first refused call. The hub's own re-read of the file (at most every 60 s) is the backstop; the pod deletion also closes any open `GET /mcp` stream.
+**Kill switch** (spec §4.6 layer L2, two steps; owner go, because both change the cluster or SOPS):
+
+1. Immediately:
+
+   ```bash
+   kubectl -n apps patch secret mcp-hub-secrets --type merge -p '{"stringData":{"allowed-subjects":""}}'
+   kubectl -n apps delete pod -l app=mcp-hub
+   ```
+
+   The new pod reads the empty file at start-up and rejects every token (target: at most 2 minutes from the patch to the first refused call). The pod deletion also closes any open `GET /mcp` stream. If the deletion is skipped, the running pod still rejects every token once the empty file reaches it and is re-read (at most every 60 s): this is the backstop.
+2. Then set `mcp_hub_allowed_subjects: []` in SOPS in the `doemefu/homelab` repository. **Until this is done, any playbook-59 run rewrites the Secret from SOPS and restores access.**
+
+Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The full incident runbook is in `DEPLOYMENT.md` of the `doemefu/homelab` repository (section "mcp-hub incident runbook").
+
+**Signing-key revocation.** The hub caches auth-service's signing keys and re-reads them at most every hour; a key that auth-service withdraws stops being accepted at the hub within 1 hour, or immediately after `kubectl -n apps delete pod -l app=mcp-hub`.
 
 **Verification**
 

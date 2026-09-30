@@ -52,7 +52,7 @@ async def test_expires_at_includes_leeway(verifier: HubTokenVerifier) -> None:
     exp = int(time.time()) - 30
     access = await verifier.verify_token(T.mint(exp=exp))
     assert access is not None
-    assert access.expires_at == exp + 60  # SDK compares expires_at without leeway (K1)
+    assert access.expires_at == exp + 60  # SDK compares expires_at without leeway (spec 080 §4.3 row 6)
 
 
 @pytest.mark.parametrize(

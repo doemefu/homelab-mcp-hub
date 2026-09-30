@@ -44,7 +44,7 @@ Validation is offline (no introspection); auth-service is contacted only for JWK
 | # | Rule | Check name |
 |---|------|------------|
 | — | Token is a parseable JWT | `malformed` |
-| 1 | `alg` is RS256; key from the auth-service JWKS by `kid` (cached; an unknown `kid` triggers at most one refetch per 60 s; keys refreshed after 1 h under the same throttle; an unreachable, failing, non-JSON or oversized JWKS keeps the previous keys and fails the affected tokens with 401) | `algorithm`, `signature` |
+| 1 | `alg` is RS256; key from the auth-service JWKS by `kid` (cached; an unknown `kid` triggers at most one refetch per 60 s; keys refreshed after 1 h under the same throttle, so a key withdrawn by auth-service stops being accepted within 1 h, or at once after a pod restart; an unreachable, failing, non-JSON or oversized JWKS keeps the previous keys and fails the affected tokens with 401) | `algorithm`, `signature` |
 | 2 | Header `typ` is `at+jwt` or `application/at+jwt`, case-insensitive | `type` |
 | 3 | `iss` equals `AUTH_ISSUER` | `issuer` |
 | 4 | `aud` (string or array) contains `HUB_RESOURCE` exactly | `audience` |
@@ -164,6 +164,6 @@ An invalid value stops the process with a `startup_failed` line that names the v
 
 JSON lines on stdout, one object per event. Fields (§9.7): `ts`, `level`, `logger`, `event`, `method` (`GET`, `POST`, `DELETE` or `other`), `route` (`/mcp`, the metadata path or `other`), `status`, `duration_ms`, `mcp_protocol_version` (known versions or `other`), `sub`, `client_id`, `jti`, `check`, `exception` (class name only), `tool`, `outcome`, `accounts`, `result_count`, `key_count`, `account`, `capability`, `key` (a credential key name). `startup_failed` may carry `reason`: a fixed message plus at most a variable, field or key **name**.
 
-Events: `request` (one per HTTP request on 8083), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`.
+Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`.
 
 Never logged: tokens, `Authorization` values, raw header values, provider URLs, addresses, mail or calendar content, credentials. `LOG_LEVEL` applies to the `mcp_hub` logger only; the root logger and `httpx2`, `httpcore2`, `mcp`, `caldav`, `niquests`, `imapclient`, `uvicorn` are pinned at `WARNING`, and `mcp.server.transport_security` at `ERROR` (the hub writes its own request line with `check="host"` or `check="origin"` instead). Records from third-party loggers are reduced to `event="third_party_log"` without their message text. uvicorn access logs are off.

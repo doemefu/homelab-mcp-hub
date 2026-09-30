@@ -37,7 +37,7 @@ def configure_logging(level: str) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
-    # Python warnings (e.g. SDK deprecations) would otherwise reach stderr as plain text (review 09 W9).
+    # Python warnings (e.g. SDK deprecations) would otherwise reach stderr as plain text.
     logging.captureWarnings(True)
     apply_logger_levels(level)
 
