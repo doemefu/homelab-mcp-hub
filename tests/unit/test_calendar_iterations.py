@@ -48,8 +48,8 @@ def expander_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     return calls
 
 
-def test_the_limit_is_100000() -> None:
-    assert MAX_ITERATED_OCCURRENCES == 100_000
+def test_the_limit_is_20000() -> None:
+    assert MAX_ITERATED_OCCURRENCES == 20_000
 
 
 @pytest.mark.parametrize(
@@ -99,7 +99,7 @@ def test_rules_that_iterate_too_many_occurrences_are_refused_before_expansion(
         ("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "19900101T090000Z"),
         ("FREQ=MONTHLY;BYDAY=1MO", "19500102T090000Z"),
         ("FREQ=YEARLY;BYMONTH=5;BYDAY=-1MO", "19500529T090000Z"),
-        ("FREQ=DAILY", "19000101T090000Z"),
+        ("FREQ=DAILY", "20000101T090000Z"),
     ],
     ids=[
         "apple-birthday-1604",
@@ -107,11 +107,40 @@ def test_rules_that_iterate_too_many_occurrences_are_refused_before_expansion(
         "weekdays-1990",
         "first-monday-1950",
         "last-monday-may-1950",
-        "daily-1900",
+        "daily-2000",
     ],
 )
 def test_legitimate_long_series_pass(rule: str, start: str) -> None:
     run(obj(rule, start))  # no ObjectSkippedError
+
+
+@pytest.mark.parametrize(
+    ("rule", "start"),
+    [("FREQ=DAILY", "19700101T090000Z"), (f"FREQ=DAILY;BYHOUR={HOURS}", "20240101T000000Z")],
+    ids=["daily-since-1970", "hourly-like-since-2024"],
+)
+def test_accepted_trade_off_refusals(rule: str, start: str, expander_calls: list[int]) -> None:
+    # Documented in INTERFACES: a daily series older than about 54 years, and other rules whose bound exceeds 20,000.
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(rule, start))
+    assert caught.value.reason == "rule_refused"
+    assert expander_calls == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "start", "most"),
+    [
+        ("FREQ=MONTHLY;BYDAY=1MO", date(1950, 1, 2), 925),
+        ("FREQ=YEARLY;BYMONTH=5;BYDAY=-1MO", date(1950, 5, 29), 78),
+        ("FREQ=YEARLY;BYDAY=20MO", date(1950, 5, 15), 78),
+        ("FREQ=MONTHLY;BYDAY=MO,WE", date(2020, 1, 6), 83 * 10),
+        ("FREQ=YEARLY;BYDAY=FR", date(2020, 1, 3), 7 * 53),
+        ("FREQ=YEARLY;BYMONTH=1,7;BYDAY=MO,2TU", date(2020, 1, 6), 7 * 2 * 6),
+    ],
+    ids=["monthly-ordinal", "yearly-month-ordinal", "yearly-ordinal", "monthly-plain", "yearly-plain", "yearly-mixed"],
+)
+def test_byday_bounds(rule: str, start: date, most: int) -> None:
+    assert iteration_bound(icalendar.vRecur.from_ical(rule), start, WINDOW_END) <= most
 
 
 def test_the_bound_for_apple_birthdays_is_small() -> None:
@@ -125,50 +154,63 @@ def _random_rule(rng: random.Random) -> tuple[str, datetime]:
     years_back = {"YEARLY": 80, "MONTHLY": 40, "WEEKLY": 6, "DAILY": 3}[freq]
     start = datetime(2026, 10, 20, 9) - timedelta(days=rng.randint(0, 365 * years_back))
     parts = [f"FREQ={freq}"]
-    if rng.random() < 0.3:
-        parts.append(f"INTERVAL={rng.randint(1, 4)}")
+    if rng.random() < 0.35:
+        parts.append(f"INTERVAL={rng.randint(2, 5)}")
     days = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-    if rng.random() < 0.5:
-        if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.5:
-            picked = [f"{rng.choice([1, 2, 3, 4, -1])}{d}" for d in rng.sample(days, rng.randint(1, 3))]
-        else:
-            picked = rng.sample(days, rng.randint(1, 7))
+    if rng.random() < 0.6:
+        picked = []
+        for day in rng.sample(days, rng.randint(1, 4)):
+            ordinal = rng.choice([0, 0, 1, 2, 3, 4, 5, -1, -2]) if freq in ("YEARLY", "MONTHLY") else 0
+            if freq == "YEARLY" and ordinal and rng.random() < 0.3:
+                ordinal = rng.choice([10, 20, 30, 40, 52, -10, -52])  # ordinals within the year
+            picked.append(f"{ordinal}{day}" if ordinal else day)
         parts.append("BYDAY=" + ",".join(picked))
-    if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.5:
-        parts.append("BYMONTHDAY=" + ",".join(map(str, rng.sample(range(1, 29), rng.randint(1, 5)))))
-    if freq == "YEARLY" and rng.random() < 0.5:
+    if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.4:
+        parts.append("BYMONTHDAY=" + ",".join(map(str, rng.sample([*range(1, 32), -1, -2], rng.randint(1, 5)))))
+    if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.4:
         parts.append("BYMONTH=" + ",".join(map(str, rng.sample(range(1, 13), rng.randint(1, 6)))))
-    if freq == "YEARLY" and rng.random() < 0.15:
-        parts.append("BYYEARDAY=" + ",".join(map(str, rng.sample(range(1, 366), rng.randint(1, 4)))))
-    if freq == "YEARLY" and rng.random() < 0.15:
-        parts.append("BYWEEKNO=" + ",".join(map(str, rng.sample(range(1, 53), rng.randint(1, 3)))))
+    if freq == "YEARLY" and rng.random() < 0.2:
+        parts.append("BYYEARDAY=" + ",".join(map(str, rng.sample([*range(1, 367), -1, -100], rng.randint(1, 4)))))
+    if freq == "YEARLY" and rng.random() < 0.2:
+        parts.append("BYWEEKNO=" + ",".join(map(str, rng.sample([*range(1, 54), -1], rng.randint(1, 3)))))
     if rng.random() < 0.4:
         parts.append("BYHOUR=" + ",".join(map(str, sorted(rng.sample(range(24), rng.randint(1, 6))))))
-    if rng.random() < 0.15:
+    if rng.random() < 0.2:
+        parts.append("BYSETPOS=" + ",".join(map(str, rng.sample([1, 2, 3, -1, -2], rng.randint(1, 2)))))
+    if rng.random() < 0.2:
         parts.append(f"COUNT={rng.randint(1, 5000)}")
-    elif rng.random() < 0.15:
+    elif rng.random() < 0.2:
         parts.append("UNTIL=" + (start + timedelta(days=rng.randint(0, 365 * years_back))).strftime("%Y%m%dT%H%M%SZ"))
     return ";".join(parts), start
 
 
-def test_the_bound_is_never_below_the_real_number_of_occurrences() -> None:
+def test_the_bound_is_never_below_the_real_number_of_occurrences(capsys: pytest.CaptureFixture[str]) -> None:
+    import time
+
     rng = random.Random(20261001)  # noqa: S311 - a seeded generator for reproducible test rules
-    checked = 0
+    compared = partial = invalid = 0
     window_end = datetime.combine(WINDOW_END, datetime.min.time())
-    for _ in range(400):
+    for _ in range(1_300):
         text, start = _random_rule(rng)
-        rule = icalendar.vRecur.from_ical(text)
-        bound = iteration_bound(rule, start.date(), WINDOW_END)
-        if bound > 30_000:
-            continue  # too slow to count here; the bound is an upper bound by construction for these too
+        bound = iteration_bound(icalendar.vRecur.from_ical(text), start.date(), WINDOW_END)
         real = rrulestr(text.replace("Z", ""), dtstart=start)
         count = 0
-        for occurrence in real:
-            if occurrence > window_end:
-                break
-            count += 1
-            if count > bound:
-                break
+
+        def counting(real: Any = real, bound: int = bound) -> None:
+            nonlocal count
+            for occurrence in real:
+                if occurrence > window_end or count > bound:
+                    return
+                count += 1
+
+        try:  # rules that never match make dateutil iterate to year 9999: stop counting after 0.15 s CPU
+            caldav._with_cpu_deadline(counting, 0.15, time.thread_time)
+            compared += 1
+        except caldav._ExpansionTooSlow:
+            partial += 1  # every occurrence counted so far is still checked against the bound
+        except Exception:
+            invalid += 1  # dateutil itself fails on this rule (e.g. IndexError): the hub skips such an object
         assert count <= bound, (text, start, count, bound)
-        checked += 1
-    assert checked >= 300
+    with capsys.disabled():
+        print(f"\nbound: {compared} fully compared, {partial} partially (CPU guard), {invalid} rejected by dateutil")
+    assert compared >= 1_000

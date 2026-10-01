@@ -54,11 +54,12 @@ MAX_OBJECT_BYTES: Final = 1024 * 1024  # one calendar object after stripping unu
 MAX_RAW_OBJECT_BYTES: Final = 4 * MAX_OBJECT_BYTES  # raw object, refused before any regex runs on it
 MAX_COMPONENTS_PER_OBJECT: Final = 1000  # VEVENT components (master and overrides) per object
 MAX_TIMEZONES_PER_OBJECT: Final = 20  # VTIMEZONE components per object (real objects carry one to three)
+_ORDINAL_DAY: Final = re.compile(r"^\s*[+-]?\d")  # BYDAY entry with an ordinal, e.g. 1MO, -1FR
 _TIME_OF_DAY_PARTS: Final = ("BYMINUTE", "BYSECOND")  # at most one value each; BYHOUR lists are allowed (<= 24/day)
 EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (iterated from DTSTART)
 # dateutil keeps every occurrence it iterates from DTSTART (60-90 bytes each) and the CPU deadline does not bound
 # memory: a rule whose estimated occurrences up to the window end exceed this is refused before expansion.
-MAX_ITERATED_OCCURRENCES: Final = 100_000
+MAX_ITERATED_OCCURRENCES: Final = 20_000
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
@@ -70,7 +71,7 @@ EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checke
 SLOW_OBJECT_CACHE_SIZE: Final = 1000
 # REPORT bodies held per account and call (discovery bodies have their own 5 MiB cap and do not count). Calendars are
 # fetched sequentially in path order; the cap drops whole calendars from the end of that order (D62).
-MAX_REPORT_BYTES_PER_CALL: Final = 10 * 1024 * 1024
+MAX_REPORT_BYTES_PER_CALL: Final = 5 * 1024 * 1024  # one maximal response uses the whole budget
 # icalendar's own unfold rule (parser.content_line.UFOLD), so the pre-screen sees exactly what the parser sees.
 # The repetition is possessive (same matches): a backtracking `*` kept state per blank line, ~290 MB on 4.6 MiB.
 _UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*+[ \t]")
@@ -377,6 +378,12 @@ def _count(rule: icalendar.vRecur, part: str) -> int:
     return len(_values(rule.get(part)))
 
 
+def _byday_entries(rule: icalendar.vRecur) -> tuple[int, int]:
+    """(entries with an ordinal such as 1MO or -1FR, plain weekdays)."""
+    ordinals = sum(1 for value in _values(rule.get("BYDAY")) if _ORDINAL_DAY.match(str(value)))
+    return ordinals, _count(rule, "BYDAY") - ordinals
+
+
 def iteration_bound(rule: icalendar.vRecur, start: date, window_end: date) -> int:
     """Upper bound of the occurrences the expansion library iterates from DTSTART up to the window end (spec 080
     rev. 4.5 D62, confirmation review C1). Deliberately conservative: periods are rounded up and each period counts
@@ -400,14 +407,24 @@ def iteration_bound(rule: icalendar.vRecur, start: date, window_end: date) -> in
     intervals = _values(rule.get("INTERVAL"))
     interval = cast(int, intervals[0]) if intervals else 1
     periods = -(-periods // interval)
+    ordinals, weekdays = _byday_entries(rule)
     if freq == "YEARLY":
-        if any(_count(rule, part) for part in ("BYWEEKNO", "BYYEARDAY", "BYDAY")):
+        if any(_count(rule, part) for part in ("BYWEEKNO", "BYYEARDAY")):
             per_period = 366
+        elif (
+            ordinals or weekdays
+        ):  # an ordinal day once per listed month (or year), a weekday <= 5 per month / 53 a year
+            if _count(rule, "BYMONTH"):
+                per_period = min(366, _count(rule, "BYMONTH") * (ordinals + 5 * weekdays))
+            else:
+                per_period = min(366, ordinals + 53 * weekdays)
         else:  # BYMONTHDAY without BYMONTH applies to all twelve months
             months = _count(rule, "BYMONTH") or (12 if _count(rule, "BYMONTHDAY") else 1)
             per_period = min(366, months * max(1, _count(rule, "BYMONTHDAY")))
     elif freq == "MONTHLY":
-        per_period = 31 if _count(rule, "BYDAY") else min(31, max(1, _count(rule, "BYMONTHDAY")))
+        per_period = (
+            min(31, ordinals + 5 * weekdays) if ordinals or weekdays else min(31, max(1, _count(rule, "BYMONTHDAY")))
+        )
     elif freq == "WEEKLY":
         per_period = min(7, max(1, _count(rule, "BYDAY")))
     else:

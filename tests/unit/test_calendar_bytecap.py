@@ -1,4 +1,4 @@
-"""REPORT byte budget per account and call (spec 080 rev. 4.5 D62): at most 10 MiB of REPORT bodies, enforced while
+"""REPORT byte budget per account and call (spec 080 rev. 4.5 D62): at most 5 MiB of REPORT bodies, enforced while
 reading; the cap drops whole calendars from the end of a deterministic (path-sorted) order."""
 
 import logging
@@ -73,17 +73,17 @@ def reports(recorder: RecordingTransport) -> list[str]:
     return [path for _, _, method, path, _ in recorder.seen if method == "REPORT"]
 
 
-def test_the_budget_is_10_mib_and_above_the_per_response_cap() -> None:
-    assert MAX_REPORT_BYTES_PER_CALL == 10 * MIB
-    assert MAX_REPORT_BYTES_PER_CALL > MAX_HTTP_RESPONSE_BYTES
+def test_the_budget_is_5_mib_per_account_and_call() -> None:
+    assert MAX_REPORT_BYTES_PER_CALL == 5 * MIB
+    assert MAX_REPORT_BYTES_PER_CALL == MAX_HTTP_RESPONSE_BYTES  # one maximal response uses the whole budget
 
 
 def test_the_byte_cap_drops_whole_calendars_from_the_end(caplog: pytest.LogCaptureFixture) -> None:
-    calendars = {name: calendar_data(name, 4 * MIB) for name in ("a", "b", "c", "d")}
+    calendars = {name: calendar_data(name, 2 * MIB) for name in ("a", "b", "c", "d")}
     caldav, recorder = source_with(calendars)
     with caplog.at_level(logging.INFO, logger="mcp_hub"):
         page = caldav.events(START, END, ZURICH, ZURICH)
-    # a and b fit (about 8 MiB); c would cross the remaining 2 MiB: requested, aborted, dropped whole; d never requested
+    # a and b fit (about 4 MiB); c would cross the remaining 1 MiB: requested, aborted, dropped whole; d never requested
     assert reports(recorder) == ["/h/a/", "/h/b/", "/h/c/"]
     assert {e.title for e in page.events} == {"a", "b"}
     assert page.truncated is True
@@ -93,7 +93,7 @@ def test_the_byte_cap_drops_whole_calendars_from_the_end(caplog: pytest.LogCaptu
 
 
 def test_calendars_are_queried_in_path_order() -> None:
-    calendars = {name: calendar_data(name, 4 * MIB) for name in ("c", "a", "b")}
+    calendars = {name: calendar_data(name, 2 * MIB) for name in ("c", "a", "b")}
     caldav, recorder = source_with(calendars, listing_order=["c", "a", "b"])
     page = caldav.events(START, END, ZURICH, ZURICH)
     assert reports(recorder) == ["/h/a/", "/h/b/", "/h/c/"]
@@ -101,7 +101,7 @@ def test_calendars_are_queried_in_path_order() -> None:
 
 
 def test_a_single_response_above_5_mib_stays_too_large() -> None:
-    calendars = {"a": calendar_data("a", 4 * MIB), "b": calendar_data("b", 6 * MIB)}
+    calendars = {"a": calendar_data("a", 1 * MIB), "b": calendar_data("b", 6 * MIB)}
     caldav, _ = source_with(calendars)
     with pytest.raises(ProviderError) as caught:
         caldav.events(START, END, ZURICH, ZURICH)
@@ -109,7 +109,7 @@ def test_a_single_response_above_5_mib_stays_too_large() -> None:
 
 
 def test_a_normal_account_is_unaffected(caplog: pytest.LogCaptureFixture) -> None:
-    calendars = {name: calendar_data(name, 1 * MIB) for name in ("a", "b", "c")}
+    calendars = {name: calendar_data(name, MIB + MIB // 2) for name in ("a", "b", "c")}
     caldav, recorder = source_with(calendars)
     with caplog.at_level(logging.INFO, logger="mcp_hub"):
         page = caldav.events(START, END, ZURICH, ZURICH)
@@ -120,9 +120,9 @@ def test_a_normal_account_is_unaffected(caplog: pytest.LogCaptureFixture) -> Non
 
 
 def test_discovery_bodies_do_not_count_against_the_budget() -> None:
-    # A 4.5 MiB listing (padded with non-calendar collections) and two 4.5 MiB calendars: REPORTs stay below 10 MiB.
+    # A 4.5 MiB listing (padded with non-calendar collections) and two 2 MiB calendars: REPORTs stay below 5 MiB.
     padding = [collection(f"/h/x{i}/", "pad " + "y" * 1500, calendar=False) for i in range(2_900)]
-    calendars = {name: calendar_data(name, 4 * MIB + MIB // 2) for name in ("a", "b")}
+    calendars = {name: calendar_data(name, 2 * MIB) for name in ("a", "b")}
     answers_listing = multistatus(collection("/h/a/", "a"), collection("/h/b/", "b"), *padding)
     assert 4 * MIB < len(answers_listing) < 5 * MIB
     caldav, recorder = source_with(calendars)
