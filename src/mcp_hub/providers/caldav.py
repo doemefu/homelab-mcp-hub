@@ -38,6 +38,9 @@ _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both 
 # expanded under a CPU deadline, and the whole call is capped by instance counts and a cooperative time budget.
 ALLOWED_FREQUENCIES: Final = frozenset({"YEARLY", "MONTHLY", "WEEKLY", "DAILY"})
 MAX_RECURRENCE_DATES: Final = 1000  # RDATE values and EXDATE values, each counted per object
+MAX_OBJECT_BYTES: Final = 256 * 1024  # one calendar object, checked before parsing
+MAX_COMPONENTS_PER_OBJECT: Final = 500  # VEVENT components (master and overrides) per object
+_TIME_OF_DAY_PARTS: Final = ("BYHOUR", "BYMINUTE", "BYSECOND")  # at most one value each
 EARLIEST_START: Final = date(1900, 1, 1)
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
@@ -46,6 +49,8 @@ EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checke
 SLOW_OBJECT_CACHE_SIZE: Final = 1000
 _FOLD: Final = re.compile(rb"\r?\n[ \t]")
 _RECURRING_LINE: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
+_BEGIN_VEVENT: Final = re.compile(rb"(?im)^BEGIN:VEVENT[ \t]*\r?$")
+_DATE_LINE: Final = re.compile(rb"(?im)^(RDATE|EXDATE)[;:][^\r\n]*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,8 +234,25 @@ def _date_count(component: icalendar.cal.Component, name: str) -> int:
     return sum(len(getattr(value, "dts", [value])) for value in _values(component.get(name)))
 
 
+def _prescreen(ics: bytes) -> None:
+    """Cheap checks on the raw object, before icalendar parses it (spec 080 rev. 4.5 D62 A). Values are counted by
+    their separators on the unfolded lines; a comma inside a parameter only makes the count larger (refuses earlier)."""
+    if len(ics) > MAX_OBJECT_BYTES:
+        raise ObjectSkippedError("object_too_large")
+    text = _FOLD.sub(b"", ics)
+    if len(_BEGIN_VEVENT.findall(text)) > MAX_COMPONENTS_PER_OBJECT:
+        raise ObjectSkippedError("too_many_components")
+    counts = {b"RDATE": 0, b"EXDATE": 0}
+    for line in _DATE_LINE.finditer(text):
+        counts[line.group(1).upper()] += line.group(0).count(b",") + 1
+    if max(counts.values()) > MAX_RECURRENCE_DATES:
+        raise ObjectSkippedError("too_many_dates")
+
+
 def _screen(calendar: icalendar.Calendar) -> None:
-    """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs."""
+    """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs: with
+    FREQ at least daily and at most one value per time-of-day part, a rule yields at most a few dozen instances in a
+    widened 31-day window (spec 080 rev. 4.5 D62 B)."""
     for component in calendar.walk("VEVENT"):
         rules = _values(component.get("RRULE"))
         if len(rules) > 1 or "EXRULE" in component:
@@ -238,6 +260,9 @@ def _screen(calendar: icalendar.Calendar) -> None:
         for rule in rules:
             frequencies = {str(value).upper() for value in _values(cast(dict[str, object], rule).get("FREQ"))}
             if len(frequencies) != 1 or not frequencies <= ALLOWED_FREQUENCIES:
+                raise ObjectSkippedError("rule_refused")
+            parts = cast(dict[str, object], rule)
+            if any(len(_values(parts.get(part))) > 1 for part in _TIME_OF_DAY_PARTS):
                 raise ObjectSkippedError("rule_refused")
         if max(_date_count(component, "RDATE"), _date_count(component, "EXDATE")) > MAX_RECURRENCE_DATES:
             raise ObjectSkippedError("too_many_dates")
@@ -286,6 +311,7 @@ def _expand_object(
     """The object's instances sorted by start, at most MAX_INSTANCES_PER_OBJECT, and whether that cap cut them."""
 
     def work() -> list[RawEvent]:
+        _prescreen(ics)
         calendar = icalendar.Calendar.from_ical(ics)
         _screen(calendar)
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)

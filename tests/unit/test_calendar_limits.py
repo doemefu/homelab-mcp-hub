@@ -352,3 +352,100 @@ def test_slow_object_cache_is_thread_safe() -> None:
     for thread in threads:
         thread.join()
     assert len(cache) == 100
+
+
+# --- raw pre-screen and BY* screen (D62 final A and B) ---------------------------------------------------------------
+
+
+@pytest.fixture
+def parser_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Counts calls into icalendar's parser."""
+    calls: list[int] = []
+    original = caldav.icalendar.Calendar.from_ical
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(caldav.icalendar.Calendar, "from_ical", spy)
+    return calls
+
+
+def many_events(count: int) -> bytes:
+    events = "".join(
+        f"BEGIN:VEVENT\r\nUID:many-{n}@example.test\r\nDTSTAMP:20260901T000000Z\r\nDTSTART:20261020T100000Z\r\n"
+        "DTEND:20261020T110000Z\r\nEND:VEVENT\r\n"
+        for n in range(count)
+    )
+    return f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\n{events}END:VCALENDAR\r\n".encode()
+
+
+def padded(size: int) -> bytes:
+    raw = obj()
+    filler = b"DESCRIPTION:" + b"x" * (size - len(raw) - len(b"DESCRIPTION:\r\n")) + b"\r\n"
+    return raw.replace(b"END:VEVENT", filler + b"END:VEVENT")
+
+
+def folded_rdates(count: int) -> bytes:
+    """RDATE values split over several RDATE lines and folded, so only a value count catches them."""
+    values = [stamp(datetime(2026, 10, 21) + timedelta(minutes=30 * i)) for i in range(count)]
+    lines = [f"RDATE:{','.join(values[i : i + 100])}" for i in range(0, count, 100)]
+    folded = ["\r\n ".join(line[j : j + 70] for j in range(0, len(line), 70)) for line in lines]
+    return obj(*folded, uid="folded@example.test", start="20261021T000000Z")
+
+
+RAW_REFUSED = {
+    "object-too-large": (padded(256 * 1024 + 1), "object_too_large"),
+    "501-components": (many_events(501), "too_many_components"),
+    "1001-rdates-folded": (folded_rdates(1001), "too_many_dates"),
+    "1001-exdates-lowercase": (obj("RRULE:FREQ=DAILY", f"exdate:{EXDATES_1001}"), "too_many_dates"),
+}
+
+
+@pytest.mark.parametrize("case", list(RAW_REFUSED))
+def test_raw_prescreen_refuses_before_parsing(case: str, parser_calls: list[int]) -> None:
+    raw, reason = RAW_REFUSED[case]
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == reason
+    assert parser_calls == []
+
+
+def test_raw_prescreen_boundaries_are_allowed(parser_calls: list[int]) -> None:
+    assert len(run(padded(256 * 1024))) == 1
+    assert len(run(many_events(500))) == 500
+    assert len(run(folded_rdates(1000))) == 1000
+    assert len(parser_calls) == 3
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY;BYHOUR=0,1",
+        "FREQ=DAILY;BYMINUTE=0,30",
+        "FREQ=DAILY;BYSECOND=0,1",
+        "FREQ=DAILY;BYHOUR=" + ",".join(map(str, range(24))) + ";BYMINUTE=" + ",".join(map(str, range(60))),
+    ],
+    ids=["two-hours", "two-minutes", "two-seconds", "review-19-shape"],
+)
+def test_time_of_day_lists_are_refused(rule: str, expander_calls: list[int]) -> None:
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(f"RRULE:{rule}"))
+    assert caught.value.reason == "rule_refused"
+    assert expander_calls == []
+
+
+def test_rules_are_screened_on_every_component_including_overrides(expander_calls: list[int]) -> None:
+    override = (
+        "END:VEVENT\r\nBEGIN:VEVENT\r\nUID:limit@example.test\r\nDTSTAMP:20260901T000000Z\r\n"
+        "RECURRENCE-ID:20261021T100000Z\r\nDTSTART:20261021T120000Z\r\nDTEND:20261021T130000Z\r\n"
+        "RRULE:FREQ=DAILY;BYSECOND=0,1,2"
+    )
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj("RRULE:FREQ=DAILY;COUNT=5", override))
+    assert caught.value.reason == "rule_refused"
+    assert expander_calls == []
+
+
+def test_single_values_for_time_of_day_parts_are_allowed() -> None:
+    assert len(run(obj("RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=30;BYSECOND=0"))) == 28
