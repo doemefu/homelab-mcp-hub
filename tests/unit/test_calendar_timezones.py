@@ -5,9 +5,11 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from icalendar import Calendar
 from icalendar.timezone import tzp
 
 from mcp_hub.config import load_settings
@@ -188,3 +190,44 @@ def test_only_the_caldav_module_imports_the_calendar_libraries() -> None:
         and re.search(r"^\s*(import|from)\s+(icalendar|recurring_ical_events|dateutil)\b", path.read_text(), re.M)
     ]
     assert offenders == []
+
+
+def test_a_definition_cached_outside_the_guard_does_not_leak_into_an_object() -> None:
+    # N8: the cache is also emptied BEFORE each object, against any other code that parses calendar data.
+    bare = obj("+0000", "bare", zones="")  # uses the custom TZID without defining it
+    reference = starts(bare)
+    Calendar.from_ical(HOSTILE)  # outside expand(): icalendar caches "Hub Probe Zone" = +05:00 process-wide
+    try:
+        assert cached(CUSTOM)
+        assert starts(bare) == reference
+    finally:
+        tzp.use_zoneinfo()
+
+
+def test_objects_are_expanded_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # N28: while object A (with its +05:00 definition) is being expanded, object B with the same TZID but no
+    # definition must wait for the lock instead of seeing A's definition.
+    bare = obj("+0000", "bare", zones="")
+    reference = starts(bare)
+    inside, release = threading.Event(), threading.Event()
+    original = caldav._instances
+
+    def blocking(calendar: Any, **kwargs: Any) -> Any:
+        if any(str(c.get("UID", "")).startswith("hostile") for c in calendar.walk("VEVENT")):
+            inside.set()
+            release.wait(5)
+        return original(calendar, **kwargs)
+
+    monkeypatch.setattr(caldav, "_instances", blocking)
+    results: dict[str, list[str]] = {}
+    first = threading.Thread(target=lambda: results.__setitem__("hostile", starts(HOSTILE)))
+    second = threading.Thread(target=lambda: results.__setitem__("bare", starts(bare)))
+    first.start()
+    assert inside.wait(5)
+    second.start()
+    second.join(0.3)
+    assert second.is_alive()  # B waits for the lock while A is inside
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert results == {"hostile": ["2026-10-20T07:00:00+02:00"], "bare": reference}

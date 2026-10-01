@@ -680,3 +680,18 @@ def test_byhour_lists_are_allowed() -> None:
         "2026-10-21T21:00:00+02:00",
     ]
     assert len(starts) == 2 * 28
+
+
+# --- delta review D5: pin the surviving mutations M7, N8, N28 -------------------------------------------------------
+
+
+def test_a_series_the_library_cannot_expand_is_skipped_not_cut(caplog: pytest.LogCaptureFixture) -> None:
+    # M7: with skip_bad_series=True the library silently returns part of this series; it must be skipped and counted.
+    broken = obj(
+        "RRULE:FREQ=DAILY;COUNT=3", "RDATE;VALUE=PERIOD:20261022T100000Z/20261021T100000Z", uid="period@example.test"
+    )
+    with caplog.at_level(logging.WARNING, logger="mcp_hub"):
+        page = source_for(broken, ics.load("allday.ics")).events(START, END, ZURICH, ZURICH)
+    assert [e.title for e in page.events] == ["Weekend away"]
+    assert page.skipped == 1
+    assert [s.get("exception") for s in skipped(caplog)] == ["PeriodEndBeforeStart"]
