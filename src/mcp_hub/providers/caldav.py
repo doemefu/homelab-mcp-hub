@@ -58,7 +58,9 @@ EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (ite
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
-OBJECT_CPU_SECONDS: Final = 2.0  # thread CPU time per object (parse, screening, expansion)
+# Thread CPU time per object (parse, screening, expansion). 4 s rather than 2 s: the cluster's slowest nodes are
+# several times slower than a laptop, and an extreme but legitimate series must not be skipped there (D62).
+OBJECT_CPU_SECONDS: Final = 4.0
 CLOCK_SAMPLE_EVENTS: Final = 64  # the trace hook reads the CPU clock every 64 call events (cuts its overhead)
 EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checked between objects
 SLOW_OBJECT_CACHE_SIZE: Final = 1000

@@ -32,6 +32,7 @@ ZURICH = ZoneInfo("Europe/Zurich")
 START = datetime(2026, 10, 17, tzinfo=ZURICH)
 END = datetime(2026, 11, 17, tzinfo=ZURICH)  # the widest allowed window (31 days)
 PASSWORD = "unit-test-password"  # throwaway value for an in-process transport
+SLOW_RULE = "FREQ=DAILY;BYHOUR=" + ",".join(map(str, range(24))) + ";BYSETPOS=25"  # never matches; ~3 s CPU here
 NO_MATCH = [
     "FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30",
     "FREQ=DAILY;BYSETPOS=2",
@@ -179,19 +180,25 @@ def test_refused_object_does_not_affect_the_others(caplog: pytest.LogCaptureFixt
 
 @pytest.mark.parametrize("rule", NO_MATCH)
 def test_no_match_rules_stop_at_the_cpu_deadline(rule: str) -> None:
+    # On a laptop these rules end on their own after 0.6-3.2 s (dateutil stops at year 9999); on a node several times
+    # slower they reach the deadline. The hook is tested at a 1 s deadline so every shape reaches it here.
     clock = FakeTime()
     with pytest.raises(ObjectSkippedError) as caught:
-        run(obj(f"RRULE:{rule}"), cpu_clock=clock)
+        run(obj(f"RRULE:{rule}"), cpu_clock=clock, cpu_seconds=1.0)
     assert caught.value.reason == "expansion_too_slow"
-    assert OBJECT_CPU_SECONDS <= clock.now < OBJECT_CPU_SECONDS + 1.0
+    assert 1.0 <= clock.now < 2.0
+
+
+def test_the_default_cpu_deadline_is_4_seconds() -> None:
+    assert OBJECT_CPU_SECONDS == 4.0
 
 
 def test_a_real_no_match_rule_stops_within_the_cpu_deadline() -> None:
     started = time.monotonic()
     with pytest.raises(ObjectSkippedError) as caught:
-        run(obj("RRULE:FREQ=DAILY;BYSETPOS=2"))
+        run(obj(f"RRULE:{SLOW_RULE}"), cpu_seconds=0.5)
     assert caught.value.reason == "expansion_too_slow"
-    assert time.monotonic() - started < 10 * OBJECT_CPU_SECONDS  # generous guard; without the deadline: ~30 s
+    assert time.monotonic() - started < 5.0  # generous guard; without the deadline: ~3 s here, far more on CI
 
 
 def _previous_tracer(frame: Any, event: str, arg: Any) -> None:
@@ -249,7 +256,7 @@ def test_the_hook_is_thread_local() -> None:
 
     def hooked() -> None:
         try:
-            run(obj("RRULE:FREQ=DAILY;BYSETPOS=2"))
+            run(obj(f"RRULE:{SLOW_RULE}"), cpu_seconds=0.5)
         except ObjectSkippedError as exc:
             slow_result.append(exc.reason)
 
