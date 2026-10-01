@@ -41,7 +41,7 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
     token = tokens.mint()
     listed = modern(client, token, "tools/list")
     assert listed.status_code == 200
-    assert [t["name"] for t in body(listed)["result"]["tools"]] == ["list_accounts"]
+    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == ["get_message", "list_accounts", "list_unread"]
     called = modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
     assert called.status_code == 200
     assert body(called)["result"]["isError"] is False
@@ -63,7 +63,7 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
     client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     listed = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     assert listed.status_code == 200
-    assert [t["name"] for t in body(listed)["result"]["tools"]] == ["list_accounts"]
+    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == ["get_message", "list_accounts", "list_unread"]
 
 
 @pytest.mark.parametrize("typ", ["application/at+jwt", "AT+JWT", "Application/At+Jwt", "at+jwt"])
@@ -212,7 +212,7 @@ def test_jwks_outage_gives_401_and_recovers(
 
 def test_list_accounts_output_and_annotations(client: TestClient, tokens: TokenFactory) -> None:
     token = tokens.mint()
-    tool = body(modern(client, token, "tools/list"))["result"]["tools"][0]
+    tool = next(t for t in body(modern(client, token, "tools/list"))["result"]["tools"] if t["name"] == "list_accounts")
     assert tool["annotations"] == {
         "readOnlyHint": True,
         "destructiveHint": False,

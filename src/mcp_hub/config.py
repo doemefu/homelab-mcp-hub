@@ -22,6 +22,7 @@ _DEFAULTS: Final[dict[str, str]] = {
     "HUB_SECRETS_DIR": "/etc/mcp-hub/secrets",
     "HUB_DEFAULT_TIMEZONE": "Europe/Zurich",
     "LOG_LEVEL": "INFO",
+    "HUB_RESPONSE_BUDGET_CHARS": "30000",
 }
 
 
@@ -42,6 +43,7 @@ class Settings:
     secrets_dir: Path
     default_timezone: str
     log_level: str
+    response_budget_chars: int
 
     @property
     def mcp_path(self) -> str:
@@ -96,6 +98,8 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         secrets_dir=Path(get("HUB_SECRETS_DIR")),
         default_timezone=timezone,
         log_level=log_level,
+        # Measured on the compact JSON of content[0].text (spec 080 rev. 4.4 §5.4, D59).
+        response_budget_chars=_int("HUB_RESPONSE_BUDGET_CHARS", get("HUB_RESPONSE_BUDGET_CHARS"), 10000, 70000),
     )
 
 

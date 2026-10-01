@@ -23,6 +23,7 @@ from mcp_hub.config import ALLOWLIST_FILE, Settings
 from mcp_hub.health import StatusStore, missing_credentials
 from mcp_hub.jwks import JwksCache
 from mcp_hub.logging import apply_logger_levels, log_event
+from mcp_hub.providers import Adapters
 from mcp_hub.registry import CAPABILITIES, Registry
 from mcp_hub.tools import HubContext, register_tools
 
@@ -187,6 +188,7 @@ def create_app(
     *,
     status: StatusStore | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    adapters: Adapters | None = None,
 ) -> HubApp:
     verifier = HubTokenVerifier(
         issuer=settings.auth_issuer,
@@ -212,7 +214,10 @@ def create_app(
         ),
     )
     apply_logger_levels(settings.log_level)  # MCPServer() calls logging.basicConfig (spec 080 §9.7)
-    register_tools(server, HubContext(settings=settings, registry=registry, status=status or StatusStore()))
+    context = HubContext(
+        settings=settings, registry=registry, status=status or StatusStore(), adapters=adapters or Adapters()
+    )
+    register_tools(server, context)
     _warn_missing_credentials(settings, registry)
     # The SDK's default streamable HTTP path is /mcp; settings.mcp_path is fixed to "/mcp".
     sdk_app = server.streamable_http_app(

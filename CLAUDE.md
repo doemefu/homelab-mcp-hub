@@ -38,6 +38,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 | MCP SDK | `mcp` 2.2.0 (`MCPServer`, Streamable HTTP) |
 | HTTP | uvicorn 0.54.0, starlette 1.7.0, httpx2 2.13.1, anyio 4.15.1 |
 | Validation / tokens | pydantic 2.13.5, PyJWT 2.15.0 (`[crypto]`) |
+| Mail | IMAPClient 4.1.0 |
 | Tooling | uv 0.12.19, ruff 0.16.9, mypy 2.3.1 `--strict`, pytest 9.1.1, pytest-httpserver 1.1.5 |
 
 ## Conventions
@@ -45,6 +46,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 - Every token validation rule (spec §4.3) has a check name in `auth.py` and a contract test in `tests/contract/` (gate G6); the SDK enforces the scopes and Host/Origin, the hub the rest.
 - The account registry (`accounts.json`) is configuration, validated by pydantic at start-up; an invalid registry stops the process (exit 2).
 - No content storage: account status is kept in memory only; tool results are built per request.
+- Provider adapters return decoded text; the tool layer sanitises it into `untrusted` and applies the output budget.
 - Third-party loggers are capped at WARNING (`mcp.server.transport_security` at ERROR); hub logs are JSON lines on stdout.
 
 ## Agent Team

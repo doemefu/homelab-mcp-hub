@@ -13,6 +13,7 @@ dependencies = [
     "httpx2==2.13.1",
     "anyio==4.15.1",
     "tzdata==2026.4",
+    "IMAPClient==4.1.0",
 ]
 
 [dependency-groups]
@@ -46,8 +47,16 @@ strict = true
 python_version = "3.13"
 mypy_path = "src"
 
+[[tool.mypy.overrides]]
+# IMAPClient ships no type information; the adapter wraps it behind a typed Protocol.
+module = ["imapclient", "imapclient.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-markers = ["integration: starts the hub as a subprocess"]
+markers = [
+    "integration: starts the hub as a subprocess",
+    "provider: needs the GreenMail/Radicale test containers (scripts/provider_services.sh); not combined with integration (B17)",
+]

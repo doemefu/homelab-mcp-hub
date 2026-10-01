@@ -50,3 +50,14 @@ def test_invalid_values_name_the_variable(env: dict[str, str], name: str) -> Non
 
 def test_log_level_is_case_insensitive() -> None:
     assert load_settings({"LOG_LEVEL": "debug"}).log_level == "DEBUG"
+
+
+def test_response_budget_default_and_override() -> None:
+    assert load_settings({}).response_budget_chars == 30000
+    assert load_settings({"HUB_RESPONSE_BUDGET_CHARS": "12000"}).response_budget_chars == 12000
+
+
+@pytest.mark.parametrize("value", ["9999", "70001", "abc"])
+def test_response_budget_out_of_range_is_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match="HUB_RESPONSE_BUDGET_CHARS"):
+        load_settings({"HUB_RESPONSE_BUDGET_CHARS": value})

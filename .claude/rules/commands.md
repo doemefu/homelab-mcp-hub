@@ -7,6 +7,9 @@ Toolchain: local uv (0.12.17 at bootstrap; CI and image pin 0.12.19), Python 3.1
 uv sync --locked                          # create .venv from uv.lock (fails if the lock is stale)
 uv run pytest                             # all tests (unit, contract, integration)
 uv run pytest tests/contract -v           # gate G6 contract tests only
+scripts/provider_services.sh up           # GreenMail test container (per-run passwords in $TMPDIR)
+HUB_PROVIDER_TESTS=1 uv run pytest -m provider -v   # provider integration tests
+scripts/provider_services.sh down         # stop and remove the test container
 uv run pytest tests/unit/test_verifier.py::test_name -v
 uv run ruff check && uv run ruff format --check
 uv run mypy --strict src

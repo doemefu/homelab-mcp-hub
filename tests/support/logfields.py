@@ -1,4 +1,4 @@
-# Spec 080 rev. 4.3 §9.7 allowed fields; `reason` only on `startup_failed`.
+# Spec 080 rev. 4.4 §9.7 allowed fields (`item` added for item_degraded); `reason` only on `startup_failed`.
 ALLOWED_FIELDS = frozenset(
     {
         "ts",
@@ -23,6 +23,7 @@ ALLOWED_FIELDS = frozenset(
         "account",
         "capability",
         "key",
+        "item",
     }
 )
 EVENT_FIELDS: dict[str, frozenset[str]] = {"startup_failed": frozenset({"reason"})}

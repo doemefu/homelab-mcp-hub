@@ -108,9 +108,52 @@ Lists the configured accounts and whether each capability currently works. It ne
 ```
 
 - `capabilities` lists only the capabilities an account has.
-- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start — the status of every enabled capability until its adapter exists), `disabled` (switched off in the registry, or a credential file is missing or unreadable).
+- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start), `disabled` (switched off in the registry, or a credential file is missing or unreadable). Mail statuses are updated by every `list_unread` / `get_message` call (`auth_expired` and `unreachable` as such, `upstream_timeout` as `unreachable`, other failures as `error`).
 
-**Tool errors** (a whole call cannot run): result with `isError: true` and body `{"code": "<ErrorCode>", "message": "<short text>"}`. `ErrorCode`: `invalid_argument`, `invalid_cursor`, `unknown_account`, `capability_unavailable`, `not_found`, `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `too_large`.
+### `list_unread` (§5.2)
+
+Unread messages in each account's configured inbox, newest first, across all mail accounts or one `account`.
+
+- Input: `account?` (registry id), `since?` (RFC 3339 with offset; default now − 24 h; older than 30 days or more than 60 s in the future → `invalid_argument`), `limit?` (1–50, default 20).
+- Output:
+
+```json
+{
+  "untrusted_content_notice": "…",
+  "items": [
+    {
+      "id": "v1.…", "account": "icloud", "folder": "INBOX",
+      "received_at": "2026-09-29T08:50:00+02:00", "unread": true, "has_attachments": false,
+      "untrusted": { "from_address": "sender@example.org", "from_name": "Sender", "subject": "…", "snippet": "…" }
+    }
+  ],
+  "next_cursor": null,
+  "truncated": false,
+  "account_errors": [ { "account": "gmail", "capability": "mail", "code": "auth_expired", "message": "Credential rejected by provider; re-login required" } ]
+}
+```
+
+- `received_at` is the IMAP `INTERNALDATE` in `HUB_DEFAULT_TIMEZONE`. The snippet (≤ 200 characters) comes from a partial fetch of at most 4 KiB of the first text part (plain preferred over HTML).
+- `truncated: true` when more unread messages exist than returned (limit, the 500 newest search candidates, or the output budget).
+- Accounts on a protocol without an adapter yet, or with a missing credential file, are skipped when `account` is omitted and answer `capability_unavailable` when named (spec rev. 4.4 §5.1). One failing or slow account yields an `account_errors` entry; the other accounts' items are still returned.
+- `has_attachments` counts every part that is not the chosen body text, including inline images.
+- A message the hub cannot decode is listed with empty third-party fields and the fixed note `[the hub could not decode this message]` in `untrusted.snippet` (one `item_degraded` log line).
+
+### `get_message` (§5.2)
+
+- Input: `id` (from `list_unread`), `max_chars?` (500–20,000, default 8,000).
+- Output: `untrusted_content_notice`, `id`, `account`, `folder`, `received_at`, `unread`, `has_attachments`, `attachment_count`, `attachments` (at most 20: `size_bytes`, `untrusted: {filename, content_type}`), `body_source` (`text/plain`, `text/html-converted` or `none`), `body_truncated`, `untrusted: {from_address, from_name, to_addresses (≤ 20), cc_addresses (≤ 20), subject, body}`, `account_errors` (always `[]`).
+- The body is the first text part, plain preferred; HTML is converted to visible text (scripts, styles, comments, images and hidden elements dropped). At most 256 KiB of the part are fetched; `body_truncated` is set when the part was cut there or by `max_chars`. Attachment content is never fetched.
+- Ids are opaque (`v1.` + base64url). An id whose folder is not the account's configured inbox answers `not_found` without contacting the provider (spec rev. 4.4 §5.1, D56). Provider failures of this single-account call are tool errors: `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `not_found` (also when `UIDVALIDITY` changed).
+
+### Common rules for the mail tools
+
+- Strictly read-only: the inbox is opened with `EXAMINE` and every body or header fetch uses `BODY.PEEK`, so the read state never changes.
+- Every third-party string is sanitised (§5.3): zero-width, bidi, control and format characters removed, URLs reduced to `[link: host]` / `[mail link]`, whitespace normalised, field limits applied with the marker ` [truncated]` (addresses 254, names and filenames 200, subject 300, snippet 200, content type 100). `content_type` must match the media-type pattern, else `null`.
+- Deadlines: 20 s per provider call, 60 s per tool call; at most two concurrent connections per account.
+- Output budget: the text content of every result is the compact JSON of its structured content, and `HUB_RESPONSE_BUDGET_CHARS` (default 30,000, hard maximum 100,000) is measured on that text. `list_unread` drops items from the end and sets `truncated`; `get_message` shortens the body first.
+
+**Tool errors** (a whole call cannot run): result with `isError: true` and body `{"code": "<ErrorCode>", "message": "<short text>"}`. `ErrorCode`: `invalid_argument`, `invalid_cursor`, `unknown_account`, `capability_unavailable`, `not_found`, `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `too_large`. The message is a fixed hub text, never provider text.
 
 ## 3. Internal port (8084)
 
@@ -126,8 +169,9 @@ Port 8083 serves no health routes; port 8084 serves no MCP routes.
 | Service | Use |
 |---------|-----|
 | auth-service JWKS (`AUTH_JWKS_URL`, in-cluster) | Signing keys for access-token validation |
+| IMAP over TLS (each mail account's configured `host` and `port`) | `list_unread`, `get_message`; credentials read from their files when a connection opens |
 
-Provider connections (IMAP, CalDAV, Microsoft Graph) arrive with later work packages.
+CalDAV and Microsoft Graph connections arrive with later work packages.
 
 ## 5. Configuration
 
@@ -145,6 +189,7 @@ Provider connections (IMAP, CalDAV, Microsoft Graph) arrive with later work pack
 | `HUB_SECRETS_DIR` | `/etc/mcp-hub/secrets` |
 | `HUB_DEFAULT_TIMEZONE` | `Europe/Zurich` (IANA zone) |
 | `LOG_LEVEL` | `INFO` (`DEBUG`, `INFO`, `WARNING`, `ERROR`; hub logger only) |
+| `HUB_RESPONSE_BUDGET_CHARS` | `30000` (10,000–70,000; output budget per tool result) |
 
 An invalid value stops the process with a `startup_failed` line that names the variable, never its value.
 
@@ -162,8 +207,8 @@ An invalid value stops the process with a `startup_failed` line that names the v
 
 ## 6. Logging
 
-JSON lines on stdout, one object per event. Fields (§9.7): `ts`, `level`, `logger`, `event`, `method` (`GET`, `POST`, `DELETE` or `other`), `route` (`/mcp`, the metadata path or `other`), `status`, `duration_ms`, `mcp_protocol_version` (known versions or `other`), `sub`, `client_id`, `jti`, `check`, `exception` (class name only), `tool`, `outcome`, `accounts`, `result_count`, `key_count`, `account`, `capability`, `key` (a credential key name). `startup_failed` may carry `reason`: a fixed message plus at most a variable, field or key **name**.
+JSON lines on stdout, one object per event. Fields (§9.7): `ts`, `level`, `logger`, `event`, `method` (`GET`, `POST`, `DELETE` or `other`), `route` (`/mcp`, the metadata path or `other`), `status`, `duration_ms`, `mcp_protocol_version` (known versions or `other`), `sub`, `client_id`, `jti`, `check`, `exception` (class name only), `tool`, `outcome`, `accounts`, `result_count`, `key_count`, `account`, `capability`, `key` (a credential key name), `item` (first 12 hex characters of a SHA-256 over an opaque id). `startup_failed` may carry `reason`: a fixed message plus at most a variable, field or key **name**.
 
-Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`.
+Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`, `provider_call_failed` (`account`, `capability`, `outcome`, `exception`), `item_degraded` (`account`, `capability`, `item`, `exception`).
 
 Never logged: tokens, `Authorization` values, raw header values, provider URLs, addresses, mail or calendar content, credentials. `LOG_LEVEL` applies to the `mcp_hub` logger only; the root logger and `httpx2`, `httpcore2`, `mcp`, `caldav`, `niquests`, `imapclient`, `uvicorn` are pinned at `WARNING`, and `mcp.server.transport_security` at `ERROR` (the hub writes its own request line with `check="host"` or `check="origin"` instead). Records from third-party loggers are reduced to `event="third_party_log"` without their message text. uvicorn access logs are off.
