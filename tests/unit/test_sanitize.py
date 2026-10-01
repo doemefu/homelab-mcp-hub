@@ -226,3 +226,16 @@ def test_hiding_implicitly_closed_element_still_hides() -> None:
     assert "SECRET" not in text
     assert "shown" in text
 
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "\u202e".encode(),  # RIGHT-TO-LEFT OVERRIDE
+        "\u200b".encode(),  # ZERO WIDTH SPACE
+    ],
+)
+def test_escaped_invisible_characters_are_restored_before_filtering(raw: bytes) -> None:
+    # Raw UTF-8 header bytes arrive as surrogate escapes (email parser); the clean-up must run before the
+    # control/format filter, not only in truncate().
+    escaped = raw.decode("ascii", "surrogateescape")
+    assert clean("a" + escaped + "b", 50) == "ab"
