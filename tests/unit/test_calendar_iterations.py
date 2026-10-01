@@ -149,34 +149,47 @@ def test_the_bound_for_apple_birthdays_is_small() -> None:
     assert 420 <= bound <= 430
 
 
+def _values_for(rng: random.Random, part: str) -> str:
+    days = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+    pick = {
+        "BYSECOND": lambda: [str(rng.randint(0, 59))],
+        "BYMINUTE": lambda: [str(rng.randint(0, 59))],
+        "BYHOUR": lambda: [str(rng.randint(0, 23)) for _ in range(rng.randint(1, 8))],
+        "BYMONTHDAY": lambda: [str(rng.choice([*range(1, 32), *range(-31, 0)])) for _ in range(rng.randint(1, 6))],
+        "BYYEARDAY": lambda: [str(rng.choice([*range(1, 367), *range(-366, 0)])) for _ in range(rng.randint(1, 6))],
+        "BYWEEKNO": lambda: [str(rng.choice([*range(1, 54), *range(-53, 0)])) for _ in range(rng.randint(1, 4))],
+        "BYMONTH": lambda: [str(rng.randint(1, 12)) for _ in range(rng.randint(1, 6))],
+        "BYSETPOS": lambda: [str(rng.choice([1, 2, 3, 5, -1, -2, -3])) for _ in range(rng.randint(1, 3))],
+        "BYDAY": lambda: [
+            (f"{rng.choice([1, 2, 3, 4, 5, -1, -2, 10, 20, 52, -10])}{d}" if rng.random() < 0.4 else d)
+            for d in (rng.choice(days) for _ in range(rng.randint(1, 5)))
+        ],
+    }[part]()
+    return ",".join(pick)  # duplicates within a list are deliberate
+
+
 def _random_rule(rng: random.Random) -> tuple[str, datetime]:
     freq = rng.choice(["YEARLY", "MONTHLY", "WEEKLY", "DAILY"])
-    years_back = {"YEARLY": 80, "MONTHLY": 40, "WEEKLY": 6, "DAILY": 3}[freq]
-    start = datetime(2026, 10, 20, 9) - timedelta(days=rng.randint(0, 365 * years_back))
+    years_back = {"YEARLY": 80, "MONTHLY": 40, "WEEKLY": 8, "DAILY": 4}[freq]
+    start = datetime(2026, 10, 20, rng.randint(0, 23)) - timedelta(days=rng.randint(0, 365 * years_back))
     parts = [f"FREQ={freq}"]
-    if rng.random() < 0.35:
-        parts.append(f"INTERVAL={rng.randint(2, 5)}")
-    days = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-    if rng.random() < 0.6:
-        picked = []
-        for day in rng.sample(days, rng.randint(1, 4)):
-            ordinal = rng.choice([0, 0, 1, 2, 3, 4, 5, -1, -2]) if freq in ("YEARLY", "MONTHLY") else 0
-            if freq == "YEARLY" and ordinal and rng.random() < 0.3:
-                ordinal = rng.choice([10, 20, 30, 40, 52, -10, -52])  # ordinals within the year
-            picked.append(f"{ordinal}{day}" if ordinal else day)
-        parts.append("BYDAY=" + ",".join(picked))
-    if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.4:
-        parts.append("BYMONTHDAY=" + ",".join(map(str, rng.sample([*range(1, 32), -1, -2], rng.randint(1, 5)))))
-    if freq in ("YEARLY", "MONTHLY") and rng.random() < 0.4:
-        parts.append("BYMONTH=" + ",".join(map(str, rng.sample(range(1, 13), rng.randint(1, 6)))))
-    if freq == "YEARLY" and rng.random() < 0.2:
-        parts.append("BYYEARDAY=" + ",".join(map(str, rng.sample([*range(1, 367), -1, -100], rng.randint(1, 4)))))
-    if freq == "YEARLY" and rng.random() < 0.2:
-        parts.append("BYWEEKNO=" + ",".join(map(str, rng.sample([*range(1, 54), -1], rng.randint(1, 3)))))
-    if rng.random() < 0.4:
-        parts.append("BYHOUR=" + ",".join(map(str, sorted(rng.sample(range(24), rng.randint(1, 6))))))
-    if rng.random() < 0.2:
-        parts.append("BYSETPOS=" + ",".join(map(str, rng.sample([1, 2, 3, -1, -2], rng.randint(1, 2)))))
+    for part in (
+        "BYMONTH",
+        "BYWEEKNO",
+        "BYYEARDAY",
+        "BYMONTHDAY",
+        "BYDAY",
+        "BYHOUR",
+        "BYMINUTE",
+        "BYSECOND",
+        "BYSETPOS",
+    ):
+        if rng.random() < 0.3:
+            parts.append(f"{part}={_values_for(rng, part)}")
+    if rng.random() < 0.3:
+        parts.append(f"INTERVAL={rng.randint(2, 6)}")
+    if rng.random() < 0.15:
+        parts.append(f"WKST={rng.choice(['MO', 'SU', 'WE'])}")
     if rng.random() < 0.2:
         parts.append(f"COUNT={rng.randint(1, 5000)}")
     elif rng.random() < 0.2:
@@ -185,15 +198,31 @@ def _random_rule(rng: random.Random) -> tuple[str, datetime]:
 
 
 def test_the_bound_is_never_below_the_real_number_of_occurrences(capsys: pytest.CaptureFixture[str]) -> None:
+    """For every generated rule that PASSES the screen: bound >= the occurrences dateutil iterates to the window end."""
     import time
+    from collections import Counter
 
     rng = random.Random(20261001)  # noqa: S311 - a seeded generator for reproducible test rules
-    compared = partial = invalid = 0
+    screened, compared, partial, invalid = Counter(), Counter(), Counter(), Counter()
     window_end = datetime.combine(WINDOW_END, datetime.min.time())
-    for _ in range(1_300):
+    for _ in range(3_000):
         text, start = _random_rule(rng)
+        freq = text.split(";")[0].split("=")[1]
+        raw = obj(text, start.strftime("%Y%m%dT%H%M%SZ"))
+        try:
+            caldav._screen(icalendar.Calendar.from_ical(caldav._prescreen(raw)), WINDOW_END)
+        except ObjectSkippedError:
+            screened[freq] += 1
+            continue
+        except Exception:
+            invalid[freq] += 1  # icalendar cannot parse it: the hub skips such an object as broken
+            continue
         bound = iteration_bound(icalendar.vRecur.from_ical(text), start.date(), WINDOW_END)
-        real = rrulestr(text.replace("Z", ""), dtstart=start)
+        try:
+            real = rrulestr(text.replace("Z", ""), dtstart=start)
+        except Exception:
+            invalid[freq] += 1
+            continue
         count = 0
 
         def counting(real: Any = real, bound: int = bound) -> None:
@@ -203,14 +232,18 @@ def test_the_bound_is_never_below_the_real_number_of_occurrences(capsys: pytest.
                     return
                 count += 1
 
-        try:  # rules that never match make dateutil iterate to year 9999: stop counting after 0.15 s CPU
-            caldav._with_cpu_deadline(counting, 0.15, time.thread_time)
-            compared += 1
+        try:  # rules that never match make dateutil iterate to year 9999: stop counting after 0.1 s CPU
+            caldav._with_cpu_deadline(counting, 0.1, time.thread_time)
+            compared[freq] += 1
         except caldav._ExpansionTooSlow:
-            partial += 1  # every occurrence counted so far is still checked against the bound
+            partial[freq] += 1  # every occurrence counted so far is still checked against the bound
         except Exception:
-            invalid += 1  # dateutil itself fails on this rule (e.g. IndexError): the hub skips such an object
+            invalid[freq] += 1  # dateutil itself fails (e.g. IndexError); the hub skips such an object
         assert count <= bound, (text, start, count, bound)
     with capsys.disabled():
-        print(f"\nbound: {compared} fully compared, {partial} partially (CPU guard), {invalid} rejected by dateutil")
-    assert compared >= 1_000
+        print(
+            f"\npassing rules fully compared {dict(compared)}; partially {dict(partial)}; refused by the screen "
+            f"{dict(screened)}; unparseable {dict(invalid)}"
+        )
+    assert sum(compared.values()) >= 1_000
+    assert min(compared[f] for f in ("YEARLY", "MONTHLY", "WEEKLY", "DAILY")) >= 150
