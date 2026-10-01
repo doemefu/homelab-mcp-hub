@@ -1,14 +1,19 @@
+import json
+import logging
 import socket
 import ssl
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
 
 import pytest
 from imapclient.exceptions import IMAPClientError, LoginError
 
-from mcp_hub.ids import MessageRef
-from mcp_hub.providers.base import ProviderError
+from mcp_hub.ids import MessageRef, encode_message_id
+from mcp_hub.providers.base import UNDECODABLE_NOTE, ProviderError, item_hash
 from mcp_hub.providers.imap import HEADER_ITEM, ImapMailbox
+from mcp_hub.providers.mime import Part
+from tests.support.logcapture import Capture
 
 T0 = datetime(2026, 9, 29, 7, 0, tzinfo=UTC)
 PLAIN = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 64, 2, None, None, None, None)
@@ -218,3 +223,67 @@ def test_production_context_verifies_hosts() -> None:
     box = ImapMailbox("icloud", host="h", port=993, folder="INBOX", username="u", password="p")
     assert box._context.verify_mode == ssl.CERT_REQUIRED
     assert box._context.check_hostname is True
+
+
+@pytest.fixture
+def provider_log() -> Iterator[Capture]:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub.providers")
+    logger.addHandler(handler)
+    yield handler
+    logger.removeHandler(handler)
+
+
+def test_undecodable_message_becomes_the_placeholder_with_one_log_line(provider_log: Capture) -> None:
+    broken = message(3, "broken")
+    broken[b"BODYSTRUCTURE"] = 5  # not a structure: walk() raises inside the per-message guards
+    client = FakeClient({1: message(5, "good"), 2: broken})
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    by_uid = {m.ref.uid: m for m in page.items}
+    assert by_uid[1].subject == "good"
+    assert by_uid[1].snippet_text == "Hello there"
+    placeholder = by_uid[2]
+    assert (placeholder.snippet_text, placeholder.subject, placeholder.from_address) == (UNDECODABLE_NOTE, None, None)
+    [line] = [json.loads(line) for line in provider_log.lines]
+    assert line["event"] == "item_degraded"
+    assert (line["account"], line["capability"], line["exception"]) == ("icloud", "mail", "TypeError")
+    assert line["item"] == item_hash(encode_message_id(MessageRef("icloud", "INBOX", 7, 2)))
+
+
+def test_item_degraded_logs_the_exception_class_name_only(
+    provider_log: Capture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mcp_hub.providers.imap as imap
+
+    original = imap._sender_and_subject
+
+    def exploding(headers: Message) -> tuple[tuple[str, str], str | None]:
+        if "secret" in str(headers.get("Subject", "")):
+            raise ValueError("SENTINEL-provider-text secret@example.test")
+        return original(headers)
+
+    monkeypatch.setattr(imap, "_sender_and_subject", exploding)
+    page = mailbox(FakeClient({1: message(3, "secret"), 2: message(4, "fine")})).list_unread(
+        T0 - timedelta(hours=1), 20
+    )
+    assert [m.snippet_text for m in page.items] == [UNDECODABLE_NOTE, "Hello there"]
+    text = "\n".join(provider_log.lines) + "\n".join(m for _, _, m in provider_log.raw)
+    assert "SENTINEL" not in text
+    assert "secret" not in text
+    assert [json.loads(line)["exception"] for line in provider_log.lines] == ["ValueError"]
+
+
+def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_hub.providers.imap as imap
+
+    original = imap.decode_part
+
+    def exploding(data: bytes, part: Part) -> str:
+        if data == b"boom":
+            raise ValueError("boom")
+        return original(data, part)
+
+    monkeypatch.setattr(imap, "decode_part", exploding)
+    client = FakeClient({1: message(3, "a", text=b"boom"), 2: message(4, "b")})
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
