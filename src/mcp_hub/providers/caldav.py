@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time as clocks
+import warnings
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from collections import OrderedDict
@@ -29,6 +30,7 @@ from zoneinfo import ZoneInfo
 import httpx2
 import icalendar
 import recurring_ical_events
+from icalendar.error import GloballyUniqueTZIDGuessed
 from icalendar.timezone import tzp
 
 from mcp_hub.logging import log_event
@@ -286,6 +288,18 @@ class SlowObjectCache:
 
 
 SLOW_OBJECTS: Final = SlowObjectCache()
+
+
+def ignore_icalendar_tzid_guess_warnings() -> None:
+    """icalendar warns once per distinct "globally unique" TZID text (e.g. "/vendor/Europe/Zurich") that it maps to an
+    IANA zone; with third-party content that would grow the warnings registry and the log per TZID (delta review D7).
+    Narrow: this category only, which icalendar defines and raises for exactly this case. No module pattern: the
+    warning is raised with stacklevel=3, so it is attributed to whichever module called into icalendar. Installed at
+    import, i.e. at start-up; an "ignore" filter also keeps the warnings registry from growing."""
+    warnings.filterwarnings("ignore", category=GloballyUniqueTZIDGuessed)
+
+
+ignore_icalendar_tzid_guess_warnings()
 # icalendar caches every VTIMEZONE whose TZID zoneinfo does not know in one process-wide map, first writer wins and
 # never evicted: one object could shift another object's (or account's) events, and unique TZIDs grow it without
 # bound. Each object is therefore parsed and expanded alone, with that cache emptied before and after (spec 080

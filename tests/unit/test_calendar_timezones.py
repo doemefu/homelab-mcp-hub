@@ -231,3 +231,32 @@ def test_objects_are_expanded_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> 
     first.join(5)
     second.join(5)
     assert results == {"hostile": ["2026-10-20T07:00:00+02:00"], "bare": reference}
+
+
+def _registry_size() -> int:
+    import sys
+
+    return sum(len(getattr(module, "__warningregistry__", {}) or {}) for module in list(sys.modules.values()))
+
+
+def test_globally_unique_tzid_guesses_neither_warn_nor_grow_the_registry(caplog: pytest.LogCaptureFixture) -> None:
+    # Delta review D7: one warning per distinct TZID text would grow the warnings registry and the log.
+    import logging
+    import warnings
+
+    from icalendar.error import GloballyUniqueTZIDGuessed
+
+    logging.captureWarnings(True)
+    try:
+        with warnings.catch_warnings(record=True) as seen, caplog.at_level(logging.DEBUG):
+            warnings.simplefilter("always")  # worst case: every other warning is shown
+            caldav.ignore_icalendar_tzid_guess_warnings()
+            before = _registry_size()
+            for i in range(10_000):
+                assert tzp.timezone(f"/vendor-{i}/Europe/Zurich") is not None
+            assert [w for w in seen if issubclass(w.category, GloballyUniqueTZIDGuessed)] == []
+            assert _registry_size() == before
+        assert not [r for r in caplog.records if "GloballyUnique" in r.getMessage() or r.name == "py.warnings"]
+    finally:
+        logging.captureWarnings(False)
+        tzp.use_zoneinfo()  # timezone() cached the guessed zones under their primary ids
