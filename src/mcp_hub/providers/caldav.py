@@ -558,7 +558,8 @@ class CalDavCalendarSource:
         for _ in range(_MAX_REDIRECTS + 1):
             if not allowed_host(self._url, url):
                 raise ProviderError("upstream_error", "ForeignHost")
-            headers = {"Depth": depth, "Content-Type": "application/xml; charset=utf-8"}
+            # Uncompressed bodies only: the 5 MiB cap must apply before any decoding (review 19 F3).
+            headers = {"Depth": depth, "Content-Type": "application/xml; charset=utf-8", "Accept-Encoding": "identity"}
             with client.stream(method, url, content=body.encode(), headers=headers) as response:
                 if response.status_code in _REDIRECTS and "location" in response.headers:
                     url = urljoin(url, response.headers["location"])
@@ -567,6 +568,8 @@ class CalDavCalendarSource:
                     raise ProviderError("auth_expired", "HttpUnauthorized")
                 if response.status_code != 207:
                     raise ProviderError("upstream_error", "UnexpectedStatus")
+                if response.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity"):
+                    raise ProviderError("upstream_error", "ContentEncoding")
                 return url, read_capped(response.iter_bytes())
         raise ProviderError("upstream_error", "TooManyRedirects")
 

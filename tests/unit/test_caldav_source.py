@@ -1,3 +1,4 @@
+import gzip
 import logging
 import re
 from datetime import datetime
@@ -442,3 +443,29 @@ def test_an_accepted_href_is_the_host_httpx2_will_contact(href: str) -> None:
 def test_partition_host_digits_are_ascii_only() -> None:
     for host in ("p\u0661", "p\uff14\uff12", "p\u0664\u0662"):
         assert not allowed_host("https://caldav.icloud.com/", f"https://{host}-caldav.icloud.com/"), host
+
+
+def test_every_request_asks_for_an_uncompressed_body(httpserver: HTTPServer) -> None:
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(report(), status=207, content_type=XML)
+    source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    assert len(httpserver.log) == 4  # three discovery PROPFINDs, one REPORT
+    assert {request.headers.get("Accept-Encoding") for request, _ in httpserver.log} == {"identity"}
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br", "gzip, identity"])
+def test_a_compressed_response_is_refused(httpserver: HTTPServer, encoding: str) -> None:
+    # Review 19 F3: a 200 KiB gzip bomb decompressed one 64 KiB chunk at a time to ~220 MB before the cap applied.
+    body = gzip.compress(principal("/p/")) if encoding.startswith("gzip") else principal("/p/")
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+        body, status=207, content_type=XML, headers={"Content-Encoding": encoding}
+    )
+    error = code_of(source(httpserver).check)
+    assert (error.code, error.cause) == ("upstream_error", "ContentEncoding")
+
+
+def test_identity_content_encoding_is_accepted(httpserver: HTTPServer) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+        principal("/p/"), status=207, content_type=XML, headers={"Content-Encoding": "identity"}
+    )
+    source(httpserver).check()
