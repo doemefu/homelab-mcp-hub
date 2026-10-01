@@ -82,7 +82,7 @@ def test_events_reports_each_selected_calendar_and_expands(httpserver: HTTPServe
     httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
         report(ics.load("dst-weekly.ics")), status=207, content_type=XML
     )
-    events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events
     assert [e.calendar_name for e in events] == ["Home", "Home", "Home"]
     [(sent, _)] = [(r, s) for r, s in httpserver.log if r.method == "REPORT"]
     assert sent.path == "/h/home/"
@@ -96,7 +96,7 @@ def test_report_above_limit_is_too_large(httpserver: HTTPServer) -> None:
     httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
         b"x" * (MAX_HTTP_RESPONSE_BYTES + 1), status=207, content_type=XML
     )
-    assert code_of(lambda: source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)).code == "too_large"
+    assert code_of(lambda: source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events).code == "too_large"
 
 
 def test_discovery_response_above_limit_is_too_large(httpserver: HTTPServer) -> None:
@@ -113,7 +113,7 @@ def test_http_401_is_auth_expired(httpserver: HTTPServer, status: int) -> None:
     httpserver.clear()
     serve_discovery(httpserver)
     httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(b"", status=status)
-    assert code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH)).code == "auth_expired"
+    assert code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH).events).code == "auth_expired"
 
 
 def test_http_500_is_upstream_error(httpserver: HTTPServer) -> None:
@@ -165,7 +165,7 @@ def test_foreign_hosts_are_refused_before_any_request(httpserver: HTTPServer, po
             )
         else:
             serve_discovery(httpserver, multistatus(collection(foreign, "Home")))
-    error = code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH))
+    error = code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH).events)
     assert (error.code, error.cause) == ("upstream_error", "ForeignHost")
     assert ("PROPFIND", "/foreign/") not in requests(httpserver)
     assert ("REPORT", "/foreign/") not in requests(httpserver)
@@ -234,7 +234,7 @@ def test_task_only_collections_are_skipped(httpserver: HTTPServer) -> None:
         multistatus(collection("/h/tasks/", "Tasks", components=("VTODO",)), collection("/h/home/", "Home")),
     )
     httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(report(), status=207, content_type=XML)
-    assert source(httpserver).events(START, END, ZURICH, ZURICH) == []
+    assert source(httpserver).events(START, END, ZURICH, ZURICH).events == []
     assert [path for method, path in requests(httpserver) if method == "REPORT"] == ["/h/home/"]
 
 
@@ -267,7 +267,7 @@ def test_icloud_shaped_discovery_crosses_to_the_partition_host() -> None:
             client_factory=factory,
         )
         try:
-            return recorder, list(caldav.events(START, END, ZURICH, ZURICH))
+            return recorder, list(caldav.events(START, END, ZURICH, ZURICH).events)
         except ProviderError as exc:
             return recorder, exc
 
@@ -298,7 +298,7 @@ def test_broken_calendar_objects_are_skipped_individually(
         report(broken_start, broken_rule, valid), status=207, content_type=XML
     )
     with caplog.at_level(logging.WARNING, logger="mcp_hub"):
-        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events
     assert len(events) == 3
     skipped = [r for r in caplog.records if r.getMessage() == "calendar_object_skipped"]
     assert len(skipped) == 2
@@ -333,7 +333,7 @@ def test_invalid_utf8_in_a_multistatus_is_replaced_once(
         raw_report(invalid_summary(), ics.load("dst-weekly.ics")), status=207, content_type=XML
     )
     with caplog.at_level(logging.INFO, logger="mcp_hub"):
-        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events
     titles = sorted(e.title or "" for e in events)
     assert titles == ["M�ller � away", "Weekly DST", "Weekly DST", "Weekly DST"]
     repaired = [r for r in caplog.records if r.getMessage() == "xml_encoding_repaired"]

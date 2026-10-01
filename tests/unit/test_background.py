@@ -10,7 +10,7 @@ from mcp_hub import checker
 from mcp_hub.app import create_app
 from mcp_hub.config import Settings, load_settings
 from mcp_hub.providers import Adapters
-from mcp_hub.providers.caldav import RawEvent
+from mcp_hub.providers.caldav import CalendarPage
 from mcp_hub.registry import Account, load_registry
 
 
@@ -26,8 +26,8 @@ class Recorder:
         self.count += 1
         self.checks.release()
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
-        return []
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+        return CalendarPage(events=[], truncated=False)
 
 
 def settings_with(settings: Settings, enabled: str) -> Settings:

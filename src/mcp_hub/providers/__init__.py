@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from mcp_hub.ids import MessageRef
 from mcp_hub.providers.base import AccountLimiters, MailDetail, UnreadPage, read_credential
-from mcp_hub.providers.caldav import CalDavCalendarSource, RawEvent
+from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
 from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.registry import Account, CalDavCalendar, Capability, ImapMail
 from mcp_hub.registry import Protocol as WireProtocol
@@ -47,7 +47,7 @@ def open_mailbox(account: Account, secrets_dir: Path) -> Mailbox:
 
 class CalendarSource(Protocol):
     def check(self) -> None: ...
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]: ...
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage: ...
 
 
 CalendarFactory = Callable[[Account, Path], CalendarSource]

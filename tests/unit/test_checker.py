@@ -12,7 +12,7 @@ from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import ProviderError
-from mcp_hub.providers.caldav import RawEvent
+from mcp_hub.providers.caldav import CalendarPage
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from tests.support.logfields import allowed_fields
@@ -38,8 +38,8 @@ class Probe:
         if self.error is not None:
             raise self.error
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
-        return []
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+        return CalendarPage(events=[], truncated=False)
 
 
 def context(secrets_dir: Path, calls: list[tuple[str, str]], errors: dict[str, Exception] | None = None) -> HubContext:

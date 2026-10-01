@@ -21,7 +21,7 @@ from mcp_hub.registry import load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.accounts import build_list_accounts
 from mcp_hub.tools.calendar import run_get_events
-from tests.support import greenmail, radicale
+from tests.support import greenmail, ics, radicale
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
 
@@ -86,7 +86,9 @@ def two_accounts(secrets_dir: Path) -> None:
 
 
 def test_fixtures_through_radicale_match_the_unit_expectations(fixture_calendar: str) -> None:
-    events = sorted(radicale.source([fixture_calendar]).events(START, END, ZURICH, ZURICH), key=lambda e: e.sort_key)
+    events = sorted(
+        radicale.source([fixture_calendar]).events(START, END, ZURICH, ZURICH).events, key=lambda e: e.sort_key
+    )
     assert [(shown(e), e.recurring, e.status) for e in events] == EXPECTED
     assert {e.calendar_name for e in events} == {fixture_calendar}
     [allday] = [e for e in events if e.all_day]
@@ -94,7 +96,9 @@ def test_fixtures_through_radicale_match_the_unit_expectations(fixture_calendar:
 
 
 def test_dst_in_utc_output(fixture_calendar: str) -> None:
-    events = sorted(radicale.source([fixture_calendar]).events(START, END, UTC_ZONE, ZURICH), key=lambda e: e.sort_key)
+    events = sorted(
+        radicale.source([fixture_calendar]).events(START, END, UTC_ZONE, ZURICH).events, key=lambda e: e.sort_key
+    )
     weekly = [shown(e) for e in events if e.title == "Weekly DST"]
     assert weekly[:2] == ["2026-10-18T08:00:00+00:00", "2026-10-25T09:00:00+00:00"]
 
@@ -103,8 +107,25 @@ def test_include_calendars_filters_by_display_name() -> None:
     wanted, other = radicale.calendar_name("wanted"), radicale.calendar_name("other")
     radicale.seed_fixtures(wanted, ("allday.ics",))
     radicale.seed_fixtures(other, ("cross-zone.ics",))
-    events = radicale.source([wanted]).events(START, END, ZURICH, ZURICH)
+    events = radicale.source([wanted]).events(START, END, ZURICH, ZURICH).events
     assert [(e.title, e.calendar_name) for e in events] == [("Weekend away", wanted)]
+
+
+def test_hostile_rule_is_skipped_next_to_normal_events(caplog: pytest.LogCaptureFixture) -> None:
+    hostile = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\n"
+        b"BEGIN:VEVENT\r\nUID:hostile-rule@example.test\r\n"
+        b"DTSTAMP:20260901T000000Z\r\nDTSTART:20261020T100000Z\r\nDTEND:20261020T100001Z\r\n"
+        b"RRULE:FREQ=SECONDLY;COUNT=10\r\nSUMMARY:Every second\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    name = radicale.calendar_name("hostile-rule")
+    radicale.seed(name, [hostile, ics.load("dst-weekly.ics"), ics.load("allday.ics")])
+    with caplog.at_level(logging.WARNING, logger="mcp_hub"):
+        page = radicale.source([name]).events(START, END, ZURICH, ZURICH)
+    assert sorted(e.title or "" for e in page.events) == ["Weekend away", "Weekly DST", "Weekly DST", "Weekly DST"]
+    assert page.truncated is False
+    skipped = [r.fields for r in caplog.records if r.getMessage() == "calendar_object_skipped"]  # type: ignore[attr-defined]
+    assert skipped == [{"account": "icloud", "capability": "calendar", "outcome": "rule_refused"}]
 
 
 def test_wrong_password_is_auth_expired(fixture_calendar: str) -> None:

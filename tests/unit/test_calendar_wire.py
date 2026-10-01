@@ -11,7 +11,7 @@ from mcp_hub.app import create_app
 from mcp_hub.config import Settings
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
-from mcp_hub.providers.caldav import RawEvent, expand
+from mcp_hub.providers.caldav import CalendarPage, expand
 from mcp_hub.registry import Account, load_registry
 from tests.support import ics
 from tests.support.mcp import body, modern
@@ -21,8 +21,8 @@ from tests.support.tokens import TokenFactory
 class Calendar:
     def check(self) -> None: ...
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
-        return expand(
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+        found = expand(
             ics.load("dst-weekly.ics"),
             href="https://cal.example.test/1/",
             name="Home",
@@ -31,6 +31,7 @@ class Calendar:
             zone=zone,
             floating=floating,
         )
+        return CalendarPage(events=found, truncated=False)
 
 
 def fake_calendar(account: Account, secrets_dir: Path) -> Calendar:

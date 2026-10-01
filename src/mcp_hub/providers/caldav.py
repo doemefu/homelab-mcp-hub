@@ -5,13 +5,19 @@ with the credential-destination rule, read as streams capped at 5 MiB; expansion
 recurring-ical-events. Blocking; the tool layer runs it through providers.base.run_blocking. Returns unsanitised text.
 """
 
+import hashlib
 import logging
 import re
+import sys
+import threading
+import time as clocks
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from types import FrameType
 from typing import Final, Literal, NoReturn, cast
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
@@ -28,6 +34,18 @@ _DAV: Final = "{DAV:}"
 _CALDAV: Final = "{urn:ietf:params:xml:ns:caldav}"
 _XML_ENCODING: Final = re.compile(rb"\s*<\?xml[^>]*?encoding\s*=\s*[\"']([A-Za-z0-9._-]+)[\"']")
 _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both sides (spec 080 rev. 4.4 §5.4)
+# Bounded expansion (spec 080 rev. 4.5 D62). Each calendar object is screened before the expansion library sees it,
+# expanded under a CPU deadline, and the whole call is capped by instance counts and a cooperative time budget.
+ALLOWED_FREQUENCIES: Final = frozenset({"YEARLY", "MONTHLY", "WEEKLY", "DAILY"})
+MAX_RECURRENCE_DATES: Final = 1000  # RDATE values and EXDATE values, each counted per object
+EARLIEST_START: Final = date(1900, 1, 1)
+MAX_INSTANCES_PER_OBJECT: Final = 1000
+MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
+OBJECT_CPU_SECONDS: Final = 2.0  # thread CPU time per object (parse, screening, expansion)
+EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checked between objects
+SLOW_OBJECT_CACHE_SIZE: Final = 1000
+_FOLD: Final = re.compile(rb"\r?\n[ \t]")
+_RECURRING_LINE: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,12 +175,174 @@ def _overlaps(low: datetime, high: datetime, start: datetime, end: datetime) -> 
     return low < end and (high > start or (high == low and low >= start))  # zero-length at `from` counts
 
 
+class ObjectSkippedError(Exception):
+    """A calendar object the hub does not expand; `reason` is a fixed outcome for the log (spec 080 rev. 4.5 D62)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _ExpansionTooSlow(BaseException):
+    """Raised by the trace hook. A BaseException, so no `except Exception` inside icalendar, recurring-ical-events or
+    dateutil can swallow it; caught only at the per-object boundary in `_expand_object`."""
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarPage:
+    events: list[RawEvent]
+    truncated: bool  # a cap or the time budget stopped the expansion
+
+
+class SlowObjectCache:
+    """Digests of objects that hit the CPU deadline, so a hostile object costs its 2 s once per process, not on every
+    call. Bounded, oldest first out, in memory only; holds SHA-256 digests of the raw calendar data, nothing else."""
+
+    def __init__(self, size: int = SLOW_OBJECT_CACHE_SIZE) -> None:
+        self._size = size
+        self._digests: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add(self, digest: str) -> None:
+        with self._lock:
+            self._digests[digest] = None
+            while len(self._digests) > self._size:
+                self._digests.popitem(last=False)
+
+    def __contains__(self, digest: object) -> bool:
+        with self._lock:
+            return digest in self._digests
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._digests)
+
+
+SLOW_OBJECTS: Final = SlowObjectCache()
+
+
+def _values(value: object) -> list[object]:
+    return value if isinstance(value, list) else ([] if value is None else [value])
+
+
+def _date_count(component: icalendar.cal.Component, name: str) -> int:
+    return sum(len(getattr(value, "dts", [value])) for value in _values(component.get(name)))
+
+
+def _screen(calendar: icalendar.Calendar) -> None:
+    """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs."""
+    for component in calendar.walk("VEVENT"):
+        rules = _values(component.get("RRULE"))
+        if len(rules) > 1 or "EXRULE" in component:
+            raise ObjectSkippedError("rule_refused")
+        for rule in rules:
+            frequencies = {str(value).upper() for value in _values(cast(dict[str, object], rule).get("FREQ"))}
+            if len(frequencies) != 1 or not frequencies <= ALLOWED_FREQUENCIES:
+                raise ObjectSkippedError("rule_refused")
+        if max(_date_count(component, "RDATE"), _date_count(component, "EXDATE")) > MAX_RECURRENCE_DATES:
+            raise ObjectSkippedError("too_many_dates")
+        if "DTSTART" in component:
+            begin = cast(date, component.decoded("DTSTART"))
+            if (begin.date() if isinstance(begin, datetime) else begin) < EARLIEST_START:
+                raise ObjectSkippedError("start_out_of_range")
+
+
+def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Callable[[], float]) -> T:
+    """Run `func` in this thread with a call-level trace hook that raises once `seconds` of thread CPU time are used.
+
+    Why a trace hook (spec 080 rev. 4.5 D62 §1a): dateutil's rrule iterates from DTSTART and loops without yielding
+    for rules that never match, so neither instance caps nor checks between objects bound one object's CPU time, and
+    a worker thread cannot be killed. The hook sees every Python call of the expansion and stops it. It is
+    thread-local, CPython-specific and replaces a debugger's or coverage tool's trace function while it runs (the
+    previous one is restored on every path). Rejected alternative: a killable subprocess per expansion (memory in a
+    256 Mi pod, start-up cost per call)."""
+    deadline = cpu_clock() + seconds
+    previous = sys.gettrace()
+
+    def hook(frame: FrameType, event: str, arg: object) -> None:
+        if cpu_clock() > deadline:
+            raise _ExpansionTooSlow  # CPython removes a raising trace function; `finally` restores the previous one
+        return None  # call events only, no line tracing
+
+    sys.settrace(hook)
+    try:
+        return func()
+    finally:
+        sys.settrace(previous)
+
+
+def _expand_object(
+    ics: bytes,
+    *,
+    href: str,
+    name: str | None,
+    start: datetime,
+    end: datetime,
+    zone: ZoneInfo,
+    floating: ZoneInfo,
+    cpu_seconds: float,
+    cpu_clock: Callable[[], float],
+) -> tuple[list[RawEvent], bool]:
+    """The object's instances sorted by start, at most MAX_INSTANCES_PER_OBJECT, and whether that cap cut them."""
+
+    def work() -> list[RawEvent]:
+        calendar = icalendar.Calendar.from_ical(ics)
+        _screen(calendar)
+        return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
+
+    try:
+        found = _with_cpu_deadline(work, cpu_seconds, cpu_clock)
+    except _ExpansionTooSlow:
+        raise ObjectSkippedError("expansion_too_slow") from None
+    found.sort(key=lambda event: event.sort_key)
+    return found[:MAX_INSTANCES_PER_OBJECT], len(found) > MAX_INSTANCES_PER_OBJECT
+
+
 def expand(
-    ics: bytes, *, href: str, name: str | None, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo
+    ics: bytes,
+    *,
+    href: str,
+    name: str | None,
+    start: datetime,
+    end: datetime,
+    zone: ZoneInfo,
+    floating: ZoneInfo,
+    cpu_seconds: float = OBJECT_CPU_SECONDS,
+    cpu_clock: Callable[[], float] = clocks.thread_time,
 ) -> list[RawEvent]:
-    """Every instance overlapping [start, end): RRULE, RDATE, EXDATE and overrides expanded, cancelled ones omitted;
-    timed events in `zone`, floating times placed in `floating`, all-day events as dates."""
-    calendar = icalendar.Calendar.from_ical(ics)
+    """Every instance of one calendar object overlapping [start, end): RRULE, RDATE, EXDATE and overrides expanded,
+    cancelled ones omitted; timed events in `zone`, floating times placed in `floating`, all-day events as dates.
+    Raises ObjectSkippedError for refused shapes and objects that exceed the CPU deadline (spec 080 rev. 4.5 D62)."""
+    found, _ = _expand_object(
+        ics,
+        href=href,
+        name=name,
+        start=start,
+        end=end,
+        zone=zone,
+        floating=floating,
+        cpu_seconds=cpu_seconds,
+        cpu_clock=cpu_clock,
+    )
+    return found
+
+
+def _recurring(ics: bytes) -> bool:
+    """RRULE or RDATE present (folded lines joined); decides only the expansion order, so a property name that
+    appears inside a text value merely moves that object back."""
+    return _RECURRING_LINE.search(_FOLD.sub(b"", ics)) is not None
+
+
+def _instances(
+    calendar: icalendar.Calendar,
+    *,
+    href: str,
+    name: str | None,
+    start: datetime,
+    end: datetime,
+    zone: ZoneInfo,
+    floating: ZoneInfo,
+) -> list[RawEvent]:
     recurring_uids = {
         str(c.get("UID", "")) for c in calendar.walk("VEVENT") if {"RRULE", "RDATE", "RECURRENCE-ID"} & set(c)
     }
@@ -303,10 +483,14 @@ class CalDavCalendarSource:
         include: Literal["all"] | list[str],
         timeout: float = PROVIDER_TIMEOUT_SECONDS,
         client_factory: ClientFactory = default_client,
+        clock: Callable[[], float] = clocks.monotonic,
+        cpu_clock: Callable[[], float] = clocks.thread_time,
+        slow_objects: SlowObjectCache = SLOW_OBJECTS,
     ) -> None:
         self._account, self._url, self._include = account_id, url, include
         self._username, self._password, self._timeout = username, password, timeout
         self._factory = client_factory
+        self._clock, self._cpu_clock, self._slow_objects = clock, cpu_clock, slow_objects
 
     def _request(self, client: httpx2.Client, method: str, url: str, body: str, depth: str) -> tuple[str, bytes]:
         """One DAV request; follows at most 3 redirects by hand, each target checked with allowed_host first."""
@@ -368,34 +552,82 @@ class CalDavCalendarSource:
         except Exception as exc:
             raise _provider_error(exc) from None
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
         try:
             with self._factory(self._username, self._password, self._timeout) as client:
                 selected = [c for c in self._calendars(client) if self._include == "all" or c.name in self._include]
                 body = REPORT_BODY.format(start=_stamp(start - _WIDEN), end=_stamp(end + _WIDEN))
-                events: list[RawEvent] = []
+                objects: list[tuple[CalendarRef, bytes]] = []
                 for calendar in selected:
                     _, raw = self._request(client, "REPORT", calendar.href, body, "1")
-                    for ics in parse_multistatus(raw, account=self._account):
-                        try:  # one broken calendar object never fails the account (spec 080 §10.2)
-                            events += expand(
-                                ics,
-                                href=calendar.href,
-                                name=calendar.name,
-                                start=start,
-                                end=end,
-                                zone=zone,
-                                floating=floating,
-                            )
-                        except Exception as exc:
-                            log_event(
-                                _log,
-                                logging.WARNING,
-                                "calendar_object_skipped",
-                                account=self._account,
-                                capability="calendar",
-                                exception=type(exc).__name__,
-                            )
-                return events
+                    objects += [(calendar, ics) for ics in parse_multistatus(raw, account=self._account)]
+            return self._expand_all(objects, start, end, zone, floating)
         except Exception as exc:
             raise _provider_error(exc) from None
+
+    def _expand_all(
+        self,
+        objects: list[tuple[CalendarRef, bytes]],
+        start: datetime,
+        end: datetime,
+        zone: ZoneInfo,
+        floating: ZoneInfo,
+    ) -> CalendarPage:
+        """Single events first, recurring objects after them, so a hostile series cannot crowd out single events;
+        stops at MAX_INSTANCES_PER_CALL or EXPANSION_BUDGET_SECONDS (spec 080 rev. 4.5 D62)."""
+        objects = sorted(objects, key=lambda pair: _recurring(pair[1]))  # stable: response order kept otherwise
+        events: list[RawEvent] = []
+        stopped: str | None = None
+        started = self._clock()
+        for calendar, ics in objects:
+            if self._clock() - started > EXPANSION_BUDGET_SECONDS:
+                stopped = "time_budget"
+                break
+            digest = hashlib.sha256(ics).hexdigest()
+            if digest in self._slow_objects:
+                self._skipped(outcome="expansion_too_slow")
+                continue
+            try:  # one broken or refused calendar object never fails the account (spec 080 §10.2)
+                found, cut = _expand_object(
+                    ics,
+                    href=calendar.href,
+                    name=calendar.name,
+                    start=start,
+                    end=end,
+                    zone=zone,
+                    floating=floating,
+                    cpu_seconds=OBJECT_CPU_SECONDS,
+                    cpu_clock=self._cpu_clock,
+                )
+            except ObjectSkippedError as exc:
+                if exc.reason == "expansion_too_slow":
+                    self._slow_objects.add(digest)
+                self._skipped(outcome=exc.reason)
+                continue
+            except Exception as exc:
+                self._skipped(exception=type(exc).__name__)
+                continue
+            if cut:
+                stopped = "instance_cap"
+            room = MAX_INSTANCES_PER_CALL - len(events)
+            if len(found) > room:
+                events += found[:room]
+                stopped = "instance_cap"
+                break
+            events += found
+        if stopped is not None:
+            log_event(
+                _log,
+                logging.INFO,
+                "expansion_stopped",
+                account=self._account,
+                capability="calendar",
+                outcome=stopped,
+                result_count=len(events),
+            )
+        return CalendarPage(events=events, truncated=stopped is not None)
+
+    def _skipped(self, **fields: str) -> None:
+        log_event(
+            _log, logging.WARNING, "calendar_object_skipped", account=self._account, capability="calendar", **fields
+        )

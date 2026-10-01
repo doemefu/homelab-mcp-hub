@@ -10,7 +10,7 @@ from mcp_hub.errors import ToolError
 from mcp_hub.health import StatusStore
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import ProviderError
-from mcp_hub.providers.caldav import RawEvent, expand
+from mcp_hub.providers.caldav import CalendarPage, RawEvent, expand
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
@@ -46,18 +46,19 @@ class FakeCalendar:
 
     def check(self) -> None: ...
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
         source = self.sources[self.account.id]
         if isinstance(source, Exception):
             raise source
         href = f"https://cal.example.test/{self.account.id}/home/"
-        return [
+        found = [
             event
             for name in source
             for event in expand(
                 ics.load(name), href=href, name="Home", start=start, end=end, zone=zone, floating=floating
             )
         ]
+        return CalendarPage(events=found, truncated=False)
 
 
 def two_calendar_accounts(secrets_dir: Path) -> None:
@@ -257,9 +258,9 @@ class HostileCalendar:
 
     def check(self) -> None: ...
 
-    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
         quoted = '"\\' * 2000
-        return [
+        found = [
             RawEvent(
                 calendar_href=f"https://cal.example.test/{self.account.id}/home/",
                 calendar_name=quoted,
@@ -281,6 +282,7 @@ class HostileCalendar:
             )
             for n in range(400)
         ]
+        return CalendarPage(events=found, truncated=False)
 
 
 @pytest.mark.parametrize("budget", [10_000, 30_000, 70_000])
@@ -299,11 +301,10 @@ async def test_invalid_utf8_in_an_event_still_serialises_strictly(secrets_dir: P
     broken = ics.load("allday.ics").replace(b"SUMMARY:Weekend away", b"SUMMARY:M\xfcller \xff\xfe away")
 
     class Mixed(FakeCalendar):
-        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
             href = "https://cal.example.test/icloud/home/"
-            return expand(
-                broken, href=href, name="Home", start=start, end=end, zone=zone, floating=floating
-            ) + super().events(start, end, zone, floating)
+            found = expand(broken, href=href, name="Home", start=start, end=end, zone=zone, floating=floating)
+            return CalendarPage(events=found + super().events(start, end, zone, floating).events, truncated=False)
 
     settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
     adapters = Adapters(calendar=lambda account, _dir: Mixed(account, {"icloud": ("dst-weekly.ics",)}))
@@ -314,3 +315,17 @@ async def test_invalid_utf8_in_an_event_still_serialises_strictly(secrets_dir: P
     titles = [i["untrusted"]["title"] for i in json.loads(text)["items"]]
     assert titles.count("Weekly DST") == 3
     assert any(t.startswith("M") and t.endswith("away") for t in titles)
+
+
+async def test_a_truncated_expansion_marks_the_result_truncated(secrets_dir: Path) -> None:
+    class Cut(FakeCalendar):
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+            return CalendarPage(events=super().events(start, end, zone, floating).events, truncated=True)
+
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    adapters = Adapters(calendar=lambda account, _dir: Cut(account, {"icloud": ("allday.ics",)}))
+    ctx = HubContext(settings, load_registry(secrets_dir / "accounts.json"), StatusStore(), adapters)
+    result, _, outcome = await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=None)
+    assert [i.untrusted.title for i in result.items] == ["Weekend away"]
+    assert result.truncated is True  # spec 080 rev. 4.5 D62: a cap or the time budget stopped the expansion
+    assert (result.account_errors, outcome) == ([], "ok")

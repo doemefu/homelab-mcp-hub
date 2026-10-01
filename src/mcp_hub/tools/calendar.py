@@ -17,7 +17,7 @@ from mcp_hub.budget import fit_items
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import encode_event_id
 from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, run_blocking
-from mcp_hub.providers.caldav import RawEvent
+from mcp_hub.providers.caldav import CalendarPage, RawEvent
 from mcp_hub.registry import Account
 from mcp_hub.sanitize import FIELD_LIMITS, clean, validate_timezone
 from mcp_hub.tools import HubContext
@@ -121,7 +121,7 @@ async def run_get_events(
     zone, floating = ZoneInfo(zone_name), ZoneInfo(ctx.settings.default_timezone)
     accounts = ready_accounts(ctx, "calendar", account)
 
-    async def call(target: Account) -> list[RawEvent]:
+    async def call(target: Account) -> CalendarPage:
         opened = partial(ctx.adapters.calendar, target, ctx.settings.secrets_dir)
         return await run_blocking(
             lambda: opened().events(window_start, window_end, zone, floating), slot=ctx.adapters.limiters.get(target.id)
@@ -129,15 +129,16 @@ async def run_get_events(
 
     gathered = await gather_accounts(accounts, "calendar", call, ctx.status)
     merged = sorted(
-        ((a.id, e) for a, events in gathered.results for e in events), key=lambda pair: (pair[1].sort_key, pair[0])
+        ((a.id, e) for a, page in gathered.results for e in page.events), key=lambda pair: (pair[1].sort_key, pair[0])
     )
+    expansion_cut = any(page.truncated for _, page in gathered.results)  # D62: a cap or the time budget stopped
     items = [_instance(account_id, event) for account_id, event in merged[:count]]
 
     def build(selected: list[EventInstance], cut: bool) -> GetEventsResult:
         return GetEventsResult(
             untrusted_content_notice=UNTRUSTED_CONTENT_NOTICE,
             items=selected,
-            truncated=len(merged) > count or cut,
+            truncated=len(merged) > count or cut or expansion_cut,
             account_errors=gathered.errors,
         )
 
