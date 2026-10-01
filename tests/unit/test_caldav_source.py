@@ -1,0 +1,309 @@
+import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import httpx2
+import pytest
+from pytest_httpserver import HTTPServer
+
+from mcp_hub.providers.base import MAX_HTTP_RESPONSE_BYTES, ProviderError
+from mcp_hub.providers.caldav import CalDavCalendarSource, allowed_host
+from tests.support import ics
+from tests.support.dav_transport import (
+    RecordingTransport,
+    collection,
+    dav,
+    home_set,
+    multistatus,
+    principal,
+    report,
+)
+from tests.support.logfields import allowed_fields
+
+ZURICH = ZoneInfo("Europe/Zurich")
+START = datetime(2026, 10, 17, tzinfo=ZURICH)
+END = datetime(2026, 11, 2, tzinfo=ZURICH)
+XML = "application/xml; charset=utf-8"
+PASSWORD = "unit-test-password"  # throwaway value for a local test server
+
+
+def serve_discovery(httpserver: HTTPServer, listing: bytes | None = None) -> None:
+    httpserver.expect_request("/", method="PROPFIND", headers={"Depth": "0"}).respond_with_data(
+        principal("/p/"), status=207, content_type=XML
+    )
+    httpserver.expect_request("/p/", method="PROPFIND", headers={"Depth": "0"}).respond_with_data(
+        home_set("/h/"), status=207, content_type=XML
+    )
+    if listing is None:
+        listing = multistatus(
+            collection("/h/", None, calendar=False),
+            collection("/h/home/", "Home", components=("VEVENT", "VTODO")),
+            collection("/h/work/", "Work"),
+            collection("/h/inbox/", "Inbox", calendar=False),
+        )
+    httpserver.expect_request("/h/", method="PROPFIND", headers={"Depth": "1"}).respond_with_data(
+        listing, status=207, content_type=XML
+    )
+
+
+def source(httpserver: HTTPServer, include: list[str] | str = "all", **kwargs: object) -> CalDavCalendarSource:
+    return CalDavCalendarSource(
+        "icloud",
+        url=httpserver.url_for("/"),
+        username="hub-cal",
+        password=PASSWORD,
+        include=include,  # type: ignore[arg-type]
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def requests(httpserver: HTTPServer) -> list[tuple[str, str]]:
+    return [(request.method, request.path) for request, _ in httpserver.log]
+
+
+def code_of(call: object) -> ProviderError:
+    with pytest.raises(ProviderError) as caught:
+        call()  # type: ignore[operator]
+    return caught.value
+
+
+def test_discovery_follows_principal_home_and_lists_calendars(httpserver: HTTPServer) -> None:
+    serve_discovery(httpserver)
+    found = source(httpserver).calendars()
+    assert [(c.name, c.href) for c in found] == [
+        ("Home", httpserver.url_for("/h/home/")),
+        ("Work", httpserver.url_for("/h/work/")),
+    ]
+    assert all(request.headers.get("Authorization") for request, _ in httpserver.log)
+
+
+def test_events_reports_each_selected_calendar_and_expands(httpserver: HTTPServer) -> None:
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        report(ics.load("dst-weekly.ics")), status=207, content_type=XML
+    )
+    events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    assert [e.calendar_name for e in events] == ["Home", "Home", "Home"]
+    [(sent, _)] = [(r, s) for r, s in httpserver.log if r.method == "REPORT"]
+    assert sent.path == "/h/home/"
+    assert sent.headers["Depth"] == "1"
+    assert sent.headers["Content-Type"] == XML
+    assert b'<C:time-range start="20261015T220000Z" end="20261102T230000Z"/>' in sent.get_data()
+
+
+def test_report_above_limit_is_too_large(httpserver: HTTPServer) -> None:
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        b"x" * (MAX_HTTP_RESPONSE_BYTES + 1), status=207, content_type=XML
+    )
+    assert code_of(lambda: source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)).code == "too_large"
+
+
+def test_discovery_response_above_limit_is_too_large(httpserver: HTTPServer) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+        b"x" * (MAX_HTTP_RESPONSE_BYTES + 1), status=207, content_type=XML
+    )
+    assert code_of(source(httpserver).calendars).code == "too_large"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_http_401_is_auth_expired(httpserver: HTTPServer, status: int) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(b"", status=status)
+    assert code_of(source(httpserver).check).code == "auth_expired"
+    httpserver.clear()
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(b"", status=status)
+    assert code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH)).code == "auth_expired"
+
+
+def test_http_500_is_upstream_error(httpserver: HTTPServer) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(b"", status=500)
+    assert code_of(source(httpserver).check).code == "upstream_error"
+
+
+def test_same_site_redirect_is_followed_with_a_limit(httpserver: HTTPServer) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(b"", status=301, headers={"Location": "/dav/"})
+    httpserver.expect_request("/dav/", method="PROPFIND").respond_with_data(
+        principal("/p/"), status=207, content_type=XML
+    )
+    source(httpserver).check()
+    assert requests(httpserver) == [("PROPFIND", "/"), ("PROPFIND", "/dav/")]
+    httpserver.clear()
+    for n in range(4):
+        httpserver.expect_request(f"/r{n}/", method="PROPFIND").respond_with_data(
+            b"", status=307, headers={"Location": f"/r{n + 1}/"}
+        )
+    chained = CalDavCalendarSource(
+        "icloud", url=httpserver.url_for("/r0/"), username="hub-cal", password=PASSWORD, include="all"
+    )
+    error = code_of(chained.check)
+    assert (error.code, error.cause) == ("upstream_error", "TooManyRedirects")
+    assert len(httpserver.log) == 4  # the original request plus three redirects, never a fifth
+
+
+@pytest.mark.parametrize("position", ["redirect", "principal", "home", "calendar"])
+def test_foreign_hosts_are_refused_before_any_request(httpserver: HTTPServer, position: str) -> None:
+    # Same server, other host name: a request would reach it, so the log proves it was never sent.
+    foreign = httpserver.url_for("/foreign/").replace("localhost", "127.0.0.1")
+    assert "127.0.0.1" in foreign
+    httpserver.expect_request("/foreign/").respond_with_data(principal("/p/"), status=207, content_type=XML)
+    if position == "redirect":
+        httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+            b"", status=302, headers={"Location": foreign}
+        )
+    elif position == "principal":
+        httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+            principal(foreign), status=207, content_type=XML
+        )
+    else:
+        httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+            principal("/p/"), status=207, content_type=XML
+        )
+        if position == "home":
+            httpserver.expect_request("/p/", method="PROPFIND").respond_with_data(
+                home_set(foreign), status=207, content_type=XML
+            )
+        else:
+            serve_discovery(httpserver, multistatus(collection(foreign, "Home")))
+    error = code_of(lambda: source(httpserver).events(START, END, ZURICH, ZURICH))
+    assert (error.code, error.cause) == ("upstream_error", "ForeignHost")
+    assert ("PROPFIND", "/foreign/") not in requests(httpserver)
+    assert ("REPORT", "/foreign/") not in requests(httpserver)
+
+
+def test_icloud_partition_hosts_are_allowed() -> None:
+    icloud = "https://caldav.icloud.com/"
+    assert allowed_host(icloud, "https://p42-caldav.icloud.com/123/calendars/")
+    assert allowed_host(icloud, "https://p42-caldav.icloud.com:443/123/calendars/")
+    assert allowed_host(icloud, "https://caldav.icloud.com/123/principal/")
+    for target in (
+        "https://p42-caldav.icloud.com.evil.example/",
+        "https://caldav.icloud.com.evil.example/",
+        "http://caldav.icloud.com/",
+        "https://other.icloud.com/",
+        "https://p42-caldav.icloud.com:8443/",
+        "https://p1234-caldav.icloud.com/",
+    ):
+        assert not allowed_host(icloud, target), target
+    other = "https://dav.example.test:8443/"
+    assert allowed_host(other, "https://dav.example.test:8443/cal/")
+    for target in ("https://dav.example.test/", "http://dav.example.test:8443/", "https://p42-caldav.icloud.com/"):
+        assert not allowed_host(other, target), target
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [(httpx2.ConnectError("x"), "unreachable"), (httpx2.ReadTimeout("x"), "upstream_timeout")],
+    ids=["connect", "timeout"],
+)
+def test_error_mapping(raised: Exception, code: str) -> None:
+    def fail(request: httpx2.Request) -> httpx2.Response:
+        raise raised
+
+    def factory(username: str, password: str, timeout: float) -> httpx2.Client:
+        return httpx2.Client(auth=(username, password), transport=httpx2.MockTransport(fail))
+
+    caldav = CalDavCalendarSource(
+        "icloud",
+        url="https://dav.example.test/",
+        username="u",
+        password=PASSWORD,
+        include="all",
+        client_factory=factory,
+    )
+    assert code_of(caldav.check).code == code
+
+
+def test_parse_refusal_is_upstream_error(httpserver: HTTPServer) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]><x>&a;</x>', status=207, content_type=XML
+    )
+    assert code_of(source(httpserver).check).code == "upstream_error"
+
+
+def test_check_is_one_principal_lookup(httpserver: HTTPServer) -> None:
+    serve_discovery(httpserver)
+    source(httpserver).check()
+    assert requests(httpserver) == [("PROPFIND", "/")]
+    assert b"current-user-principal" in httpserver.log[0][0].get_data()
+
+
+def test_task_only_collections_are_skipped(httpserver: HTTPServer) -> None:
+    serve_discovery(
+        httpserver,
+        multistatus(collection("/h/tasks/", "Tasks", components=("VTODO",)), collection("/h/home/", "Home")),
+    )
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(report(), status=207, content_type=XML)
+    assert source(httpserver).events(START, END, ZURICH, ZURICH) == []
+    assert [path for method, path in requests(httpserver) if method == "REPORT"] == ["/h/home/"]
+
+
+def test_icloud_shaped_discovery_crosses_to_the_partition_host() -> None:
+    calendars = "https://p42-caldav.icloud.com:443/123/calendars/"
+
+    def run(home: str) -> tuple[RecordingTransport, list[object] | ProviderError]:
+        recorder = RecordingTransport(
+            {
+                ("PROPFIND", "https://caldav.icloud.com:443/"): dav(principal("/123/principal/")),
+                ("PROPFIND", "https://caldav.icloud.com:443/123/principal/"): dav(home_set(home)),
+                ("PROPFIND", "https://p42-caldav.icloud.com:443/123/calendars/"): dav(
+                    multistatus(collection("/123/calendars/home/", "Home", components=("VEVENT",)))
+                ),
+                ("REPORT", "https://p42-caldav.icloud.com:443/123/calendars/home/"): dav(
+                    report(ics.load("dst-weekly.ics"))
+                ),
+            }
+        )
+
+        def factory(username: str, password: str, timeout: float) -> httpx2.Client:
+            return httpx2.Client(auth=(username, password), transport=recorder.transport(), trust_env=False)
+
+        caldav = CalDavCalendarSource(
+            "icloud",
+            url="https://caldav.icloud.com/",
+            username="u",
+            password=PASSWORD,
+            include="all",
+            client_factory=factory,
+        )
+        try:
+            return recorder, list(caldav.events(START, END, ZURICH, ZURICH))
+        except ProviderError as exc:
+            return recorder, exc
+
+    recorder, events = run(calendars)
+    assert isinstance(events, list)
+    assert len(events) == 3
+    assert {(host, port) for host, port, *_ in recorder.seen} == {
+        ("caldav.icloud.com", 443),
+        ("p42-caldav.icloud.com", 443),
+    }
+    assert all(has_auth for *_, has_auth in recorder.seen)
+    recorder, failed = run("https://p42-caldav.icloud.com.evil.example/123/calendars/")
+    assert isinstance(failed, ProviderError)
+    assert (failed.code, failed.cause) == ("upstream_error", "ForeignHost")
+    assert all(host != "p42-caldav.icloud.com.evil.example" for host, *_ in recorder.seen)
+
+
+def test_broken_calendar_objects_are_skipped_individually(
+    httpserver: HTTPServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    valid = ics.load("dst-weekly.ics")
+    broken_start = valid.replace(
+        b"DTSTART;TZID=Europe/Zurich:20261018T100000", b"DTSTART;TZID=Europe/Zurich:not-a-date"
+    )
+    broken_rule = valid.replace(b"RRULE:FREQ=WEEKLY;COUNT=3", b"RRULE:FREQ=SOMETIMES;COUNT=x")
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        report(broken_start, broken_rule, valid), status=207, content_type=XML
+    )
+    with caplog.at_level(logging.WARNING, logger="mcp_hub"):
+        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    assert len(events) == 3
+    skipped = [r for r in caplog.records if r.getMessage() == "calendar_object_skipped"]
+    assert len(skipped) == 2
+    for record in skipped:
+        fields = record.fields  # type: ignore[attr-defined]
+        assert set(fields) == {"account", "capability", "exception"}
+        assert (fields["account"], fields["capability"]) == ("icloud", "calendar")
+        assert set(fields) <= allowed_fields("calendar_object_skipped")

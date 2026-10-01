@@ -5,18 +5,23 @@ with the credential-destination rule, read as streams capped at 5 MiB; expansion
 recurring-ical-events. Blocking; the tool layer runs it through providers.base.run_blocking. Returns unsanitised text.
 """
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Final, Literal, NoReturn, cast
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
+import httpx2
 import icalendar
 import recurring_ical_events
 
-from mcp_hub.providers.base import ProviderError
+from mcp_hub.logging import log_event
+from mcp_hub.providers.base import PROVIDER_TIMEOUT_SECONDS, ProviderError, read_capped
 from mcp_hub.sanitize import validate_timezone
 
 _DAV: Final = "{DAV:}"
@@ -131,7 +136,8 @@ def expand(
     recurring_uids = {
         str(c.get("UID", "")) for c in calendar.walk("VEVENT") if {"RRULE", "RDATE", "RECURRENCE-ID"} & set(c)
     }
-    query = recurring_ical_events.of(calendar, skip_bad_series=True)
+    # A broken series raises, so the caller skips this object and logs calendar_object_skipped (spec 080 §10.2).
+    query = recurring_ical_events.of(calendar, skip_bad_series=False)
     events: list[RawEvent] = []
     for component in query.between(start.astimezone(UTC) - _WIDEN, end.astimezone(UTC) + _WIDEN):
         if component.name != "VEVENT" or str(component.get("STATUS", "CONFIRMED")).upper() == "CANCELLED":
@@ -180,3 +186,186 @@ def expand(
             )
         )
     return events
+
+
+_NS: Final = 'xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"'
+PRINCIPAL_BODY: Final = (
+    f'<?xml version="1.0" encoding="utf-8"?><D:propfind {_NS}><D:prop><D:current-user-principal/></D:prop></D:propfind>'
+)
+HOME_BODY: Final = (
+    f'<?xml version="1.0" encoding="utf-8"?><D:propfind {_NS}><D:prop><C:calendar-home-set/></D:prop></D:propfind>'
+)
+LIST_BODY: Final = (
+    f'<?xml version="1.0" encoding="utf-8"?><D:propfind {_NS}><D:prop><D:resourcetype/><D:displayname/>'
+    "<C:supported-calendar-component-set/></D:prop></D:propfind>"
+)
+REPORT_BODY: Final = (
+    f'<?xml version="1.0" encoding="utf-8"?><C:calendar-query {_NS}>'
+    "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
+    '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">'
+    '<C:time-range start="{start}" end="{end}"/>'
+    "</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+)
+_ICLOUD_HOST: Final = "caldav.icloud.com"
+_ICLOUD_PARTITION: Final = re.compile(r"^p\d{1,3}-caldav\.icloud\.com$")
+_MAX_REDIRECTS: Final = 3
+_REDIRECTS: Final = frozenset({301, 302, 307, 308})
+_log = logging.getLogger("mcp_hub.providers.caldav")
+
+ClientFactory = Callable[[str, str, float], httpx2.Client]
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarRef:
+    href: str
+    name: str | None
+
+
+def allowed_host(configured: str, target: str) -> bool:
+    """Credentials go only to the configured scheme/host/port, or - for iCloud - to its pNN-caldav partition hosts
+    on port 443 (spec 080 rev. 4.4 §6.1, D58). Checked before every request, including redirects and discovered
+    hrefs."""
+    a, b = urlsplit(configured), urlsplit(target)
+    if a.scheme != b.scheme or not b.hostname:
+        return False
+    if (a.hostname, a.port) == (b.hostname, b.port):
+        return True
+    return (
+        a.hostname == _ICLOUD_HOST
+        and a.scheme == "https"
+        and b.port in (None, 443)
+        and bool(_ICLOUD_PARTITION.fullmatch(b.hostname))
+    )
+
+
+def default_client(username: str, password: str, timeout: float) -> httpx2.Client:
+    return httpx2.Client(auth=(username, password), timeout=timeout, trust_env=False, follow_redirects=False)
+
+
+def _provider_error(exc: Exception) -> ProviderError:
+    if isinstance(exc, ProviderError):
+        return exc
+    cause = type(exc).__name__
+    if isinstance(exc, TimeoutError | httpx2.TimeoutException):
+        return ProviderError("upstream_timeout", cause)
+    if isinstance(exc, OSError | httpx2.TransportError):
+        return ProviderError("unreachable", cause)
+    return ProviderError("upstream_error", cause)
+
+
+def _stamp(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _href(element: ET.Element | None, base: str) -> str | None:
+    node = element.find(f"{_DAV}href") if element is not None else None
+    return urljoin(base, node.text.strip()) if node is not None and node.text else None
+
+
+class CalDavCalendarSource:
+    def __init__(
+        self,
+        account_id: str,
+        *,
+        url: str,
+        username: str,
+        password: str,
+        include: Literal["all"] | list[str],
+        timeout: float = PROVIDER_TIMEOUT_SECONDS,
+        client_factory: ClientFactory = default_client,
+    ) -> None:
+        self._account, self._url, self._include = account_id, url, include
+        self._username, self._password, self._timeout = username, password, timeout
+        self._factory = client_factory
+
+    def _request(self, client: httpx2.Client, method: str, url: str, body: str, depth: str) -> tuple[str, bytes]:
+        """One DAV request; follows at most 3 redirects by hand, each target checked with allowed_host first."""
+        for _ in range(_MAX_REDIRECTS + 1):
+            if not allowed_host(self._url, url):
+                raise ProviderError("upstream_error", "ForeignHost")
+            headers = {"Depth": depth, "Content-Type": "application/xml; charset=utf-8"}
+            with client.stream(method, url, content=body.encode(), headers=headers) as response:
+                if response.status_code in _REDIRECTS and "location" in response.headers:
+                    url = urljoin(url, response.headers["location"])
+                    continue
+                if response.status_code in (401, 403):
+                    raise ProviderError("auth_expired", "HttpUnauthorized")
+                if response.status_code != 207:
+                    raise ProviderError("upstream_error", "UnexpectedStatus")
+                return url, read_capped(response.iter_bytes())
+        raise ProviderError("upstream_error", "TooManyRedirects")
+
+    def _principal(self, client: httpx2.Client) -> str:
+        base, raw = self._request(client, "PROPFIND", self._url, PRINCIPAL_BODY, "0")
+        principal = _href(parse_xml(raw).find(f".//{_DAV}current-user-principal"), base)
+        if principal is None:
+            raise ProviderError("upstream_error", "NoPrincipal")
+        return principal
+
+    def _calendars(self, client: httpx2.Client) -> list[CalendarRef]:
+        principal = self._principal(client)
+        base, raw = self._request(client, "PROPFIND", principal, HOME_BODY, "0")
+        home = _href(parse_xml(raw).find(f".//{_CALDAV}calendar-home-set"), base)
+        if home is None:
+            raise ProviderError("upstream_error", "NoCalendarHome")
+        base, raw = self._request(client, "PROPFIND", home, LIST_BODY, "1")
+        found = []
+        for response in parse_xml(raw).iter(f"{_DAV}response"):
+            href = _href(response, base)
+            if href is None or response.find(f".//{_DAV}resourcetype/{_CALDAV}calendar") is None:
+                continue
+            components = response.find(f".//{_CALDAV}supported-calendar-component-set")
+            if components is not None and not any(
+                comp.get("name", "").upper() == "VEVENT" for comp in components.iter(f"{_CALDAV}comp")
+            ):
+                continue  # task-only list: no REPORT spent on it; kept when the property is absent
+            name = response.findtext(f".//{_DAV}displayname")
+            found.append(CalendarRef(href=href, name=name.strip() if name else None))
+        return found
+
+    def check(self) -> None:
+        """Status check (spec 080 §7.4): one PROPFIND for current-user-principal."""
+        try:
+            with self._factory(self._username, self._password, self._timeout) as client:
+                self._principal(client)
+        except Exception as exc:
+            raise _provider_error(exc) from None
+
+    def calendars(self) -> list[CalendarRef]:
+        try:
+            with self._factory(self._username, self._password, self._timeout) as client:
+                return self._calendars(client)
+        except Exception as exc:
+            raise _provider_error(exc) from None
+
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+        try:
+            with self._factory(self._username, self._password, self._timeout) as client:
+                selected = [c for c in self._calendars(client) if self._include == "all" or c.name in self._include]
+                body = REPORT_BODY.format(start=_stamp(start - _WIDEN), end=_stamp(end + _WIDEN))
+                events: list[RawEvent] = []
+                for calendar in selected:
+                    _, raw = self._request(client, "REPORT", calendar.href, body, "1")
+                    for ics in parse_multistatus(raw):
+                        try:  # one broken calendar object never fails the account (spec 080 §10.2)
+                            events += expand(
+                                ics,
+                                href=calendar.href,
+                                name=calendar.name,
+                                start=start,
+                                end=end,
+                                zone=zone,
+                                floating=floating,
+                            )
+                        except Exception as exc:
+                            log_event(
+                                _log,
+                                logging.WARNING,
+                                "calendar_object_skipped",
+                                account=self._account,
+                                capability="calendar",
+                                exception=type(exc).__name__,
+                            )
+                return events
+        except Exception as exc:
+            raise _provider_error(exc) from None
