@@ -58,6 +58,8 @@ spec:
               value: "/etc/mcp-hub/secrets"
             - name: HUB_DEFAULT_TIMEZONE
               value: "Europe/Zurich"
+            - name: HUB_RESPONSE_BUDGET_CHARS
+              value: "30000"
             - name: LOG_LEVEL
               value: "INFO"
           securityContext:
