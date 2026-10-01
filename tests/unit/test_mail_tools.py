@@ -254,3 +254,41 @@ async def test_get_message_argument_errors(
     with pytest.raises(ToolError) as caught:
         await run_get_message(context(secrets_dir, {}, detail()), message_id=message_id, max_chars=max_chars)
     assert caught.value.code == code
+
+
+LONG_ADDRESS = "a" * 240 + "@example.test"
+QUOTES = '"\\' * 400
+
+
+@pytest.mark.parametrize("budget", [10_000, 30_000, 70_000])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"to_addresses": [f"{i}{LONG_ADDRESS}" for i in range(20)],
+         "cc_addresses": [f"{i}{LONG_ADDRESS}" for i in range(20)], "body_text": "x" * 40_000},
+        {"subject": QUOTES, "from_name": QUOTES, "body_text": QUOTES * 50,
+         "attachments": [AttachmentMeta(1, QUOTES, "text/plain") for _ in range(25)],
+         "to_addresses": [f'"{i}"{QUOTES}@example.test' for i in range(30)]},
+        {"attachments": [AttachmentMeta(i, f"{i}{QUOTES}", "application/pdf") for i in range(25)],
+         "cc_addresses": [f"{i}{LONG_ADDRESS}" for i in range(25)]},
+    ],
+)  # fmt: skip
+async def test_get_message_never_exceeds_the_budget(secrets_dir: Path, budget: int, changes: dict[str, object]) -> None:
+    ctx = context(secrets_dir, {}, detail(**changes), env={"HUB_RESPONSE_BUDGET_CHARS": str(budget)})
+    result, _ = await run_get_message(ctx, message_id=ICLOUD_ID, max_chars=20_000)
+    assert len(result.model_dump_json()) <= budget
+
+
+@pytest.mark.parametrize("budget", [10_000, 30_000, 70_000])
+async def test_list_unread_never_exceeds_the_budget(secrets_dir: Path, budget: int) -> None:
+    hostile = [
+        replace(
+            summary("icloud", i, i), subject=QUOTES, from_name=QUOTES, snippet_text=QUOTES, from_address=LONG_ADDRESS
+        )
+        for i in range(1, 51)
+    ]
+    pages: dict[str, UnreadPage | Exception] = {"icloud": UnreadPage(hostile, False), "gmail": UnreadPage([], False)}
+    ctx = context(secrets_dir, pages, env={"HUB_RESPONSE_BUDGET_CHARS": str(budget)})
+    result, _, _ = await run_list_unread(ctx, account=None, since=None, limit=50, now=NOW)
+    assert len(result.model_dump_json()) <= budget
+    assert result.items

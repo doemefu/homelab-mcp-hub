@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel
 
-from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_to_fit
+from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_or_drop, shrink_to_fit
 from mcp_hub.sanitize import TRUNCATION_MARKER
 
 
@@ -67,3 +67,31 @@ def test_hard_maximum_caps_a_larger_budget() -> None:
 
 def test_shrink_to_fit_gives_up_below_the_minimum() -> None:
     assert shrink_to_fit(item(0, 10), lambda m: False) is None
+
+
+class Listed(BaseModel):
+    names: list[str]
+    untrusted: U
+
+
+def drop_name(model: Listed) -> Listed | None:
+    return model.model_copy(update={"names": model.names[:-1]}) if model.names else None
+
+
+def test_shrink_or_drop_drops_list_entries_until_the_shrunk_model_fits() -> None:
+    model = Listed(names=["n" * 200] * 40, untrusted=U(subject="s", body="b" * 20_000))
+    fitted = shrink_or_drop(model, lambda m: serialized_length(m) <= 3_000, drop_name)
+    assert fitted is not None
+    assert serialized_length(fitted) <= 3_000
+    assert 0 < len(fitted.names) < 40  # entries were dropped only as far as needed
+
+
+def test_shrink_or_drop_keeps_every_entry_when_shrinking_is_enough() -> None:
+    model = Listed(names=["n"] * 5, untrusted=U(subject="s", body="b" * 20_000))
+    fitted = shrink_or_drop(model, lambda m: serialized_length(m) <= 2_000, drop_name)
+    assert fitted is not None
+    assert len(fitted.names) == 5
+
+
+def test_shrink_or_drop_gives_up_when_nothing_is_left() -> None:
+    assert shrink_or_drop(Listed(names=["a"], untrusted=U(subject="s", body="b")), lambda m: False, drop_name) is None

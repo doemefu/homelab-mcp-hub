@@ -10,7 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult
 from pydantic import BaseModel
 
-from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_to_fit
+from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_or_drop
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import decode_message_id, encode_message_id
 from mcp_hub.providers.base import (
@@ -240,30 +240,28 @@ async def run_get_message(ctx: HubContext, *, message_id: str, max_chars: int | 
     )
     limit = min(ctx.settings.response_budget_chars, HARD_MAX_CHARS)
     if serialized_length(result) > limit:
-        fitted = shrink_to_fit(result, lambda candidate: serialized_length(candidate) <= limit)
-        result = (fitted or _drop_list_entries(result, limit)).model_copy(update={"body_truncated": True})
+        # The body is shortened first; cc, to and attachment entries are dropped only when that is not enough.
+        fitted = shrink_or_drop(
+            result.model_copy(update={"body_truncated": True}),
+            lambda candidate: serialized_length(candidate) <= limit,
+            _drop_one_list_entry,
+        )
+        if fitted is None:  # unreachable with the accepted budget range; never return an oversized result
+            raise ToolError("too_large", "Result exceeds the output budget")
+        result = fitted
     return result, "ok"
 
 
-def _drop_list_entries(result: GetMessageResult, limit: int) -> GetMessageResult:
-    """Last resort: drop cc, to and attachment entries from the end until the result fits; attachment_count keeps
-    the real number."""
-    current = result
-    while serialized_length(current) > limit:
-        u = current.untrusted
-        if u.cc_addresses:
-            current = current.model_copy(
-                update={"untrusted": u.model_copy(update={"cc_addresses": u.cc_addresses[:-1]})}
-            )
-        elif u.to_addresses:
-            current = current.model_copy(
-                update={"untrusted": u.model_copy(update={"to_addresses": u.to_addresses[:-1]})}
-            )
-        elif current.attachments:
-            current = current.model_copy(update={"attachments": current.attachments[:-1]})
-        else:
-            break
-    return current
+def _drop_one_list_entry(result: GetMessageResult) -> GetMessageResult | None:
+    """Drop the last cc, else to, else attachment entry; attachment_count keeps the real number."""
+    u = result.untrusted
+    if u.cc_addresses:
+        return result.model_copy(update={"untrusted": u.model_copy(update={"cc_addresses": u.cc_addresses[:-1]})})
+    if u.to_addresses:
+        return result.model_copy(update={"untrusted": u.model_copy(update={"to_addresses": u.to_addresses[:-1]})})
+    if result.attachments:
+        return result.model_copy(update={"attachments": result.attachments[:-1]})
+    return None
 
 
 def register(server: MCPServer, ctx: HubContext) -> None:
