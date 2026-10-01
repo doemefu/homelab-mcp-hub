@@ -195,8 +195,14 @@ def _end(component: icalendar.Event, begin: date) -> date:
     return begin if isinstance(begin, datetime) else begin + timedelta(days=1)
 
 
-def _text(component: icalendar.Event, name: str) -> str | None:
+def _first(component: icalendar.cal.Component, name: str) -> object:
+    """The first value of a property that may repeat (two SUMMARY lines give a list, review 19 F7)."""
     value = component.get(name)
+    return value[0] if isinstance(value, list) and value else value
+
+
+def _text(component: icalendar.Event, name: str) -> str | None:
+    value = _first(component, name)
     return str(value) if value is not None else None
 
 
@@ -429,7 +435,7 @@ def _instances(
         rid = recurrence.dt if recurrence is not None else begin
         if isinstance(rid, datetime) and rid.tzinfo is not None:
             rid = rid.astimezone(UTC)
-        organizer = component.get("ORGANIZER")
+        organizer = cast(icalendar.vCalAddress | None, _first(component, "ORGANIZER"))
         attendees = component.get("ATTENDEE")
         uid = str(component.get("UID", ""))
         events.append(

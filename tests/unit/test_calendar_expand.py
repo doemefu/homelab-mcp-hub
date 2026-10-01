@@ -185,3 +185,17 @@ def test_an_event_starting_exactly_at_the_window_end_is_excluded() -> None:
 
     assert expand_until(END) == []
     assert len(expand_until(END + timedelta(seconds=1))) == 1
+
+
+def test_repeated_text_properties_take_the_first_value() -> None:
+    # Review 19 F7: two SUMMARY lines gave a list whose repr became the title.
+    raw = ics.load("hostile.ics")
+    for name in (b"SUMMARY", b"LOCATION", b"DESCRIPTION"):
+        raw = raw.replace(b"END:VEVENT", name + b":second " + name.lower() + b"\r\nEND:VEVENT")
+    [event] = expand(raw, href="/h/", name="Home", start=START, end=END, zone=ZURICH, floating=ZURICH)
+    assert (event.title or "").startswith("Invoice")
+    assert event.location == "Room 1"
+    assert (event.description or "").startswith("Please review")
+    for text in (event.title or "", event.location or "", event.description or ""):
+        assert "vText" not in text
+        assert "second" not in text
