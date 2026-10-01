@@ -19,7 +19,7 @@ def test_exact_case_sensitive_match(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "content",
-    ["\ufeffowner-test\r\n", "  owner-test  \n\n", "other\r\nowner-test\r\n", "\nowner-test"],
+    ["﻿owner-test\r\n", "  owner-test  \n\n", "other\r\nowner-test\r\n", "\nowner-test"],
     ids=["bom-crlf", "spaces-blank-lines", "two-lines-crlf", "leading-blank"],
 )
 def test_allowlist_line_handling(tmp_path: Path, content: str) -> None:
