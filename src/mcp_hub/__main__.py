@@ -44,7 +44,7 @@ def main(env: Mapping[str, str] | None = None) -> int:
         log_event(_log, logging.ERROR, "startup_failed", reason=UNEXPECTED_ERROR, exception=type(exc).__name__)
         return 2
     try:
-        hub = create_app(settings, registry)
+        hub = create_app(settings, registry, background_checks=True)
         config = uvicorn.Config(
             hub.asgi,
             log_config=None,

@@ -3,10 +3,11 @@
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Final
 
+import anyio
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
@@ -19,6 +20,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_hub import __version__
 from mcp_hub.auth import HubTokenVerifier, SubjectAllowlist
+from mcp_hub.checker import HealthChecker
 from mcp_hub.config import ALLOWLIST_FILE, Settings
 from mcp_hub.health import StatusStore, missing_credentials
 from mcp_hub.jwks import JwksCache
@@ -136,23 +138,35 @@ class Readiness:
 class PortDispatcher:
     """Routes by listening port: internal port -> health app; anything else -> MCP app (which owns the lifespan)."""
 
-    def __init__(self, public: ASGIApp, internal: ASGIApp, internal_port: int, readiness: Readiness) -> None:
+    def __init__(
+        self,
+        public: ASGIApp,
+        internal: ASGIApp,
+        internal_port: int,
+        readiness: Readiness,
+        background: Callable[[], Coroutine[None, None, None]] | None = None,
+    ) -> None:
         self._public = public
         self._internal = internal
         self._internal_port = internal_port
         self._readiness = readiness
+        self._background = background
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
+            async with anyio.create_task_group() as tg:
 
-            async def track(message: Message) -> None:
-                if message["type"] == "lifespan.startup.complete":
-                    self._readiness.ready = True
-                elif message["type"].startswith("lifespan.shutdown"):
-                    self._readiness.ready = False
-                await send(message)
+                async def track(message: Message) -> None:
+                    if message["type"] == "lifespan.startup.complete":
+                        self._readiness.ready = True
+                        if self._background is not None:
+                            tg.start_soon(self._background)  # the status check runs inside the server's loop
+                    elif message["type"].startswith("lifespan.shutdown"):
+                        self._readiness.ready = False
+                    await send(message)
 
-            await self._public(scope, receive, track)
+                await self._public(scope, receive, track)
+                tg.cancel_scope.cancel()  # the lifespan has ended: stop the status check
             return
         server = scope.get("server")
         if server is not None and server[1] == self._internal_port:
@@ -189,6 +203,7 @@ def create_app(
     status: StatusStore | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     adapters: Adapters | None = None,
+    background_checks: bool = False,
 ) -> HubApp:
     verifier = HubTokenVerifier(
         issuer=settings.auth_issuer,
@@ -233,8 +248,16 @@ def create_app(
     )
     readiness = Readiness()
     internal = build_internal_app(readiness)
+    # Opt-in twice: the production entry point asks for it and the deployment enables it (spec 080 rev. 4.4 §7.4).
+    checker = (
+        HealthChecker(context, interval=settings.health_check_interval_seconds)
+        if background_checks and settings.status_check_enabled
+        else None
+    )
     return HubApp(
-        asgi=PortDispatcher(public, internal, settings.internal_port, readiness),
+        asgi=PortDispatcher(
+            public, internal, settings.internal_port, readiness, background=checker.run if checker else None
+        ),
         public=public,
         internal=internal,
         server=server,

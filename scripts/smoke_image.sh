@@ -74,4 +74,5 @@ LOGS="$(docker logs "hub-$$" 2>&1)"
 ! grep -q "$VALID" <<<"$LOGS" || fail "token in logs"
 ! grep -q 'HTTP Request' <<<"$LOGS" || fail "httpx2 request line in logs"
 ! grep -q 'evil.example.org' <<<"$LOGS" || fail "header value in logs"
+! grep -q 'status_check' <<<"$LOGS" || fail "status check ran in the smoke container"  # HUB_STATUS_CHECK_ENABLED unset
 echo "smoke OK"

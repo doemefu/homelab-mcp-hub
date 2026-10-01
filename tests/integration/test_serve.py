@@ -48,6 +48,10 @@ def wait_ready(internal: int) -> None:
 
 
 def test_serves_both_ports_and_shuts_down_cleanly(secrets_dir: Path) -> None:
+    data = json.loads((secrets_dir / "accounts.json").read_text())
+    for entry in data["accounts"]:
+        entry["enabled"] = False  # no status check may reach a real provider from CI (spec 080 §7.4 check is live)
+    (secrets_dir / "accounts.json").write_text(json.dumps(data))
     port, internal = free_port(), free_port()
     process = start(secrets_dir, port, internal)
     try:
