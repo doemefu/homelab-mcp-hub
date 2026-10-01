@@ -251,6 +251,7 @@ def test_globally_unique_tzid_guesses_neither_warn_nor_grow_the_registry(caplog:
         with warnings.catch_warnings(record=True) as seen, caplog.at_level(logging.DEBUG):
             warnings.simplefilter("always")  # worst case: every other warning is shown
             caldav.ignore_icalendar_tzid_guess_warnings()
+            tzp.timezone("/vendor-warm-up/Europe/Zurich")  # CPython adds one "version" key after a filter change
             before = _registry_size()
             for i in range(10_000):
                 assert tzp.timezone(f"/vendor-{i}/Europe/Zurich") is not None
