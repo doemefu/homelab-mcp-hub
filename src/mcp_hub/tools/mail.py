@@ -13,7 +13,15 @@ from pydantic import BaseModel
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_to_fit
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import decode_message_id, encode_message_id
-from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, MailDetail, MailSummary, UnreadPage, run_blocking
+from mcp_hub.providers.base import (
+    ACCOUNT_ERROR_MESSAGES,
+    MailDetail,
+    MailSummary,
+    UnreadPage,
+    log_message_skipped,
+    placeholder_summary,
+    run_blocking,
+)
 from mcp_hub.registry import Account, ImapMail
 from mcp_hub.sanitize import FIELD_LIMITS, clean, clean_flagged, validate_content_type
 from mcp_hub.tools import HubContext
@@ -132,6 +140,18 @@ def _summary(item: MailSummary, zone: ZoneInfo) -> MessageSummary:
     )
 
 
+def _summary_or_placeholder(item: MailSummary, zone: ZoneInfo) -> MessageSummary:
+    """Per-item isolation: an item that cannot be built or serialised degrades to the placeholder entry and one
+    item_degraded line; it never fails the listing of the other messages and accounts."""
+    try:
+        summary = _summary(item, zone)
+        summary.model_dump_json()
+    except Exception as exc:
+        log_message_skipped(item.ref, "mail", exc)
+        return _summary(placeholder_summary(item.ref, item.received_at, item.unread), zone)
+    return summary
+
+
 async def run_list_unread(
     ctx: HubContext, *, account: str | None, since: str | None, limit: int | None, now: datetime | None = None
 ) -> tuple[ListUnreadResult, list[str], str]:
@@ -151,7 +171,7 @@ async def run_list_unread(
     merged = sorted((m for _, page in gathered.results for m in page.items), key=lambda m: m.received_at, reverse=True)
     more = any(page.more for _, page in gathered.results) or len(merged) > count
     zone = ZoneInfo(ctx.settings.default_timezone)
-    items = [_summary(m, zone) for m in merged[:count]]
+    items = [_summary_or_placeholder(m, zone) for m in merged[:count]]
 
     def build(selected: list[MessageSummary], cut: bool) -> ListUnreadResult:
         return ListUnreadResult(
