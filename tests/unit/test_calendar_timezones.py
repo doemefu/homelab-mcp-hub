@@ -118,7 +118,7 @@ def test_the_cache_is_empty_and_the_lock_free_after_every_exit_path(path: str) -
     ticks = [0.0]
 
     def clock() -> float:
-        ticks[0] += 1e-5
+        ticks[0] += 1e-5 * caldav.CLOCK_SAMPLE_EVENTS
         return ticks[0]
 
     try:

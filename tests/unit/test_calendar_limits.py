@@ -72,7 +72,8 @@ def rdates(count: int, uid: str, minutes: int = 30) -> bytes:
 class FakeTime:
     """One fake clock for both the CPU deadline and the budget: every reading advances it by `step`."""
 
-    def __init__(self, step: float = 1e-5) -> None:  # a normal object makes ~1,000-7,500 Python calls
+    # A normal object makes ~1,000-7,500 Python calls; the hook reads the clock every CLOCK_SAMPLE_EVENTS calls.
+    def __init__(self, step: float = 1e-5 * caldav.CLOCK_SAMPLE_EVENTS) -> None:
         self.now, self.step = 0.0, step
 
     def __call__(self) -> float:

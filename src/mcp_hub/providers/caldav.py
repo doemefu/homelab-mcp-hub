@@ -59,6 +59,7 @@ _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
 OBJECT_CPU_SECONDS: Final = 2.0  # thread CPU time per object (parse, screening, expansion)
+CLOCK_SAMPLE_EVENTS: Final = 64  # the trace hook reads the CPU clock every 64 call events (cuts its overhead)
 EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checked between objects
 SLOW_OBJECT_CACHE_SIZE: Final = 1000
 # REPORT bodies held per account and call (discovery bodies have their own 5 MiB cap and do not count). Calendars are
@@ -397,15 +398,22 @@ def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Call
     thread-local, CPython-specific and replaces a debugger's or coverage tool's trace function while it runs (the
     previous one is restored on every path). A library layer that catches the injected BaseException also removes
     the hook (CPython drops a raising trace function), so the CPU time is read once more after the call on every path.
-    The clock is read on every call event: sampling every 16 events saved only about a third of the 0.4 ms per object.
+    The clock is read every CLOCK_SAMPLE_EVENTS call events: reading it on every event (a syscall per generator
+    resume) made a 600-override series cost 0.45 s instead of 0.30 s and a normal object 0.73 ms instead of 0.54 ms
+    (0.12 s / 0.31 ms without the hook); a no-match rule is still stopped at 2.0 s.
     Rejected alternative: a killable subprocess per expansion (memory in a
     256 Mi pod, start-up cost per call)."""
     deadline = cpu_clock() + seconds
     previous = sys.gettrace()
+    events = 0
 
     def hook(frame: FrameType, event: str, arg: object) -> None:
-        if cpu_clock() > deadline:
-            raise _ExpansionTooSlow  # CPython removes a raising trace function; `finally` restores the previous one
+        nonlocal events
+        events += 1
+        if events >= CLOCK_SAMPLE_EVENTS:
+            events = 0
+            if cpu_clock() > deadline:
+                raise _ExpansionTooSlow  # CPython removes a raising trace function; `finally` restores the previous
         return None  # call events only, no line tracing
 
     sys.settrace(hook)
