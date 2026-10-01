@@ -1,8 +1,10 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import anyio
 import pytest
 
 from mcp_hub.config import load_settings
@@ -12,6 +14,7 @@ from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.caldav import CalendarPage, RawEvent, expand
 from mcp_hub.registry import Account, load_registry
+from mcp_hub.sanitize import FIELD_LIMITS
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
 from tests.support import ics
@@ -354,3 +357,109 @@ async def test_event_ids_ignore_the_host_of_the_calendar_url(secrets_dir: Path) 
         ids.append([i.id for i in result.items])
     assert ids[0] == ids[1]
     assert len(set(ids[0])) == 3
+
+
+# --- D1: text work off the event loop and bounded per call (delta review of PR #11) ---------------------------------
+
+
+def _big_daily(n: int, size: int = 60_000) -> bytes:
+    text = "w" * size
+    return (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\nBEGIN:VEVENT\r\n"
+        f"UID:big-{n}@example.test\r\nDTSTAMP:20260901T000000Z\r\nDTSTART:20261017T080000Z\r\n"
+        f"DTEND:20261017T090000Z\r\nRRULE:FREQ=DAILY\r\nSUMMARY:{text}\r\nLOCATION:{text}\r\nDESCRIPTION:{text}\r\n"
+        f"ORGANIZER;CN={text}:mailto:organizer@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    ).encode()
+
+
+async def test_text_passed_to_clean_is_bounded(secrets_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_hub.tools import calendar as calendar_tools
+
+    seen: list[int] = []
+    original = calendar_tools.clean
+
+    def counting(value: str | None, limit: int, *, multiline: bool = False) -> str:
+        seen.append(len(value or ""))
+        return original(value, limit, multiline=multiline)
+
+    monkeypatch.setattr(calendar_tools, "clean", counting)
+
+    class Big(FakeCalendar):
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+            found = [
+                e
+                for n in range(7)
+                for e in expand(
+                    _big_daily(n), href="/h/", name="Home", start=start, end=end, zone=zone, floating=floating
+                )
+            ]
+            return CalendarPage(events=found, truncated=False)
+
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    ctx = HubContext(
+        settings,
+        load_registry(secrets_dir / "accounts.json"),
+        StatusStore(),
+        Adapters(calendar=lambda a, d: Big(a, {})),
+    )
+    await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=200)
+    assert seen
+    assert max(seen) <= 4 * max(FIELD_LIMITS.values())  # cut at extraction, before sharing (4x the field limit)
+    assert sum(seen) <= 200 * 6 * 4 * max(FIELD_LIMITS.values())
+
+
+async def test_cleaning_does_not_block_the_event_loop(secrets_dir: Path) -> None:
+    text = "w" * 60_000
+
+    class Huge(FakeCalendar):
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+            found = [
+                RawEvent(
+                    calendar_href="https://cal.example.test/h/",
+                    calendar_name=text,
+                    uid=f"huge-{n}@example.test",
+                    recurrence_id=str(n),
+                    all_day=False,
+                    start=start.astimezone(zone),
+                    end=end.astimezone(zone),
+                    sort_key=start,
+                    recurring=False,
+                    status="confirmed",
+                    attendee_count=0,
+                    title=text,
+                    location=text,
+                    description=text,
+                    organizer_name=text,
+                    organizer_address=text,
+                    original_timezone=None,
+                )
+                for n in range(200)
+            ]
+            return CalendarPage(events=found, truncated=False)
+
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    ctx = HubContext(
+        settings,
+        load_registry(secrets_dir / "accounts.json"),
+        StatusStore(),
+        Adapters(calendar=lambda a, d: Huge(a, {})),
+    )
+    gaps: list[float] = []
+    done = anyio.Event()
+
+    async def ticker() -> None:
+        last = time.perf_counter()
+        while not done.is_set():
+            await anyio.sleep(0.005)
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(ticker)
+        started = time.perf_counter()
+        await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=200)
+        elapsed = time.perf_counter() - started
+        done.set()
+    assert elapsed > 0.2  # the work is real (cleaning 200 x 6 fields of 60 KB)
+    assert max(gaps) < 0.15  # the loop kept serving other coroutines meanwhile

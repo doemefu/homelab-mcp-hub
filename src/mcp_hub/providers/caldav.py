@@ -33,7 +33,7 @@ from icalendar.timezone import tzp
 
 from mcp_hub.logging import log_event
 from mcp_hub.providers.base import MAX_HTTP_RESPONSE_BYTES, PROVIDER_TIMEOUT_SECONDS, ProviderError, read_capped
-from mcp_hub.sanitize import validate_timezone
+from mcp_hub.sanitize import FIELD_LIMITS, validate_timezone
 
 _DAV: Final = "{DAV:}"
 _CALDAV: Final = "{urn:ietf:params:xml:ns:caldav}"
@@ -42,6 +42,7 @@ _XML_FORBIDDEN: Final = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 MAX_XML_DEPTH: Final = 32  # a multistatus is about 8 levels deep
 MAX_XML_ELEMENTS: Final = 100_000  # per response (spec 080 rev. 4.5, review 19 F2)
 _XML_ENCODING: Final = re.compile(rb"\s*<\?xml[^>]*?encoding\s*=\s*[\"']([A-Za-z0-9._-]+)[\"']")
+RAW_TEXT_FACTOR: Final = 4  # third-party text is cut to 4x its output field limit at extraction (worker thread)
 _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both sides (spec 080 rev. 4.4 §5.4)
 # Bounded expansion (spec 080 rev. 4.5 D62). Each calendar object is screened before the expansion library sees it,
 # expanded under a CPU deadline, and the whole call is capped by instance counts and a cooperative time budget.
@@ -211,15 +212,20 @@ def _first(component: icalendar.cal.Component, name: str) -> object:
     return value[0] if isinstance(value, list) and value else value
 
 
-def _text(component: icalendar.Event, name: str, strings: dict[int, tuple[object, str]]) -> str | None:
-    """The property as str. Instances of one object share the library's value objects; converting each only once
-    keeps memory at the object's size instead of size x instances (spec 080 rev. 4.5 D62 E)."""
+def _cut(value: object, field: str) -> str:
+    """str(value), at most RAW_TEXT_FACTOR x the output field limit: the tool layer never cleans more than that."""
+    return str(value)[: RAW_TEXT_FACTOR * FIELD_LIMITS[field]]
+
+
+def _text(component: icalendar.Event, name: str, field: str, strings: dict[int, tuple[object, str]]) -> str | None:
+    """The property as str, cut before it is shared. Instances of one object share the library's value objects;
+    converting each only once keeps memory at the object's size instead of size x instances (D62 E)."""
     value = _first(component, name)
     if value is None:
         return None
     known = strings.get(id(value))
     if known is None:
-        known = strings[id(value)] = (value, str(value))  # the value is kept alive, so its id stays unique
+        known = strings[id(value)] = (value, _cut(value, field))  # the value is kept alive, so its id stays unique
     return known[1]
 
 
@@ -498,13 +504,17 @@ def _instances(
                 recurring=uid in recurring_uids,
                 status="tentative" if str(component.get("STATUS", "")).upper() == "TENTATIVE" else "confirmed",
                 attendee_count=len(attendees) if isinstance(attendees, list) else int(attendees is not None),
-                title=_text(component, "SUMMARY", strings),
-                location=_text(component, "LOCATION", strings),
-                description=_text(component, "DESCRIPTION", strings),
+                title=_text(component, "SUMMARY", "title", strings),
+                location=_text(component, "LOCATION", "location", strings),
+                description=_text(component, "DESCRIPTION", "description", strings),
                 organizer_name=(
-                    str(organizer.params["CN"]) if organizer is not None and "CN" in organizer.params else None
+                    _cut(organizer.params["CN"], "organizer_name")
+                    if organizer is not None and "CN" in organizer.params
+                    else None
                 ),
-                organizer_address=re.sub(r"(?i)^mailto:", "", str(organizer)) if organizer is not None else None,
+                organizer_address=(
+                    _cut(re.sub(r"(?i)^mailto:", "", str(organizer)), "address") if organizer is not None else None
+                ),
                 original_timezone=None if all_day else _zone_name(begin),
             )
         )
@@ -694,7 +704,7 @@ class CalDavCalendarSource:
             ):
                 continue  # task-only list: no REPORT spent on it; kept when the property is absent
             name = response.findtext(f".//{_DAV}displayname")
-            found.append(CalendarRef(href=href, name=name.strip() if name else None))
+            found.append(CalendarRef(href=href, name=_cut(name.strip(), "calendar_name") if name else None))
         return found
 
     def check(self) -> None:

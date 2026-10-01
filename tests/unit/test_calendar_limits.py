@@ -530,7 +530,7 @@ def test_instances_of_one_object_share_their_text() -> None:
     assert len(events) == 1000
     assert len({id(e.description) for e in events}) == 1
     assert len({id(e.title) for e in events}) == 1
-    assert events[0].description == "x" * 100_000
+    assert events[0].description == "x" * 4 * 500  # cut to 4x the description limit at extraction (D1)
 
 
 # --- one series per object (D62 B, final round) ----------------------------------------------------------------------

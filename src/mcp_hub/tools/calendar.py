@@ -3,6 +3,7 @@
 
 import inspect
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import partial
 from typing import Annotated, Any, Final, Literal
@@ -17,7 +18,7 @@ from mcp_hub.budget import fit_items
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import encode_event_id
 from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, run_blocking
-from mcp_hub.providers.caldav import CalendarPage, RawEvent
+from mcp_hub.providers.caldav import RawEvent
 from mcp_hub.registry import Account
 from mcp_hub.sanitize import FIELD_LIMITS, clean, validate_timezone
 from mcp_hub.tools import HubContext
@@ -76,6 +77,13 @@ class GetEventsResult(BaseModel):
     account_errors: list[AccountErrorItem]
 
 
+@dataclass(frozen=True, slots=True)
+class _AccountItems:
+    items: list[tuple[datetime, EventInstance]]  # the account's first instances by start, built in the worker thread
+    total: int
+    truncated: bool
+
+
 def _instance(account_id: str, event: RawEvent) -> EventInstance:
     timed = isinstance(event.start, datetime) and isinstance(event.end, datetime)
     start_text, end_text = _timed(event.start), _timed(event.end)
@@ -121,24 +129,35 @@ async def run_get_events(
     zone, floating = ZoneInfo(zone_name), ZoneInfo(ctx.settings.default_timezone)
     accounts = ready_accounts(ctx, "calendar", account)
 
-    async def call(target: Account) -> CalendarPage:
+    async def call(target: Account) -> _AccountItems:
         opened = partial(ctx.adapters.calendar, target, ctx.settings.secrets_dir)
-        return await run_blocking(
-            lambda: opened().events(window_start, window_end, zone, floating), slot=ctx.adapters.limiters.get(target.id)
-        )
+
+        def work() -> _AccountItems:
+            # In the worker thread: only the account's first `count` instances can reach the result, and cleaning
+            # third-party text must never run on the event loop (delta review D1).
+            page = opened().events(window_start, window_end, zone, floating)
+            first = sorted(page.events, key=lambda event: event.sort_key)[:count]
+            return _AccountItems(
+                items=[(event.sort_key, _instance(target.id, event)) for event in first],
+                total=len(page.events),
+                truncated=page.truncated,
+            )
+
+        return await run_blocking(work, slot=ctx.adapters.limiters.get(target.id))
 
     gathered = await gather_accounts(accounts, "calendar", call, ctx.status)
     merged = sorted(
-        ((a.id, e) for a, page in gathered.results for e in page.events), key=lambda pair: (pair[1].sort_key, pair[0])
+        ((key, a.id, item) for a, page in gathered.results for key, item in page.items), key=lambda t: (t[0], t[1])
     )
+    total = sum(page.total for _, page in gathered.results)
     expansion_cut = any(page.truncated for _, page in gathered.results)  # D62: a cap or the time budget stopped
-    items = [_instance(account_id, event) for account_id, event in merged[:count]]
+    items = [item for _, _, item in merged[:count]]
 
     def build(selected: list[EventInstance], cut: bool) -> GetEventsResult:
         return GetEventsResult(
             untrusted_content_notice=UNTRUSTED_CONTENT_NOTICE,
             items=selected,
-            truncated=len(merged) > count or cut or expansion_cut,
+            truncated=total > count or cut or expansion_cut,
             account_errors=gathered.errors,
         )
 
