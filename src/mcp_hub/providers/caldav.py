@@ -23,13 +23,15 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from types import FrameType
-from typing import Final, Literal, NoReturn, cast
+from typing import Any, Final, Literal, NoReturn, cast
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
+import dateutil.rrule
 import httpx2
 import icalendar
 import recurring_ical_events
+import recurring_ical_events.series.rrule as _library_rrule
 from icalendar.error import GloballyUniqueTZIDGuessed
 from icalendar.timezone import tzp
 
@@ -343,12 +345,31 @@ ignore_icalendar_tzid_guess_warnings()
 EXPANSION_LOCK: Final = threading.Lock()
 
 
+def _rrulestr_without_cache(*args: Any, **kwargs: Any) -> Any:
+    return dateutil.rrule.rrulestr(*args, **{**kwargs, "cache": False})
+
+
+def _rruleset_without_cache(*args: Any, **kwargs: Any) -> dateutil.rrule.rruleset:
+    return dateutil.rrule.rruleset(*args, **{**kwargs, "cache": False})
+
+
 def _isolated[T](func: Callable[[], T]) -> T:
+    """One object at a time, with an empty time-zone cache and without dateutil's occurrence cache.
+
+    recurring-ical-events builds its rules with rrulestr(..., cache=True) and rruleset(cache=True), so dateutil keeps
+    every occurrence it iterates from DTSTART (60-90 bytes each): memory, not only CPU, grew with old or dense rules.
+    The hub swaps those two names in the library module for cache=False versions while it holds the lock, and puts
+    the originals back on every exit path; results are identical, memory stays flat and only CPU grows, which the
+    deadline bounds (second confirmation pass of PR #11). A test pins the patch point for the pinned library."""
     with EXPANSION_LOCK:
         tzp.use_zoneinfo()  # public API: a fresh, empty time-zone cache
+        original_rrulestr, original_rruleset = _library_rrule.rrulestr, _library_rrule.rruleset
+        _library_rrule.rrulestr = _rrulestr_without_cache  # same call shape
+        _library_rrule.rruleset = _rruleset_without_cache  # same call shape
         try:
             return func()
         finally:
+            _library_rrule.rrulestr, _library_rrule.rruleset = original_rrulestr, original_rruleset
             tzp.use_zoneinfo()  # every exit path: normal, library error, refusal, injected deadline
 
 
