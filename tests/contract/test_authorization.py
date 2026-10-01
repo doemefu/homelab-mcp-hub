@@ -41,7 +41,12 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
     token = tokens.mint()
     listed = modern(client, token, "tools/list")
     assert listed.status_code == 200
-    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == ["get_message", "list_accounts", "list_unread"]
+    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == [
+        "get_events",
+        "get_message",
+        "list_accounts",
+        "list_unread",
+    ]
     called = modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
     assert called.status_code == 200
     assert body(called)["result"]["isError"] is False
@@ -63,7 +68,12 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
     client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     listed = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     assert listed.status_code == 200
-    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == ["get_message", "list_accounts", "list_unread"]
+    assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == [
+        "get_events",
+        "get_message",
+        "list_accounts",
+        "list_unread",
+    ]
 
 
 @pytest.mark.parametrize("typ", ["application/at+jwt", "AT+JWT", "Application/At+Jwt", "at+jwt"])
