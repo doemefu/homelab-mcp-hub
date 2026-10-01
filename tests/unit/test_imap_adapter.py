@@ -212,3 +212,9 @@ def test_connect_failure_is_unreachable() -> None:
     with pytest.raises(ProviderError) as caught:
         box.check()
     assert caught.value.code == "unreachable"
+
+
+def test_production_context_verifies_hosts() -> None:
+    box = ImapMailbox("icloud", host="h", port=993, folder="INBOX", username="u", password="p")
+    assert box._context.verify_mode == ssl.CERT_REQUIRED
+    assert box._context.check_hostname is True
