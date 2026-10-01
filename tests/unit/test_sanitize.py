@@ -188,14 +188,17 @@ def test_truncate_and_html_to_text_return_no_surrogates() -> None:
     assert not _has_surrogate(html_to_text("<p>a\udcffb</p>"))
 
 
-def test_unclosed_tags_keep_the_open_element_stack_bounded() -> None:
-    # Work per tag and per text chunk is bounded by the stack depth, so 256 KiB of unclosed tags stays linear.
-    from mcp_hub.sanitize import MAX_HTML_DEPTH, _TextExtractor
+def test_html_converter_keeps_constant_state_on_unclosed_tags() -> None:
+    # The region rule needs O(1) state: 256 KiB of unclosed tags leaves no per-element bookkeeping behind.
+    from html.parser import HTMLParser
+
+    from mcp_hub.sanitize import _TextExtractor
 
     parser = _TextExtractor()
     parser.feed("<b>x" * 65_536)
-    assert len(parser._stack) <= MAX_HTML_DEPTH
     parser.close()
+    own = {name: value for name, value in vars(parser).items() if name not in vars(HTMLParser()) and name != "parts"}
+    assert all(isinstance(value, int | str | bool | type(None)) for value in own.values()), own
     assert "".join(parser.parts).count("x") == 65_536
 
 

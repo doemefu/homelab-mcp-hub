@@ -30,7 +30,6 @@ _URL: Final = re.compile(r"(?i)(?:\bmailto:[^\s<>\"']*|\b(?:https?|ftp)://[^\s<>
 _SURROGATE: Final = re.compile(r"[\ud800-\udfff]")
 # Raw patterns: the regex engine reads the \u escapes, so no lone surrogate appears in the source string.
 _NON_ESCAPE_SURROGATE: Final = re.compile(r"[\ud800-\udc7f\udd00-\udfff]")
-MAX_HTML_DEPTH: Final = 256  # open elements tracked by the HTML-to-text converter
 _BLANK_RUNS: Final = re.compile(r"\n{3,}")
 _SPACES: Final = re.compile(r" +")
 _CONTENT_TYPE: Final = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
@@ -38,12 +37,12 @@ _DROPPED_ELEMENTS: Final = frozenset({"script", "style", "head", "template", "no
 _VOID_ELEMENTS: Final = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 )
-# Elements browsers close implicitly; legacy mail often leaves them open. Not tracked unless they hide content.
-_IMPLICITLY_CLOSED: Final = frozenset(
-    {"p", "li", "td", "th", "tr", "dd", "dt", "option", "tbody", "thead", "tfoot", "colgroup"}
-)
 # An unterminated comment, CDATA section or declaration at the end hides the rest, as in a browser.
 _UNTERMINATED: Final = (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<!", ">"), ("<?", ">"))
+# Inside a hidden region a browser may tokenise these differently from the stdlib parser. Raw-text elements end
+# at their own end tag in a browser, so everything up to it is ignored; the others hide the rest of the document.
+_RAW_TEXT: Final = frozenset({"textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript"})
+_HIDE_REST: Final = frozenset({"plaintext", "select", "svg", "math"})
 _BLOCK_ELEMENTS: Final = frozenset(
     {
         "p", "div", "br", "li", "tr", "table", "ul", "ol", "blockquote", "section", "article", "header", "footer",
@@ -121,60 +120,69 @@ def _hidden(attrs: list[tuple[str, str | None]]) -> bool:
 
 
 class _TextExtractor(HTMLParser):
-    """Visible text only: dropped and hidden elements hide their whole subtree; images and comments vanish.
+    """Visible text only, by a region rule with O(1) state that fails closed (spec 080 §5.3 rule 2).
 
-    Every step costs at most O(MAX_HTML_DEPTH): a counter tracks the hiding elements on the stack, and start tags
-    beyond the depth cap are not pushed (their end tags are consumed by `_overflow`), so unclosed tags cannot make
-    the conversion quadratic. A hiding element beyond the cap hides the rest of the document."""
+    A start tag that hides (`hidden`, inline display:none or visibility:hidden, or an always-dropped element such
+    as script, style or head) opens a hidden region named after its tag. Inside the region nothing is emitted, and
+    only tags of that name count: a start tag adds one, an end tag removes one, and the region ends at zero. All
+    other tags are ignored for hiding, so stray, misnested or implicitly closed tags can never end a region early.
+    A self-closing non-void element (`<div hidden/>`) opens like a start tag, as browsers ignore the slash. Inside
+    a region, a raw-text element (title, textarea, iframe, ...) suspends counting up to its own end tag, as a
+    browser reads it as text, and an element with other parsing rules (plaintext, select, svg, math) hides the rest
+    of the document.
+
+    Accepted over-hiding: a hiding element that relies on an implied end tag (`<p hidden>` followed by another
+    `<p>` without `</p>`, likewise li, td, tr) hides everything up to its balancing explicit end tag or the end
+    of the document."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self._stack: list[tuple[str, bool, int]] = []  # tag, hides, untracked count of that tag before it
-        self._hiding = 0  # hiding elements on the stack
-        self._overflow = 0  # open start tags beyond the depth cap
+        self._region: str | None = None  # tag name of the hidden region
+        self._depth = 0  # open elements of that name inside the region
+        self._raw: str | None = None  # raw-text element inside the region: everything up to its end tag is ignored
         self._hide_rest = False
-        self._untracked: dict[str, int] = {}  # open implicitly closed elements that were not pushed, per tag
 
     def _visible(self) -> bool:
-        return self._hiding == 0 and not self._hide_rest
+        return self._region is None and not self._hide_rest
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _BLOCK_ELEMENTS and self._visible():
+        if self._hide_rest:
+            return
+        if self._region is not None:
+            if self._raw is not None:
+                return
+            if tag == self._region:
+                self._depth += 1
+            elif tag in _RAW_TEXT:
+                self._raw = tag
+            elif tag in _HIDE_REST:
+                self._hide_rest = True
+            return
+        if tag in _BLOCK_ELEMENTS:
             self.parts.append("\n")
-        if tag in _VOID_ELEMENTS:
-            return
-        hides = tag in _DROPPED_ELEMENTS or _hidden(attrs)
-        if tag in _IMPLICITLY_CLOSED and not hides:
-            self._untracked[tag] = self._untracked.get(tag, 0) + 1
-            return
-        if len(self._stack) >= MAX_HTML_DEPTH:
-            self._overflow += 1
-            self._hide_rest = self._hide_rest or hides
-            return
-        # Untracked same-name elements opened before this one are closed by end tags only after it is closed.
-        self._stack.append((tag, hides, self._untracked.pop(tag, 0)))
-        self._hiding += hides
+        if tag not in _VOID_ELEMENTS and (tag in _DROPPED_ELEMENTS or _hidden(attrs)):
+            self._region, self._depth = tag, 1
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _BLOCK_ELEMENTS and self._visible():
-            self.parts.append("\n")
+        if tag in _VOID_ELEMENTS:
+            if tag in _BLOCK_ELEMENTS and self._visible():
+                self.parts.append("\n")
+            return
+        self.handle_starttag(tag, attrs)  # browsers ignore the slash on non-void elements
 
     def handle_endtag(self, tag: str) -> None:
-        if self._untracked.get(tag):
-            # Closes an untracked element first, never an outer hiding one of the same name: at worst a hiding
-            # element stays open too long (fail closed).
-            self._untracked[tag] -= 1
-        elif self._overflow and tag not in _IMPLICITLY_CLOSED:
-            self._overflow -= 1
-        else:
-            for index in range(len(self._stack) - 1, -1, -1):  # unmatched end tags are ignored
-                if self._stack[index][0] == tag:
-                    for name, hides, untracked_before in reversed(self._stack[index:]):
-                        self._hiding -= hides
-                        self._untracked[name] = untracked_before  # opens inside it closed with it
-                    del self._stack[index:]
-                    break
+        if self._region is not None:
+            if self._raw is not None:
+                if tag == self._raw:
+                    self._raw = None
+                return
+            if tag != self._region:
+                return
+            self._depth -= 1
+            if self._depth:
+                return
+            self._region = None
         if tag in _BLOCK_ELEMENTS and self._visible():
             self.parts.append("\n")
 

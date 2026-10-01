@@ -53,7 +53,7 @@ def hidden_text_leaks() -> list[str]:
         "cdata with >": "<p>Hi</p><![CDATA[ a > SECRET",
         "bogus": "<p>Hi</p><! SECRET",
         "nested end tag": "<td style='display:none'><table><tr><td>inner</td></tr></table>SECRET</td>",
-        "end tag beyond the depth cap": "<div>" * 300 + "<td hidden>S</td>SECRET",
+        "deep nesting": "<div>" * 300 + "<span hidden>SECRET</span>",
     }
     return [name for name, html in cases.items() if "SECRET" in html_to_text(html)]
 
