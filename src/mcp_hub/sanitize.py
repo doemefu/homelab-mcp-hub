@@ -130,10 +130,11 @@ class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self._stack: list[tuple[str, bool]] = []
+        self._stack: list[tuple[str, bool, int]] = []  # tag, hides, untracked count of that tag before it
         self._hiding = 0  # hiding elements on the stack
         self._overflow = 0  # open start tags beyond the depth cap
         self._hide_rest = False
+        self._untracked: dict[str, int] = {}  # open implicitly closed elements that were not pushed, per tag
 
     def _visible(self) -> bool:
         return self._hiding == 0 and not self._hide_rest
@@ -145,12 +146,14 @@ class _TextExtractor(HTMLParser):
             return
         hides = tag in _DROPPED_ELEMENTS or _hidden(attrs)
         if tag in _IMPLICITLY_CLOSED and not hides:
+            self._untracked[tag] = self._untracked.get(tag, 0) + 1
             return
         if len(self._stack) >= MAX_HTML_DEPTH:
             self._overflow += 1
             self._hide_rest = self._hide_rest or hides
             return
-        self._stack.append((tag, hides))
+        # Untracked same-name elements opened before this one are closed by end tags only after it is closed.
+        self._stack.append((tag, hides, self._untracked.pop(tag, 0)))
         self._hiding += hides
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -158,12 +161,18 @@ class _TextExtractor(HTMLParser):
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if self._overflow and tag not in _IMPLICITLY_CLOSED:
+        if self._untracked.get(tag):
+            # Closes an untracked element first, never an outer hiding one of the same name: at worst a hiding
+            # element stays open too long (fail closed).
+            self._untracked[tag] -= 1
+        elif self._overflow and tag not in _IMPLICITLY_CLOSED:
             self._overflow -= 1
         else:
             for index in range(len(self._stack) - 1, -1, -1):  # unmatched end tags are ignored
                 if self._stack[index][0] == tag:
-                    self._hiding -= sum(hides for _, hides in self._stack[index:])
+                    for name, hides, untracked_before in reversed(self._stack[index:]):
+                        self._hiding -= hides
+                        self._untracked[name] = untracked_before  # opens inside it closed with it
                     del self._stack[index:]
                     break
         if tag in _BLOCK_ELEMENTS and self._visible():

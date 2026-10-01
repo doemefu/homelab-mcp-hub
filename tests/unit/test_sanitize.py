@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from mcp_hub.sanitize import (
@@ -239,3 +241,70 @@ def test_escaped_invisible_characters_are_restored_before_filtering(raw: bytes) 
     # control/format filter, not only in truncate().
     escaped = raw.decode("ascii", "surrogateescape")
     assert clean("a" + escaped + "b", 50) == "ab"
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<td style='display:none'><table><tr><td>inner</td></tr></table>SECRET</td>shown",
+        "<li hidden><ul><li>x</li></ul>SECRET</li>shown",
+        "<tr hidden><td><table><tr><td>i</td></tr></table>SECRET</td></tr>shown",
+    ],
+)
+def test_nested_same_name_end_tag_does_not_close_an_outer_hiding_element(html: str) -> None:
+    assert "SECRET" not in html_to_text(html)
+
+
+def _nestings() -> list[str]:
+    cases = []
+    for tag in ("td", "li", "tr", "p"):
+        for depth in range(1, 6):
+            nested = f"<{tag}>" * depth + "inner" + f"</{tag}>" * depth
+            siblings = "".join(f"<{tag}>inner{n}</{tag}>" for n in range(depth))
+            unclosed = f"<{tag}>inner" * depth
+            for inside in (nested, siblings, unclosed):
+                cases.append(f"<{tag} hidden>{inside}SECRET</{tag}>after")
+                cases.append(f"<div><{tag} style='display:none'>{inside}SECRET</{tag}></div>after")
+    return cases
+
+
+@pytest.mark.parametrize("html", _nestings())
+def test_hidden_implicitly_closed_elements_never_reveal_secret(html: str) -> None:
+    assert "SECRET" not in html_to_text(html)
+
+
+def test_hidden_sibling_paragraph_closes_without_hiding_the_rest() -> None:
+    # Unclosed paragraphs before a hidden preheader paragraph must not keep the preheader open to the end.
+    text = html_to_text("<p>Hello<p style='display:none'>PREHEADER</p><p>Your invoice is attached.")
+    assert "PREHEADER" not in text
+    assert "Your invoice is attached." in text
+
+
+def _random_tree(rng: random.Random, depth: int, hidden: bool) -> str:
+    parts = []
+    for _ in range(rng.randrange(1, 4)):
+        if depth > 0 and rng.random() < 0.7:
+            tag = rng.choice(["td", "li", "tr", "p", "div", "span", "table", "ul", "dd", "option"])
+            hides = rng.random() < 0.25
+            inner = _random_tree(rng, depth - 1, hidden or hides)
+            # Implicitly closed, non-hiding elements sometimes lose their end tag, as in legacy mail.
+            omit = tag in {"td", "li", "tr", "p", "dd", "option"} and not hides and rng.random() < 0.5
+            parts.append(f"<{tag}{' hidden' if hides else ''}>{inner}{'' if omit else f'</{tag}>'}")
+        else:
+            parts.append("SECRET" if hidden else "ok")
+    return "".join(parts)
+
+
+def test_text_inside_hidden_elements_never_appears_in_random_documents() -> None:
+    rng = random.Random(7)  # noqa: S311 - deterministic test data
+    for _ in range(3000):
+        html = _random_tree(rng, rng.randrange(1, 7), False)
+        assert "SECRET" not in html_to_text(html), html
+
+
+def test_end_tag_closes_a_tracked_hiding_cell_while_deeper_elements_overflow() -> None:
+    # A hiding cell below the cap, more than MAX_HTML_DEPTH open elements inside it, then its end tag: the cell's
+    # content stays hidden and the text after the cell is shown, as in a browser.
+    text = html_to_text("<table><tr><td hidden>SECRET" + "<div>" * 300 + "</td>after")
+    assert "SECRET" not in text
+    assert "after" in text
