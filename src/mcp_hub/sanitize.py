@@ -38,6 +38,10 @@ _DROPPED_ELEMENTS: Final = frozenset({"script", "style", "head", "template", "no
 _VOID_ELEMENTS: Final = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 )
+# Elements browsers close implicitly; legacy mail often leaves them open. Not tracked unless they hide content.
+_IMPLICITLY_CLOSED: Final = frozenset(
+    {"p", "li", "td", "th", "tr", "dd", "dt", "option", "tbody", "thead", "tfoot", "colgroup"}
+)
 # An unterminated comment, CDATA section or declaration at the end hides the rest, as in a browser.
 _UNTERMINATED: Final = (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<!", ">"), ("<?", ">"))
 _BLOCK_ELEMENTS: Final = frozenset(
@@ -140,6 +144,8 @@ class _TextExtractor(HTMLParser):
         if tag in _VOID_ELEMENTS:
             return
         hides = tag in _DROPPED_ELEMENTS or _hidden(attrs)
+        if tag in _IMPLICITLY_CLOSED and not hides:
+            return
         if len(self._stack) >= MAX_HTML_DEPTH:
             self._overflow += 1
             self._hide_rest = self._hide_rest or hides
@@ -152,7 +158,7 @@ class _TextExtractor(HTMLParser):
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if self._overflow:
+        if self._overflow and tag not in _IMPLICITLY_CLOSED:
             self._overflow -= 1
         else:
             for index in range(len(self._stack) - 1, -1, -1):  # unmatched end tags are ignored

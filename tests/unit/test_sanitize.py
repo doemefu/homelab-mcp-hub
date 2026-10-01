@@ -205,9 +205,24 @@ def test_unclosed_tags_convert_quickly() -> None:
     assert time.perf_counter() - started < 5.0  # generous guard; was about 28 s before the depth cap
 
 
-def test_hidden_element_below_the_depth_cap_still_hides() -> None:
+def test_hidden_element_beyond_the_depth_cap_still_hides() -> None:
     deep = "<div>" * 400
     text = html_to_text(f"{deep}visible<span hidden>SECRET</span><div style='display:none'>MORE</div>")
     assert "visible" in text
     assert "SECRET" not in text
     assert "MORE" not in text
+
+
+def test_implicitly_closed_elements_do_not_fill_the_depth_cap() -> None:
+    # Legacy mail: unclosed table rows and cells, which browsers close implicitly, then a hidden preheader.
+    rows = "<table>" + "<tr><td>cell" * 150
+    text = html_to_text(f"{rows}<p>Hello<span style='display:none'>PREHEADER</span><p>Your invoice is attached.")
+    assert "Your invoice is attached." in text
+    assert "PREHEADER" not in text
+
+
+def test_hiding_implicitly_closed_element_still_hides() -> None:
+    text = html_to_text("<table><tr><td hidden>SECRET</td><td>shown</td></tr></table>")
+    assert "SECRET" not in text
+    assert "shown" in text
+
