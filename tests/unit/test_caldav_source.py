@@ -2,6 +2,7 @@ import gzip
 import logging
 import re
 from datetime import datetime
+from typing import Any
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -535,3 +536,28 @@ def test_skipped_object_log_carries_the_class_name_only(
     assert record.fields["exception"] == "ValueError"  # type: ignore[attr-defined]
     assert "sentinel-text-7q" not in caplog.text
     assert "evil.example.test" not in caplog.text
+
+
+def test_no_request_is_sent_after_the_call_deadline(httpserver: HTTPServer) -> None:
+    # Review 19 F12: an abandoned worker must not keep sending REPORTs for every listed calendar.
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(report(), status=207, content_type=XML)
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    original = httpserver.dispatch
+
+    def dispatch(request: Any) -> Any:
+        if request.path == "/h/":  # the listing is the last discovery step: time runs out right after it
+            now[0] = 21.0
+        return original(request)
+
+    httpserver.dispatch = dispatch  # type: ignore[method-assign]
+    caldav = CalDavCalendarSource(
+        "icloud", url=httpserver.url_for("/"), username="hub-cal", password=PASSWORD, include="all", clock=clock
+    )
+    error = code_of(lambda: caldav.events(START, END, ZURICH, ZURICH))
+    assert (error.code, error.cause) == ("upstream_timeout", "CallDeadline")
+    assert [path for method, path in requests(httpserver) if method == "REPORT"] == []

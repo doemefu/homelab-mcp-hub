@@ -576,10 +576,17 @@ class CalDavCalendarSource:
         self._username, self._password, self._timeout = username, password, timeout
         self._factory = client_factory
         self._clock, self._cpu_clock, self._slow_objects = clock, cpu_clock, slow_objects
+        self._deadline = float("inf")  # set per call; no new request after it (review 19 F12)
+
+    def _client(self) -> httpx2.Client:
+        self._deadline = self._clock() + self._timeout
+        return self._factory(self._username, self._password, self._timeout)
 
     def _request(self, client: httpx2.Client, method: str, url: str, body: str, depth: str) -> tuple[str, bytes]:
         """One DAV request; follows at most 3 redirects by hand, each target checked with allowed_host first."""
         for _ in range(_MAX_REDIRECTS + 1):
+            if self._clock() > self._deadline:  # the caller has given up: stop sending
+                raise ProviderError("upstream_timeout", "CallDeadline")
             if not allowed_host(self._url, url):
                 raise ProviderError("upstream_error", "ForeignHost")
             # Uncompressed bodies only: the 5 MiB cap must apply before any decoding (review 19 F3).
@@ -628,21 +635,21 @@ class CalDavCalendarSource:
     def check(self) -> None:
         """Status check (spec 080 §7.4): one PROPFIND for current-user-principal."""
         try:
-            with self._factory(self._username, self._password, self._timeout) as client:
+            with self._client() as client:
                 self._principal(client)
         except Exception as exc:
             raise _provider_error(exc) from None
 
     def calendars(self) -> list[CalendarRef]:
         try:
-            with self._factory(self._username, self._password, self._timeout) as client:
+            with self._client() as client:
                 return self._calendars(client)
         except Exception as exc:
             raise _provider_error(exc) from None
 
     def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
         try:
-            with self._factory(self._username, self._password, self._timeout) as client:
+            with self._client() as client:
                 selected = [c for c in self._calendars(client) if self._include == "all" or c.name in self._include]
                 body = REPORT_BODY.format(start=_stamp(start - _WIDEN), end=_stamp(end + _WIDEN))
                 objects: list[tuple[CalendarRef, bytes]] = []
