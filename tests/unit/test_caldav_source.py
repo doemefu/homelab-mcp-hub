@@ -309,11 +309,12 @@ def test_broken_calendar_objects_are_skipped_individually(
     assert len(events) == 3
     skipped = [r for r in caplog.records if r.getMessage() == "calendar_object_skipped"]
     assert len(skipped) == 2
-    for record in skipped:
-        fields = record.fields  # type: ignore[attr-defined]
-        assert set(fields) == {"account", "capability", "exception"}
-        assert (fields["account"], fields["capability"]) == ("icloud", "calendar")
-        assert set(fields) <= allowed_fields("calendar_object_skipped")
+    fields = [record.fields for record in skipped]  # type: ignore[attr-defined]
+    # The broken DTSTART fails inside icalendar (class name only); a malformed RRULE is refused by the screen.
+    assert [sorted(f) for f in fields] == [["account", "capability", "exception"], ["account", "capability", "outcome"]]
+    assert fields[1]["outcome"] == "rule_refused"
+    assert all((f["account"], f["capability"]) == ("icloud", "calendar") for f in fields)
+    assert all(set(f) <= allowed_fields("calendar_object_skipped") for f in fields)
 
 
 def raw_report(*objects: bytes, prolog: bytes = b'<?xml version="1.0" encoding="utf-8"?>') -> bytes:

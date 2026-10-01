@@ -375,6 +375,11 @@ def _screen(calendar: icalendar.Calendar) -> None:
         if len(rules) > 1 or "EXRULE" in component:
             raise ObjectSkippedError("rule_refused")
         for rule in rules:
+            if not isinstance(rule, icalendar.vRecur):  # icalendar could not parse it (e.g. INTERVAL=x)
+                raise ObjectSkippedError("rule_refused")
+            intervals = _values(rule.get("INTERVAL"))
+            if any(not isinstance(value, int) or value < 1 for value in intervals):  # INTERVAL=0 never terminates
+                raise ObjectSkippedError("rule_refused")
             frequencies = {str(value).upper() for value in _values(cast(dict[str, object], rule).get("FREQ"))}
             if len(frequencies) != 1 or not frequencies <= ALLOWED_FREQUENCIES:
                 raise ObjectSkippedError("rule_refused")

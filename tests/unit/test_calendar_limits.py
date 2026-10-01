@@ -202,7 +202,13 @@ def _previous_tracer(frame: Any, event: str, arg: Any) -> None:
     ("raw", "outcome"),
     [
         (ics.load("dst-weekly.ics"), "ok"),
-        (ics.load("dst-weekly.ics").replace(b"RRULE:FREQ=WEEKLY;COUNT=3", b"RRULE:FREQ=WEEKLY;BYDAY=XX"), "error"),
+        (
+            ics.load("dst-weekly.ics").replace(
+                b"RRULE:FREQ=WEEKLY;COUNT=3",
+                b"RRULE:FREQ=WEEKLY;COUNT=3\r\nRDATE;VALUE=PERIOD:20261022T100000Z/20261021T100000Z",
+            ),
+            "error",
+        ),
         (obj("RRULE:FREQ=DAILY;BYSETPOS=2"), "expansion_too_slow"),
     ],
     ids=["normal", "library-error", "deadline"],
@@ -573,7 +579,10 @@ def test_one_series_with_many_overrides_is_allowed() -> None:
 def test_every_skip_is_counted_in_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = SlowObjectCache()
     hostile = obj("RRULE:FREQ=SECONDLY;COUNT=10", uid="refused@example.test")
-    broken = ics.load("dst-weekly.ics").replace(b"RRULE:FREQ=WEEKLY;COUNT=3", b"RRULE:FREQ=WEEKLY;BYDAY=XX")
+    broken = ics.load("dst-weekly.ics").replace(
+        b"RRULE:FREQ=WEEKLY;COUNT=3",
+        b"RRULE:FREQ=WEEKLY;COUNT=3\r\nRDATE;VALUE=PERIOD:20261022T100000Z/20261021T100000Z",
+    )
     slow = obj("RRULE:FREQ=DAILY;BYSETPOS=2", uid="slow@example.test")
     objects = (hostile, broken, slow, ics.load("allday.ics"))
     first = source_for(*objects, slow_objects=cache, cpu_clock=FakeTime()).events(START, END, ZURICH, ZURICH)
@@ -696,3 +705,17 @@ def test_a_series_the_library_cannot_expand_is_skipped_not_cut(caplog: pytest.Lo
     assert [e.title for e in page.events] == ["Weekend away"]
     assert page.skipped == 1
     assert [s.get("exception") for s in skipped(caplog)] == ["PeriodEndBeforeStart"]
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "x", "1.5"], ids=["zero", "negative", "non-numeric", "fraction"])
+def test_a_non_positive_or_non_numeric_interval_is_refused(interval: str, expander_calls: list[int]) -> None:
+    # INTERVAL=0 makes dateutil loop forever (only the CPU deadline stopped it); refused up front now.
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(f"RRULE:FREQ=DAILY;INTERVAL={interval}"))
+    assert caught.value.reason in ("rule_refused",)
+    assert expander_calls == []
+
+
+def test_positive_intervals_are_allowed() -> None:
+    assert len(run(obj("RRULE:FREQ=DAILY;INTERVAL=2"))) == 14
+    assert len(run(obj("RRULE:FREQ=DAILY"))) == 28  # absent = 1

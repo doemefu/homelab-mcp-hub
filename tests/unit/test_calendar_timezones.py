@@ -111,7 +111,9 @@ def test_an_iana_zone_cannot_be_redefined_by_an_object() -> None:
 def test_the_cache_is_empty_and_the_lock_free_after_every_exit_path(path: str) -> None:
     raw = {
         "normal": LEGIT,
-        "library-error": obj("-0300", "broken", rule="FREQ=WEEKLY;BYDAY=XX"),
+        "library-error": obj(
+            "-0300", "broken", rule="FREQ=WEEKLY;COUNT=3\r\nRDATE;VALUE=PERIOD:20261022T100000Z/20261021T100000Z"
+        ),
         "refused": obj("-0300", "refused", rule="FREQ=SECONDLY;COUNT=2"),
         "deadline": obj("-0300", "slow", rule="FREQ=DAILY;BYSETPOS=2"),
     }[path]
