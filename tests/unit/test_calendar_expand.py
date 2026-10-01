@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -170,3 +170,18 @@ def test_a_deeply_nested_5_mib_document_is_refused_early() -> None:
     raw = b"<a>" * depth + b"</a>" * depth  # well-formed: only the depth limit can refuse it
     with pytest.raises(ProviderError):
         parse_xml(raw)
+
+
+def test_an_event_starting_exactly_at_the_window_end_is_excluded() -> None:
+    # Review 19 M11: overlap is start < to. 18:00 New York (EST) == 2026-11-01T23:00Z == END.
+    raw = (
+        ics.load("cross-zone.ics")
+        .replace(b"20261028T090000", b"20261101T180000")
+        .replace(b"20261028T100000", b"20261101T190000")
+    )
+
+    def expand_until(end: datetime) -> list[RawEvent]:
+        return expand(raw, href="/h/", name="Home", start=START, end=end, zone=ZURICH, floating=ZURICH)
+
+    assert expand_until(END) == []
+    assert len(expand_until(END + timedelta(seconds=1))) == 1

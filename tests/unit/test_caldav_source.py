@@ -9,6 +9,7 @@ import httpx2
 import pytest
 from pytest_httpserver import HTTPServer
 
+from mcp_hub.providers import caldav as caldav_module
 from mcp_hub.providers.base import MAX_HTTP_RESPONSE_BYTES, ProviderError
 from mcp_hub.providers.caldav import CalDavCalendarSource, allowed_host
 from tests.support import ics
@@ -502,3 +503,35 @@ def test_a_control_character_before_a_doctype_is_still_refused(httpserver: HTTPS
     httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
     error = code_of(source(httpserver).check)
     assert (error.code, error.cause) == ("upstream_error", "XmlRefused")
+
+
+def test_proxy_environment_is_ignored(httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review 19 M5: trust_env=False; an unreachable proxy in the environment must not be used.
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(principal("/p/"), status=207, content_type=XML)
+    CalDavCalendarSource(
+        "icloud", url=httpserver.url_for("/"), username="hub-cal", password=PASSWORD, include="all"
+    ).check()  # default_client
+
+
+def test_skipped_object_log_carries_the_class_name_only(
+    httpserver: HTTPServer, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review 19 M8: never the exception text.
+    def broken(*args: object, **kwargs: object) -> list[object]:
+        raise ValueError("sentinel-text-7q https://evil.example.test/")
+
+    monkeypatch.setattr(caldav_module, "_instances", broken)
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        report(ics.load("dst-weekly.ics")), status=207, content_type=XML
+    )
+    with caplog.at_level(logging.DEBUG, logger="mcp_hub"):
+        source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    [record] = [r for r in caplog.records if r.getMessage() == "calendar_object_skipped"]
+    assert record.fields["exception"] == "ValueError"  # type: ignore[attr-defined]
+    assert "sentinel-text-7q" not in caplog.text
+    assert "evil.example.test" not in caplog.text

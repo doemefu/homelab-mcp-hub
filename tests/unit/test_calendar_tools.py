@@ -329,3 +329,28 @@ async def test_a_truncated_expansion_marks_the_result_truncated(secrets_dir: Pat
     assert [i.untrusted.title for i in result.items] == ["Weekend away"]
     assert result.truncated is True  # spec 080 rev. 4.5 D62: a cap or the time budget stopped the expansion
     assert (result.account_errors, outcome) == ([], "ok")
+
+
+async def test_event_ids_ignore_the_host_of_the_calendar_url(secrets_dir: Path) -> None:
+    # Review 19 M14 / spec 080 rev. 4.4 D56: the id covers the calendar path, UID and recurrence id, not the host.
+    class Host(FakeCalendar):
+        def __init__(self, account: Account, host: str) -> None:
+            super().__init__(account, {"icloud": ("dst-weekly.ics",)})
+            self.host = host
+
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+            href = f"https://{self.host}/123/calendars/home/"
+            found = expand(
+                ics.load("dst-weekly.ics"), href=href, name="Home", start=start, end=end, zone=zone, floating=floating
+            )
+            return CalendarPage(events=found, truncated=False)
+
+    ids = []
+    for host in ("p01-caldav.icloud.com", "p42-caldav.icloud.com:443"):
+        settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+        adapters = Adapters(calendar=lambda account, _dir, h=host: Host(account, h))  # type: ignore[misc]
+        ctx = HubContext(settings, load_registry(secrets_dir / "accounts.json"), StatusStore(), adapters)
+        result, _, _ = await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=None)
+        ids.append([i.id for i in result.items])
+    assert ids[0] == ids[1]
+    assert len(set(ids[0])) == 3
