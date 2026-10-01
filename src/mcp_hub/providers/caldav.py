@@ -18,7 +18,7 @@ import time as clocks
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from types import FrameType
@@ -32,7 +32,7 @@ import recurring_ical_events
 from icalendar.timezone import tzp
 
 from mcp_hub.logging import log_event
-from mcp_hub.providers.base import PROVIDER_TIMEOUT_SECONDS, ProviderError, read_capped
+from mcp_hub.providers.base import MAX_HTTP_RESPONSE_BYTES, PROVIDER_TIMEOUT_SECONDS, ProviderError, read_capped
 from mcp_hub.sanitize import validate_timezone
 
 _DAV: Final = "{DAV:}"
@@ -57,6 +57,9 @@ MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
 OBJECT_CPU_SECONDS: Final = 2.0  # thread CPU time per object (parse, screening, expansion)
 EXPANSION_BUDGET_SECONDS: Final = 5.0  # monotonic, per account and call, checked between objects
 SLOW_OBJECT_CACHE_SIZE: Final = 1000
+# REPORT bodies held per account and call (discovery bodies have their own 5 MiB cap and do not count). Calendars are
+# fetched sequentially in path order; the cap drops whole calendars from the end of that order (D62).
+MAX_REPORT_BYTES_PER_CALL: Final = 10 * 1024 * 1024
 _FOLD: Final = re.compile(rb"\r?\n[ \t]")
 _RECURRING_LINE: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
 _BEGIN_VEVENT: Final = re.compile(rb"(?im)^BEGIN:VEVENT[ \t]*\r?$")
@@ -565,6 +568,28 @@ def allowed_host(configured: str, target: str) -> bool:
     return a[:2] == ("https", _ICLOUD_HOST) and b[2] == 443 and bool(_ICLOUD_PARTITION.fullmatch(b[1]))
 
 
+class _OverBudgetError(Exception):
+    """A REPORT body would exceed the remaining byte budget of the call (not the 5 MiB per-response cap)."""
+
+
+def _read_within(chunks: Iterable[bytes], budget: int) -> bytes:
+    """The body if it fits `budget`; beyond it the bytes are dropped and the rest drained without storing, up to
+    the 5 MiB per-response cap, only to tell `too_large` (one response too big) from the call's byte budget."""
+    buffer = bytearray()
+    total = 0
+    for chunk in chunks:
+        total += len(chunk)
+        if total > MAX_HTTP_RESPONSE_BYTES:
+            raise ProviderError("too_large", "ResponseTooLarge")
+        if total <= budget:
+            buffer += chunk
+        elif buffer:
+            buffer = bytearray()  # never parse a partial multistatus
+    if total > budget:
+        raise _OverBudgetError
+    return bytes(buffer)
+
+
 def default_client(username: str, password: str, timeout: float) -> httpx2.Client:
     return httpx2.Client(auth=(username, password), timeout=timeout, trust_env=False, follow_redirects=False)
 
@@ -614,7 +639,9 @@ class CalDavCalendarSource:
         self._deadline = self._clock() + self._timeout
         return self._factory(self._username, self._password, self._timeout)
 
-    def _request(self, client: httpx2.Client, method: str, url: str, body: str, depth: str) -> tuple[str, bytes]:
+    def _request(
+        self, client: httpx2.Client, method: str, url: str, body: str, depth: str, budget: int | None = None
+    ) -> tuple[str, bytes]:
         """One DAV request; follows at most 3 redirects by hand, each target checked with allowed_host first."""
         for _ in range(_MAX_REDIRECTS + 1):
             if self._clock() > self._deadline:  # the caller has given up: stop sending
@@ -633,6 +660,8 @@ class CalDavCalendarSource:
                     raise ProviderError("upstream_error", "UnexpectedStatus")
                 if response.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity"):
                     raise ProviderError("upstream_error", "ContentEncoding")
+                if budget is not None:
+                    return url, _read_within(response.iter_bytes(), budget)
                 return url, read_capped(response.iter_bytes())
         raise ProviderError("upstream_error", "TooManyRedirects")
 
@@ -683,12 +712,20 @@ class CalDavCalendarSource:
         try:
             with self._client() as client:
                 selected = [c for c in self._calendars(client) if self._include == "all" or c.name in self._include]
+                selected.sort(key=lambda calendar: urlsplit(calendar.href).path)  # the byte cap cuts from the end
                 body = REPORT_BODY.format(start=_stamp(start - _WIDEN), end=_stamp(end + _WIDEN))
                 objects: list[tuple[CalendarRef, bytes]] = []
-                for calendar in selected:
-                    _, raw = self._request(client, "REPORT", calendar.href, body, "1")
+                remaining = MAX_REPORT_BYTES_PER_CALL
+                stopped: str | None = None
+                for calendar in selected:  # sequential: the byte accounting needs no locking
+                    try:
+                        _, raw = self._request(client, "REPORT", calendar.href, body, "1", budget=remaining)
+                    except _OverBudgetError:
+                        stopped = "byte_cap"  # this calendar is dropped whole; no further calendar is requested
+                        break
+                    remaining -= len(raw)
                     objects += [(calendar, ics) for ics in parse_multistatus(raw, account=self._account)]
-            return self._expand_all(objects, start, end, zone, floating)
+            return self._expand_all(objects, start, end, zone, floating, stopped=stopped)
         except Exception as exc:
             raise _provider_error(exc) from None
 
@@ -699,16 +736,16 @@ class CalDavCalendarSource:
         end: datetime,
         zone: ZoneInfo,
         floating: ZoneInfo,
+        stopped: str | None = None,
     ) -> CalendarPage:
         """Single events first, recurring objects after them, so a hostile series cannot crowd out single events;
         stops at MAX_INSTANCES_PER_CALL or EXPANSION_BUDGET_SECONDS (spec 080 rev. 4.5 D62)."""
         objects = sorted(objects, key=lambda pair: _recurring(pair[1]))  # stable: response order kept otherwise
         events: list[RawEvent] = []
-        stopped: str | None = None
         started = self._clock()
         for calendar, ics in objects:
             if self._clock() - started > EXPANSION_BUDGET_SECONDS:
-                stopped = "time_budget"
+                stopped = stopped or "time_budget"
                 break
             digest = hashlib.sha256(ics).hexdigest()
             if digest in self._slow_objects:
@@ -735,11 +772,11 @@ class CalDavCalendarSource:
                 self._skipped(exception=type(exc).__name__)
                 continue
             if cut:
-                stopped = "instance_cap"
+                stopped = stopped or "instance_cap"
             room = MAX_INSTANCES_PER_CALL - len(events)
             if len(found) > room:
                 events += found[:room]
-                stopped = "instance_cap"
+                stopped = stopped or "instance_cap"
                 break
             events += found
         if stopped is not None:
