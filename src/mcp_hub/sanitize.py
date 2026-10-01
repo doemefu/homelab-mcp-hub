@@ -27,8 +27,9 @@ FIELD_LIMITS: Final[dict[str, int]] = {
 # Zero-width (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi controls (U+202A-U+202E, U+2066-U+2069).
 _INVISIBLE: Final = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u202a-\u202e\u2066-\u2069]")
 _URL: Final = re.compile(r"(?i)(?:\bmailto:[^\s<>\"']*|\b(?:https?|ftp)://[^\s<>\"']*|\bwww\.[^\s<>\"']+)")
-_SURROGATE: Final = re.compile("[\ud800-\udfff]")
-_NON_ESCAPE_SURROGATE: Final = re.compile("[\ud800-\udc7f\udd00-\udfff]")
+_SURROGATE: Final = re.compile(r"[\ud800-\udfff]")
+# Raw patterns: the regex engine reads the \u escapes, so no lone surrogate appears in the source string.
+_NON_ESCAPE_SURROGATE: Final = re.compile(r"[\ud800-\udc7f\udd00-\udfff]")
 MAX_HTML_DEPTH: Final = 256  # open elements tracked by the HTML-to-text converter
 _BLANK_RUNS: Final = re.compile(r"\n{3,}")
 _SPACES: Final = re.compile(r" +")
