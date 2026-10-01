@@ -1,5 +1,8 @@
-"""HTML-to-text hiding as a region rule (spec 080 §5.3 rule 2): regression corpus from review report 18 and a
-generator-based check. Comments give what a browser shows."""
+"""HTML-to-text hiding as a region rule (spec 080 §5.3 rule 2).
+
+The named corpus checks the rule against browsers (each comment gives what a browser shows; cases from all review
+rounds of report 18). The generator checks that the code follows the rule: its oracle is a model of the rule, so
+it cannot find places where the rule itself differs from a browser."""
 
 import random
 
@@ -47,6 +50,40 @@ CORPUS = [
     # Other parsing rules inside a region: the rest of the document is hidden.
     ("<div hidden><svg></div>SECRET", "SECRET", None),
     ("<div hidden><plaintext></div>SECRET", "SECRET", None),
+    # N-R8a: table, object, template and button bound the scope of an end tag; a browser ignores a </div> or
+    # </span> that is not in scope, so SECRET stays inside the hidden element.
+    ("<div hidden><table><tr><td></div>SECRET</td></tr></table></div>", "SECRET", None),
+    ("<span hidden><table><tr><td></span>SECRET", "SECRET", None),
+    ("<div hidden><object></div>SECRET", "SECRET", None),
+    ("<div hidden><table><caption></div>SECRET", "SECRET", None),
+    ("<div hidden><template></div>SECRET", "SECRET", None),
+    ("<p hidden><button></p>SECRET</button>", "SECRET", None),
+    # A table closed inside the region does not keep it open: the browser closes the div at its end tag.
+    ("<div hidden><table><tr><td>x</td></tr></table></div>after", "x", "after"),
+    # N-R8b: the end tag of a formatting element runs the adoption agency algorithm; the text after it lands in a
+    # hidden clone of the element, so it stays hidden.
+    ("<b hidden><div>x</b>SECRET</div>", "SECRET", None),
+    ("<a style='display:none'><p>x</a>SECRET</p>", "SECRET", None),
+    ("<font style='visibility:hidden'><table><tr><td><div>x</font>SECRET", "SECRET", None),
+    # A formatting element without blocks inside closes normally.
+    ("<b hidden>x</b>after", "x", "after"),
+    # N-R8c: script data in the double-escaped state: the first </script> does not end the script.
+    ("<script><!--<script></script>SECRET</script>-->after", "SECRET", None),
+    # Old comment-wrapped scripts without a nested <script do not hide the rest.
+    ("<script><!-- var a = 1; //--></script><p>after</p>", "var a", "after"),
+    # N-R9: the first element that is not allowed in head starts the body, as in a browser.
+    ("<head><title>t</title><p>Hello", "t", "Hello"),
+    ("<head><style>p{}</style></head><body>Hi", "p{}", "Hi"),
+    ("<head><meta charset='utf-8'><body>Body text", None, "Body text"),
+    ("<head><title>t</title><div hidden>SECRET</div><p>shown", "SECRET", "shown"),
+    # N-R10: foreign elements honour the slash: a self-closing svg or math is empty.
+    ("<svg/><p>BODYTEXT</p>", None, "BODYTEXT"),
+    ("<div hidden><math/></div>after", None, "after"),
+    ("<div hidden><svg></div>SECRET<p>more", "more", None),
+    # N-R11: a hidden void element (a tracking image) never opens a region.
+    ("<p>a</p><img src=x style='display:none'><p>after</p>", None, "after"),
+    ("<p>a</p><img src=x hidden><p>after</p>", None, "after"),
+    ("<p>a</p><img src=x hidden/><p>after</p>", None, "after"),
     # An ordinary HTML mail: the title inside head stays hidden and the body is shown.
     ("<html><head><title>T</title><style>p{}</style></head><body><p>Hello</p></body></html>", "T", "Hello"),
 ]
@@ -69,76 +106,129 @@ def test_implied_end_tag_over_hides_by_design() -> None:
     assert "after" not in text
 
 
-NAMES = ["div", "span", "p", "td", "tr", "li", "b", "a", "table", "ul"]
+NAMES = ["div", "span", "p", "td", "tr", "li", "b", "a", "font", "table", "ul", "button", "object"]
 RAW_TEXT = ["textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript"]
 HIDE_REST = ["plaintext", "select", "svg", "math"]
+SCOPE = {"table", "object", "applet", "marquee", "template", "button"}
+FORMATTING = {"a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"}
+BLOCKS = {"div", "p", "li", "ul", "ol", "table", "h1", "pre", "blockquote", "section", "center", "form", "dl"}
+DROPPED = {"script", "style", "head", "template", "noscript", "svg", "iframe", "object"}
 HIDING_ATTRS = [" hidden", " style='display:none'", " style='VISIBILITY : hidden'", " HIDDEN"]
+SCRIPT_DATA = ["x", "<!-- y //-->", "<!--<script>", "<!--<SCRIPT>z", "<!-- a --><script"]
 
 
 def _case(rng: random.Random, name: str) -> str:
     return name.upper() if rng.random() < 0.2 else name
 
 
+class Rule:
+    """Token-level model of the region rule, written independently of the parser callbacks."""
+
+    def __init__(self) -> None:
+        self.region: str | None = None
+        self.depth = 0
+        self.bounds: dict[str, int] = {}
+        self.raw: str | None = None
+        self.to_end = False
+
+    def hidden(self) -> bool:
+        return self.to_end or self.region is not None
+
+    def start(self, name: str, *, hiding: bool, self_closing: bool = False) -> None:
+        if self.to_end or (self_closing and name in {"svg", "math"}):
+            return
+        if self.region is None:
+            if hiding or name in DROPPED:
+                self.region, self.depth = name, 1
+            return
+        if self.raw is not None:
+            return
+        boundaries = SCOPE | BLOCKS if self.region in FORMATTING else SCOPE
+        if name == self.region and not sum(self.bounds.values()):
+            self.depth += 1
+        elif name in boundaries:
+            self.bounds[name] = self.bounds.get(name, 0) + 1
+        elif name in RAW_TEXT:
+            self.raw = name
+        elif name in HIDE_REST:
+            self.to_end = True
+
+    def end(self, name: str) -> None:
+        if self.region is None:
+            return
+        if self.raw is not None:
+            if name == self.raw:
+                self.raw = None
+            return
+        if self.bounds.get(name):
+            self.bounds[name] -= 1
+            return
+        if name != self.region or sum(self.bounds.values()):
+            return
+        self.depth -= 1
+        if not self.depth:
+            self.region, self.bounds = None, {}
+
+    def script(self, data: str) -> None:
+        lowered = data.lower()
+        opened = lowered.find("<!--")
+        if opened != -1 and "<script" in lowered[opened + 4 :]:
+            self.to_end = True
+
+
 def _document(rng: random.Random) -> tuple[str, list[str], list[str]]:
     """Token-level document plus the markers that must stay hidden and those that must appear.
 
-    The generator tracks the rule itself (state: visible, region (X, n) with an optional raw-text element, or
-    hidden to the end) and places a SECRET marker only where the rule hides and a VISIBLE marker only before the
-    first hiding start tag."""
+    The oracle is the Rule model: SECRET markers go where the rule hides, VISIBLE markers everywhere else. The
+    generator emits stray, misnested and self-closing tags, mixed case, nested same-name elements, scope
+    boundaries, formatting elements around blocks, raw-text and foreign elements and script blocks with and
+    without double escapes."""
     parts: list[str] = []
     secrets: list[str] = []
     visibles: list[str] = []
-    region: tuple[str, int] | None = None
-    raw: str | None = None
-    to_end = seen_hiding = False
+    rule = Rule()
     for index in range(rng.randrange(5, 40)):
         roll = rng.random()
         name = rng.choice(NAMES)
+        slash = "/" if rng.random() < 0.2 else ""
         if roll < 0.3:  # text
-            if to_end or region is not None:
+            if rule.hidden():
                 parts.append(f" SECRET{index} ")
                 secrets.append(f"SECRET{index}")
-            elif not seen_hiding:
+            else:
                 parts.append(f" VISIBLE{index} ")
                 visibles.append(f"VISIBLE{index}")
-            else:
-                parts.append(" x ")
-        elif raw is not None and roll < 0.6:  # tags are text inside a raw-text element; sometimes its end tag
-            parts.append(f"</{_case(rng, raw)}>" if rng.random() < 0.5 else f"<{name} hidden></{name}>")
-            if parts[-1].lower() == f"</{raw}>":
-                raw = None
-        elif roll < 0.5:  # hiding start tag, sometimes self-closing
-            slash = "/" if rng.random() < 0.2 else ""
+        elif rule.raw is not None and roll < 0.6:  # tags are text inside a raw-text element; sometimes its end tag
+            closing = rng.random() < 0.5
+            parts.append(f"</{_case(rng, rule.raw)}>" if closing else f"<{name} hidden></{name}>")
+            if closing:
+                rule.end(rule.raw)
+        elif roll < 0.45:  # hiding start tag, sometimes self-closing
             parts.append(f"<{_case(rng, name)}{rng.choice(HIDING_ATTRS)}{slash}>")
-            seen_hiding = True
-            if raw is not None or to_end:
-                continue
-            if region is None:
-                region = (name, 1)
-            elif region[0] == name:
-                region = (name, region[1] + 1)
-        elif roll < 0.75:  # plain start tag, sometimes self-closing
-            slash = "/" if rng.random() < 0.2 else ""
+            rule.start(name, hiding=True, self_closing=bool(slash))
+        elif roll < 0.68:  # plain start tag, sometimes self-closing
             parts.append(f"<{_case(rng, name)}{slash}>")
-            if raw is None and region is not None and region[0] == name:
-                region = (name, region[1] + 1)
-        elif roll < 0.95:  # end tag: matching, stray or misnested
+            rule.start(name, hiding=False, self_closing=bool(slash))
+        elif roll < 0.9:  # end tag: matching, stray or misnested
             parts.append(f"</{_case(rng, name)}>")
-            if raw is None and region is not None and region[0] == name:
-                region = (name, region[1] - 1) if region[1] > 1 else None
-        elif region is not None and raw is None:  # element with other parsing rules inside a region
+            rule.end(name)
+        elif roll < 0.95 and rule.raw is None:  # script block
+            data = rng.choice(SCRIPT_DATA)
+            parts.append(f"<script>{data}</script>")
+            rule.start("script", hiding=True)
+            rule.script(data)
+            rule.end("script")
+        elif rule.region is not None and rule.raw is None:  # element with other parsing rules inside a region
             element = rng.choice(RAW_TEXT + HIDE_REST)
-            parts.append(f"<{_case(rng, element)}>")
-            if element in RAW_TEXT:
-                raw = element
-            else:
-                to_end = True
+            foreign_slash = "/" if element in {"svg", "math"} and rng.random() < 0.3 else ""
+            parts.append(f"<{_case(rng, element)}{foreign_slash}>")
+            rule.start(element, hiding=False, self_closing=bool(foreign_slash))
     return "".join(parts), secrets, visibles
 
 
 def test_generated_documents_follow_the_region_rule() -> None:
     rng = random.Random(20261001)  # noqa: S311 - deterministic test data
-    for _ in range(5000):
+    for _ in range(6000):
         html, secrets, visibles = _document(rng)
         text = html_to_text(html)
         for marker in secrets:

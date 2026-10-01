@@ -54,6 +54,8 @@ def hidden_text_leaks() -> list[str]:
         "bogus": "<p>Hi</p><! SECRET",
         "nested end tag": "<td style='display:none'><table><tr><td>inner</td></tr></table>SECRET</td>",
         "deep nesting": "<div>" * 300 + "<span hidden>SECRET</span>",
+        "script double escape": "<script><!--<script></script>SECRET</script>-->after",
+        "end tag out of scope": "<div hidden><table><tr><td></div>SECRET</td></tr></table></div>",
     }
     return [name for name, html in cases.items() if "SECRET" in html_to_text(html)]
 

@@ -43,6 +43,22 @@ _UNTERMINATED: Final = (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<!", ">"), ("<?
 # at their own end tag in a browser, so everything up to it is ignored; the others hide the rest of the document.
 _RAW_TEXT: Final = frozenset({"textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript"})
 _HIDE_REST: Final = frozenset({"plaintext", "select", "svg", "math"})
+_FOREIGN: Final = frozenset({"svg", "math"})  # these honour a self-closing slash: <svg/> is empty
+# Scope boundaries: a browser ignores an end tag of the region's element while one of these is open inside it.
+_SCOPE_BOUNDARIES: Final = frozenset({"table", "object", "applet", "marquee", "template", "button"})
+# Formatting elements: their end tag runs the adoption agency algorithm across these blocks, so the text after it
+# stays in a (hidden) clone; inside such a region the blocks count as boundaries too.
+_FORMATTING: Final = frozenset(
+    {"a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"}
+)
+_FORMATTING_BOUNDARIES: Final = _SCOPE_BOUNDARIES | frozenset(
+    {
+        "address", "article", "aside", "blockquote", "center", "div", "dl", "fieldset", "footer", "form", "h1", "h2",
+        "h3", "h4", "h5", "h6", "header", "li", "main", "nav", "ol", "p", "pre", "section", "ul",
+    }
+)  # fmt: skip
+# Elements allowed in head; any other start tag ends a head region and starts the body, as in a browser.
+_HEAD_CONTENT: Final = frozenset({"title", "meta", "link", "style", "script", "base", "noscript", "template"})
 _BLOCK_ELEMENTS: Final = frozenset(
     {
         "p", "div", "br", "li", "tr", "table", "ul", "ol", "blockquote", "section", "article", "header", "footer",
@@ -129,7 +145,15 @@ class _TextExtractor(HTMLParser):
     A self-closing non-void element (`<div hidden/>`) opens like a start tag, as browsers ignore the slash. Inside
     a region, a raw-text element (title, textarea, iframe, ...) suspends counting up to its own end tag, as a
     browser reads it as text, and an element with other parsing rules (plaintext, select, svg, math) hides the rest
-    of the document.
+    of the document; a self-closing svg or math is empty. While a scope boundary (table, object, applet, marquee,
+    template, button; for a formatting element such as b or a also block elements such as div or p) is open inside
+    the region, the region's end tag is not in scope and is ignored, as in a browser. A head region ends at body or
+    at the first element not allowed in head. Script data with "<!--" and a later "<script" hides the rest.
+
+    Known limits: hidden-content removal is best effort and errs towards hiding. It recognises the hidden attribute
+    and inline display:none / visibility:hidden only, not CSS classes or style sheets, zero-size or same-colour text
+    or off-screen positioning, and it does not reproduce every HTML5 tree-construction rule. Mail content reaches
+    the model marked as untrusted regardless.
 
     Accepted over-hiding: a hiding element that relies on an implied end tag (`<p hidden>` followed by another
     `<p>` without `</p>`, likewise li, td, tr) hides everything up to its balancing explicit end tag or the end
@@ -140,53 +164,90 @@ class _TextExtractor(HTMLParser):
         self.parts: list[str] = []
         self._region: str | None = None  # tag name of the hidden region
         self._depth = 0  # open elements of that name inside the region
+        self._bounds: dict[str, int] = {}  # open scope boundaries inside the region, per tag (fixed tag set)
+        self._bound_total = 0
         self._raw: str | None = None  # raw-text element inside the region: everything up to its end tag is ignored
+        self._in_script = False  # the parser delivers script data
+        self._script_comment = False  # that script data has opened "<!--"
         self._hide_rest = False
 
     def _visible(self) -> bool:
         return self._region is None and not self._hide_rest
 
+    def _close_region(self) -> None:
+        self._region, self._depth, self._bounds, self._bound_total = None, 0, {}, 0
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if self._hide_rest:
-            return
-        if self._region is not None:
-            if self._raw is not None:
-                return
-            if tag == self._region:
-                self._depth += 1
-            elif tag in _RAW_TEXT:
-                self._raw = tag
-            elif tag in _HIDE_REST:
-                self._hide_rest = True
-            return
-        if tag in _BLOCK_ELEMENTS:
-            self.parts.append("\n")
-        if tag not in _VOID_ELEMENTS and (tag in _DROPPED_ELEMENTS or _hidden(attrs)):
-            self._region, self._depth = tag, 1
+        self._start(tag, attrs, self_closing=False)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _VOID_ELEMENTS:
             if tag in _BLOCK_ELEMENTS and self._visible():
                 self.parts.append("\n")
             return
-        self.handle_starttag(tag, attrs)  # browsers ignore the slash on non-void elements
+        self._start(tag, attrs, self_closing=True)  # browsers ignore the slash on non-void HTML elements
+
+    def _start(self, tag: str, attrs: list[tuple[str, str | None]], *, self_closing: bool) -> None:
+        if tag == "script" and not self_closing:
+            self._in_script, self._script_comment = True, False
+        if self._hide_rest or (self_closing and tag in _FOREIGN):
+            return
+        if self._region is not None:
+            if self._raw is not None:
+                return
+            if self._region == "head" and not self._bound_total and (tag == "body" or tag not in _HEAD_CONTENT):
+                self._close_region()  # the body starts here; handle the tag as visible content
+            else:
+                self._start_in_region(tag)
+                return
+        if tag in _BLOCK_ELEMENTS:
+            self.parts.append("\n")
+        if tag not in _VOID_ELEMENTS and (tag in _DROPPED_ELEMENTS or _hidden(attrs)):
+            self._region, self._depth = tag, 1
+
+    def _start_in_region(self, tag: str) -> None:
+        boundaries = _FORMATTING_BOUNDARIES if self._region in _FORMATTING else _SCOPE_BOUNDARIES
+        if tag == self._region and not self._bound_total:
+            self._depth += 1
+        elif tag in boundaries:
+            self._bounds[tag] = self._bounds.get(tag, 0) + 1
+            self._bound_total += 1
+        elif tag in _RAW_TEXT:
+            self._raw = tag
+        elif tag in _HIDE_REST:
+            self._hide_rest = True
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self._in_script = False
         if self._region is not None:
             if self._raw is not None:
                 if tag == self._raw:
                     self._raw = None
                 return
-            if tag != self._region:
+            if self._bounds.get(tag):
+                self._bounds[tag] -= 1
+                self._bound_total -= 1
+                return
+            if tag != self._region or self._bound_total:  # not in scope while a boundary is open
                 return
             self._depth -= 1
             if self._depth:
                 return
-            self._region = None
+            self._close_region()
         if tag in _BLOCK_ELEMENTS and self._visible():
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        if self._in_script and not self._hide_rest:
+            # Script data with "<!--" and a later "<script" is double-escaped in a browser: its first </script>
+            # does not end the script, so the rest is hidden.
+            lowered = data.lower()
+            start = 0
+            if not self._script_comment and (opened := lowered.find("<!--")) != -1:
+                self._script_comment, start = True, opened + 4
+            if self._script_comment and "<script" in lowered[start:]:
+                self._hide_rest = True
         if self._visible():
             self.parts.append(data)
 

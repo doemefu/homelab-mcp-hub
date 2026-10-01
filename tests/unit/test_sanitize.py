@@ -198,7 +198,9 @@ def test_html_converter_keeps_constant_state_on_unclosed_tags() -> None:
     parser.feed("<b>x" * 65_536)
     parser.close()
     own = {name: value for name, value in vars(parser).items() if name not in vars(HTMLParser()) and name != "parts"}
-    assert all(isinstance(value, int | str | bool | type(None)) for value in own.values()), own
+    counters = [value for value in own.values() if isinstance(value, dict)]  # per-tag counts over a fixed tag set
+    assert all(isinstance(value, int | str | bool | type(None) | dict) for value in own.values()), own
+    assert all(len(counter) <= 40 for counter in counters)
     assert "".join(parser.parts).count("x") == 65_536
 
 
@@ -306,8 +308,8 @@ def test_text_inside_hidden_elements_never_appears_in_random_documents() -> None
 
 
 def test_end_tag_closes_a_tracked_hiding_cell_while_deeper_elements_overflow() -> None:
-    # A hiding cell below the cap, more than MAX_HTML_DEPTH open elements inside it, then its end tag: the cell's
-    # content stays hidden and the text after the cell is shown, as in a browser.
+    # A hiding cell with 300 open elements inside it, then its end tag: the cell's content stays hidden and the
+    # text after the cell is shown, as in a browser.
     text = html_to_text("<table><tr><td hidden>SECRET" + "<div>" * 300 + "</td>after")
     assert "SECRET" not in text
     assert "after" in text
