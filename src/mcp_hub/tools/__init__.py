@@ -1,11 +1,12 @@
 """MCP tools. Each domain module exposes register(server, ctx)."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mcp.server.mcpserver import MCPServer
 
 from mcp_hub.config import Settings
 from mcp_hub.health import StatusStore
+from mcp_hub.providers import Adapters
 from mcp_hub.registry import Registry
 
 
@@ -14,6 +15,7 @@ class HubContext:
     settings: Settings
     registry: Registry
     status: StatusStore
+    adapters: Adapters = field(default_factory=Adapters)
 
 
 def register_tools(server: MCPServer, ctx: HubContext) -> None:
