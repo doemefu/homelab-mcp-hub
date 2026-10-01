@@ -561,3 +561,37 @@ def test_no_request_is_sent_after_the_call_deadline(httpserver: HTTPServer) -> N
     error = code_of(lambda: caldav.events(START, END, ZURICH, ZURICH))
     assert (error.code, error.cause) == ("upstream_timeout", "CallDeadline")
     assert [path for method, path in requests(httpserver) if method == "REPORT"] == []
+
+
+@pytest.mark.parametrize(
+    ("position", "downgrade"),
+    [
+        ("redirect", "http://caldav.icloud.com/123/principal/"),
+        ("principal", "http://caldav.icloud.com/123/principal/"),
+        ("redirect", "http://p42-caldav.icloud.com:443/123/principal/"),
+        ("principal", "http://p42-caldav.icloud.com:443/123/principal/"),
+    ],
+    ids=["redirect-same-host", "href-same-host", "redirect-partition-443", "href-partition-443"],
+)
+def test_https_never_downgrades_to_http(position: str, downgrade: str) -> None:
+    first = (
+        (lambda request: httpx2.Response(301, headers={"Location": downgrade}))
+        if position == "redirect"
+        else dav(principal(downgrade))
+    )
+    recorder = RecordingTransport({("PROPFIND", "https://caldav.icloud.com:443/"): first})
+
+    def factory(username: str, password: str, timeout: float) -> httpx2.Client:
+        return httpx2.Client(auth=(username, password), transport=recorder.transport(), trust_env=False)
+
+    caldav = CalDavCalendarSource(
+        "icloud",
+        url="https://caldav.icloud.com/",
+        username="u",
+        password=PASSWORD,
+        include="all",
+        client_factory=factory,
+    )
+    error = code_of(caldav.calendars)
+    assert (error.code, error.cause) == ("upstream_error", "ForeignHost")
+    assert [(host, port) for host, port, *_ in recorder.seen] == [("caldav.icloud.com", 443)]
