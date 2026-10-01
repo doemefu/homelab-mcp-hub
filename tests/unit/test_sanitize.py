@@ -143,3 +143,18 @@ def test_content_type_validation(value: str | None, expected: str | None) -> Non
 )
 def test_timezone_validation(value: str | None, expected: str | None) -> None:
     assert validate_timezone(value) == expected
+
+
+def test_timezone_names_do_not_depend_on_the_system_zone_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Linux system zoneinfo directories contain `localtime` and `posixrules`; the IANA list must not.
+    import mcp_hub.sanitize as sanitize
+
+    monkeypatch.setattr(sanitize, "available_timezones", lambda: {"localtime", "posixrules"}, raising=False)
+    sanitize._iana_names.cache_clear()
+    try:
+        assert validate_timezone("localtime") is None
+        assert validate_timezone("posixrules") is None
+        assert validate_timezone("Factory") is None
+        assert validate_timezone("Europe/Zurich") == "Europe/Zurich"
+    finally:
+        sanitize._iana_names.cache_clear()

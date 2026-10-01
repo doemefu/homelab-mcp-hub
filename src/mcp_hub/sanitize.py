@@ -4,9 +4,10 @@ import functools
 import re
 import unicodedata
 from html.parser import HTMLParser
+from importlib import resources
 from typing import Final
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 TRUNCATION_MARKER: Final = " [truncated]"
 FIELD_LIMITS: Final[dict[str, int]] = {
@@ -146,7 +147,10 @@ def validate_content_type(value: str | None) -> str | None:
 
 @functools.cache
 def _iana_names() -> frozenset[str]:
-    return frozenset(available_timezones())  # excludes localtime, posixrules, Factory
+    """IANA zone names from the pinned tzdata package, not from the system directory (Linux zoneinfo trees also
+    hold `localtime` and `posixrules`); `Factory` is a placeholder, not a place."""
+    zones = resources.files("tzdata").joinpath("zones").read_text(encoding="utf-8").split()
+    return frozenset(zones) - {"Factory"}
 
 
 def validate_timezone(value: str | None) -> str | None:
