@@ -11,7 +11,7 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 | Work package | Scope | Status |
 |--------------|-------|--------|
 | WP5a | Repository bootstrap, authorization layer, `list_accounts`, image, CI, `k8s/` | Done |
-| WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | In review |
+| WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | Done |
 | WP5c | CalDAV adapter, `get_events` | Planned |
 | WP5d | `search_mail`, paging, metrics on the internal port | Planned |
 | WP8–WP10 | Further accounts (IMAP folder handling, Microsoft Graph, calendar feed) | Planned |
@@ -45,7 +45,7 @@ scripts/provider_services.sh up && HUB_PROVIDER_TESTS=1 uv run pytest -m provide
 
 ```bash
 docker build -t mcp-hub:dev .
-scripts/smoke_image.sh mcp-hub:dev   # starts the image read-only as uid 10001 and checks 401/200/403/421
+scripts/smoke_image.sh mcp-hub:dev   # starts the image read-only as uid 10001, checks 401/200/403/421 and the HTML converter
 ```
 
 `scripts/smoke_image.sh` generates a throwaway signing key, a JWKS and a secrets directory with the example registry, so no real credentials are involved.

@@ -50,7 +50,7 @@ tests/
   integration/     the real process on two ports; test_imap.py against GreenMail (marker `provider`)
   support/         keys, tokens, clock, MCP wire helpers, GreenMail helpers, log capture
   fixtures/        example registry (neutral ids, no real data)
-scripts/           dev_token.py, smoke_image.sh, provider_services.sh (development only, not in the image)
+scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh (development only, not in the image)
 k8s/               Deployment and Service for namespace apps
 ```
 

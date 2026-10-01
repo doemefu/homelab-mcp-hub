@@ -23,7 +23,7 @@ Resources are estimates (requests 50m / 128Mi, limits 500m / 256Mi); confirm wit
 
 1. Merge the bootstrap pull request; the first `Build and Push` run on `main` publishes the first image.
 2. Owner: GitHub → Packages → `homelab-mcp-hub` → visibility **Public**; confirm it is linked to this repository.
-3. Owner: add the required status checks (`lint-and-test`, `image-smoke`, `Analyze (python)`) and the CodeQL rule to the ruleset `main` once GitHub knows the check names.
+3. Owner: add the required status checks (`lint-and-test`, `image-smoke`, `providers`, `Analyze (python)`) and the CodeQL rule to the ruleset `main` once GitHub knows the check names.
 4. Owner: create a write deploy key for this repository and the Secret `mcp-hub-flux-auth` in `flux-system` (private key never through chat).
 5. `doemefu/homelab` platform pull request (WP6): Flux bundle `cluster/apps/mcp-hub/`, playbook 59 writes Secret `mcp-hub-secrets` (`accounts.json`, `allowed-subjects`, credential keys).
 6. Flux replaces the placeholder image tag in `k8s/deployment.yaml` (it was never built) with the newest `main-<ts>` tag and pushes an image-update commit to `main`. The ruleset `main` requires pull requests, with bypass for the admin role only; that first Flux commit proves the push works. If image automation reports a rejected push, the owner adds the deploy key as a bypass actor.
