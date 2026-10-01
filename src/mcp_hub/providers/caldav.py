@@ -60,6 +60,32 @@ EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (ite
 # dateutil keeps every occurrence it iterates from DTSTART (60-90 bytes each) and the CPU deadline does not bound
 # memory: a rule whose estimated occurrences up to the window end exceed this is refused before expansion.
 MAX_ITERATED_OCCURRENCES: Final = 20_000
+# Only RFC 5545 rule parts (dateutil also understands BYEASTER and others the bound does not model), and only where
+# RFC 5545 allows them for the frequency (second confirmation pass of PR #11, E1/E2).
+RFC5545_RULE_PARTS: Final = frozenset(
+    {
+        "FREQ",
+        "UNTIL",
+        "COUNT",
+        "INTERVAL",
+        "BYSECOND",
+        "BYMINUTE",
+        "BYHOUR",
+        "BYDAY",
+        "BYMONTHDAY",
+        "BYYEARDAY",
+        "BYWEEKNO",
+        "BYMONTH",
+        "BYSETPOS",
+        "WKST",
+    }
+)
+_PARTS_NOT_ALLOWED: Final = {
+    "DAILY": frozenset({"BYWEEKNO", "BYYEARDAY"}),
+    "WEEKLY": frozenset({"BYWEEKNO", "BYYEARDAY", "BYMONTHDAY"}),
+    "MONTHLY": frozenset({"BYWEEKNO", "BYYEARDAY"}),
+    "YEARLY": frozenset(),
+}
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
@@ -463,6 +489,13 @@ def _screen(calendar: icalendar.Calendar, window_end: date) -> None:
                 raise ObjectSkippedError("rule_refused")
             frequencies = {str(value).upper() for value in _values(cast(dict[str, object], rule).get("FREQ"))}
             if len(frequencies) != 1 or not frequencies <= ALLOWED_FREQUENCIES:
+                raise ObjectSkippedError("rule_refused")
+            # The part names of the exact string recurring-ical-events hands to dateutil (rrule.to_ical()).
+            received = cast(Callable[[], bytes], rule.to_ical)().decode()
+            names = [part.split("=", 1)[0].strip().upper() for part in received.split(";") if part]
+            if len(set(names)) != len(names) or not set(names) <= RFC5545_RULE_PARTS:
+                raise ObjectSkippedError("rule_refused")
+            if set(names) & _PARTS_NOT_ALLOWED[next(iter(frequencies))]:
                 raise ObjectSkippedError("rule_refused")
             parts = cast(dict[str, object], rule)
             if any(len(_values(parts.get(part))) > 1 for part in _TIME_OF_DAY_PARTS):
