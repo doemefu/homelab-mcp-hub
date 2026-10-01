@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -449,3 +450,52 @@ def test_rules_are_screened_on_every_component_including_overrides(expander_call
 
 def test_single_values_for_time_of_day_parts_are_allowed() -> None:
     assert len(run(obj("RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=30;BYSECOND=0"))) == 28
+
+
+# --- swallowed deadline (D62 final C) --------------------------------------------------------------------------------
+
+
+def _swallowing_expansion(clock: FakeTime) -> Callable[..., list[caldav.RawEvent]]:
+    """Stands in for a library layer that catches everything, the injected deadline included."""
+
+    def instances(*args: Any, **kwargs: Any) -> list[caldav.RawEvent]:
+        try:
+            while True:
+                clock()  # a Python call: the hook fires and raises once the deadline has passed
+        except BaseException:  # noqa: S110 - swallowing everything is the point of this test
+            pass
+        for _ in range(10):
+            clock()  # more work after the swallowed exception, now without a trace function
+        return []
+
+    return instances
+
+
+@pytest.mark.parametrize("failing", [False, True], ids=["returns", "raises-after"])
+def test_a_swallowed_deadline_is_caught_after_the_call(monkeypatch: pytest.MonkeyPatch, failing: bool) -> None:
+    clock = FakeTime()
+    swallow = _swallowing_expansion(clock)
+
+    def instances(*args: Any, **kwargs: Any) -> list[caldav.RawEvent]:
+        swallow()
+        if failing:
+            raise ValueError("library error after the swallowed deadline")
+        return []
+
+    monkeypatch.setattr(caldav, "_instances", instances)
+    previous = sys.gettrace()
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(ics.load("dst-weekly.ics"), cpu_clock=clock)
+    assert caught.value.reason == "expansion_too_slow"
+    assert sys.gettrace() is previous
+
+
+def test_a_swallowed_deadline_feeds_the_negative_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeTime()
+    monkeypatch.setattr(caldav, "_instances", _swallowing_expansion(clock))
+    cache = SlowObjectCache()
+    page = source_for(ics.load("dst-weekly.ics"), slow_objects=cache, cpu_clock=clock).events(
+        START, END, ZURICH, ZURICH
+    )
+    assert page.events == []
+    assert len(cache) == 1

@@ -279,7 +279,10 @@ def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Call
     for rules that never match, so neither instance caps nor checks between objects bound one object's CPU time, and
     a worker thread cannot be killed. The hook sees every Python call of the expansion and stops it. It is
     thread-local, CPython-specific and replaces a debugger's or coverage tool's trace function while it runs (the
-    previous one is restored on every path). Rejected alternative: a killable subprocess per expansion (memory in a
+    previous one is restored on every path). A library layer that catches the injected BaseException also removes
+    the hook (CPython drops a raising trace function), so the CPU time is read once more after the call on every path.
+    The clock is read on every call event: sampling every 16 events saved only about a third of the 0.4 ms per object.
+    Rejected alternative: a killable subprocess per expansion (memory in a
     256 Mi pod, start-up cost per call)."""
     deadline = cpu_clock() + seconds
     previous = sys.gettrace()
@@ -291,9 +294,16 @@ def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Call
 
     sys.settrace(hook)
     try:
-        return func()
+        result = func()
+    except Exception:
+        if cpu_clock() > deadline:  # the injected exception was swallowed and turned into another one
+            raise _ExpansionTooSlow from None
+        raise
     finally:
-        sys.settrace(previous)
+        sys.settrace(previous)  # never threading.settrace: that would reach every new thread
+    if cpu_clock() > deadline:  # the injected exception was swallowed and the call still returned
+        raise _ExpansionTooSlow
+    return result
 
 
 def _expand_object(
