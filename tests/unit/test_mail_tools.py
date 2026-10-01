@@ -1,3 +1,4 @@
+import json
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -292,3 +293,20 @@ async def test_list_unread_never_exceeds_the_budget(secrets_dir: Path, budget: i
     result, _, _ = await run_list_unread(ctx, account=None, since=None, limit=50, now=NOW)
     assert len(result.model_dump_json()) <= budget
     assert result.items
+
+
+@pytest.mark.parametrize("disabled_by", ["registry", "missing_credential"])
+async def test_get_message_for_a_disabled_account_is_capability_unavailable(
+    secrets_dir: Path, disabled_by: str
+) -> None:
+    ctx = context(secrets_dir, {}, AssertionError("provider must not be called"))
+    if disabled_by == "registry":
+        registry = json.loads((secrets_dir / "accounts.json").read_text())
+        registry["accounts"][1]["enabled"] = False  # gmail
+        (secrets_dir / "accounts.json").write_text(json.dumps(registry))
+        ctx = HubContext(ctx.settings, load_registry(secrets_dir / "accounts.json"), ctx.status, ctx.adapters)
+    else:
+        (secrets_dir / "gmail-app-password").unlink()
+    with pytest.raises(ToolError) as caught:
+        await run_get_message(ctx, message_id=encode_message_id(MessageRef("gmail", "INBOX", 7, 3)), max_chars=None)
+    assert caught.value.code == "capability_unavailable"
