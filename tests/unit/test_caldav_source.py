@@ -469,3 +469,36 @@ def test_identity_content_encoding_is_accepted(httpserver: HTTPServer) -> None:
         principal("/p/"), status=207, content_type=XML, headers={"Content-Encoding": "identity"}
     )
     source(httpserver).check()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [b"\x01", b"\x0b", b"\x1f", b"\xef\xbf\xbe", b"\xef\xbf\xbf", b"\xff"],
+    ids=["c0-01", "c0-0b", "c0-1f", "u-fffe", "u-ffff", "invalid-utf8"],
+)
+def test_one_object_with_xml_forbidden_text_does_not_fail_the_others(httpserver: HTTPServer, bad: bytes) -> None:
+    # Review 19 F4: servers built on xml.etree write such characters unescaped; the multistatus must still parse.
+    broken = ics.load("allday.ics").replace(b"SUMMARY:Weekend away", b"SUMMARY:Weekend" + bad + b"away")
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        raw_report(broken, ics.load("dst-weekly.ics")), status=207, content_type=XML
+    )
+    events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events
+    titles = sorted(e.title or "" for e in events)
+    assert titles == ["Weekend\ufffdaway", "Weekly DST", "Weekly DST", "Weekly DST"]
+
+
+def test_a_document_that_stays_broken_after_the_repair_is_refused(httpserver: HTTPServer) -> None:
+    body = b'<?xml version="1.0" encoding="utf-8"?>' + (_PRINCIPAL % b"/p/").replace(b"\xff", b"\x01").replace(
+        b"</D:prop>", b"<D:prop>"
+    )
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
+    error = code_of(source(httpserver).check)
+    assert (error.code, error.cause) == ("upstream_error", "XmlRefused")
+
+
+def test_a_control_character_before_a_doctype_is_still_refused(httpserver: HTTPServer) -> None:
+    body = b'<?xml version="1.0" encoding="utf-8"?><!--\x01--><!DOCTYPE x [<!ENTITY a "/p/">]>' + _PRINCIPAL % b"&a;"
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
+    error = code_of(source(httpserver).check)
+    assert (error.code, error.cause) == ("upstream_error", "XmlRefused")

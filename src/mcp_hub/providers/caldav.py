@@ -32,6 +32,8 @@ from mcp_hub.sanitize import validate_timezone
 
 _DAV: Final = "{DAV:}"
 _CALDAV: Final = "{urn:ietf:params:xml:ns:caldav}"
+REPLACEMENT_CHARACTER: Final = "\ufffd"
+_XML_FORBIDDEN: Final = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 MAX_XML_DEPTH: Final = 32  # a multistatus is about 8 levels deep
 MAX_XML_ELEMENTS: Final = 100_000  # per response (spec 080 rev. 4.5, review 19 F2)
 _XML_ENCODING: Final = re.compile(rb"\s*<\?xml[^>]*?encoding\s*=\s*[\"']([A-Za-z0-9._-]+)[\"']")
@@ -125,30 +127,38 @@ def _declares_utf8(raw: bytes) -> bool:
     return declared is None or declared.group(1).lower() in (b"utf-8", b"utf8")
 
 
+def _repaired(raw: bytes) -> bytes | None:
+    """The UTF-8 document with invalid bytes and XML 1.0-forbidden code points (C0 controls except TAB, LF and CR;
+    U+FFFE; U+FFFF) replaced by U+FFFD, or None when it is not UTF-8 or nothing needs repair."""
+    if not _declares_utf8(raw):
+        return None
+    fixed = _XML_FORBIDDEN.sub(REPLACEMENT_CHARACTER, raw.decode("utf-8", "replace")).encode("utf-8")
+    return fixed if fixed != raw else None
+
+
 def parse_xml(raw: bytes, *, account: str | None = None) -> ET.Element:
     """Stdlib-only hardened parse (D58): expat itself refuses any DOCTYPE and any entity declaration, whatever the
-    document encoding (UTF-16 included); parameter entities are never parsed; no external resource is ever fetched.
-    The tree is built with ElementTree's TreeBuilder.
+    document encoding (UTF-16 included); parameter entities are never parsed; no external resource is ever fetched;
+    depth and element count are bounded. The tree is built with ElementTree's TreeBuilder.
 
-    A UTF-8 document that is not valid UTF-8 is parsed exactly once more, by the same refusing parser, with the
-    invalid bytes replaced by U+FFFD, so one event with broken bytes does not cost the whole calendar (spec 080
-    rev. 4.5). Other declared encodings get no retry and no charset guessing."""
+    A UTF-8 document that is not well-formed only because of invalid bytes or XML-forbidden characters is repaired
+    (U+FFFD) and parsed exactly once more by the same refusing parser, so one broken object does not cost the whole
+    calendar (spec 080 rev. 4.5, review 19 F4). A refusal is never retried; other encodings get no retry."""
     try:
         return _parse(raw)
-    except (_RefusedError, xml.parsers.expat.ExpatError, AssertionError):
-        pass
-    try:
-        raw.decode("utf-8")
-    except UnicodeDecodeError:
-        if _declares_utf8(raw):
-            try:
-                tree = _parse(raw.decode("utf-8", "replace").encode("utf-8"))
-            except (_RefusedError, xml.parsers.expat.ExpatError, AssertionError):
-                pass
-            else:
-                if account is not None:
-                    log_event(_log, logging.WARNING, "xml_encoding_repaired", account=account, capability="calendar")
-                return tree
+    except _RefusedError:
+        raise ProviderError("upstream_error", "XmlRefused") from None
+    except (xml.parsers.expat.ExpatError, AssertionError):
+        repaired = _repaired(raw)
+    if repaired is not None:
+        try:
+            tree = _parse(repaired)
+        except (_RefusedError, xml.parsers.expat.ExpatError, AssertionError):
+            pass
+        else:
+            if account is not None:
+                log_event(_log, logging.WARNING, "xml_encoding_repaired", account=account, capability="calendar")
+            return tree
     raise ProviderError("upstream_error", "XmlRefused")
 
 
