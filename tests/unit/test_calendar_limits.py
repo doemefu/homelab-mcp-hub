@@ -499,3 +499,15 @@ def test_a_swallowed_deadline_feeds_the_negative_cache(monkeypatch: pytest.Monke
     )
     assert page.events == []
     assert len(cache) == 1
+
+
+def test_instances_of_one_object_share_their_text() -> None:
+    # D62 E: 1,000 RDATE instances of one object with a 100 KB description must not hold 1,000 copies (95 MiB).
+    raw = rdates(1000, "shared-text@example.test").replace(
+        b"SUMMARY:", b"DESCRIPTION:" + b"x" * 100_000 + b"\r\nSUMMARY:"
+    )
+    events = run(raw)
+    assert len(events) == 1000
+    assert len({id(e.description) for e in events}) == 1
+    assert len({id(e.title) for e in events}) == 1
+    assert events[0].description == "x" * 100_000

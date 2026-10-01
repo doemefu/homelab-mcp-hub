@@ -208,9 +208,16 @@ def _first(component: icalendar.cal.Component, name: str) -> object:
     return value[0] if isinstance(value, list) and value else value
 
 
-def _text(component: icalendar.Event, name: str) -> str | None:
+def _text(component: icalendar.Event, name: str, strings: dict[int, tuple[object, str]]) -> str | None:
+    """The property as str. Instances of one object share the library's value objects; converting each only once
+    keeps memory at the object's size instead of size x instances (spec 080 rev. 4.5 D62 E)."""
     value = _first(component, name)
-    return str(value) if value is not None else None
+    if value is None:
+        return None
+    known = strings.get(id(value))
+    if known is None:
+        known = strings[id(value)] = (value, str(value))  # the value is kept alive, so its id stays unique
+    return known[1]
 
 
 def _overlaps(low: datetime, high: datetime, start: datetime, end: datetime) -> bool:
@@ -445,6 +452,7 @@ def _instances(
     # A broken series raises, so the caller skips this object and logs calendar_object_skipped (spec 080 §10.2).
     query = recurring_ical_events.of(calendar, skip_bad_series=False)
     events: list[RawEvent] = []
+    strings: dict[int, tuple[object, str]] = {}
     for component in query.between(start.astimezone(UTC) - _WIDEN, end.astimezone(UTC) + _WIDEN):
         if component.name != "VEVENT" or str(component.get("STATUS", "CONFIRMED")).upper() == "CANCELLED":
             continue
@@ -483,9 +491,9 @@ def _instances(
                 recurring=uid in recurring_uids,
                 status="tentative" if str(component.get("STATUS", "")).upper() == "TENTATIVE" else "confirmed",
                 attendee_count=len(attendees) if isinstance(attendees, list) else int(attendees is not None),
-                title=_text(component, "SUMMARY"),
-                location=_text(component, "LOCATION"),
-                description=_text(component, "DESCRIPTION"),
+                title=_text(component, "SUMMARY", strings),
+                location=_text(component, "LOCATION", strings),
+                description=_text(component, "DESCRIPTION", strings),
                 organizer_name=(
                     str(organizer.params["CN"]) if organizer is not None and "CN" in organizer.params else None
                 ),
