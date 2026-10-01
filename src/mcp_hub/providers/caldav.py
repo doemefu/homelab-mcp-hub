@@ -412,11 +412,19 @@ def _instances(
     recurring_uids = {
         str(c.get("UID", "")) for c in calendar.walk("VEVENT") if {"RRULE", "RDATE", "RECURRENCE-ID"} & set(c)
     }
+    # A cancelled master cancels the whole series, its overrides included (review 19 F11).
+    cancelled_uids = {
+        str(c.get("UID", ""))
+        for c in calendar.walk("VEVENT")
+        if "RECURRENCE-ID" not in c and str(c.get("STATUS", "")).upper() == "CANCELLED"
+    }
     # A broken series raises, so the caller skips this object and logs calendar_object_skipped (spec 080 §10.2).
     query = recurring_ical_events.of(calendar, skip_bad_series=False)
     events: list[RawEvent] = []
     for component in query.between(start.astimezone(UTC) - _WIDEN, end.astimezone(UTC) + _WIDEN):
         if component.name != "VEVENT" or str(component.get("STATUS", "CONFIRMED")).upper() == "CANCELLED":
+            continue
+        if str(component.get("UID", "")) in cancelled_uids:
             continue
         begin = cast(date, component.decoded("DTSTART"))
         finish = _end(component, begin)

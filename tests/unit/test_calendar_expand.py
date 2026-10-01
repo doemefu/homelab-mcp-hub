@@ -199,3 +199,13 @@ def test_repeated_text_properties_take_the_first_value() -> None:
     for text in (event.title or "", event.location or "", event.description or ""):
         assert "vText" not in text
         assert "second" not in text
+
+
+def test_a_cancelled_master_cancels_its_overrides_too() -> None:
+    # Review 19 F11: the moved, non-cancelled override of a cancelled series must not come back.
+    raw = ics.load("standup-overrides.ics").replace(
+        b"SUMMARY:Standup\r\n", b"SUMMARY:Standup\r\nSTATUS:CANCELLED\r\n", 1
+    )
+    assert expand(raw, href="/h/", name="Home", start=START, end=END, zone=ZURICH, floating=ZURICH) == []
+    other = ics.load("dst-weekly.ics")
+    assert len(expand(other, href="/h/", name="Home", start=START, end=END, zone=ZURICH, floating=ZURICH)) == 3
