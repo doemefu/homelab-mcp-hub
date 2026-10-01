@@ -38,6 +38,8 @@ _DROPPED_ELEMENTS: Final = frozenset({"script", "style", "head", "template", "no
 _VOID_ELEMENTS: Final = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 )
+# An unterminated comment, CDATA section or declaration at the end hides the rest, as in a browser.
+_UNTERMINATED: Final = (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<!", ">"), ("<?", ">"))
 _BLOCK_ELEMENTS: Final = frozenset(
     {
         "p", "div", "br", "li", "tr", "table", "ul", "ol", "blockquote", "section", "article", "header", "footer",
@@ -166,9 +168,20 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
 
+def _cut_unterminated(html: str) -> str:
+    """Drop a trailing comment, CDATA section or declaration that never ends; older CPython releases return it as
+    visible text on close()."""
+    cut = len(html)
+    for opener, closer in _UNTERMINATED:
+        start = html.find(opener, html.rfind(closer) + 1)
+        if start != -1:
+            cut = min(cut, start)
+    return html[:cut]
+
+
 def html_to_text(html: str) -> str:
     parser = _TextExtractor()
-    parser.feed(html)
+    parser.feed(_cut_unterminated(html))
     parser.close()
     return without_surrogates("".join(parser.parts))
 
