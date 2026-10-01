@@ -184,3 +184,30 @@ def test_lone_surrogates_never_leave_the_sanitiser(raw: str, expected: str) -> N
 def test_truncate_and_html_to_text_return_no_surrogates() -> None:
     assert not _has_surrogate(truncate("x\udcff" * 100, 50))
     assert not _has_surrogate(html_to_text("<p>a\udcffb</p>"))
+
+
+def test_unclosed_tags_keep_the_open_element_stack_bounded() -> None:
+    # Work per tag and per text chunk is bounded by the stack depth, so 256 KiB of unclosed tags stays linear.
+    from mcp_hub.sanitize import MAX_HTML_DEPTH, _TextExtractor
+
+    parser = _TextExtractor()
+    parser.feed("<b>x" * 65_536)
+    assert len(parser._stack) <= MAX_HTML_DEPTH
+    parser.close()
+    assert "".join(parser.parts).count("x") == 65_536
+
+
+def test_unclosed_tags_convert_quickly() -> None:
+    import time
+
+    started = time.perf_counter()
+    html_to_text("<b>x" * 65_536 + "<div>y" * 1_000)
+    assert time.perf_counter() - started < 5.0  # generous guard; was about 28 s before the depth cap
+
+
+def test_hidden_element_below_the_depth_cap_still_hides() -> None:
+    deep = "<div>" * 400
+    text = html_to_text(f"{deep}visible<span hidden>SECRET</span><div style='display:none'>MORE</div>")
+    assert "visible" in text
+    assert "SECRET" not in text
+    assert "MORE" not in text
