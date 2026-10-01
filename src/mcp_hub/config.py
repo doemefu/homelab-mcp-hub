@@ -23,6 +23,8 @@ _DEFAULTS: Final[dict[str, str]] = {
     "HUB_DEFAULT_TIMEZONE": "Europe/Zurich",
     "LOG_LEVEL": "INFO",
     "HUB_RESPONSE_BUDGET_CHARS": "30000",
+    "HUB_HEALTH_CHECK_INTERVAL_SECONDS": "1800",
+    "HUB_STATUS_CHECK_ENABLED": "false",
 }
 
 
@@ -44,6 +46,8 @@ class Settings:
     default_timezone: str
     log_level: str
     response_budget_chars: int
+    health_check_interval_seconds: int
+    status_check_enabled: bool
 
     @property
     def mcp_path(self) -> str:
@@ -100,6 +104,12 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         log_level=log_level,
         # Measured on the compact JSON of content[0].text (spec 080 rev. 4.4 §5.4, D59).
         response_budget_chars=_int("HUB_RESPONSE_BUDGET_CHARS", get("HUB_RESPONSE_BUDGET_CHARS"), 10000, 70000),
+        # Background status check interval (spec 080 rev. 4.4 §7.4, §8.1).
+        health_check_interval_seconds=_int(
+            "HUB_HEALTH_CHECK_INTERVAL_SECONDS", get("HUB_HEALTH_CHECK_INTERVAL_SECONDS"), 60, 86400
+        ),
+        # The background check contacts providers; only the deployment turns it on (spec 080 rev. 4.4 §8.1, D57).
+        status_check_enabled=_bool("HUB_STATUS_CHECK_ENABLED", get("HUB_STATUS_CHECK_ENABLED")),
     )
 
 
@@ -107,6 +117,13 @@ def _require_url(name: str, value: str, schemes: set[str]) -> None:
     parts = urlsplit(value)
     if parts.scheme not in schemes or not parts.netloc:
         raise ConfigError(f"{name} must be a URL with scheme {'/'.join(sorted(schemes))}")
+
+
+def _bool(name: str, value: str) -> bool:
+    lowered = value.lower()
+    if lowered not in ("true", "false"):
+        raise ConfigError(f"{name} must be true or false")
+    return lowered == "true"
 
 
 def _int(name: str, value: str, low: int, high: int) -> int:

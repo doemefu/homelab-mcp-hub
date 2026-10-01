@@ -41,7 +41,7 @@ def wired(settings: Settings, secrets_dir: Path) -> Iterator[TestClient]:
 
 def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, tokens: TokenFactory) -> None:
     tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
-    assert set(tools) == {"list_accounts", "list_unread", "get_message"}
+    assert set(tools) == {"list_accounts", "list_unread", "get_message", "get_events"}
     for name in ("list_unread", "get_message"):
         assert tools[name]["annotations"]["readOnlyHint"] is True
         assert tools[name]["annotations"]["destructiveHint"] is False

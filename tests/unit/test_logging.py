@@ -7,7 +7,7 @@ import pytest
 
 from mcp_hub.logging import JsonFormatter, apply_logger_levels, configure_logging, log_event
 
-THIRD_PARTY = ["httpx2", "httpcore2", "mcp", "caldav", "niquests", "imapclient", "uvicorn"]
+THIRD_PARTY = ["httpx2", "httpcore2", "mcp", "imapclient", "uvicorn"]
 
 
 def test_third_party_loggers_are_capped_even_at_debug() -> None:
@@ -85,3 +85,10 @@ def test_python_warnings_become_json_lines() -> None:
     line = JsonFormatter().format(captured[-1])
     assert json.loads(line)["event"] == "third_party_log"
     assert "secret-sentinel" not in line
+
+
+def test_pinned_loggers_are_the_installed_third_party_packages() -> None:
+    # spec 080 rev. 4.4 §9.7: no pins for packages that are not installed (caldav, niquests; D60)
+    from mcp_hub.logging import PINNED_WARNING
+
+    assert sorted(PINNED_WARNING) == sorted(THIRD_PARTY)

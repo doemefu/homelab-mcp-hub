@@ -154,3 +154,12 @@ def test_named_account_errors(account: str, code: str) -> None:
     with pytest.raises(ToolError) as info:
         select_accounts(registry_with_uzh(False), "calendar", account)
     assert info.value.code == code
+
+
+@pytest.mark.parametrize("url", ["http://caldav.icloud.com/", "ftp://caldav.icloud.com/", "//caldav.icloud.com/"])
+def test_a_calendar_url_must_be_https(tmp_path: Path, url: str) -> None:
+    # The CalDAV host rule compares schemes; this validation is what makes every credential destination https.
+    data = example()
+    data["accounts"][0]["calendar"]["url"] = url
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))
