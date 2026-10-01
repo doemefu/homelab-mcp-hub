@@ -26,10 +26,14 @@ SHAPES = {
 }
 
 
-def elapsed(text: str) -> float:
-    started = time.perf_counter()
-    html_to_text(text)
-    return time.perf_counter() - started
+def elapsed(text: str, runs: int = 3) -> float:
+    """Fastest of `runs` timings, so one scheduler hiccup cannot fail the check."""
+    best = float("inf")
+    for _ in range(runs):
+        started = time.perf_counter()
+        html_to_text(text)
+        best = min(best, time.perf_counter() - started)
+    return best
 
 
 def measure() -> list[tuple[str, float, float]]:
@@ -42,7 +46,15 @@ def scales_linearly(small: float, large: float) -> bool:
 
 def hidden_text_leaks() -> list[str]:
     """Unterminated comment or CDATA at the end of a document must stay hidden (R4)."""
-    cases = {"comment": "<p>Hi</p><!-- SECRET", "cdata": "<p>Hi</p><![CDATA[ SECRET", "bogus": "<p>Hi</p><! SECRET"}
+    cases = {
+        "comment": "<p>Hi</p><!-- SECRET",
+        "comment with >": "<p>Hi</p><!-- a > SECRET",
+        "cdata": "<p>Hi</p><![CDATA[ SECRET",
+        "cdata with >": "<p>Hi</p><![CDATA[ a > SECRET",
+        "bogus": "<p>Hi</p><! SECRET",
+        "nested end tag": "<td style='display:none'><table><tr><td>inner</td></tr></table>SECRET</td>",
+        "end tag beyond the depth cap": "<div>" * 300 + "<td hidden>S</td>SECRET",
+    }
     return [name for name, html in cases.items() if "SECRET" in html_to_text(html)]
 
 
