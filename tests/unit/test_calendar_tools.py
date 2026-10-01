@@ -463,3 +463,31 @@ async def test_cleaning_does_not_block_the_event_loop(secrets_dir: Path) -> None
         done.set()
     assert elapsed > 0.2  # the work is real (cleaning 200 x 6 fields of 60 KB)
     assert max(gaps) < 0.15  # the loop kept serving other coroutines meanwhile
+
+
+async def test_skipped_objects_are_reported_per_call(secrets_dir: Path) -> None:
+    two_calendar_accounts(secrets_dir)
+
+    class Skipping(FakeCalendar):
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> CalendarPage:
+            page = super().events(start, end, zone, floating)
+            return CalendarPage(events=page.events, truncated=False, skipped=2 if self.account.id == "icloud" else 1)
+
+    sources: dict[str, tuple[str, ...] | Exception] = {"icloud": ("allday.ics",), "icloud2": ("cross-zone.ics",)}
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir), "HUB_RESPONSE_BUDGET_CHARS": "10000"})
+    ctx = HubContext(
+        settings,
+        load_registry(secrets_dir / "accounts.json"),
+        StatusStore(),
+        Adapters(calendar=lambda a, d: Skipping(a, sources)),
+    )
+    result, _, outcome = await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=None)
+    assert result.skipped_objects == 3
+    assert result.truncated is False  # independent of truncated
+    assert outcome == "ok"
+    assert json.loads(result.model_dump_json())["skipped_objects"] == 3
+
+
+async def test_skipped_objects_is_always_present(secrets_dir: Path) -> None:
+    ctx = context(secrets_dir, {"icloud": ()})
+    assert (await get(ctx))["skipped_objects"] == 0

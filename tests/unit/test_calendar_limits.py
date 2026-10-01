@@ -567,3 +567,16 @@ def test_one_series_with_many_overrides_is_allowed() -> None:
     events = run(series_with_overrides(499))
     assert len(events) == 31  # the daily instances 10-17 .. 11-16 in the window, each moved to 12:00
     assert {e.title for e in events} == {"Moved"}
+
+
+def test_every_skip_is_counted_in_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = SlowObjectCache()
+    hostile = obj("RRULE:FREQ=SECONDLY;COUNT=10", uid="refused@example.test")
+    broken = ics.load("dst-weekly.ics").replace(b"RRULE:FREQ=WEEKLY;COUNT=3", b"RRULE:FREQ=WEEKLY;BYDAY=XX")
+    slow = obj("RRULE:FREQ=DAILY;BYSETPOS=2", uid="slow@example.test")
+    objects = (hostile, broken, slow, ics.load("allday.ics"))
+    first = source_for(*objects, slow_objects=cache, cpu_clock=FakeTime()).events(START, END, ZURICH, ZURICH)
+    assert (len(first.events), first.skipped) == (1, 3)
+    second = source_for(*objects, slow_objects=cache, cpu_clock=FakeTime()).events(START, END, ZURICH, ZURICH)
+    assert second.skipped == 3  # the slow object is skipped from the cache and still counted
+    assert source_for(ics.load("allday.ics")).events(START, END, ZURICH, ZURICH).skipped == 0

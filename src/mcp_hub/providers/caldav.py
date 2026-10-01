@@ -250,6 +250,7 @@ class _ExpansionTooSlow(BaseException):
 class CalendarPage:
     events: list[RawEvent]
     truncated: bool  # a cap or the time budget stopped the expansion
+    skipped: int = 0  # calendar objects left out (one calendar_object_skipped line each)
 
 
 class SlowObjectCache:
@@ -756,6 +757,7 @@ class CalDavCalendarSource:
         stops at MAX_INSTANCES_PER_CALL or EXPANSION_BUDGET_SECONDS (spec 080 rev. 4.5 D62)."""
         objects = sorted(objects, key=lambda pair: _recurring(pair[1]))  # stable: response order kept otherwise
         events: list[RawEvent] = []
+        skipped = 0
         started = self._clock()
         for calendar, ics in objects:
             if self._clock() - started > EXPANSION_BUDGET_SECONDS:
@@ -764,6 +766,7 @@ class CalDavCalendarSource:
             digest = hashlib.sha256(ics).hexdigest()
             if digest in self._slow_objects:
                 self._skipped(outcome="expansion_too_slow")
+                skipped += 1
                 continue
             try:  # one broken or refused calendar object never fails the account (spec 080 §10.2)
                 found, cut = _expand_object(
@@ -781,9 +784,11 @@ class CalDavCalendarSource:
                 if exc.reason == "expansion_too_slow":
                     self._slow_objects.add(digest)
                 self._skipped(outcome=exc.reason)
+                skipped += 1
                 continue
             except Exception as exc:
                 self._skipped(exception=type(exc).__name__)
+                skipped += 1
                 continue
             if cut:
                 stopped = stopped or "instance_cap"
@@ -803,7 +808,7 @@ class CalDavCalendarSource:
                 outcome=stopped,
                 result_count=len(events),
             )
-        return CalendarPage(events=events, truncated=stopped is not None)
+        return CalendarPage(events=events, truncated=stopped is not None, skipped=skipped)
 
     def _skipped(self, **fields: str) -> None:
         log_event(

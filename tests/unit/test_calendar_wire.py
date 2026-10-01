@@ -75,3 +75,14 @@ def test_get_events_without_offset_is_invalid_argument(wired: TestClient, tokens
     result = body(modern(wired, tokens.mint(), "tools/call", params, name="get_events"))["result"]
     assert result["isError"] is True
     assert json.loads(result["content"][0]["text"])["code"] == "invalid_argument"
+
+
+def test_get_events_output_schema_has_skipped_objects(wired: TestClient, tokens: TokenFactory) -> None:
+    tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
+    schema = tools["get_events"]["outputSchema"]
+    field = schema["properties"]["skipped_objects"]
+    assert field["type"] == "integer"
+    assert field["minimum"] == 0
+    assert "may be incomplete" in field["description"]
+    assert "skipped_objects" in schema["required"]
+    assert "skipped_objects" in tools["get_events"]["description"]
