@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Final
 
 HUB_LOGGER: Final = "mcp_hub"
-PINNED_WARNING: Final = ("httpx2", "httpcore2", "mcp", "caldav", "niquests", "imapclient", "uvicorn")
+PINNED_WARNING: Final = ("httpx2", "httpcore2", "mcp", "imapclient", "uvicorn")
 # Loggers whose WARNING lines contain request data; the hub logs its own check name instead.
 PINNED_ERROR: Final = ("mcp.server.transport_security",)
 
