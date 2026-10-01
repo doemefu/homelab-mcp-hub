@@ -23,6 +23,7 @@ _DEFAULTS: Final[dict[str, str]] = {
     "HUB_DEFAULT_TIMEZONE": "Europe/Zurich",
     "LOG_LEVEL": "INFO",
     "HUB_RESPONSE_BUDGET_CHARS": "30000",
+    "HUB_HEALTH_CHECK_INTERVAL_SECONDS": "1800",
 }
 
 
@@ -44,6 +45,7 @@ class Settings:
     default_timezone: str
     log_level: str
     response_budget_chars: int
+    health_check_interval_seconds: int
 
     @property
     def mcp_path(self) -> str:
@@ -100,6 +102,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         log_level=log_level,
         # Measured on the compact JSON of content[0].text (spec 080 rev. 4.4 §5.4, D59).
         response_budget_chars=_int("HUB_RESPONSE_BUDGET_CHARS", get("HUB_RESPONSE_BUDGET_CHARS"), 10000, 70000),
+        # Background status check interval (spec 080 rev. 4.4 §7.4, §8.1).
+        health_check_interval_seconds=_int(
+            "HUB_HEALTH_CHECK_INTERVAL_SECONDS", get("HUB_HEALTH_CHECK_INTERVAL_SECONDS"), 60, 86400
+        ),
     )
 
 

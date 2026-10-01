@@ -61,3 +61,14 @@ def test_response_budget_default_and_override() -> None:
 def test_response_budget_out_of_range_is_rejected(value: str) -> None:
     with pytest.raises(ConfigError, match="HUB_RESPONSE_BUDGET_CHARS"):
         load_settings({"HUB_RESPONSE_BUDGET_CHARS": value})
+
+
+def test_health_check_interval_default_and_override() -> None:
+    assert load_settings({}).health_check_interval_seconds == 1800
+    assert load_settings({"HUB_HEALTH_CHECK_INTERVAL_SECONDS": "600"}).health_check_interval_seconds == 600
+
+
+@pytest.mark.parametrize("value", ["59", "86401", "x"])
+def test_health_check_interval_out_of_range_is_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match="HUB_HEALTH_CHECK_INTERVAL_SECONDS"):
+        load_settings({"HUB_HEALTH_CHECK_INTERVAL_SECONDS": value})

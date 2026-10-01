@@ -60,6 +60,8 @@ spec:
               value: "Europe/Zurich"
             - name: HUB_RESPONSE_BUDGET_CHARS
               value: "30000"
+            - name: HUB_HEALTH_CHECK_INTERVAL_SECONDS
+              value: "1800"
             - name: LOG_LEVEL
               value: "INFO"
           securityContext:
