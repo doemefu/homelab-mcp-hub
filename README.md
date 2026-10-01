@@ -10,8 +10,8 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 
 | Work package | Scope | Status |
 |--------------|-------|--------|
-| WP5a | Repository bootstrap, authorization layer, `list_accounts`, image, CI, `k8s/` | Done (this release) |
-| WP5b | IMAP adapter, `list_unread`, `get_message` | Planned |
+| WP5a | Repository bootstrap, authorization layer, `list_accounts`, image, CI, `k8s/` | Done |
+| WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | In review |
 | WP5c | CalDAV adapter, `get_events` | Planned |
 | WP5d | `search_mail`, paging, metrics on the internal port | Planned |
 | WP8–WP10 | Further accounts (IMAP folder handling, Microsoft Graph, calendar feed) | Planned |
@@ -26,7 +26,8 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 | Protocol versions | `2026-07-28` (stateless) and `2025-11-25` (initialize handshake) |
 | Scopes | `mail:read calendar:read` (both required) |
 | Image | `ghcr.io/doemefu/homelab-mcp-hub:main-<UTC timestamp>` (linux/amd64 + linux/arm64) |
-| Stack | Python 3.13, `mcp` 2.2.0, uvicorn, starlette, pydantic, PyJWT |
+| Tools | `list_accounts`, `list_unread`, `get_message` (all read-only) |
+| Stack | Python 3.13, `mcp` 2.2.0, uvicorn, starlette, pydantic, PyJWT, IMAPClient |
 | Deployment | Flux from `k8s/` into namespace `apps` (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
 
 ## Build and test
@@ -35,7 +36,9 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 uv sync --locked
 uv run ruff check && uv run ruff format --check
 uv run mypy --strict src
-uv run pytest                      # unit, contract (gate G6) and integration tests
+uv run pytest -m "not provider"    # unit, contract (gate G6) and integration tests
+# provider tests against a local GreenMail container (see CONTRIBUTING.md)
+scripts/provider_services.sh up && HUB_PROVIDER_TESTS=1 uv run pytest -m provider; scripts/provider_services.sh down
 ```
 
 ## Run locally
