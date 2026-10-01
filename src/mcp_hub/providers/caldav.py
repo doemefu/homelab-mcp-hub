@@ -3,6 +3,10 @@
 Discovery (principal -> calendar home -> calendars) and one calendar-query REPORT per calendar, all through httpx2
 with the credential-destination rule, read as streams capped at 5 MiB; expansion on the client with
 recurring-ical-events. Blocking; the tool layer runs it through providers.base.run_blocking. Returns unsanitised text.
+
+This is the only module that imports icalendar, recurring-ical-events or dateutil (a unit test enforces it). `expand()`
+is the single guarded entry point for parsing and expanding one calendar object (pre-screen, rule screen, per-object
+time-zone isolation, CPU deadline, caps; spec 080 rev. 4.5 D62); the ICS-feed adapter of a later story must use it.
 """
 
 import hashlib
@@ -25,6 +29,7 @@ from zoneinfo import ZoneInfo
 import httpx2
 import icalendar
 import recurring_ical_events
+from icalendar.timezone import tzp
 
 from mcp_hub.logging import log_event
 from mcp_hub.providers.base import PROVIDER_TIMEOUT_SECONDS, ProviderError, read_capped
@@ -44,6 +49,7 @@ ALLOWED_FREQUENCIES: Final = frozenset({"YEARLY", "MONTHLY", "WEEKLY", "DAILY"})
 MAX_RECURRENCE_DATES: Final = 1000  # RDATE values and EXDATE values, each counted per object
 MAX_OBJECT_BYTES: Final = 256 * 1024  # one calendar object, checked before parsing
 MAX_COMPONENTS_PER_OBJECT: Final = 500  # VEVENT components (master and overrides) per object
+MAX_TIMEZONES_PER_OBJECT: Final = 20  # VTIMEZONE components per object (real objects carry one to three)
 _TIME_OF_DAY_PARTS: Final = ("BYHOUR", "BYMINUTE", "BYSECOND")  # at most one value each
 EARLIEST_START: Final = date(1900, 1, 1)
 MAX_INSTANCES_PER_OBJECT: Final = 1000
@@ -54,6 +60,7 @@ SLOW_OBJECT_CACHE_SIZE: Final = 1000
 _FOLD: Final = re.compile(rb"\r?\n[ \t]")
 _RECURRING_LINE: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
 _BEGIN_VEVENT: Final = re.compile(rb"(?im)^BEGIN:VEVENT[ \t]*\r?$")
+_BEGIN_VTIMEZONE: Final = re.compile(rb"(?im)^BEGIN:VTIMEZONE[ \t]*\r?$")
 _DATE_LINE: Final = re.compile(rb"(?im)^(RDATE|EXDATE)[;:][^\r\n]*")
 
 
@@ -254,6 +261,21 @@ class SlowObjectCache:
 
 
 SLOW_OBJECTS: Final = SlowObjectCache()
+# icalendar caches every VTIMEZONE whose TZID zoneinfo does not know in one process-wide map, first writer wins and
+# never evicted: one object could shift another object's (or account's) events, and unique TZIDs grow it without
+# bound. Each object is therefore parsed and expanded alone, with that cache emptied before and after (spec 080
+# rev. 4.5 D62, "time-zone definitions are isolated per calendar object"). Held for one object only, never across
+# network I/O; the CPU deadline inside bounds how long it is held.
+EXPANSION_LOCK: Final = threading.Lock()
+
+
+def _isolated[T](func: Callable[[], T]) -> T:
+    with EXPANSION_LOCK:
+        tzp.use_zoneinfo()  # public API: a fresh, empty time-zone cache
+        try:
+            return func()
+        finally:
+            tzp.use_zoneinfo()  # every exit path: normal, library error, refusal, injected deadline
 
 
 def _values(value: object) -> list[object]:
@@ -271,6 +293,8 @@ def _prescreen(ics: bytes) -> None:
         raise ObjectSkippedError("object_too_large")
     text = _FOLD.sub(b"", ics)
     if len(_BEGIN_VEVENT.findall(text)) > MAX_COMPONENTS_PER_OBJECT:
+        raise ObjectSkippedError("too_many_components")
+    if len(_BEGIN_VTIMEZONE.findall(text)) > MAX_TIMEZONES_PER_OBJECT:
         raise ObjectSkippedError("too_many_components")
     counts = {b"RDATE": 0, b"EXDATE": 0}
     for line in _DATE_LINE.finditer(text):
@@ -357,7 +381,7 @@ def _expand_object(
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
 
     try:
-        found = _with_cpu_deadline(work, cpu_seconds, cpu_clock)
+        found = _isolated(lambda: _with_cpu_deadline(work, cpu_seconds, cpu_clock))  # lock outside, hook inside
     except _ExpansionTooSlow:
         raise ObjectSkippedError("expansion_too_slow") from None
     found.sort(key=lambda event: event.sort_key)
