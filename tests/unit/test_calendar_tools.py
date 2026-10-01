@@ -247,3 +247,70 @@ async def test_event_ids_are_opaque_and_distinct_per_instance(secrets_dir: Path)
         assert "standup" not in value
     again = [i["id"] for i in (await get(ctx))["items"]]  # type: ignore[union-attr]
     assert again == ids
+
+
+class HostileCalendar:
+    """Hundreds of instances with quote-heavy, maximal third-party fields (review 18 F2 invariant)."""
+
+    def __init__(self, account: Account) -> None:
+        self.account = account
+
+    def check(self) -> None: ...
+
+    def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+        quoted = '"\\' * 2000
+        return [
+            RawEvent(
+                calendar_href=f"https://cal.example.test/{self.account.id}/home/",
+                calendar_name=quoted,
+                uid=f"hostile-{n}@example.test",
+                recurrence_id=str(n),
+                all_day=False,
+                start=start.astimezone(zone),
+                end=end.astimezone(zone),
+                sort_key=start,
+                recurring=True,
+                status="confirmed",
+                attendee_count=10_000,
+                title=quoted,
+                location=quoted,
+                description=quoted * 20,
+                organizer_name=quoted,
+                organizer_address=quoted,
+                original_timezone="Europe/Zurich",
+            )
+            for n in range(400)
+        ]
+
+
+@pytest.mark.parametrize("budget", [10_000, 30_000, 70_000])
+async def test_result_never_exceeds_the_budget(secrets_dir: Path, budget: int) -> None:
+    two_calendar_accounts(secrets_dir)
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir), "HUB_RESPONSE_BUDGET_CHARS": str(budget)})
+    adapters = Adapters(calendar=lambda account, _dir: HostileCalendar(account))
+    ctx = HubContext(settings, load_registry(secrets_dir / "accounts.json"), StatusStore(), adapters)
+    result, _, _ = await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=200)
+    assert len(result.model_dump_json()) <= budget
+    assert result.items
+    assert result.truncated is True
+
+
+async def test_invalid_utf8_in_an_event_still_serialises_strictly(secrets_dir: Path) -> None:
+    broken = ics.load("allday.ics").replace(b"SUMMARY:Weekend away", b"SUMMARY:M\xfcller \xff\xfe away")
+
+    class Mixed(FakeCalendar):
+        def events(self, start: datetime, end: datetime, zone: ZoneInfo, floating: ZoneInfo) -> list[RawEvent]:
+            href = "https://cal.example.test/icloud/home/"
+            return expand(
+                broken, href=href, name="Home", start=start, end=end, zone=zone, floating=floating
+            ) + super().events(start, end, zone, floating)
+
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    adapters = Adapters(calendar=lambda account, _dir: Mixed(account, {"icloud": ("dst-weekly.ics",)}))
+    ctx = HubContext(settings, load_registry(secrets_dir / "accounts.json"), StatusStore(), adapters)
+    result, _, _ = await run_get_events(ctx, start=FROM, end=TO, account=None, timezone=None, limit=None)
+    text = result.model_dump_json()
+    text.encode("utf-8")  # strict: no lone surrogates
+    titles = [i["untrusted"]["title"] for i in json.loads(text)["items"]]
+    assert titles.count("Weekly DST") == 3
+    assert any(t.startswith("M") and t.endswith("away") for t in titles)
