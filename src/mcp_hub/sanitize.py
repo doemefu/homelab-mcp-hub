@@ -27,6 +27,10 @@ FIELD_LIMITS: Final[dict[str, int]] = {
 # Zero-width (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi controls (U+202A-U+202E, U+2066-U+2069).
 _INVISIBLE: Final = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u202a-\u202e\u2066-\u2069]")
 _URL: Final = re.compile(r"(?i)(?:\bmailto:[^\s<>\"']*|\b(?:https?|ftp)://[^\s<>\"']*|\bwww\.[^\s<>\"']+)")
+_SURROGATE: Final = re.compile(r"[\ud800-\udfff]")
+# Raw patterns: the regex engine reads the \u escapes, so no lone surrogate appears in the source string.
+_NON_ESCAPE_SURROGATE: Final = re.compile(r"[\ud800-\udc7f\udd00-\udfff]")
+MAX_HTML_DEPTH: Final = 256  # open elements tracked by the HTML-to-text converter
 _BLANK_RUNS: Final = re.compile(r"\n{3,}")
 _SPACES: Final = re.compile(r" +")
 _CONTENT_TYPE: Final = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
@@ -42,8 +46,21 @@ _BLOCK_ELEMENTS: Final = frozenset(
 )  # fmt: skip
 
 
+def without_surrogates(text: str) -> str:
+    """No lone surrogate (category Cs) survives: it would make the JSON result unserialisable.
+
+    The stdlib email parser keeps undecodable header bytes as surrogate escapes (U+DC80-U+DCFF). They are turned
+    back into bytes and decoded as UTF-8, so raw UTF-8 headers keep their text; bytes of any other charset become
+    U+FFFD (the charset is unknown, guessing one could invent text). Any other lone surrogate becomes U+FFFD."""
+    if not _SURROGATE.search(text):
+        return text
+    text = _NON_ESCAPE_SURROGATE.sub("\ufffd", text)
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 def truncate(text: str, limit: int) -> str:
     """Cut to `limit` characters including the visible marker (limits are all longer than the marker)."""
+    text = without_surrogates(text)
     if len(text) <= limit:
         return text
     return text[: max(limit - len(TRUNCATION_MARKER), 0)].rstrip() + TRUNCATION_MARKER
@@ -61,7 +78,7 @@ def _link(match: re.Match[str]) -> str:
 
 
 def _normalise(value: str, *, multiline: bool) -> str:
-    text = unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
+    text = unicodedata.normalize("NFC", without_surrogates(value)).replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u2028", "\n").replace("\u2029", "\n")
     text = _INVISIBLE.sub("", text)  # the spec's explicit list (§5.3 rule 3)
     # Superset (spec 080 rev. 4.4 §5.3, S10): every other control (Cc) and format (Cf) character, which includes the
@@ -98,31 +115,49 @@ def _hidden(attrs: list[tuple[str, str | None]]) -> bool:
 
 
 class _TextExtractor(HTMLParser):
-    """Visible text only: dropped and hidden elements hide their whole subtree; images and comments vanish."""
+    """Visible text only: dropped and hidden elements hide their whole subtree; images and comments vanish.
+
+    Every step costs at most O(MAX_HTML_DEPTH): a counter tracks the hiding elements on the stack, and start tags
+    beyond the depth cap are not pushed (their end tags are consumed by `_overflow`), so unclosed tags cannot make
+    the conversion quadratic. A hiding element beyond the cap hides the rest of the document."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._stack: list[tuple[str, bool]] = []
+        self._hiding = 0  # hiding elements on the stack
+        self._overflow = 0  # open start tags beyond the depth cap
+        self._hide_rest = False
 
     def _visible(self) -> bool:
-        return not any(hides for _, hides in self._stack)
+        return self._hiding == 0 and not self._hide_rest
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _BLOCK_ELEMENTS and self._visible():
             self.parts.append("\n")
-        if tag not in _VOID_ELEMENTS:
-            self._stack.append((tag, tag in _DROPPED_ELEMENTS or _hidden(attrs)))
+        if tag in _VOID_ELEMENTS:
+            return
+        hides = tag in _DROPPED_ELEMENTS or _hidden(attrs)
+        if len(self._stack) >= MAX_HTML_DEPTH:
+            self._overflow += 1
+            self._hide_rest = self._hide_rest or hides
+            return
+        self._stack.append((tag, hides))
+        self._hiding += hides
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _BLOCK_ELEMENTS and self._visible():
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        for index in range(len(self._stack) - 1, -1, -1):  # unmatched end tags are ignored
-            if self._stack[index][0] == tag:
-                del self._stack[index:]
-                break
+        if self._overflow:
+            self._overflow -= 1
+        else:
+            for index in range(len(self._stack) - 1, -1, -1):  # unmatched end tags are ignored
+                if self._stack[index][0] == tag:
+                    self._hiding -= sum(hides for _, hides in self._stack[index:])
+                    del self._stack[index:]
+                    break
         if tag in _BLOCK_ELEMENTS and self._visible():
             self.parts.append("\n")
 
@@ -135,7 +170,7 @@ def html_to_text(html: str) -> str:
     parser = _TextExtractor()
     parser.feed(html)
     parser.close()
-    return "".join(parser.parts)
+    return without_surrogates("".join(parser.parts))
 
 
 def validate_content_type(value: str | None) -> str | None:

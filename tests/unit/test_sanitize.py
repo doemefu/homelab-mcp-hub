@@ -6,6 +6,7 @@ from mcp_hub.sanitize import (
     clean,
     clean_flagged,
     html_to_text,
+    truncate,
     validate_content_type,
     validate_timezone,
 )
@@ -158,3 +159,55 @@ def test_timezone_names_do_not_depend_on_the_system_zone_database(monkeypatch: p
         assert validate_timezone("Europe/Zurich") == "Europe/Zurich"
     finally:
         sanitize._iana_names.cache_clear()
+
+
+def _has_surrogate(text: str) -> bool:
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("M\udcfcller", "M�ller"),  # raw Latin-1 byte, escaped by the email parser: unknown charset
+        ("J\udcc3\udcbcrg", "Jürg"),  # raw UTF-8 bytes, escaped by the email parser: restored
+        ("\udcff", "�"),
+        ("a\ud800b", "a�b"),  # a lone surrogate outside the escape range
+        ("ok", "ok"),
+    ],
+)
+def test_lone_surrogates_never_leave_the_sanitiser(raw: str, expected: str) -> None:
+    assert clean(raw, 100) == expected
+    assert clean_flagged(raw, 100, multiline=True)[0] == expected
+    assert clean(raw, 100).encode("utf-8")  # strict encoding works
+
+
+def test_truncate_and_html_to_text_return_no_surrogates() -> None:
+    assert not _has_surrogate(truncate("x\udcff" * 100, 50))
+    assert not _has_surrogate(html_to_text("<p>a\udcffb</p>"))
+
+
+def test_unclosed_tags_keep_the_open_element_stack_bounded() -> None:
+    # Work per tag and per text chunk is bounded by the stack depth, so 256 KiB of unclosed tags stays linear.
+    from mcp_hub.sanitize import MAX_HTML_DEPTH, _TextExtractor
+
+    parser = _TextExtractor()
+    parser.feed("<b>x" * 65_536)
+    assert len(parser._stack) <= MAX_HTML_DEPTH
+    parser.close()
+    assert "".join(parser.parts).count("x") == 65_536
+
+
+def test_unclosed_tags_convert_quickly() -> None:
+    import time
+
+    started = time.perf_counter()
+    html_to_text("<b>x" * 65_536 + "<div>y" * 1_000)
+    assert time.perf_counter() - started < 5.0  # generous guard; was about 28 s before the depth cap
+
+
+def test_hidden_element_below_the_depth_cap_still_hides() -> None:
+    deep = "<div>" * 400
+    text = html_to_text(f"{deep}visible<span hidden>SECRET</span><div style='display:none'>MORE</div>")
+    assert "visible" in text
+    assert "SECRET" not in text
+    assert "MORE" not in text
