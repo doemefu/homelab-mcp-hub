@@ -56,6 +56,9 @@ MAX_COMPONENTS_PER_OBJECT: Final = 1000  # VEVENT components (master and overrid
 MAX_TIMEZONES_PER_OBJECT: Final = 20  # VTIMEZONE components per object (real objects carry one to three)
 _TIME_OF_DAY_PARTS: Final = ("BYMINUTE", "BYSECOND")  # at most one value each; BYHOUR lists are allowed (<= 24/day)
 EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (iterated from DTSTART)
+# dateutil keeps every occurrence it iterates from DTSTART (60-90 bytes each) and the CPU deadline does not bound
+# memory: a rule whose estimated occurrences up to the window end exceed this is refused before expansion.
+MAX_ITERATED_OCCURRENCES: Final = 100_000
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
@@ -370,7 +373,53 @@ def _prescreen(ics: bytes) -> bytes:
     return bytes(kept)
 
 
-def _screen(calendar: icalendar.Calendar) -> None:
+def _count(rule: icalendar.vRecur, part: str) -> int:
+    return len(_values(rule.get(part)))
+
+
+def iteration_bound(rule: icalendar.vRecur, start: date, window_end: date) -> int:
+    """Upper bound of the occurrences the expansion library iterates from DTSTART up to the window end (spec 080
+    rev. 4.5 D62, confirmation review C1). Deliberately conservative: periods are rounded up and each period counts
+    the most occurrences its BY lists allow. A property test compares it with dateutil."""
+    end = window_end
+    for until in _values(rule.get("UNTIL")):
+        day = until.date() if isinstance(until, datetime) else until
+        if isinstance(day, date):
+            end = min(end, day + timedelta(days=1))  # a day of slack for UTC vs. local dates
+    freq = str(_values(rule.get("FREQ"))[0]).upper()
+    if end < start:
+        periods = 1
+    elif freq == "YEARLY":
+        periods = end.year - start.year + 1
+    elif freq == "MONTHLY":
+        periods = (end.year - start.year) * 12 + end.month - start.month + 1
+    elif freq == "WEEKLY":
+        periods = (end - start).days // 7 + 2
+    else:
+        periods = (end - start).days + 1
+    intervals = _values(rule.get("INTERVAL"))
+    interval = cast(int, intervals[0]) if intervals else 1
+    periods = -(-periods // interval)
+    if freq == "YEARLY":
+        if any(_count(rule, part) for part in ("BYWEEKNO", "BYYEARDAY", "BYDAY")):
+            per_period = 366
+        else:  # BYMONTHDAY without BYMONTH applies to all twelve months
+            months = _count(rule, "BYMONTH") or (12 if _count(rule, "BYMONTHDAY") else 1)
+            per_period = min(366, months * max(1, _count(rule, "BYMONTHDAY")))
+    elif freq == "MONTHLY":
+        per_period = 31 if _count(rule, "BYDAY") else min(31, max(1, _count(rule, "BYMONTHDAY")))
+    elif freq == "WEEKLY":
+        per_period = min(7, max(1, _count(rule, "BYDAY")))
+    else:
+        per_period = 1
+    bound = periods * per_period * max(1, _count(rule, "BYHOUR"))  # BYMINUTE/BYSECOND carry at most one value
+    counts = _values(rule.get("COUNT"))
+    if counts:
+        bound = min(bound, cast(int, counts[0]))
+    return max(1, bound)
+
+
+def _screen(calendar: icalendar.Calendar, window_end: date) -> None:
     """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs: with
     FREQ at least daily and at most one value per time-of-day part, a rule yields at most a few dozen instances in a
     widened 31-day window (spec 080 rev. 4.5 D62 B). One object holds one series: one UID (one per CalDAV resource,
@@ -401,12 +450,15 @@ def _screen(calendar: icalendar.Calendar) -> None:
             parts = cast(dict[str, object], rule)
             if any(len(_values(parts.get(part))) > 1 for part in _TIME_OF_DAY_PARTS):
                 raise ObjectSkippedError("rule_refused")
-            # Only daily and weekly rules iterate a long way from an old DTSTART; yearly birthdays from 1604
-            # (Apple's year-less birthdays) and old monthly series stay cheap.
-            if frequencies & _EARLY_START_FREQUENCIES and "DTSTART" in component:
+            if "DTSTART" in component:
                 begin = cast(date, component.decoded("DTSTART"))
-                if (begin.date() if isinstance(begin, datetime) else begin) < EARLIEST_START:
+                first = begin.date() if isinstance(begin, datetime) else begin
+                # Only daily and weekly rules are held to 1900; yearly birthdays from 1604 (Apple's year-less
+                # birthdays) and old monthly series stay cheap and are bounded by the estimate below.
+                if frequencies & _EARLY_START_FREQUENCIES and first < EARLIEST_START:
                     raise ObjectSkippedError("start_out_of_range")
+                if iteration_bound(rule, first, window_end) > MAX_ITERATED_OCCURRENCES:
+                    raise ObjectSkippedError("rule_refused")
 
 
 def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Callable[[], float]) -> T:
@@ -466,7 +518,7 @@ def _expand_object(
 
     def work() -> list[RawEvent]:
         calendar = icalendar.Calendar.from_ical(_prescreen(ics))
-        _screen(calendar)
+        _screen(calendar, (end + _WIDEN).astimezone(UTC).date() + timedelta(days=1))
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
 
     try:
