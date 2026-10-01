@@ -307,3 +307,67 @@ def test_broken_calendar_objects_are_skipped_individually(
         assert set(fields) == {"account", "capability", "exception"}
         assert (fields["account"], fields["capability"]) == ("icloud", "calendar")
         assert set(fields) <= allowed_fields("calendar_object_skipped")
+
+
+def raw_report(*objects: bytes, prolog: bytes = b'<?xml version="1.0" encoding="utf-8"?>') -> bytes:
+    """A multistatus built from raw bytes (report() would need valid UTF-8)."""
+    parts = b"".join(
+        b"<D:response><D:href>/o%d.ics</D:href><D:propstat><D:prop><C:calendar-data>%s</C:calendar-data></D:prop>"
+        b"<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>" % (n, o)
+        for n, o in enumerate(objects)
+    )
+    return (
+        prolog + b'<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">' + parts + b"</D:multistatus>"
+    )
+
+
+def invalid_summary() -> bytes:
+    return ics.load("allday.ics").replace(b"SUMMARY:Weekend away", b"SUMMARY:M\xfcller \xff away")
+
+
+def test_invalid_utf8_in_a_multistatus_is_replaced_once(
+    httpserver: HTTPServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    serve_discovery(httpserver)
+    httpserver.expect_request("/h/home/", method="REPORT").respond_with_data(
+        raw_report(invalid_summary(), ics.load("dst-weekly.ics")), status=207, content_type=XML
+    )
+    with caplog.at_level(logging.INFO, logger="mcp_hub"):
+        events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH)
+    titles = sorted(e.title or "" for e in events)
+    assert titles == ["M�ller � away", "Weekly DST", "Weekly DST", "Weekly DST"]
+    repaired = [r for r in caplog.records if r.getMessage() == "xml_encoding_repaired"]
+    assert len(repaired) == 1
+    assert repaired[0].fields == {"account": "icloud", "capability": "calendar"}  # type: ignore[attr-defined]
+
+
+_PRINCIPAL = (
+    b'<D:multistatus xmlns:D="DAV:"><D:response><D:href>/</D:href><D:propstat><D:prop>'
+    b"<D:displayname>\xff</D:displayname><D:current-user-principal><D:href>%s</D:href></D:current-user-principal>"
+    b"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"
+)
+
+
+def test_the_utf8_retry_parses_a_principal_with_invalid_bytes(httpserver: HTTPServer) -> None:
+    body = b'<?xml version="1.0" encoding="utf-8"?>' + _PRINCIPAL % b"/p/"
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
+    source(httpserver).check()  # the retry succeeds: same document shape as the refusal cases below
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Each would yield a valid principal if the retry accepted a document type or entity declaration.
+        b'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE x [<!ENTITY a "/p/">]>' + _PRINCIPAL % b"&a;",
+        b'<?xml version="1.0"?><!DOCTYPE x SYSTEM "file:///etc/passwd">' + _PRINCIPAL % b"/p/",
+        b'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE x>' + _PRINCIPAL % b"/p/",
+        # Still malformed after the replacement; non-UTF-8 declarations get no retry.
+        b'<?xml version="1.0" encoding="utf-8"?>' + (_PRINCIPAL % b"/p/").replace(b"</D:prop>", b"<D:prop>"),
+        b'<?xml version="1.0" encoding="US-ASCII"?>' + _PRINCIPAL % b"/p/",
+    ],
+    ids=["entity", "system-dtd", "doctype", "still-malformed", "declared-ascii"],
+)
+def test_the_utf8_retry_is_no_bypass(httpserver: HTTPServer, body: bytes) -> None:
+    httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
+    error = code_of(source(httpserver).check)
+    assert (error.code, error.cause) == ("upstream_error", "XmlRefused")

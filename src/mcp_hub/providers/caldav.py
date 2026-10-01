@@ -26,6 +26,7 @@ from mcp_hub.sanitize import validate_timezone
 
 _DAV: Final = "{DAV:}"
 _CALDAV: Final = "{urn:ietf:params:xml:ns:caldav}"
+_XML_ENCODING: Final = re.compile(rb"\s*<\?xml[^>]*?encoding\s*=\s*[\"']([A-Za-z0-9._-]+)[\"']")
 _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both sides (spec 080 rev. 4.4 §5.4)
 
 
@@ -62,10 +63,7 @@ def _clark(name: str) -> str:
     return "{" + name if "}" in name else name  # expat "ns}local" -> ElementTree "{ns}local"
 
 
-def parse_xml(raw: bytes) -> ET.Element:
-    """Stdlib-only hardened parse (D58): expat itself refuses any DOCTYPE and any entity declaration, whatever the
-    document encoding (UTF-16 included); parameter entities are never parsed; no external resource is ever fetched.
-    The tree is built with ElementTree's TreeBuilder."""
+def _parse(raw: bytes) -> ET.Element:
     builder = ET.TreeBuilder()
     parser = xml.parsers.expat.ParserCreate(namespace_separator="}")
     parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
@@ -78,17 +76,49 @@ def parse_xml(raw: bytes) -> ET.Element:
     )
     parser.EndElementHandler = lambda name: builder.end(_clark(name))
     parser.CharacterDataHandler = builder.data
+    parser.Parse(raw, True)
+    return builder.close()
+
+
+def _declares_utf8(raw: bytes) -> bool:
+    """UTF-8 by declaration or by default (no UTF-16/32 byte-order mark, no other declared encoding)."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
+        return False
+    declared = _XML_ENCODING.match(raw.removeprefix(b"\xef\xbb\xbf"))
+    return declared is None or declared.group(1).lower() in (b"utf-8", b"utf8")
+
+
+def parse_xml(raw: bytes, *, account: str | None = None) -> ET.Element:
+    """Stdlib-only hardened parse (D58): expat itself refuses any DOCTYPE and any entity declaration, whatever the
+    document encoding (UTF-16 included); parameter entities are never parsed; no external resource is ever fetched.
+    The tree is built with ElementTree's TreeBuilder.
+
+    A UTF-8 document that is not valid UTF-8 is parsed exactly once more, by the same refusing parser, with the
+    invalid bytes replaced by U+FFFD, so one event with broken bytes does not cost the whole calendar (spec 080
+    rev. 4.5). Other declared encodings get no retry and no charset guessing."""
     try:
-        parser.Parse(raw, True)
-        return builder.close()
+        return _parse(raw)
     except (_RefusedError, xml.parsers.expat.ExpatError, AssertionError):
-        raise ProviderError("upstream_error", "XmlRefused") from None
+        pass
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if _declares_utf8(raw):
+            try:
+                tree = _parse(raw.decode("utf-8", "replace").encode("utf-8"))
+            except (_RefusedError, xml.parsers.expat.ExpatError, AssertionError):
+                pass
+            else:
+                if account is not None:
+                    log_event(_log, logging.WARNING, "xml_encoding_repaired", account=account, capability="calendar")
+                return tree
+    raise ProviderError("upstream_error", "XmlRefused")
 
 
-def parse_multistatus(raw: bytes) -> list[bytes]:
+def parse_multistatus(raw: bytes, *, account: str | None = None) -> list[bytes]:
     """calendar-data of every propstat with status 200."""
     found = []
-    for propstat in parse_xml(raw).iter(f"{_DAV}propstat"):
+    for propstat in parse_xml(raw, account=account).iter(f"{_DAV}propstat"):
         if " 200 " not in f"{propstat.findtext(f'{_DAV}status', '')} ":
             continue
         data = propstat.find(f"{_DAV}prop/{_CALDAV}calendar-data")
@@ -297,7 +327,7 @@ class CalDavCalendarSource:
 
     def _principal(self, client: httpx2.Client) -> str:
         base, raw = self._request(client, "PROPFIND", self._url, PRINCIPAL_BODY, "0")
-        principal = _href(parse_xml(raw).find(f".//{_DAV}current-user-principal"), base)
+        principal = _href(parse_xml(raw, account=self._account).find(f".//{_DAV}current-user-principal"), base)
         if principal is None:
             raise ProviderError("upstream_error", "NoPrincipal")
         return principal
@@ -305,12 +335,12 @@ class CalDavCalendarSource:
     def _calendars(self, client: httpx2.Client) -> list[CalendarRef]:
         principal = self._principal(client)
         base, raw = self._request(client, "PROPFIND", principal, HOME_BODY, "0")
-        home = _href(parse_xml(raw).find(f".//{_CALDAV}calendar-home-set"), base)
+        home = _href(parse_xml(raw, account=self._account).find(f".//{_CALDAV}calendar-home-set"), base)
         if home is None:
             raise ProviderError("upstream_error", "NoCalendarHome")
         base, raw = self._request(client, "PROPFIND", home, LIST_BODY, "1")
         found = []
-        for response in parse_xml(raw).iter(f"{_DAV}response"):
+        for response in parse_xml(raw, account=self._account).iter(f"{_DAV}response"):
             href = _href(response, base)
             if href is None or response.find(f".//{_DAV}resourcetype/{_CALDAV}calendar") is None:
                 continue
@@ -346,7 +376,7 @@ class CalDavCalendarSource:
                 events: list[RawEvent] = []
                 for calendar in selected:
                     _, raw = self._request(client, "REPORT", calendar.href, body, "1")
-                    for ics in parse_multistatus(raw):
+                    for ics in parse_multistatus(raw, account=self._account):
                         try:  # one broken calendar object never fails the account (spec 080 §10.2)
                             events += expand(
                                 ics,
