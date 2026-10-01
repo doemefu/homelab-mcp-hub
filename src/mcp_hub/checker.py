@@ -18,6 +18,12 @@ FIRST_CHECK_DELAY_SECONDS: Final = 30.0
 _log = logging.getLogger("mcp_hub.checker")
 
 
+def _cycle_outcome(total: int, ok: int) -> str:
+    if total == 0:
+        return "skipped"  # nothing to check (e.g. every account disabled), not "ok"
+    return "ok" if ok == total else ("partial" if ok else "error")
+
+
 class HealthChecker:
     def __init__(
         self,
@@ -89,8 +95,9 @@ class HealthChecker:
         while True:
             try:
                 total, ok = await self.check_once()
-                outcome = "ok" if ok == total else ("partial" if ok else "error")
-                log_event(_log, logging.INFO, "status_check_cycle", result_count=total, outcome=outcome)
+                log_event(
+                    _log, logging.INFO, "status_check_cycle", result_count=total, outcome=_cycle_outcome(total, ok)
+                )
             except Exception as exc:  # e.g. an unexpected registry state; the server keeps running
                 log_event(_log, logging.WARNING, "status_check_cycle", outcome="error", exception=type(exc).__name__)
             await self._sleep(self._interval)

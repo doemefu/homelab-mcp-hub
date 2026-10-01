@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 from datetime import datetime
@@ -166,3 +167,23 @@ async def test_list_accounts_reflects_background_results(secrets_dir: Path) -> N
     await HealthChecker(ctx, interval=60).check_once()
     [icloud] = [a for a in build_list_accounts(ctx).accounts if a.id == "icloud"]
     assert {c.capability: c.status for c in icloud.capabilities} == {"mail": "ok", "calendar": "ok"}
+
+
+async def test_a_cycle_without_targets_is_not_ok(secrets_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # Review 19 F10: stage a (every account disabled) checks nothing, so the cycle must not report "ok".
+    data = json.loads((secrets_dir / "accounts.json").read_text())
+    for entry in data["accounts"]:
+        entry["enabled"] = False
+    (secrets_dir / "accounts.json").write_text(json.dumps(data))
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise anyio.get_cancelled_exc_class()
+
+    checker = HealthChecker(context(secrets_dir, []), interval=60, first_delay=0, sleep=sleep)
+    with caplog.at_level(logging.INFO, logger="mcp_hub"), pytest.raises(anyio.get_cancelled_exc_class()):
+        await checker.run()
+    cycles = [r.fields for r in caplog.records if r.getMessage() == "status_check_cycle"]  # type: ignore[attr-defined]
+    assert cycles == [{"result_count": 0, "outcome": "skipped"}]
