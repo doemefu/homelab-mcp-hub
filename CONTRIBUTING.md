@@ -42,7 +42,7 @@ src/mcp_hub/
   sanitize.py      untrusted-content rules and field limits (spec §5.3, §5.4)
   budget.py        output budget (spec §5.4)
   ids.py           opaque message and event ids (spec §5.1)
-  providers/       base.py (deadlines, connection limits, inbound limits), mime.py, imap.py (read-only IMAP adapter)
+  providers/       base.py (deadlines, connection limits, inbound limits), mime.py, imap.py (read-only IMAP adapter), caldav.py (read-only CalDAV adapter and recurrence expansion)
   tools/           list_accounts, mail (list_unread, get_message); common.py: account selection and aggregation
 tests/
   unit/            per-module tests
@@ -51,6 +51,10 @@ tests/
   support/         keys, tokens, clock, MCP wire helpers, GreenMail helpers, log capture
   fixtures/        example registry (neutral ids, no real data)
 scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh (development only, not in the image)
+  integration/     the real process on two ports; test_imap.py against GreenMail, test_caldav.py against Radicale (marker `provider`)
+  support/         keys, tokens, clock, MCP wire helpers, GreenMail and Radicale helpers, ICS fixture loader, canned DAV answers, log capture
+  fixtures/        example registry (neutral ids, no real data), ics/ calendar fixtures, radicale/ test server config
+scripts/           dev_token.py, smoke_image.sh, provider_services.sh (development only, not in the image)
 k8s/               Deployment and Service for namespace apps
 ```
 
@@ -64,7 +68,7 @@ uv run pytest tests/integration -v   # starts python -m mcp_hub as a subprocess
 
 ### Provider integration tests
 
-The IMAP adapter is tested against a local GreenMail container (pinned by digest). `scripts/provider_services.sh up` starts it on `127.0.0.1` with neutral `example.test` users and passwords generated per run (written to `$HUB_PROVIDER_STATE_DIR` or `$TMPDIR`, never committed); `down` stops and removes it.
+The IMAP adapter is tested against a local GreenMail container and the CalDAV adapter against a local Radicale container (both pinned by digest). `scripts/provider_services.sh up` starts both on `127.0.0.1` with neutral `example.test` users and passwords generated per run (written to `$HUB_PROVIDER_STATE_DIR` or `$TMPDIR`, never committed; Radicale reads a per-run copy of `tests/fixtures/radicale/config`); `down` stops and removes them. The calendar fixtures in `tests/fixtures/ics/` (DST change, overrides, `EXDATE`, `RDATE`, cancellations, all-day, floating, cross-zone, window edge, hostile text) are checked in unit tests and again through Radicale; `tests/support/ics.py` loads them with CRLF line endings and turns the `{ZWSP}` placeholder into a zero-width space, so no invisible character is committed.
 
 ```bash
 scripts/provider_services.sh up

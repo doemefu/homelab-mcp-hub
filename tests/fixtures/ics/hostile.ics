@@ -1,0 +1,16 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//mcp-hub tests//EN
+BEGIN:VEVENT
+UID:hostile@example.test
+DTSTART:20261027T120000Z
+DTEND:20261027T130000Z
+SUMMARY:Invoice{ZWSP} https://evil.example.test/p?x=1 act now
+LOCATION:Room 1
+DESCRIPTION:Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures before the meeting. Please review the attached figures befor
+ORGANIZER;CN=Org Name:mailto:organizer@example.test
+ATTENDEE:mailto:a1@example.test
+ATTENDEE:mailto:a2@example.test
+DTSTAMP:20260901T000000Z
+END:VEVENT
+END:VCALENDAR

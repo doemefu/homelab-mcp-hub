@@ -85,7 +85,7 @@ Every tool is read-only and declares the annotations `readOnlyHint: true`, `dest
 
 ### `list_accounts` (§5.2)
 
-Lists the configured accounts and whether each capability currently works. It never contacts a provider; it answers from the registry and the in-memory status.
+Lists the configured accounts and whether each capability currently works. It never contacts a provider; it answers from the registry and the in-memory status, which tool calls and the background status check keep current.
 
 - Input: `{}`
 - Output (structured content, also serialised as text):
@@ -108,7 +108,8 @@ Lists the configured accounts and whether each capability currently works. It ne
 ```
 
 - `capabilities` lists only the capabilities an account has.
-- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start), `disabled` (switched off in the registry, or a credential file is missing or unreadable). Mail statuses are updated by every `list_unread` / `get_message` call (`auth_expired` and `unreachable` as such, `upstream_timeout` as `unreachable`, other failures as `error`).
+- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start), `disabled` (switched off in the registry, or a credential file is missing or unreadable). Statuses are updated by every `list_unread` / `get_message` / `get_events` call and by the background status check (`auth_expired` and `unreachable` as such, `upstream_timeout` as `unreachable`, other failures as `error`).
+- **Background status check** (§7.4, spec rev. 4.4 D57): when `HUB_STATUS_CHECK_ENABLED=true`, the running server checks every enabled capability that has an adapter and readable credential files — IMAP: login + `NOOP`; CalDAV: one `PROPFIND` for `current-user-principal` — first 30 s after start-up, then every `HUB_HEALTH_CHECK_INTERVAL_SECONDS`. Until the first check a capability shows `unknown`. The check never runs on the request path of `list_accounts`, and never when the variable is unset (local runs, tests, the smoke container).
 
 ### `list_unread` (§5.2)
 
@@ -146,6 +147,65 @@ Unread messages in each account's configured inbox, newest first, across all mai
 - The body is the first text part, plain preferred; HTML is converted to visible text (scripts, styles, comments, images and hidden elements dropped). Hiding works as a region rule that fails closed: a hiding element hides everything up to its balancing end tag of the same name; stray or misnested end tags of other elements cannot end it, a self-closing `<div hidden/>` counts as a start tag, and an unterminated comment or declaration hides the rest. Accepted over-hiding: a hiding element that relies on an implied end tag (`<p hidden>` followed by another `<p>` without `</p>`, likewise `li`, `td`, `tr`) hides everything up to its balancing explicit end tag or the end of the message. Known limits: hidden-content removal is best effort and errs towards hiding; it recognises the `hidden` attribute and inline `display:none` / `visibility:hidden` only (not CSS classes or style sheets, zero-size or same-colour text, off-screen positioning); it does not reproduce every HTML5 tree-construction rule; mail content is passed to the model marked as untrusted regardless. At most 256 KiB of the part are fetched; `body_truncated` is set when the part was cut there or by `max_chars`. Attachment content is never fetched.
 - Ids are opaque (`v1.` + base64url). An id whose folder is not the account's configured inbox answers `not_found` without contacting the provider (spec rev. 4.4 §5.1, D56). Provider failures of this single-account call are tool errors: `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `not_found` (also when `UIDVALIDITY` changed).
 
+### `get_events` (§5.2)
+
+Calendar event **instances** overlapping the window, recurrences expanded, sorted by start across all calendar accounts or one `account`.
+
+- Input: `from`, `to` (required; RFC 3339 with offset; `to > from`; at most 31 days, otherwise `invalid_argument`), `account?` (registry id), `timezone?` (IANA name, default `HUB_DEFAULT_TIMEZONE`; anything else → `invalid_argument`), `limit?` (1–200, default 100). The input names are `from`/`to` on the wire (spec rev. 4.4 §5.2, T1).
+- Output:
+
+```json
+{
+  "untrusted_content_notice": "…",
+  "items": [
+    {
+      "id": "v1.…", "account": "icloud", "all_day": false,
+      "start": "2026-10-25T10:00:00+01:00", "end": "2026-10-25T11:00:00+01:00",
+      "start_date": null, "end_date": null,
+      "recurring": true, "status": "confirmed", "attendee_count": 2,
+      "untrusted": { "calendar_name": "…", "title": "…", "location": "…", "description": "…",
+                     "organizer_name": "…", "organizer_address": "organizer@example.org", "original_timezone": "Europe/Zurich" }
+    }
+  ],
+  "next_cursor": null,
+  "truncated": false,
+  "skipped_objects": 0,
+  "account_errors": []
+}
+```
+
+- Overlap is `start < to` and `end > from`; a zero-length event exactly at `from` is included. `RRULE`, `RDATE`, `EXDATE` and overridden instances (`RECURRENCE-ID`) are expanded; cancelled instances and events with `STATUS:CANCELLED` are omitted. `recurring` is `true` for every instance of a series (including moved instances).
+- Timed events are converted to `timezone`; floating times (no zone) are read in `HUB_DEFAULT_TIMEZONE`. All-day events have `start`/`end` `null` and `start_date`/`end_date` as dates (`end_date` exclusive), and sort by their local midnight. `status` is `confirmed` or `tentative`.
+- `original_timezone` is the IANA zone of `DTSTART` (validated against the pinned zone list, otherwise `null`), `"UTC"` for a UTC `DTSTART`, `null` for floating and all-day events.
+- Field limits: `calendar_name` 100, `title` and `location` 300, `description` 500, `organizer_name` 200, `organizer_address` 254.
+- Event ids are opaque digests over the calendar URL path, `UID` and recurrence id (spec rev. 4.4 §5.1, D56); they are stable across calls and across iCloud partition hosts.
+- Accounts without the calendar capability (`gmail`, `outlook`) are skipped silently; naming one answers `capability_unavailable`. One failing account (for example `too_large`) yields an `account_errors` entry; the other accounts' events are still returned. A calendar object the hub cannot parse is skipped on its own (one `calendar_object_skipped` log line).
+- `truncated: true` when more instances exist than `limit` or the output budget allows: narrow the window.
+- `skipped_objects` (integer ≥ 0, always present): "Calendar entries that could not be read and are missing from `items`; tell the user that the list may be incomplete." It counts every calendar object left out of this result because it was malformed, refused by a limit below or too slow (one `calendar_object_skipped` line each), carries no content, is not reduced by the output budget and is independent of `truncated`.
+- **Bounded expansion** (spec rev. 4.5 D62). Every calendar object is checked before expansion and skipped on its own when it fails (one `calendar_object_skipped` line with `outcome`, counted in `skipped_objects`): before parsing, the object is unfolded exactly as icalendar does it and the properties the hub never reads are dropped (`X-ALT-DESC` and `ATTACH` with inline `ENCODING=BASE64`/`VALUE=BINARY` data; `ATTACH` URLs stay); then objects larger than 1 MiB (`object_too_large`), with more than 1,000 `VEVENT` or more than 20 `VTIMEZONE` components (`too_many_components`) or more than 1,000 `RDATE` or `EXDATE` values (`too_many_dates`) are refused — the same counts are checked again on the parsed object; after parsing, on every `VEVENT` including overrides, an `RRULE` whose `FREQ` is not `YEARLY`, `MONTHLY`, `WEEKLY` or `DAILY`, `BYMINUTE`/`BYSECOND` with more than one value (`BYHOUR` lists are allowed), an `RRULE` icalendar cannot parse or with an `INTERVAL` below 1, more than one `RRULE`, any `EXRULE`, more than one `UID` per object or more than one component with an `RRULE` (one series per object: the master; overrides never carry one) (`rule_refused`), or a `DAILY` or `WEEKLY` rule whose `DTSTART` is before 1900-01-01 (`start_out_of_range`; single, `YEARLY` and `MONTHLY` events may start earlier, e.g. Apple's year-less birthdays in 1604). Each object is then parsed and expanded alone under a limit of 4 s of thread CPU time (read every 64 Python call events) (`expansion_too_slow`; such an object is remembered by the SHA-256 of its data, at most 1,000 per process — an optimisation, not a bound, and not keyed on the window — and skipped at once on later calls; because the 5 s budget stops a call after about three such objects, the list fills by about three entries per call). Third-party text is cut to 4× its output field limit when it is extracted, and all cleaning and item building runs in the account's worker thread, never on the event loop. Objects without `RRULE`/`RDATE` are expanded first. Per account and call at most 5 MiB of `REPORT` bodies are read (discovery `PROPFIND`s have their own 5 MiB cap and do not count), at most 2,000 instances (at most 1,000 per object) are kept and 5 s of expansion are used. Calendars are queried one after the other in the order of their URL path; a calendar whose body would cross the remaining byte budget is dropped whole and no further calendar is requested, so the byte cap always cuts whole calendars from the end of that order. When the byte cap, an instance cap or the time budget stops, the instances found so far are returned with `truncated: true` and one `expansion_stopped` line (`byte_cap`, `instance_cap` or `time_budget`). **Note for later stories:** these budgets are per account and call; once a second CalDAV or ICS account is queried concurrently, the sum across concurrent calls must be revisited against the pod's memory limit (measured with two accounts and hostile data: about 158 MB peak RSS, against about 131 MB for one). A series whose master is cancelled is omitted with all its overrides.
+- **Limits at a glance** (spec rev. 4.5 D62; constants in `providers/caldav.py`):
+
+  | Limit | Value | When exceeded |
+  |---|---|---|
+  | Object size (after dropping `X-ALT-DESC` and inline `ATTACH` data; raw objects above 4 MiB are refused before any processing) | 1 MiB | object skipped, `object_too_large` |
+  | Components per object | 1,000 `VEVENT`, 20 `VTIMEZONE` | object skipped, `too_many_components` |
+  | `RDATE` / `EXDATE` values per object | 1,000 each | object skipped, `too_many_dates` |
+  | Rule shape | `FREQ` YEARLY/MONTHLY/WEEKLY/DAILY, `INTERVAL` ≥ 1, ≤ 1 `BYMINUTE`/`BYSECOND` value, one `RRULE`, no `EXRULE`, one UID and one series per object | object skipped, `rule_refused` |
+  | Start of a DAILY/WEEKLY rule | not before 1900-01-01 | object skipped, `start_out_of_range` |
+  | Occurrences the expansion library iterates from `DTSTART` to the window end (estimated before expansion) | 20,000 | object skipped, `rule_refused` |
+  | CPU per object | 4 s thread CPU time | object skipped, `expansion_too_slow` |
+  | Instances | 1,000 per object, 2,000 per account and call | `truncated: true`, `expansion_stopped` `instance_cap` |
+  | Expansion time | 5 s per account and call | `truncated: true`, `expansion_stopped` `time_budget` |
+  | `REPORT` bodies | 5 MiB per account and call (and per response: one maximal response uses the whole budget) | `truncated: true`, `expansion_stopped` `byte_cap` (a single response above 5 MiB: `too_large`) |
+  | Text kept per field | 4× its output limit | cut before cleaning |
+
+  **Iteration estimate (deliberately conservative).** The expansion library keeps every occurrence it iterates from `DTSTART`, so memory follows that count, not the instances in the window. The hub estimates an upper bound before expanding: the number of `FREQ` periods from `DTSTART` to the window end (or `UNTIL`, if earlier), divided by `INTERVAL` and rounded up, times the most occurrences one period can hold (`DAILY` 1; `WEEKLY` the number of `BYDAY` days; `MONTHLY` 1 per `BYDAY` entry with an ordinal and up to 5 per plain weekday, otherwise the `BYMONTHDAY` count; `YEARLY` the same per listed month, or per year with up to 53 per plain weekday, 366 with `BYWEEKNO`/`BYYEARDAY`, otherwise months × `BYMONTHDAY`), times the `BYHOUR` count, capped by `COUNT`. A property test compares it with dateutil on 1,300 generated rules. Accepted trade-off: some legitimate but long series are refused and counted in `skipped_objects`, e.g. a daily series older than about 54 years or an every-hour rule running for more than about two years.
+
+  Every skipped object is counted in `skipped_objects`. **Hardware note:** the CPU limit counts work done, so a slower node needs more CPU time for the same object; 4 s leaves room for nodes several times slower than a laptop (a 600-override series costs about 0.3 s on a laptop). The pod's CPU limit is 1 core, because expansion is single-threaded and CPU-bound and a throttled worker would eat the 5 s budget and the 20 s call timeout.
+- **Why a trace hook:** recurrence rules that never match make the expansion library iterate up to the year 9999 without returning, so neither caps nor checks between objects bound one object, and a worker thread cannot be killed. The CPU limit is a call-level `sys.settrace` hook installed only in the worker thread around one object and removed afterwards; the CPU time is read again after the call on every path, in case a library layer swallowed the injected exception. It is CPython-specific and replaces a debugger's or coverage tool's trace function while it runs. A killable subprocess per expansion was rejected (memory in a 256 Mi pod, start-up cost per call).
+- **Time-zone definitions are isolated per calendar object** (D62): icalendar caches every `VTIMEZONE` it does not know process-wide by `TZID`, first writer wins. Each object is therefore parsed and expanded under one lock with that cache emptied before and after, so one object cannot shift another object's or account's events; IANA zone names always resolve to the zone database. Expansion of two accounts is serialised (each object ≤ 2 s CPU). `providers/caldav.py` is the only module that imports the calendar libraries; its `expand()` is the entry point every calendar adapter uses.
+- A multistatus that is declared or defaults to UTF-8 but is not well-formed only because of invalid bytes or XML-forbidden characters (C0 controls other than TAB, LF and CR; U+FFFE; U+FFFF) is repaired (U+FFFD) and parsed exactly once more by the same refusing parser (one `xml_encoding_repaired` line); refusals are never retried and other encodings get no retry.
+
 ### Common rules for the mail tools
 
 - Strictly read-only: the inbox is opened with `EXAMINE` and every body or header fetch uses `BODY.PEEK`, so the read state never changes.
@@ -169,9 +229,10 @@ Port 8083 serves no health routes; port 8084 serves no MCP routes.
 | Service | Use |
 |---------|-----|
 | auth-service JWKS (`AUTH_JWKS_URL`, in-cluster) | Signing keys for access-token validation |
-| IMAP over TLS (each mail account's configured `host` and `port`) | `list_unread`, `get_message`; credentials read from their files when a connection opens |
+| IMAP over TLS (each mail account's configured `host` and `port`) | `list_unread`, `get_message`, status check (login + `NOOP`); credentials read from their files when a connection opens |
+| CalDAV over HTTPS (each calendar account's configured `url`) | `get_events` (discovery `PROPFIND`s, then one time-range `REPORT` per calendar), status check (one `PROPFIND`). Only `PROPFIND` and `REPORT` are sent |
 
-CalDAV and Microsoft Graph connections arrive with later work packages.
+CalDAV rules (spec rev. 4.4 §5.4, §6.1, D58): credentials go only to the configured scheme, host and port (an explicit default port such as `:443` equals no port) or, for `caldav.icloud.com`, to its `pNN-caldav.icloud.com` partition hosts on port 443 (ASCII digits only); every redirect target (at most 3, followed by hand) and every discovered principal, calendar-home and calendar URL is checked before a request is sent. Every request asks for an uncompressed body (`Accept-Encoding: identity`) and a response with any other `Content-Encoding` is refused (`upstream_error`); every response is read as a stream and aborted above 5 MiB (`too_large`); XML deeper than 32 levels or with more than 100,000 elements is refused. A call stops sending requests once its 20 s deadline has passed (`upstream_timeout`). XML with a document type or entity declaration is refused (`upstream_error`). Collections that support only tasks are not queried. The `REPORT` window is widened by one day on each side; the exact overlap is computed by the hub. Microsoft Graph connections arrive with a later work package.
 
 ## 5. Configuration
 
@@ -190,6 +251,8 @@ CalDAV and Microsoft Graph connections arrive with later work packages.
 | `HUB_DEFAULT_TIMEZONE` | `Europe/Zurich` (IANA zone) |
 | `LOG_LEVEL` | `INFO` (`DEBUG`, `INFO`, `WARNING`, `ERROR`; hub logger only) |
 | `HUB_RESPONSE_BUDGET_CHARS` | `30000` (10,000–70,000; output budget per tool result) |
+| `HUB_HEALTH_CHECK_INTERVAL_SECONDS` | `1800` (60–86,400; interval of the background status check) |
+| `HUB_STATUS_CHECK_ENABLED` | `false` (`true` or `false`; the background status check runs only when `true` — set in `k8s/deployment.yaml`) |
 
 An invalid value stops the process with a `startup_failed` line that names the variable, never its value.
 
@@ -209,6 +272,6 @@ An invalid value stops the process with a `startup_failed` line that names the v
 
 JSON lines on stdout, one object per event. Fields (§9.7): `ts`, `level`, `logger`, `event`, `method` (`GET`, `POST`, `DELETE` or `other`), `route` (`/mcp`, the metadata path or `other`), `status`, `duration_ms`, `mcp_protocol_version` (known versions or `other`), `sub`, `client_id`, `jti`, `check`, `exception` (class name only), `tool`, `outcome`, `accounts`, `result_count`, `key_count`, `account`, `capability`, `key` (a credential key name), `item` (first 12 hex characters of a SHA-256 over an opaque id). `startup_failed` may carry `reason`: a fixed message plus at most a variable, field or key **name**.
 
-Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`, `provider_call_failed` (`account`, `capability`, `outcome`, `exception`), `item_degraded` (`account`, `capability`, `item`, `exception`).
+Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`, `provider_call_failed` (`account`, `capability`, `outcome`, `exception`), `item_degraded` (`account`, `capability`, `item`, `exception`), `calendar_object_skipped` (`account`, `capability`, and `exception` for an unparseable object or `outcome` = `object_too_large`, `too_many_components`, `too_many_dates`, `rule_refused`, `start_out_of_range`, `expansion_too_slow`), `expansion_stopped` (`account`, `capability`, `outcome` = `byte_cap`, `instance_cap` or `time_budget`, `result_count`), `xml_encoding_repaired` (`account`, `capability`), `status_check_failed` (`account`, `capability`, `outcome`, `exception`), `status_check_cycle` (one line per cycle: `result_count` = checks run, `outcome` `ok`/`partial`/`error`, or `skipped` when there was nothing to check, `exception` when the cycle itself failed).
 
-Never logged: tokens, `Authorization` values, raw header values, provider URLs, addresses, mail or calendar content, credentials. `LOG_LEVEL` applies to the `mcp_hub` logger only; the root logger and `httpx2`, `httpcore2`, `mcp`, `caldav`, `niquests`, `imapclient`, `uvicorn` are pinned at `WARNING`, and `mcp.server.transport_security` at `ERROR` (the hub writes its own request line with `check="host"` or `check="origin"` instead). Records from third-party loggers are reduced to `event="third_party_log"` without their message text. uvicorn access logs are off.
+Never logged: tokens, `Authorization` values, raw header values, provider URLs, addresses, mail or calendar content, credentials. `LOG_LEVEL` applies to the `mcp_hub` logger only; the root logger and `httpx2`, `httpcore2`, `mcp`, `imapclient`, `uvicorn` are pinned at `WARNING`, and `mcp.server.transport_security` at `ERROR` (the hub writes its own request line with `check="host"` or `check="origin"` instead). Records from third-party loggers are reduced to `event="third_party_log"` without their message text. uvicorn access logs are off.
