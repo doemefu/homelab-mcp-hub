@@ -137,7 +137,7 @@ Unread messages in each account's configured inbox, newest first, across all mai
 - `truncated: true` when more unread messages exist than returned (limit, the 500 newest search candidates, or the output budget).
 - Accounts on a protocol without an adapter yet, or with a missing credential file, are skipped when `account` is omitted and answer `capability_unavailable` when named (spec rev. 4.4 §5.1). One failing or slow account yields an `account_errors` entry; the other accounts' items are still returned.
 - `has_attachments` counts every part that is not the chosen body text, including inline images.
-- A message the hub cannot decode is listed with empty third-party fields and the fixed note `[the hub could not decode this message]` in `untrusted.snippet` (one `item_degraded` log line).
+- A message the hub cannot decode is listed with empty third-party fields and the fixed note `[the hub could not decode this message]` in `untrusted.snippet` (one `item_degraded` log line). A snippet that cannot be fetched (a protocol error, not a lost connection) is left empty. Header bytes in an unknown charset appear as U+FFFD.
 
 ### `get_message` (§5.2)
 
@@ -151,7 +151,7 @@ Unread messages in each account's configured inbox, newest first, across all mai
 - Strictly read-only: the inbox is opened with `EXAMINE` and every body or header fetch uses `BODY.PEEK`, so the read state never changes.
 - Every third-party string is sanitised (§5.3): zero-width, bidi, control and format characters removed, URLs reduced to `[link: host]` / `[mail link]`, whitespace normalised, field limits applied with the marker ` [truncated]` (addresses 254, names and filenames 200, subject 300, snippet 200, content type 100). `content_type` must match the media-type pattern, else `null`.
 - Deadlines: 20 s per provider call, 60 s per tool call; at most two concurrent connections per account.
-- Output budget: the text content of every result is the compact JSON of its structured content, and `HUB_RESPONSE_BUDGET_CHARS` (default 30,000, hard maximum 100,000) is measured on that text. `list_unread` drops items from the end and sets `truncated`; `get_message` shortens the body first.
+- Output budget: the text content of every result is the compact JSON of its structured content, and `HUB_RESPONSE_BUDGET_CHARS` (default 30,000, hard maximum 100,000) is measured on that text. `list_unread` drops items from the end and sets `truncated`; `get_message` shortens the body first, then drops cc, to and attachment entries from the end; the result never exceeds the budget.
 
 **Tool errors** (a whole call cannot run): result with `isError: true` and body `{"code": "<ErrorCode>", "message": "<short text>"}`. `ErrorCode`: `invalid_argument`, `invalid_cursor`, `unknown_account`, `capability_unavailable`, `not_found`, `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `too_large`. The message is a fixed hub text, never provider text.
 
