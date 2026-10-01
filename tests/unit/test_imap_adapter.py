@@ -7,10 +7,10 @@ from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage, Message
 
 import pytest
-from imapclient.exceptions import IMAPClientError, LoginError
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError, ProtocolError
 
 from mcp_hub.ids import MessageRef, encode_message_id
-from mcp_hub.providers.base import UNDECODABLE_NOTE, ProviderError, item_hash
+from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ProviderError, item_hash
 from mcp_hub.providers.imap import HEADER_ITEM, ImapMailbox
 from mcp_hub.providers.mime import Part
 from tests.support.logcapture import Capture
@@ -163,7 +163,21 @@ def test_adapter_only_uses_read_only_commands() -> None:
 
 
 def test_get_message_fetches_the_text_part_partially() -> None:
-    client = FakeClient({9: message(5, "big", text=b"x" * 300_000)})
+    big = message(5, "big", text=b"x" * 300_000)
+    big[b"BODYSTRUCTURE"] = (
+        b"text",
+        b"plain",
+        (b"charset", b"utf-8"),
+        None,
+        None,
+        b"7bit",
+        300_000,
+        1,
+        None,
+        None,
+        None,
+    )
+    client = FakeClient({9: big})
     detail = mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, 9))
     part_fetch = [
         items
@@ -287,3 +301,67 @@ def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytes
     client = FakeClient({1: message(3, "a", text=b"boom"), 2: message(4, "b")})
     page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
+
+
+class SnippetFailingClient(FakeClient):
+    def __init__(self, messages: dict[int, dict[bytes, object]], error: Exception) -> None:
+        super().__init__(messages)
+        self.error = error
+
+    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
+        if any(item.endswith(f"<0.{SNIPPET_FETCH_BYTES}>") for item in data):
+            raise self.error
+        return super().fetch(messages, data)
+
+
+def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> None:
+    client = SnippetFailingClient({1: message(3, "a"), 2: message(4, "b")}, ProtocolError("SENTINEL odd literal"))
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "")]
+    lines = [json.loads(line) for line in provider_log.lines]
+    assert [(e["event"], e["exception"]) for e in lines] == [("item_degraded", "ProtocolError")] * 2
+    assert "SENTINEL" not in "\n".join(provider_log.lines)
+
+
+@pytest.mark.parametrize(
+    ("error", "code"), [(OSError("reset"), "unreachable"), (IMAPClientAbortError("eof"), "upstream_error")]
+)
+def test_connection_failure_during_the_snippet_fetch_still_fails_the_account(error: Exception, code: str) -> None:
+    with pytest.raises(ProviderError) as caught:
+        mailbox(SnippetFailingClient({1: message(3, "a")}, error)).list_unread(T0 - timedelta(hours=1), 20)
+    assert caught.value.code == code
+
+
+class DeepStructureClient(FakeClient):
+    """IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE nested ~1000 deep."""
+
+    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in data and any(self.messages[uid].get(b"DEEP") for uid in messages if uid in self.messages):
+            raise RecursionError("maximum recursion depth exceeded")
+        return super().fetch(messages, data)
+
+
+def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log: Capture) -> None:
+    deep = message(3, "deep")
+    deep[b"DEEP"] = True
+    page = mailbox(DeepStructureClient({1: deep, 2: message(4, "fine")})).list_unread(T0 - timedelta(hours=1), 20)
+    by_uid = {m.ref.uid: m for m in page.items}
+    assert by_uid[1].snippet_text == UNDECODABLE_NOTE
+    assert (by_uid[2].subject, by_uid[2].snippet_text) == ("fine", "Hello there")
+    assert [json.loads(line)["exception"] for line in provider_log.lines] == ["RecursionError"]
+
+
+def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
+    deep = message(3, "deep")
+    deep[b"DEEP"] = True
+    detail = mailbox(DeepStructureClient({1: deep})).get_message(MessageRef("icloud", "INBOX", 7, 1))
+    assert (detail.subject, detail.body_source, detail.attachments) == ("deep", "none", [])
+
+
+@pytest.mark.parametrize(("size", "cut"), [(262_144, False), (262_145, True)])
+def test_body_cut_only_when_the_part_is_longer_than_the_limit(size: int, cut: bool) -> None:
+    row = message(5, "edge", text=b"x" * size)
+    row[b"BODYSTRUCTURE"] = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", size, 1, None, None, None)
+    detail = mailbox(FakeClient({9: row})).get_message(MessageRef("icloud", "INBOX", 7, 9))
+    assert len(detail.body_text) == 262_144
+    assert detail.body_cut is cut
