@@ -37,6 +37,19 @@ def shrink_to_fit[T: BaseModel](model: T, fits: Callable[[T], bool]) -> T | None
     return current
 
 
+def shrink_or_drop[T: BaseModel](model: T, fits: Callable[[T], bool], drop: Callable[[T], T | None]) -> T | None:
+    """shrink_to_fit; when shortening the untrusted text is not enough, `drop` removes one list entry (None when
+    nothing is left to drop) and the text is shortened again from its full length, so text is kept before list
+    entries. Terminates because every round removes an entry; None if even the emptied model does not fit."""
+    candidate: T | None = model
+    while candidate is not None:
+        fitted = shrink_to_fit(candidate, fits)
+        if fitted is not None:
+            return fitted
+        candidate = drop(candidate)
+    return None
+
+
 def fit_items[T: BaseModel, R: BaseModel](items: list[T], build: Callable[[list[T], bool], R], budget: int) -> R:
     """Largest prefix of `items` whose result fits; `build(items, cut)` must OR `cut` into its truncated flag."""
     limit = min(budget, HARD_MAX_CHARS)

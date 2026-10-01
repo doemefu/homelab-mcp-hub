@@ -1,3 +1,5 @@
+import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from mcp_hub.providers.base import ProviderError
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import gather_accounts, int_argument, parse_timestamp, ready_accounts
+from tests.support.logcapture import Capture
 
 pytestmark = pytest.mark.anyio
 
@@ -123,3 +126,25 @@ def test_int_argument_bounds(value: int) -> None:
     with pytest.raises(ToolError):
         int_argument(value, "limit", default=20, low=1, high=50)
     assert int_argument(None, "limit", default=20, low=1, high=50) == 20
+
+
+async def test_provider_failure_log_carries_the_exception_class_name_only(secrets_dir: Path) -> None:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub.providers")
+    logger.addHandler(handler)
+    context = ctx(secrets_dir)
+
+    async def boom(account: Account) -> list[str]:
+        raise RuntimeError("SENTINEL-provider-text secret@example.test")
+
+    try:
+        await gather_accounts(ready_accounts(context, "mail", None), "mail", boom, context.status)
+    finally:
+        logger.removeHandler(handler)
+    [line] = [json.loads(line) for line in handler.lines]
+    assert (line["event"], line["outcome"], line["exception"]) == (
+        "provider_call_failed",
+        "upstream_error",
+        "RuntimeError",
+    )
+    assert "SENTINEL" not in "\n".join(handler.lines) + "\n".join(m for _, _, m in handler.raw)

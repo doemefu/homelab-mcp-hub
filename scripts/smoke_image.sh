@@ -74,4 +74,7 @@ LOGS="$(docker logs "hub-$$" 2>&1)"
 ! grep -q "$VALID" <<<"$LOGS" || fail "token in logs"
 ! grep -q 'HTTP Request' <<<"$LOGS" || fail "httpx2 request line in logs"
 ! grep -q 'evil.example.org' <<<"$LOGS" || fail "header value in logs"
+# HTML converter on the image's own interpreter: linear growth on malformed input, unterminated comments hidden.
+docker run --rm -i --label org.furchert.homelab.workpackage=mcp-hub-wp5a --read-only --user 10001:10001 \
+  --network none "$IMAGE" python - <"$ROOT/scripts/html_scaling_check.py" || fail "html scaling check"
 echo "smoke OK"

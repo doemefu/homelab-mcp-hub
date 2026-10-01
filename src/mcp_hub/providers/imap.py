@@ -5,6 +5,7 @@ Blocking; the tool layer runs it through providers.base.run_blocking. Returns de
 
 import contextlib
 import email.policy
+import imaplib
 import ssl
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -38,6 +39,8 @@ HEADER_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT)]<0.{MAX_HEAD
 SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", HEADER_ITEM)
 MAX_SEARCH_CANDIDATES: Final = 500  # newest unread UIDs considered per call
 _SEEN: Final = b"\\Seen"
+# The connection itself is gone: these fail the account; other errors in optional steps only degrade items.
+_CONNECTION_ERRORS: Final = (OSError, imaplib.IMAP4.abort)
 _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 
 
@@ -124,6 +127,27 @@ def _sender_and_subject(headers: Message) -> tuple[tuple[str, str], str | None]:
     return sender, str(headers.get("Subject", "")) or None
 
 
+def _fetch_summaries(
+    client: ImapClientLike, uids: list[int]
+) -> tuple[dict[int, dict[bytes, object]], dict[int, Exception]]:
+    """Summary rows of `uids`. IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE
+    nested about 1000 deep; the batch is then fetched per UID, and a UID that fails alone is returned as unparsable
+    so only that message degrades."""
+    if not uids:
+        return {}, {}
+    try:
+        return client.fetch(uids, list(SUMMARY_ITEMS)), {}
+    except RecursionError:
+        rows: dict[int, dict[bytes, object]] = {}
+        unparsable: dict[int, Exception] = {}
+        for uid in uids:
+            try:
+                rows.update(client.fetch([uid], list(SUMMARY_ITEMS)))
+            except RecursionError as exc:
+                unparsable[uid] = exc
+        return rows, unparsable
+
+
 class ImapMailbox:
     def __init__(
         self,
@@ -186,14 +210,18 @@ class ImapMailbox:
         )
         chosen = recent[:limit]
         more = len(recent) > limit or len(found) > MAX_SEARCH_CANDIDATES
-        rows = client.fetch([uid for _, uid in chosen], list(SUMMARY_ITEMS)) if chosen else {}
-        texts = self._fetch_texts(client, rows, SNIPPET_FETCH_BYTES)
+        rows, unparsable = _fetch_summaries(client, [uid for _, uid in chosen])
+        texts = self._fetch_texts(client, rows, SNIPPET_FETCH_BYTES, validity)
         items: list[MailSummary] = []
         for received, uid in chosen:
+            ref = MessageRef(self._account, self._folder, validity, uid)
+            if uid in unparsable:
+                log_message_skipped(ref, "mail", unparsable[uid])
+                items.append(placeholder_summary(ref, received, True))  # found by the UNSEEN search
+                continue
             row = rows.get(uid)
             if row is None:  # expunged meanwhile
                 continue
-            ref = MessageRef(self._account, self._folder, validity, uid)
             try:  # one hostile message degrades to a placeholder, never fails the account
                 parts = _structure(row)
                 text_part = choose_text_part(parts)
@@ -215,8 +243,11 @@ class ImapMailbox:
                 items.append(placeholder_summary(ref, received, _unread(row)))
         return UnreadPage(items=items, more=more)
 
-    def _fetch_texts(self, client: ImapClientLike, rows: dict[int, dict[bytes, object]], length: int) -> dict[int, str]:
-        """Partial fetch of each message's chosen text part, one FETCH per section number."""
+    def _fetch_texts(
+        self, client: ImapClientLike, rows: dict[int, dict[bytes, object]], length: int, validity: int
+    ) -> dict[int, str]:
+        """Partial fetch of each message's chosen text part, one FETCH per section number. Snippets are optional:
+        a FETCH that fails without losing the connection leaves those snippets empty."""
         by_section: dict[str, list[tuple[int, Part]]] = {}
         for uid, row in rows.items():
             try:  # per UID: an empty or odd BODYSTRUCTURE leaves this snippet empty
@@ -227,7 +258,14 @@ class ImapMailbox:
                 by_section.setdefault(part.section, []).append((uid, part))
         texts: dict[int, str] = {}
         for section, members in by_section.items():
-            data = client.fetch([uid for uid, _ in members], [f"BODY.PEEK[{section}]<0.{length}>"])
+            try:
+                data = client.fetch([uid for uid, _ in members], [f"BODY.PEEK[{section}]<0.{length}>"])
+            except _CONNECTION_ERRORS:
+                raise
+            except Exception as exc:  # protocol or parse error: no snippet for these messages
+                for uid, _ in members:
+                    log_message_skipped(MessageRef(self._account, self._folder, validity, uid), "mail", exc)
+                continue
             key = f"BODY[{section}]<0>".encode()
             for uid, part in members:
                 try:  # per UID: a broken part only empties that message's snippet
@@ -241,7 +279,13 @@ class ImapMailbox:
     def _get_message(self, client: ImapClientLike, ref: MessageRef) -> MailDetail:
         if _uidvalidity(client.select_folder(ref.folder, readonly=True)) != ref.uidvalidity:
             raise ProviderError("not_found", "UidValidityChanged")
-        row = client.fetch([ref.uid], list(SUMMARY_ITEMS)).get(ref.uid)
+        structure_known = True
+        try:
+            row = client.fetch([ref.uid], list(SUMMARY_ITEMS)).get(ref.uid)
+        except RecursionError as exc:  # see _fetch_summaries: open the message without its structure
+            log_message_skipped(ref, "mail", exc)
+            structure_known = False
+            row = client.fetch([ref.uid], [i for i in SUMMARY_ITEMS if i != "BODYSTRUCTURE"]).get(ref.uid)
         if row is None:
             raise ProviderError("not_found", "UnknownUid")
         received = _aware(row.get(b"INTERNALDATE")) or datetime.now(UTC)
@@ -251,15 +295,19 @@ class ImapMailbox:
         parts: list[Part] = []
         text_part: Part | None = None
         try:  # each step degrades on its own; a hostile message still opens
-            parts = _structure(row)
-            text_part = choose_text_part(parts)
+            if structure_known:
+                parts = _structure(row)
+                text_part = choose_text_part(parts)
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
         if text_part is not None:
             data = client.fetch([ref.uid], [f"BODY.PEEK[{text_part.section}]<0.{MAX_TEXT_PART_BYTES}>"])
             raw = data.get(ref.uid, {}).get(f"BODY[{text_part.section}]<0>".encode())
             raw_bytes = raw if isinstance(raw, bytes) else b""
-            cut = text_part.size > MAX_TEXT_PART_BYTES or len(raw_bytes) >= MAX_TEXT_PART_BYTES
+            # The BODYSTRUCTURE size decides; only without one does a full-length fetch count as cut.
+            cut = text_part.size > MAX_TEXT_PART_BYTES or (
+                text_part.size <= 0 and len(raw_bytes) >= MAX_TEXT_PART_BYTES
+            )
             try:
                 body = decode_part(raw_bytes, text_part)
                 if text_part.mime_type == "text/html":

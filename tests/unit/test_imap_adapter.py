@@ -1,14 +1,19 @@
+import json
+import logging
 import socket
 import ssl
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
 
 import pytest
-from imapclient.exceptions import IMAPClientError, LoginError
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError, ProtocolError
 
-from mcp_hub.ids import MessageRef
-from mcp_hub.providers.base import ProviderError
+from mcp_hub.ids import MessageRef, encode_message_id
+from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ProviderError, item_hash
 from mcp_hub.providers.imap import HEADER_ITEM, ImapMailbox
+from mcp_hub.providers.mime import Part
+from tests.support.logcapture import Capture
 
 T0 = datetime(2026, 9, 29, 7, 0, tzinfo=UTC)
 PLAIN = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 64, 2, None, None, None, None)
@@ -158,7 +163,21 @@ def test_adapter_only_uses_read_only_commands() -> None:
 
 
 def test_get_message_fetches_the_text_part_partially() -> None:
-    client = FakeClient({9: message(5, "big", text=b"x" * 300_000)})
+    big = message(5, "big", text=b"x" * 300_000)
+    big[b"BODYSTRUCTURE"] = (
+        b"text",
+        b"plain",
+        (b"charset", b"utf-8"),
+        None,
+        None,
+        b"7bit",
+        300_000,
+        1,
+        None,
+        None,
+        None,
+    )
+    client = FakeClient({9: big})
     detail = mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, 9))
     part_fetch = [
         items
@@ -218,3 +237,131 @@ def test_production_context_verifies_hosts() -> None:
     box = ImapMailbox("icloud", host="h", port=993, folder="INBOX", username="u", password="p")
     assert box._context.verify_mode == ssl.CERT_REQUIRED
     assert box._context.check_hostname is True
+
+
+@pytest.fixture
+def provider_log() -> Iterator[Capture]:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub.providers")
+    logger.addHandler(handler)
+    yield handler
+    logger.removeHandler(handler)
+
+
+def test_undecodable_message_becomes_the_placeholder_with_one_log_line(provider_log: Capture) -> None:
+    broken = message(3, "broken")
+    broken[b"BODYSTRUCTURE"] = 5  # not a structure: walk() raises inside the per-message guards
+    client = FakeClient({1: message(5, "good"), 2: broken})
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    by_uid = {m.ref.uid: m for m in page.items}
+    assert by_uid[1].subject == "good"
+    assert by_uid[1].snippet_text == "Hello there"
+    placeholder = by_uid[2]
+    assert (placeholder.snippet_text, placeholder.subject, placeholder.from_address) == (UNDECODABLE_NOTE, None, None)
+    [line] = [json.loads(line) for line in provider_log.lines]
+    assert line["event"] == "item_degraded"
+    assert (line["account"], line["capability"], line["exception"]) == ("icloud", "mail", "TypeError")
+    assert line["item"] == item_hash(encode_message_id(MessageRef("icloud", "INBOX", 7, 2)))
+
+
+def test_item_degraded_logs_the_exception_class_name_only(
+    provider_log: Capture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mcp_hub.providers.imap as imap
+
+    original = imap._sender_and_subject
+
+    def exploding(headers: Message) -> tuple[tuple[str, str], str | None]:
+        if "secret" in str(headers.get("Subject", "")):
+            raise ValueError("SENTINEL-provider-text secret@example.test")
+        return original(headers)
+
+    monkeypatch.setattr(imap, "_sender_and_subject", exploding)
+    page = mailbox(FakeClient({1: message(3, "secret"), 2: message(4, "fine")})).list_unread(
+        T0 - timedelta(hours=1), 20
+    )
+    assert [m.snippet_text for m in page.items] == [UNDECODABLE_NOTE, "Hello there"]
+    text = "\n".join(provider_log.lines) + "\n".join(m for _, _, m in provider_log.raw)
+    assert "SENTINEL" not in text
+    assert "secret" not in text
+    assert [json.loads(line)["exception"] for line in provider_log.lines] == ["ValueError"]
+
+
+def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_hub.providers.imap as imap
+
+    original = imap.decode_part
+
+    def exploding(data: bytes, part: Part) -> str:
+        if data == b"boom":
+            raise ValueError("boom")
+        return original(data, part)
+
+    monkeypatch.setattr(imap, "decode_part", exploding)
+    client = FakeClient({1: message(3, "a", text=b"boom"), 2: message(4, "b")})
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
+
+
+class SnippetFailingClient(FakeClient):
+    def __init__(self, messages: dict[int, dict[bytes, object]], error: Exception) -> None:
+        super().__init__(messages)
+        self.error = error
+
+    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
+        if any(item.endswith(f"<0.{SNIPPET_FETCH_BYTES}>") for item in data):
+            raise self.error
+        return super().fetch(messages, data)
+
+
+def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> None:
+    client = SnippetFailingClient({1: message(3, "a"), 2: message(4, "b")}, ProtocolError("SENTINEL odd literal"))
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "")]
+    lines = [json.loads(line) for line in provider_log.lines]
+    assert [(e["event"], e["exception"]) for e in lines] == [("item_degraded", "ProtocolError")] * 2
+    assert "SENTINEL" not in "\n".join(provider_log.lines)
+
+
+@pytest.mark.parametrize(
+    ("error", "code"), [(OSError("reset"), "unreachable"), (IMAPClientAbortError("eof"), "upstream_error")]
+)
+def test_connection_failure_during_the_snippet_fetch_still_fails_the_account(error: Exception, code: str) -> None:
+    with pytest.raises(ProviderError) as caught:
+        mailbox(SnippetFailingClient({1: message(3, "a")}, error)).list_unread(T0 - timedelta(hours=1), 20)
+    assert caught.value.code == code
+
+
+class DeepStructureClient(FakeClient):
+    """IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE nested ~1000 deep."""
+
+    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in data and any(self.messages[uid].get(b"DEEP") for uid in messages if uid in self.messages):
+            raise RecursionError("maximum recursion depth exceeded")
+        return super().fetch(messages, data)
+
+
+def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log: Capture) -> None:
+    deep = message(3, "deep")
+    deep[b"DEEP"] = True
+    page = mailbox(DeepStructureClient({1: deep, 2: message(4, "fine")})).list_unread(T0 - timedelta(hours=1), 20)
+    by_uid = {m.ref.uid: m for m in page.items}
+    assert by_uid[1].snippet_text == UNDECODABLE_NOTE
+    assert (by_uid[2].subject, by_uid[2].snippet_text) == ("fine", "Hello there")
+    assert [json.loads(line)["exception"] for line in provider_log.lines] == ["RecursionError"]
+
+
+def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
+    deep = message(3, "deep")
+    deep[b"DEEP"] = True
+    detail = mailbox(DeepStructureClient({1: deep})).get_message(MessageRef("icloud", "INBOX", 7, 1))
+    assert (detail.subject, detail.body_source, detail.attachments) == ("deep", "none", [])
+
+
+@pytest.mark.parametrize(("size", "cut"), [(262_144, False), (262_145, True)])
+def test_body_cut_only_when_the_part_is_longer_than_the_limit(size: int, cut: bool) -> None:
+    row = message(5, "edge", text=b"x" * size)
+    row[b"BODYSTRUCTURE"] = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", size, 1, None, None, None)
+    detail = mailbox(FakeClient({9: row})).get_message(MessageRef("icloud", "INBOX", 7, 9))
+    assert len(detail.body_text) == 262_144
+    assert detail.body_cut is cut

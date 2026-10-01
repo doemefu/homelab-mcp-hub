@@ -21,3 +21,10 @@ All notable changes to this project are documented in this file. The format is b
 - `get_events` reports `skipped_objects`: calendar entries that could not be read and are missing from the result. Heavy unused properties (`X-ALT-DESC`, inline attachments) are dropped before the 1 MiB object limit; up to 1,000 events per object; year-less birthdays and other early yearly/monthly series, and `BYHOUR` lists, are accepted; text is cut and cleaned off the event loop.
 - Background status check for IMAP and CalDAV accounts (`HUB_STATUS_CHECK_ENABLED`, `HUB_HEALTH_CHECK_INTERVAL_SECONDS`), feeding `list_accounts`.
 - CalDAV integration tests against Radicale in the `providers` job.
+
+### Fixed
+
+- Undecodable header bytes no longer make `list_unread` fail for every account; one message that cannot be processed degrades only its own entry.
+- `get_message` stays within `HUB_RESPONSE_BUDGET_CHARS` when recipients and attachments alone exceed it.
+- HTML with many unclosed tags converts in linear time.
+- A failing snippet fetch or a deeply nested MIME structure degrades only the affected messages; a text part of exactly 256 KiB is not reported as truncated.
