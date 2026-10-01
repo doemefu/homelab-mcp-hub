@@ -45,6 +45,14 @@ def test_named_accounts_that_cannot_serve_are_tool_errors(secrets_dir: Path, acc
     assert caught.value.code == code
 
 
+def test_ready_accounts_for_calendar_skips_graph_accounts(secrets_dir: Path) -> None:
+    # icloud has CalDAV credentials; uzh is disabled; gmail and outlook lack the calendar capability (no error).
+    assert [a.id for a in ready_accounts(ctx(secrets_dir), "calendar", None)] == ["icloud"]
+    with pytest.raises(ToolError) as caught:
+        ready_accounts(ctx(secrets_dir), "calendar", "gmail")
+    assert caught.value.code == "capability_unavailable"
+
+
 async def test_gather_records_status_and_reports_failures(secrets_dir: Path) -> None:
     for ref in ("gmail-username", "gmail-app-password"):
         (secrets_dir / ref).write_text("placeholder")
