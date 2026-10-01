@@ -142,7 +142,8 @@ REFUSED = {
     "exrule": (obj("RRULE:FREQ=DAILY;COUNT=2", "EXRULE:FREQ=DAILY;COUNT=1"), "rule_refused"),
     "1001-rdates": (rdates(1001, "rdates-1001@example.test"), "too_many_dates"),
     "1001-exdates": (obj("RRULE:FREQ=DAILY", f"EXDATE:{EXDATES_1001}"), "too_many_dates"),
-    "before-1900": (obj("RRULE:FREQ=YEARLY", start="18991231T100000Z"), "start_out_of_range"),
+    "daily-before-1900": (obj("RRULE:FREQ=DAILY", start="18991231T100000Z"), "start_out_of_range"),
+    "weekly-before-1900": (obj("RRULE:FREQ=WEEKLY", start="18991231T100000Z"), "start_out_of_range"),
 }
 
 
@@ -416,8 +417,8 @@ def folded_rdates(count: int) -> bytes:
 
 
 RAW_REFUSED = {
-    "object-too-large": (padded(256 * 1024 + 1), "object_too_large"),
-    "501-components": (series_with_overrides(500), "too_many_components"),
+    "object-too-large": (padded(1024 * 1024 + 1), "object_too_large"),
+    "1001-components": (series_with_overrides(1000), "too_many_components"),
     "1001-rdates-folded": (folded_rdates(1001), "too_many_dates"),
     "1001-exdates-lowercase": (obj("RRULE:FREQ=DAILY", f"exdate:{EXDATES_1001}"), "too_many_dates"),
 }
@@ -433,8 +434,8 @@ def test_raw_prescreen_refuses_before_parsing(case: str, parser_calls: list[int]
 
 
 def test_raw_prescreen_boundaries_are_allowed(parser_calls: list[int]) -> None:
-    assert len(run(padded(256 * 1024))) == 1
-    assert len(run(series_with_overrides(499))) == 31  # 500 VEVENTs of one series
+    assert len(run(padded(1024 * 1024))) == 1
+    assert len(run(series_with_overrides(999))) == 31  # 1,000 VEVENTs of one series
     assert len(run(folded_rdates(1000))) == 1000
     assert len(parser_calls) == 3
 
@@ -442,12 +443,11 @@ def test_raw_prescreen_boundaries_are_allowed(parser_calls: list[int]) -> None:
 @pytest.mark.parametrize(
     "rule",
     [
-        "FREQ=DAILY;BYHOUR=0,1",
         "FREQ=DAILY;BYMINUTE=0,30",
         "FREQ=DAILY;BYSECOND=0,1",
         "FREQ=DAILY;BYHOUR=" + ",".join(map(str, range(24))) + ";BYMINUTE=" + ",".join(map(str, range(60))),
     ],
-    ids=["two-hours", "two-minutes", "two-seconds", "review-19-shape"],
+    ids=["two-minutes", "two-seconds", "review-19-shape"],
 )
 def test_time_of_day_lists_are_refused(rule: str, expander_calls: list[int]) -> None:
     with pytest.raises(ObjectSkippedError) as caught:
@@ -580,3 +580,103 @@ def test_every_skip_is_counted_in_the_page(monkeypatch: pytest.MonkeyPatch) -> N
     second = source_for(*objects, slow_objects=cache, cpu_clock=FakeTime()).events(START, END, ZURICH, ZURICH)
     assert second.skipped == 3  # the slow object is skipped from the cache and still counted
     assert source_for(ics.load("allday.ics")).events(START, END, ZURICH, ZURICH).skipped == 0
+
+
+# --- delta review D2/D4: stripping, unfold rule, parsed re-counts, old starts, BYHOUR lists --------------------------
+
+
+def with_lines(raw: bytes, *lines: bytes) -> bytes:
+    return raw.replace(b"END:VEVENT", b"".join(line + b"\r\n" for line in lines) + b"END:VEVENT", 1)
+
+
+def test_unused_heavy_properties_do_not_count_against_the_size_limit() -> None:
+    html = b"X-ALT-DESC;FMTTYPE=text/html:" + b"<p>" + b"h" * 700_000 + b"</p>"
+    attachment = b"ATTACH;FMTTYPE=image/png;ENCODING=BASE64;VALUE=BINARY:" + b"A" * 700_000
+    url = b"ATTACH:https://files.example.test/agenda.pdf"
+    raw = with_lines(obj(uid="heavy@example.test"), html, attachment, url)
+    assert len(raw) > 1024 * 1024
+    [event] = run(raw)
+    assert event.uid == "heavy@example.test"
+
+
+def test_folded_heavy_properties_are_stripped_with_their_continuations() -> None:
+    folded = b"X-ALT-DESC;FMTTYPE=text/html:" + b"\r\n ".join([b"<p>" + b"h" * 70] * 16_000)
+    raw = with_lines(obj(uid="folded-html@example.test"), folded)
+    assert len(raw) > 1024 * 1024
+    assert len(run(raw)) == 1
+
+
+def test_inline_attachment_detection_respects_quoted_parameters() -> None:
+    attachment = b'ATTACH;FMTTYPE="text/plain";X-NOTE="a:b;c";ENCODING=BASE64:' + b"A" * 1_100_000
+    assert len(run(with_lines(obj(uid="quoted@example.test"), attachment))) == 1
+
+
+def test_the_size_limit_applies_to_the_text_the_hub_uses() -> None:
+    big = with_lines(obj(uid="big@example.test"), b"DESCRIPTION:" + b"d" * (1024 * 1024))
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(big)
+    assert caught.value.reason == "object_too_large"
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (series_with_overrides(1000).replace(b"BEGIN:VEVENT", b"BEGIN;X-HIDE=1:VEVENT"), "too_many_components"),
+        (series_with_overrides(1000).replace(b"BEGIN:VEVENT", b"BEGIN:VEV\r\n\r\n ENT"), "too_many_components"),
+        (folded_rdates(1001).replace(b"RDATE:", b"RDATE\r\n\r\n :"), "too_many_dates"),
+    ],
+    ids=["begin-with-parameter", "begin-blank-line-fold", "rdate-blank-line-fold"],
+)
+def test_the_prescreen_sees_what_the_parser_sees(raw: bytes, reason: str, parser_calls: list[int]) -> None:
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == reason
+    assert parser_calls == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (series_with_overrides(1000), "too_many_components"),
+        (folded_rdates(1001), "too_many_dates"),
+        (
+            obj(
+                "RRULE:FREQ=DAILY",
+                "EXDATE:" + ",".join(stamp(datetime(2027, 1, 1) + timedelta(days=i)) for i in range(1001)),
+            ),
+            "too_many_dates",
+        ),
+    ],
+    ids=["components", "rdates", "exdates"],
+)
+def test_the_parsed_object_is_counted_again(
+    raw: bytes, reason: str, monkeypatch: pytest.MonkeyPatch, expander_calls: list[int]
+) -> None:
+    # Belt and braces (delta review D4/D5 N27): with the raw pre-screen disabled the parsed counts still refuse.
+    monkeypatch.setattr(caldav, "_prescreen", lambda ics: ics)
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == reason
+    assert expander_calls == []
+
+
+def test_old_starts_are_allowed_unless_the_rule_is_daily_or_weekly() -> None:
+    assert run(obj(start="18500101T100000Z")) == []  # a single event: allowed, outside the window
+    assert run(obj("RRULE:FREQ=MONTHLY", start="18501020T100000Z"))[0].start.isoformat() == "2026-10-20T12:00:00+02:00"
+    assert run(obj("RRULE:FREQ=YEARLY", start="16041020T100000Z"))[0].start.isoformat() == "2026-10-20T12:00:00+02:00"
+    for rule in ("DAILY", "WEEKLY"):
+        with pytest.raises(ObjectSkippedError) as caught:
+            run(obj(f"RRULE:FREQ={rule}", start="18991231T100000Z"))
+        assert caught.value.reason == "start_out_of_range"
+
+
+def test_byhour_lists_are_allowed() -> None:
+    events = run(obj("RRULE:FREQ=DAILY;BYHOUR=7,19;BYMINUTE=0;BYSECOND=0", start="20261020T070000Z"))
+    starts = [e.start.isoformat() for e in events]
+    assert starts[:4] == [
+        "2026-10-20T09:00:00+02:00",
+        "2026-10-20T21:00:00+02:00",
+        "2026-10-21T09:00:00+02:00",
+        "2026-10-21T21:00:00+02:00",
+    ]
+    assert len(starts) == 2 * 28

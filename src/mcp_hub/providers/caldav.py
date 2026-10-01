@@ -48,11 +48,12 @@ _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both 
 # expanded under a CPU deadline, and the whole call is capped by instance counts and a cooperative time budget.
 ALLOWED_FREQUENCIES: Final = frozenset({"YEARLY", "MONTHLY", "WEEKLY", "DAILY"})
 MAX_RECURRENCE_DATES: Final = 1000  # RDATE values and EXDATE values, each counted per object
-MAX_OBJECT_BYTES: Final = 256 * 1024  # one calendar object, checked before parsing
-MAX_COMPONENTS_PER_OBJECT: Final = 500  # VEVENT components (master and overrides) per object
+MAX_OBJECT_BYTES: Final = 1024 * 1024  # one calendar object after stripping unused heavy properties, before parsing
+MAX_COMPONENTS_PER_OBJECT: Final = 1000  # VEVENT components (master and overrides) per object
 MAX_TIMEZONES_PER_OBJECT: Final = 20  # VTIMEZONE components per object (real objects carry one to three)
-_TIME_OF_DAY_PARTS: Final = ("BYHOUR", "BYMINUTE", "BYSECOND")  # at most one value each
-EARLIEST_START: Final = date(1900, 1, 1)
+_TIME_OF_DAY_PARTS: Final = ("BYMINUTE", "BYSECOND")  # at most one value each; BYHOUR lists are allowed (<= 24/day)
+EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (iterated from DTSTART)
+_EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
 OBJECT_CPU_SECONDS: Final = 2.0  # thread CPU time per object (parse, screening, expansion)
@@ -61,11 +62,18 @@ SLOW_OBJECT_CACHE_SIZE: Final = 1000
 # REPORT bodies held per account and call (discovery bodies have their own 5 MiB cap and do not count). Calendars are
 # fetched sequentially in path order; the cap drops whole calendars from the end of that order (D62).
 MAX_REPORT_BYTES_PER_CALL: Final = 10 * 1024 * 1024
-_FOLD: Final = re.compile(rb"\r?\n[ \t]")
-_RECURRING_LINE: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
-_BEGIN_VEVENT: Final = re.compile(rb"(?im)^BEGIN:VEVENT[ \t]*\r?$")
-_BEGIN_VTIMEZONE: Final = re.compile(rb"(?im)^BEGIN:VTIMEZONE[ \t]*\r?$")
-_DATE_LINE: Final = re.compile(rb"(?im)^(RDATE|EXDATE)[;:][^\r\n]*")
+# icalendar's own unfold rule (parser.content_line.UFOLD), so the pre-screen sees exactly what the parser sees.
+_UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*[ \t]")
+_LINE_BREAK: Final = re.compile(rb"\r?\n")
+_RECURRING_LINE: Final = re.compile(rb"(?i)^(?:RRULE|RDATE)[;:]")
+_BEGIN_VEVENT: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VEVENT[ \t]*$")
+_BEGIN_VTIMEZONE: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VTIMEZONE[ \t]*$")
+_DATE_LINE: Final = re.compile(rb"(?i)^(RDATE|EXDATE)[;:]")
+# Properties the hub never reads: HTML alternative descriptions and inline (base64/binary) attachments; URL
+# attachments stay. Dropped before the size check and before parsing (spec 080 rev. 4.5 D62).
+_ALT_DESC: Final = re.compile(rb"(?i)^X-ALT-DESC[;:]")
+_ATTACH_PARAMS: Final = re.compile(rb'(?i)^ATTACH((?:;(?:[^;:"]|"[^"]*")*)*):')
+_INLINE_DATA: Final = re.compile(rb'(?i);(?:ENCODING="?BASE64|VALUE="?BINARY)\b')
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,21 +311,33 @@ def _date_count(component: icalendar.cal.Component, name: str) -> int:
     return sum(len(getattr(value, "dts", [value])) for value in _values(component.get(name)))
 
 
-def _prescreen(ics: bytes) -> None:
-    """Cheap checks on the raw object, before icalendar parses it (spec 080 rev. 4.5 D62 A). Values are counted by
-    their separators on the unfolded lines; a comma inside a parameter only makes the count larger (refuses earlier)."""
-    if len(ics) > MAX_OBJECT_BYTES:
+def _unused(line: bytes) -> bool:
+    if _ALT_DESC.match(line):
+        return True
+    attach = _ATTACH_PARAMS.match(line)
+    return attach is not None and _INLINE_DATA.search(attach.group(1)) is not None
+
+
+def _prescreen(ics: bytes) -> bytes:
+    """Cheap checks on the object before icalendar parses it (spec 080 rev. 4.5 D62 A); returns the unfolded text
+    without the properties the hub never reads, which is what gets parsed. Values are counted by their separators; a
+    comma inside a parameter only makes a count larger (refuses earlier)."""
+    lines = [line for line in _LINE_BREAK.split(_UNFOLD.sub(b"", ics)) if line and not _unused(line)]
+    text = b"\r\n".join(lines) + b"\r\n"
+    if len(text) > MAX_OBJECT_BYTES:
         raise ObjectSkippedError("object_too_large")
-    text = _FOLD.sub(b"", ics)
-    if len(_BEGIN_VEVENT.findall(text)) > MAX_COMPONENTS_PER_OBJECT:
+    if sum(1 for line in lines if _BEGIN_VEVENT.match(line)) > MAX_COMPONENTS_PER_OBJECT:
         raise ObjectSkippedError("too_many_components")
-    if len(_BEGIN_VTIMEZONE.findall(text)) > MAX_TIMEZONES_PER_OBJECT:
+    if sum(1 for line in lines if _BEGIN_VTIMEZONE.match(line)) > MAX_TIMEZONES_PER_OBJECT:
         raise ObjectSkippedError("too_many_components")
     counts = {b"RDATE": 0, b"EXDATE": 0}
-    for line in _DATE_LINE.finditer(text):
-        counts[line.group(1).upper()] += line.group(0).count(b",") + 1
+    for line in lines:
+        found = _DATE_LINE.match(line)
+        if found:
+            counts[found.group(1).upper()] += line.count(b",") + 1
     if max(counts.values()) > MAX_RECURRENCE_DATES:
         raise ObjectSkippedError("too_many_dates")
+    return text
 
 
 def _screen(calendar: icalendar.Calendar) -> None:
@@ -326,6 +346,13 @@ def _screen(calendar: icalendar.Calendar) -> None:
     widened 31-day window (spec 080 rev. 4.5 D62 B). One object holds one series: one UID (one per CalDAV resource,
     RFC 4791 §4.1) and at most one component with an RRULE (the master; overrides never carry one)."""
     components = calendar.walk("VEVENT")
+    # The raw counts again, on the parsed object (belt and braces, delta review D4).
+    if len(components) > MAX_COMPONENTS_PER_OBJECT or len(calendar.walk("VTIMEZONE")) > MAX_TIMEZONES_PER_OBJECT:
+        raise ObjectSkippedError("too_many_components")
+    rdates = sum(_date_count(c, "RDATE") for c in components)
+    exdates = sum(_date_count(c, "EXDATE") for c in components)
+    if max(rdates, exdates) > MAX_RECURRENCE_DATES:
+        raise ObjectSkippedError("too_many_dates")
     if len({str(c.get("UID", "")) for c in components}) > 1 or sum("RRULE" in c for c in components) > 1:
         raise ObjectSkippedError("rule_refused")
     for component in components:
@@ -339,12 +366,12 @@ def _screen(calendar: icalendar.Calendar) -> None:
             parts = cast(dict[str, object], rule)
             if any(len(_values(parts.get(part))) > 1 for part in _TIME_OF_DAY_PARTS):
                 raise ObjectSkippedError("rule_refused")
-        if max(_date_count(component, "RDATE"), _date_count(component, "EXDATE")) > MAX_RECURRENCE_DATES:
-            raise ObjectSkippedError("too_many_dates")
-        if "DTSTART" in component:
-            begin = cast(date, component.decoded("DTSTART"))
-            if (begin.date() if isinstance(begin, datetime) else begin) < EARLIEST_START:
-                raise ObjectSkippedError("start_out_of_range")
+            # Only daily and weekly rules iterate a long way from an old DTSTART; yearly birthdays from 1604
+            # (Apple's year-less birthdays) and old monthly series stay cheap.
+            if frequencies & _EARLY_START_FREQUENCIES and "DTSTART" in component:
+                begin = cast(date, component.decoded("DTSTART"))
+                if (begin.date() if isinstance(begin, datetime) else begin) < EARLIEST_START:
+                    raise ObjectSkippedError("start_out_of_range")
 
 
 def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Callable[[], float]) -> T:
@@ -396,8 +423,7 @@ def _expand_object(
     """The object's instances sorted by start, at most MAX_INSTANCES_PER_OBJECT, and whether that cap cut them."""
 
     def work() -> list[RawEvent]:
-        _prescreen(ics)
-        calendar = icalendar.Calendar.from_ical(ics)
+        calendar = icalendar.Calendar.from_ical(_prescreen(ics))
         _screen(calendar)
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
 
@@ -441,7 +467,7 @@ def expand(
 def _recurring(ics: bytes) -> bool:
     """RRULE or RDATE present (folded lines joined); decides only the expansion order, so a property name that
     appears inside a text value merely moves that object back."""
-    return _RECURRING_LINE.search(_FOLD.sub(b"", ics)) is not None
+    return any(_RECURRING_LINE.match(line) for line in _LINE_BREAK.split(_UNFOLD.sub(b"", ics)))
 
 
 def _instances(
