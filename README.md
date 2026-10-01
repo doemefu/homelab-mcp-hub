@@ -45,7 +45,7 @@ scripts/provider_services.sh up && HUB_PROVIDER_TESTS=1 uv run pytest -m provide
 
 ```bash
 docker build -t mcp-hub:dev .
-scripts/smoke_image.sh mcp-hub:dev   # starts the image read-only as uid 10001 and checks 401/200/403/421
+scripts/smoke_image.sh mcp-hub:dev   # starts the image read-only as uid 10001, checks 401/200/403/421 and the HTML converter
 ```
 
 `scripts/smoke_image.sh` generates a throwaway signing key, a JWKS and a secrets directory with the example registry, so no real credentials are involved.
