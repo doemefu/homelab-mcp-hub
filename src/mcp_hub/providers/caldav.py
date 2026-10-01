@@ -316,8 +316,12 @@ def _prescreen(ics: bytes) -> None:
 def _screen(calendar: icalendar.Calendar) -> None:
     """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs: with
     FREQ at least daily and at most one value per time-of-day part, a rule yields at most a few dozen instances in a
-    widened 31-day window (spec 080 rev. 4.5 D62 B)."""
-    for component in calendar.walk("VEVENT"):
+    widened 31-day window (spec 080 rev. 4.5 D62 B). One object holds one series: one UID (one per CalDAV resource,
+    RFC 4791 §4.1) and at most one component with an RRULE (the master; overrides never carry one)."""
+    components = calendar.walk("VEVENT")
+    if len({str(c.get("UID", "")) for c in components}) > 1 or sum("RRULE" in c for c in components) > 1:
+        raise ObjectSkippedError("rule_refused")
+    for component in components:
         rules = _values(component.get("RRULE"))
         if len(rules) > 1 or "EXRULE" in component:
             raise ObjectSkippedError("rule_refused")

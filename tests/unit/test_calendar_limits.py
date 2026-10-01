@@ -381,6 +381,26 @@ def many_events(count: int) -> bytes:
     return f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\n{events}END:VCALENDAR\r\n".encode()
 
 
+def series_with_overrides(
+    overrides: int, *, rule_on_overrides: bool = False, uid: str = "series@example.test"
+) -> bytes:
+    """A daily master plus `overrides` moved instances of the same UID (how CalDAV stores one series)."""
+    master = (
+        f"BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260901T000000Z\r\nDTSTART:20261017T100000Z\r\n"
+        "DTEND:20261017T110000Z\r\nRRULE:FREQ=DAILY;COUNT=600\r\nSUMMARY:Series\r\nEND:VEVENT\r\n"
+    )
+    moved = "".join(
+        f"BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260901T000000Z\r\n"
+        f"RECURRENCE-ID:{stamp(datetime(2026, 10, 17, 10) + timedelta(days=i))}\r\n"
+        f"DTSTART:{stamp(datetime(2026, 10, 17, 12) + timedelta(days=i))}\r\n"
+        f"DTEND:{stamp(datetime(2026, 10, 17, 13) + timedelta(days=i))}\r\n"
+        + ("RRULE:FREQ=DAILY;COUNT=2\r\n" if rule_on_overrides and i == 0 else "")
+        + "SUMMARY:Moved\r\nEND:VEVENT\r\n"
+        for i in range(overrides)
+    )
+    return f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\n{master}{moved}END:VCALENDAR\r\n".encode()
+
+
 def padded(size: int) -> bytes:
     raw = obj()
     filler = b"DESCRIPTION:" + b"x" * (size - len(raw) - len(b"DESCRIPTION:\r\n")) + b"\r\n"
@@ -397,7 +417,7 @@ def folded_rdates(count: int) -> bytes:
 
 RAW_REFUSED = {
     "object-too-large": (padded(256 * 1024 + 1), "object_too_large"),
-    "501-components": (many_events(501), "too_many_components"),
+    "501-components": (series_with_overrides(500), "too_many_components"),
     "1001-rdates-folded": (folded_rdates(1001), "too_many_dates"),
     "1001-exdates-lowercase": (obj("RRULE:FREQ=DAILY", f"exdate:{EXDATES_1001}"), "too_many_dates"),
 }
@@ -414,7 +434,7 @@ def test_raw_prescreen_refuses_before_parsing(case: str, parser_calls: list[int]
 
 def test_raw_prescreen_boundaries_are_allowed(parser_calls: list[int]) -> None:
     assert len(run(padded(256 * 1024))) == 1
-    assert len(run(many_events(500))) == 500
+    assert len(run(series_with_overrides(499))) == 31  # 500 VEVENTs of one series
     assert len(run(folded_rdates(1000))) == 1000
     assert len(parser_calls) == 3
 
@@ -511,3 +531,39 @@ def test_instances_of_one_object_share_their_text() -> None:
     assert len({id(e.description) for e in events}) == 1
     assert len({id(e.title) for e in events}) == 1
     assert events[0].description == "x" * 100_000
+
+
+# --- one series per object (D62 B, final round) ----------------------------------------------------------------------
+
+
+def two_uids() -> bytes:
+    return obj(uid="first@example.test").replace(
+        b"END:VCALENDAR",
+        b"BEGIN:VEVENT\r\nUID:second@example.test\r\nDTSTAMP:20260901T000000Z\r\nDTSTART:20261021T100000Z\r\n"
+        b"DTEND:20261021T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    )
+
+
+def two_series() -> bytes:
+    raw = obj("RRULE:FREQ=DAILY;COUNT=3", uid="one@example.test")
+    second = obj("RRULE:FREQ=WEEKLY;COUNT=3", uid="one@example.test")
+    component = second[second.index(b"BEGIN:VEVENT") : second.index(b"END:VCALENDAR")]
+    return raw.replace(b"END:VCALENDAR", component + b"END:VCALENDAR")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [series_with_overrides(3, rule_on_overrides=True), two_series(), two_uids()],
+    ids=["rule-on-an-override", "two-series-one-uid", "two-uids"],
+)
+def test_an_object_holds_one_series_of_one_uid(raw: bytes, expander_calls: list[int]) -> None:
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == "rule_refused"
+    assert expander_calls == []
+
+
+def test_one_series_with_many_overrides_is_allowed() -> None:
+    events = run(series_with_overrides(499))
+    assert len(events) == 31  # the daily instances 10-17 .. 11-16 in the window, each moved to 12:00
+    assert {e.title for e in events} == {"Moved"}
