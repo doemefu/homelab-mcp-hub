@@ -19,7 +19,8 @@ class HubContext:
 
 
 def register_tools(server: MCPServer, ctx: HubContext) -> None:
-    from mcp_hub.tools import accounts, mail
+    from mcp_hub.tools import accounts, calendar, mail
 
     accounts.register(server, ctx)
     mail.register(server, ctx)
+    calendar.register(server, ctx)
