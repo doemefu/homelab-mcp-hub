@@ -1,6 +1,7 @@
 """Bounded recurrence expansion (spec 080 rev. 4.5 D62): screening, CPU deadline per object, caps, budget, order,
 negative cache."""
 
+import contextlib
 import logging
 import sys
 import threading
@@ -726,3 +727,61 @@ def test_a_non_positive_or_non_numeric_interval_is_refused(interval: str, expand
 def test_positive_intervals_are_allowed() -> None:
     assert len(run(obj("RRULE:FREQ=DAILY;INTERVAL=2"))) == 14
     assert len(run(obj("RRULE:FREQ=DAILY"))) == 28  # absent = 1
+
+
+# --- confirmation review C2: the pre-screen works on bounded memory ---------------------------------------------
+
+
+def _peak_of(call: Callable[[], object]) -> int:
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        with contextlib.suppress(ObjectSkippedError):
+            call()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_blank_line_folds_do_not_blow_up_the_unfold() -> None:
+    # Review 19 C2: 4.6 MiB of blank lines before one continuation took +291 MB in the regex engine.
+    raw = obj(uid="blank@example.test").replace(b"SUMMARY:", b"SUMMARY:x" + b"\r\n" * 1_900_000 + b" y\r\nX-PAD:")
+    assert 3 * 1024 * 1024 < len(raw) <= 4 * caldav.MAX_OBJECT_BYTES
+    assert _peak_of(lambda: run(raw)) < 10 * 1024 * 1024
+
+
+def test_many_short_lines_are_refused_without_materialising_them() -> None:
+    # Review 19 C2: splitting 800,000 short lines into a list cost +127 MB before the size check.
+    raw = obj(uid="short@example.test").replace(b"END:VEVENT", b"X-A:1\r\n" * 550_000 + b"END:VEVENT")
+    assert caldav.MAX_OBJECT_BYTES < len(raw) <= 4 * caldav.MAX_OBJECT_BYTES
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == "object_too_large"
+    assert _peak_of(lambda: run(raw)) < 10 * 1024 * 1024
+
+
+def test_a_raw_object_above_four_times_the_limit_is_refused_before_any_regex(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert caldav.MAX_RAW_OBJECT_BYTES == 4 * caldav.MAX_OBJECT_BYTES
+    raw = with_lines(obj(uid="huge@example.test"), b"X-ALT-DESC:" + b"h" * (4 * 1024 * 1024))
+
+    class Exploding:
+        def sub(self, *args: object) -> bytes:
+            raise AssertionError("regex ran on an oversized object")
+
+    monkeypatch.setattr(caldav, "_UNFOLD", Exploding())
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(raw)
+    assert caught.value.reason == "object_too_large"
+
+
+@pytest.mark.parametrize("name", [*ics.NAMES, "apple-birthday.ics"])
+def test_the_prescreen_unfolds_exactly_like_icalendar(name: str) -> None:
+    from icalendar.parser.content_line import UFOLD
+
+    raw = ics.load(name)
+    folded = raw.replace(b"SUMMARY:", b"SUMMARY:fol\r\n\r\n ded \r\n\t", 1)
+    for text in (raw, folded):
+        ours = [line for line in caldav._prescreen(text).split(b"\r\n") if line]
+        theirs = [line.encode() for line in UFOLD.sub("", text.decode()).splitlines() if line]
+        assert ours == theirs

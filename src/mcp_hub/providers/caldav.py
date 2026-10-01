@@ -51,6 +51,7 @@ _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both 
 ALLOWED_FREQUENCIES: Final = frozenset({"YEARLY", "MONTHLY", "WEEKLY", "DAILY"})
 MAX_RECURRENCE_DATES: Final = 1000  # RDATE values and EXDATE values, each counted per object
 MAX_OBJECT_BYTES: Final = 1024 * 1024  # one calendar object after stripping unused heavy properties, before parsing
+MAX_RAW_OBJECT_BYTES: Final = 4 * MAX_OBJECT_BYTES  # raw object, refused before any regex runs on it
 MAX_COMPONENTS_PER_OBJECT: Final = 1000  # VEVENT components (master and overrides) per object
 MAX_TIMEZONES_PER_OBJECT: Final = 20  # VTIMEZONE components per object (real objects carry one to three)
 _TIME_OF_DAY_PARTS: Final = ("BYMINUTE", "BYSECOND")  # at most one value each; BYHOUR lists are allowed (<= 24/day)
@@ -68,9 +69,10 @@ SLOW_OBJECT_CACHE_SIZE: Final = 1000
 # fetched sequentially in path order; the cap drops whole calendars from the end of that order (D62).
 MAX_REPORT_BYTES_PER_CALL: Final = 10 * 1024 * 1024
 # icalendar's own unfold rule (parser.content_line.UFOLD), so the pre-screen sees exactly what the parser sees.
-_UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*[ \t]")
-_LINE_BREAK: Final = re.compile(rb"\r?\n")
-_RECURRING_LINE: Final = re.compile(rb"(?i)^(?:RRULE|RDATE)[;:]")
+# The repetition is possessive (same matches): a backtracking `*` kept state per blank line, ~290 MB on 4.6 MiB.
+_UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*+[ \t]")
+_LINE: Final = re.compile(rb"[^\r\n]+")
+_RECURRING_SEARCH: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
 _BEGIN_VEVENT: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VEVENT[ \t]*$")
 _BEGIN_VTIMEZONE: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VTIMEZONE[ \t]*$")
 _DATE_LINE: Final = re.compile(rb"(?i)^(RDATE|EXDATE)[;:]")
@@ -337,24 +339,35 @@ def _unused(line: bytes) -> bool:
 
 def _prescreen(ics: bytes) -> bytes:
     """Cheap checks on the object before icalendar parses it (spec 080 rev. 4.5 D62 A); returns the unfolded text
-    without the properties the hub never reads, which is what gets parsed. Values are counted by their separators; a
-    comma inside a parameter only makes a count larger (refuses earlier)."""
-    lines = [line for line in _LINE_BREAK.split(_UNFOLD.sub(b"", ics)) if line and not _unused(line)]
-    text = b"\r\n".join(lines) + b"\r\n"
-    if len(text) > MAX_OBJECT_BYTES:
+    without the properties the hub never reads, which is what gets parsed. Lines are processed one at a time and the
+    work stops as soon as the kept text passes MAX_OBJECT_BYTES. Values are counted by their separators; a comma
+    inside a parameter only makes a count larger (refuses earlier)."""
+    if len(ics) > MAX_RAW_OBJECT_BYTES:
         raise ObjectSkippedError("object_too_large")
-    if sum(1 for line in lines if _BEGIN_VEVENT.match(line)) > MAX_COMPONENTS_PER_OBJECT:
+    kept = bytearray()
+    vevents = vtimezones = rdates = exdates = 0
+    for match in _LINE.finditer(_UNFOLD.sub(b"", ics)):
+        line = match.group(0)
+        if _unused(line):
+            continue
+        kept += line + b"\r\n"
+        if len(kept) > MAX_OBJECT_BYTES:
+            raise ObjectSkippedError("object_too_large")
+        if _BEGIN_VEVENT.match(line):
+            vevents += 1
+        elif _BEGIN_VTIMEZONE.match(line):
+            vtimezones += 1
+        elif found := _DATE_LINE.match(line):
+            values = line.count(b",") + 1
+            if found.group(1).upper() == b"RDATE":
+                rdates += values
+            else:
+                exdates += values
+    if vevents > MAX_COMPONENTS_PER_OBJECT or vtimezones > MAX_TIMEZONES_PER_OBJECT:
         raise ObjectSkippedError("too_many_components")
-    if sum(1 for line in lines if _BEGIN_VTIMEZONE.match(line)) > MAX_TIMEZONES_PER_OBJECT:
-        raise ObjectSkippedError("too_many_components")
-    counts = {b"RDATE": 0, b"EXDATE": 0}
-    for line in lines:
-        found = _DATE_LINE.match(line)
-        if found:
-            counts[found.group(1).upper()] += line.count(b",") + 1
-    if max(counts.values()) > MAX_RECURRENCE_DATES:
+    if max(rdates, exdates) > MAX_RECURRENCE_DATES:
         raise ObjectSkippedError("too_many_dates")
-    return text
+    return bytes(kept)
 
 
 def _screen(calendar: icalendar.Calendar) -> None:
@@ -496,7 +509,9 @@ def expand(
 def _recurring(ics: bytes) -> bool:
     """RRULE or RDATE present (folded lines joined); decides only the expansion order, so a property name that
     appears inside a text value merely moves that object back."""
-    return any(_RECURRING_LINE.match(line) for line in _LINE_BREAK.split(_UNFOLD.sub(b"", ics)))
+    if len(ics) > MAX_RAW_OBJECT_BYTES:
+        return False  # refused by the pre-screen anyway; no regex on it
+    return _RECURRING_SEARCH.search(_UNFOLD.sub(b"", ics)) is not None
 
 
 def _instances(
