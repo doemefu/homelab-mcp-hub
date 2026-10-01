@@ -39,6 +39,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 | HTTP | uvicorn 0.54.0, starlette 1.7.0, httpx2 2.13.1, anyio 4.15.1 |
 | Validation / tokens | pydantic 2.13.5, PyJWT 2.15.0 (`[crypto]`) |
 | Mail | IMAPClient 4.1.0 |
+| Calendar | icalendar 7.3.0, recurring-ical-events 3.8.2 (CalDAV requests over httpx2) |
 | Tooling | uv 0.12.19, ruff 0.16.9, mypy 2.3.1 `--strict`, pytest 9.1.1, pytest-httpserver 1.1.5 |
 
 ## Conventions
@@ -47,6 +48,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 - The account registry (`accounts.json`) is configuration, validated by pydantic at start-up; an invalid registry stops the process (exit 2).
 - No content storage: account status is kept in memory only; tool results are built per request.
 - Provider adapters return decoded text; the tool layer sanitises it into `untrusted` and applies the output budget.
+- The background status check runs only from the production entry point (`create_app(..., background_checks=True)` in `__main__`) and only when `HUB_STATUS_CHECK_ENABLED=true`; tests and local runs never contact a provider.
 - Third-party loggers are capped at WARNING (`mcp.server.transport_security` at ERROR); hub logs are JSON lines on stdout.
 
 ## Agent Team

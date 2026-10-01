@@ -63,6 +63,8 @@ kubectl -n apps get pods -l app=mcp-hub            # after a deploy
 kubectl -n apps logs deployment/mcp-hub --tail=50
 ```
 
+After a registry change that enables an account (stage b, spec §11.1): the background status check runs about 30 s after the pod start (`HUB_STATUS_CHECK_ENABLED=true` in `k8s/deployment.yaml`), so `list_accounts` shows `ok` for each working capability shortly after that; until then it shows `unknown`. Each cycle writes one `status_check_cycle` line (`result_count`, `outcome`).
+
 ## Rollback
 
 Revert the Flux image-update commit on `main` (or the offending code commit) through a pull request; Flux applies the previous tag. The hub keeps no state apart from in-memory status, so a rollback needs no data migration.
@@ -75,4 +77,7 @@ Revert the Flux image-update commit on `main` (or the offending code commit) thr
 | An account shows `disabled` | `credential_missing` warnings at start-up name the missing or unreadable key; if every credential is unreadable, try `defaultMode: 0440` on the Secret volume |
 | Pod restarts with exit code 2 | `startup_failed` line: `reason` names the invalid variable or registry field |
 | `/readyz` 503 | The process has not finished start-up; check the log for `startup_failed` |
+| An account shows `auth_expired` | `status_check_failed` line with `outcome=auth_expired` for that `account` and `capability`: the provider rejected the credential (for iCloud: create a new app-specific password, update the credential in SOPS, run playbook 59, delete the pod) |
+| An account shows `unreachable` or `error` | `status_check_failed` / `provider_call_failed` lines: `unreachable` = connection or timeout (egress, provider outage), `error` with `outcome=too_large` = a provider answer above 5 MiB (narrow `include_calendars`), other `upstream_error` = an unexpected provider answer |
+| An event is missing from `get_events` | `calendar_object_skipped` lines: that calendar object could not be parsed and was skipped on its own |
 | 421 or 403 without `WWW-Authenticate` | Request `Host` is not `mcp.furchert.ch` or `Origin` is not allowed (`request` line with `check` `host` / `origin`) |

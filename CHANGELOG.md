@@ -16,3 +16,6 @@ All notable changes to this project are documented in this file. The format is b
 - Read-only IMAP adapter (IMAPClient 4.1.0; `EXAMINE` and `BODY.PEEK` only, partial fetches within the §5.4 inbound limits) and the tools `list_unread` and `get_message`, with per-account errors, a 20 s provider and 60 s tool deadline and at most two connections per account.
 - Sanitiser for third-party content (invisible and control characters, links reduced to their host, hidden HTML dropped), opaque message and event ids, and the output budget `HUB_RESPONSE_BUDGET_CHARS`.
 - Provider integration tests against GreenMail (`scripts/provider_services.sh`) and the CI job `providers`.
+- Read-only CalDAV adapter and the tool `get_events`: own discovery and time-range `REPORT` over HTTPS (credentials only to the configured host or the iCloud partition hosts, every response capped at 5 MiB, XML with document type or entity declarations refused), recurrence expansion with `recurring-ical-events` 3.8.2 and `icalendar` 7.3.0 (`RRULE`, `RDATE`, `EXDATE`, overridden and cancelled instances), time-zone conversion, all-day events as dates.
+- Background status check for IMAP and CalDAV accounts (`HUB_STATUS_CHECK_ENABLED`, `HUB_HEALTH_CHECK_INTERVAL_SECONDS`), feeding `list_accounts`.
+- CalDAV integration tests against Radicale in the `providers` job.

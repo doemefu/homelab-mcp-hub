@@ -85,7 +85,7 @@ Every tool is read-only and declares the annotations `readOnlyHint: true`, `dest
 
 ### `list_accounts` (§5.2)
 
-Lists the configured accounts and whether each capability currently works. It never contacts a provider; it answers from the registry and the in-memory status.
+Lists the configured accounts and whether each capability currently works. It never contacts a provider; it answers from the registry and the in-memory status, which tool calls and the background status check keep current.
 
 - Input: `{}`
 - Output (structured content, also serialised as text):
@@ -108,7 +108,8 @@ Lists the configured accounts and whether each capability currently works. It ne
 ```
 
 - `capabilities` lists only the capabilities an account has.
-- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start), `disabled` (switched off in the registry, or a credential file is missing or unreadable). Mail statuses are updated by every `list_unread` / `get_message` call (`auth_expired` and `unreachable` as such, `upstream_timeout` as `unreachable`, other failures as `error`).
+- `HealthStatus`: `ok`, `auth_expired`, `unreachable`, `error`, `unknown` (enabled, credential files readable, not checked since start), `disabled` (switched off in the registry, or a credential file is missing or unreadable). Statuses are updated by every `list_unread` / `get_message` / `get_events` call and by the background status check (`auth_expired` and `unreachable` as such, `upstream_timeout` as `unreachable`, other failures as `error`).
+- **Background status check** (§7.4, spec rev. 4.4 D57): when `HUB_STATUS_CHECK_ENABLED=true`, the running server checks every enabled capability that has an adapter and readable credential files — IMAP: login + `NOOP`; CalDAV: one `PROPFIND` for `current-user-principal` — first 30 s after start-up, then every `HUB_HEALTH_CHECK_INTERVAL_SECONDS`. Until the first check a capability shows `unknown`. The check never runs on the request path of `list_accounts`, and never when the variable is unset (local runs, tests, the smoke container).
 
 ### `list_unread` (§5.2)
 
@@ -146,6 +147,40 @@ Unread messages in each account's configured inbox, newest first, across all mai
 - The body is the first text part, plain preferred; HTML is converted to visible text (scripts, styles, comments, images and hidden elements dropped). At most 256 KiB of the part are fetched; `body_truncated` is set when the part was cut there or by `max_chars`. Attachment content is never fetched.
 - Ids are opaque (`v1.` + base64url). An id whose folder is not the account's configured inbox answers `not_found` without contacting the provider (spec rev. 4.4 §5.1, D56). Provider failures of this single-account call are tool errors: `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `not_found` (also when `UIDVALIDITY` changed).
 
+### `get_events` (§5.2)
+
+Calendar event **instances** overlapping the window, recurrences expanded, sorted by start across all calendar accounts or one `account`.
+
+- Input: `from`, `to` (required; RFC 3339 with offset; `to > from`; at most 31 days, otherwise `invalid_argument`), `account?` (registry id), `timezone?` (IANA name, default `HUB_DEFAULT_TIMEZONE`; anything else → `invalid_argument`), `limit?` (1–200, default 100). The input names are `from`/`to` on the wire (spec rev. 4.4 §5.2, T1).
+- Output:
+
+```json
+{
+  "untrusted_content_notice": "…",
+  "items": [
+    {
+      "id": "v1.…", "account": "icloud", "all_day": false,
+      "start": "2026-10-25T10:00:00+01:00", "end": "2026-10-25T11:00:00+01:00",
+      "start_date": null, "end_date": null,
+      "recurring": true, "status": "confirmed", "attendee_count": 2,
+      "untrusted": { "calendar_name": "…", "title": "…", "location": "…", "description": "…",
+                     "organizer_name": "…", "organizer_address": "organizer@example.org", "original_timezone": "Europe/Zurich" }
+    }
+  ],
+  "next_cursor": null,
+  "truncated": false,
+  "account_errors": []
+}
+```
+
+- Overlap is `start < to` and `end > from`; a zero-length event exactly at `from` is included. `RRULE`, `RDATE`, `EXDATE` and overridden instances (`RECURRENCE-ID`) are expanded; cancelled instances and events with `STATUS:CANCELLED` are omitted. `recurring` is `true` for every instance of a series (including moved instances).
+- Timed events are converted to `timezone`; floating times (no zone) are read in `HUB_DEFAULT_TIMEZONE`. All-day events have `start`/`end` `null` and `start_date`/`end_date` as dates (`end_date` exclusive), and sort by their local midnight. `status` is `confirmed` or `tentative`.
+- `original_timezone` is the IANA zone of `DTSTART` (validated against the pinned zone list, otherwise `null`), `"UTC"` for a UTC `DTSTART`, `null` for floating and all-day events.
+- Field limits: `calendar_name` 100, `title` and `location` 300, `description` 500, `organizer_name` 200, `organizer_address` 254.
+- Event ids are opaque digests over the calendar URL path, `UID` and recurrence id (spec rev. 4.4 §5.1, D56); they are stable across calls and across iCloud partition hosts.
+- Accounts without the calendar capability (`gmail`, `outlook`) are skipped silently; naming one answers `capability_unavailable`. One failing account (for example `too_large`) yields an `account_errors` entry; the other accounts' events are still returned. A calendar object the hub cannot parse is skipped on its own (one `calendar_object_skipped` log line).
+- `truncated: true` when more instances exist than `limit` or the output budget allows: narrow the window.
+
 ### Common rules for the mail tools
 
 - Strictly read-only: the inbox is opened with `EXAMINE` and every body or header fetch uses `BODY.PEEK`, so the read state never changes.
@@ -169,9 +204,10 @@ Port 8083 serves no health routes; port 8084 serves no MCP routes.
 | Service | Use |
 |---------|-----|
 | auth-service JWKS (`AUTH_JWKS_URL`, in-cluster) | Signing keys for access-token validation |
-| IMAP over TLS (each mail account's configured `host` and `port`) | `list_unread`, `get_message`; credentials read from their files when a connection opens |
+| IMAP over TLS (each mail account's configured `host` and `port`) | `list_unread`, `get_message`, status check (login + `NOOP`); credentials read from their files when a connection opens |
+| CalDAV over HTTPS (each calendar account's configured `url`) | `get_events` (discovery `PROPFIND`s, then one time-range `REPORT` per calendar), status check (one `PROPFIND`). Only `PROPFIND` and `REPORT` are sent |
 
-CalDAV and Microsoft Graph connections arrive with later work packages.
+CalDAV rules (spec rev. 4.4 §5.4, §6.1, D58): credentials go only to the configured scheme, host and port or, for `caldav.icloud.com`, to its `pNN-caldav.icloud.com` partition hosts on port 443; every redirect target (at most 3, followed by hand) and every discovered principal, calendar-home and calendar URL is checked before a request is sent. Every response is read as a stream and aborted above 5 MiB (`too_large`). XML with a document type or entity declaration is refused (`upstream_error`). Collections that support only tasks are not queried. The `REPORT` window is widened by one day on each side; the exact overlap is computed by the hub. Microsoft Graph connections arrive with a later work package.
 
 ## 5. Configuration
 
@@ -190,6 +226,8 @@ CalDAV and Microsoft Graph connections arrive with later work packages.
 | `HUB_DEFAULT_TIMEZONE` | `Europe/Zurich` (IANA zone) |
 | `LOG_LEVEL` | `INFO` (`DEBUG`, `INFO`, `WARNING`, `ERROR`; hub logger only) |
 | `HUB_RESPONSE_BUDGET_CHARS` | `30000` (10,000–70,000; output budget per tool result) |
+| `HUB_HEALTH_CHECK_INTERVAL_SECONDS` | `1800` (60–86,400; interval of the background status check) |
+| `HUB_STATUS_CHECK_ENABLED` | `false` (`true` or `false`; the background status check runs only when `true` — set in `k8s/deployment.yaml`) |
 
 An invalid value stops the process with a `startup_failed` line that names the variable, never its value.
 
@@ -209,6 +247,6 @@ An invalid value stops the process with a `startup_failed` line that names the v
 
 JSON lines on stdout, one object per event. Fields (§9.7): `ts`, `level`, `logger`, `event`, `method` (`GET`, `POST`, `DELETE` or `other`), `route` (`/mcp`, the metadata path or `other`), `status`, `duration_ms`, `mcp_protocol_version` (known versions or `other`), `sub`, `client_id`, `jti`, `check`, `exception` (class name only), `tool`, `outcome`, `accounts`, `result_count`, `key_count`, `account`, `capability`, `key` (a credential key name), `item` (first 12 hex characters of a SHA-256 over an opaque id). `startup_failed` may carry `reason`: a fixed message plus at most a variable, field or key **name**.
 
-Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`, `provider_call_failed` (`account`, `capability`, `outcome`, `exception`), `item_degraded` (`account`, `capability`, `item`, `exception`).
+Events: `request` (one per HTTP request on 8083; `check` is set for `scope`, `host` and `origin` rejections — a 401 for a request with an `Authorization` header has its own `token_rejected` line with the check name, a 401 for a request without one has no check name), `tool_call`, `token_rejected`, `jwks_refreshed`, `jwks_fetch_failed`, `allowlist_unavailable`, `allowlist_empty`, `credential_missing`, `startup`, `startup_failed`, `provider_call_failed` (`account`, `capability`, `outcome`, `exception`), `item_degraded` (`account`, `capability`, `item`, `exception`), `calendar_object_skipped` (`account`, `capability`, `exception`), `status_check_failed` (`account`, `capability`, `outcome`, `exception`), `status_check_cycle` (one line per cycle: `result_count` = checks run, `outcome` `ok`/`partial`/`error`, `exception` when the cycle itself failed).
 
 Never logged: tokens, `Authorization` values, raw header values, provider URLs, addresses, mail or calendar content, credentials. `LOG_LEVEL` applies to the `mcp_hub` logger only; the root logger and `httpx2`, `httpcore2`, `mcp`, `caldav`, `niquests`, `imapclient`, `uvicorn` are pinned at `WARNING`, and `mcp.server.transport_security` at `ERROR` (the hub writes its own request line with `check="host"` or `check="origin"` instead). Records from third-party loggers are reduced to `event="third_party_log"` without their message text. uvicorn access logs are off.
