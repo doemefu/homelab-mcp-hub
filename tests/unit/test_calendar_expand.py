@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from mcp_hub.providers.base import ProviderError
-from mcp_hub.providers.caldav import RawEvent, expand, parse_multistatus
+from mcp_hub.providers.caldav import RawEvent, expand, parse_multistatus, parse_xml
 from tests.support import ics
 
 ZURICH, UTC_ZONE = ZoneInfo("Europe/Zurich"), ZoneInfo("UTC")
@@ -143,3 +143,30 @@ def test_multistatus_refuses_dtds_entities_and_malformed_xml(bad: bytes) -> None
     with pytest.raises(ProviderError) as caught:
         parse_multistatus(bad)
     assert caught.value.code == "upstream_error"
+
+
+@pytest.mark.parametrize(
+    ("raw", "limit"),
+    [
+        (b"<a>" * 33 + b"</a>" * 33, "depth"),
+        (b"<r>" + b"<e/>" * 100_000 + b"</r>", "elements"),
+    ],
+    ids=["depth-33", "100001-elements"],
+)
+def test_xml_depth_and_element_count_are_bounded(raw: bytes, limit: str) -> None:
+    with pytest.raises(ProviderError) as caught:
+        parse_xml(raw)
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", "XmlRefused")
+
+
+def test_xml_at_the_limits_is_accepted() -> None:
+    assert parse_xml(b"<a>" * 32 + b"</a>" * 32).tag == "a"
+    assert len(parse_xml(b"<r>" + b"<e/>" * 99_999 + b"</r>")) == 99_999
+
+
+def test_a_deeply_nested_5_mib_document_is_refused_early() -> None:
+    # Review 19 F2: 5 MiB of nested elements built a 583 MB tree before.
+    depth = 5 * 1024 * 1024 // 7
+    raw = b"<a>" * depth + b"</a>" * depth  # well-formed: only the depth limit can refuse it
+    with pytest.raises(ProviderError):
+        parse_xml(raw)

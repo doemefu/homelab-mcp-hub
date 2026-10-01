@@ -32,6 +32,8 @@ from mcp_hub.sanitize import validate_timezone
 
 _DAV: Final = "{DAV:}"
 _CALDAV: Final = "{urn:ietf:params:xml:ns:caldav}"
+MAX_XML_DEPTH: Final = 32  # a multistatus is about 8 levels deep
+MAX_XML_ELEMENTS: Final = 100_000  # per response (spec 080 rev. 4.5, review 19 F2)
 _XML_ENCODING: Final = re.compile(rb"\s*<\?xml[^>]*?encoding\s*=\s*[\"']([A-Za-z0-9._-]+)[\"']")
 _WIDEN: Final = timedelta(days=1)  # query and expansion window widened on both sides (spec 080 rev. 4.4 §5.4)
 # Bounded expansion (spec 080 rev. 4.5 D62). Each calendar object is screened before the expansion library sees it,
@@ -94,10 +96,22 @@ def _parse(raw: bytes) -> ET.Element:
     parser.EntityDeclHandler = _refuse
     parser.UnparsedEntityDeclHandler = _refuse
     parser.ExternalEntityRefHandler = _refuse
-    parser.StartElementHandler = lambda name, attrs: builder.start(
-        _clark(name), {_clark(key): value for key, value in attrs.items()}
-    )
-    parser.EndElementHandler = lambda name: builder.end(_clark(name))
+    depth = elements = 0
+
+    def start(name: str, attrs: dict[str, str]) -> None:
+        nonlocal depth, elements
+        depth, elements = depth + 1, elements + 1
+        if depth > MAX_XML_DEPTH or elements > MAX_XML_ELEMENTS:  # a 5 MiB body could build a tree of ~600 MB
+            raise _RefusedError
+        builder.start(_clark(name), {_clark(key): value for key, value in attrs.items()})
+
+    def end(name: str) -> None:
+        nonlocal depth
+        depth -= 1
+        builder.end(_clark(name))
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
     parser.CharacterDataHandler = builder.data
     parser.Parse(raw, True)
     return builder.close()
