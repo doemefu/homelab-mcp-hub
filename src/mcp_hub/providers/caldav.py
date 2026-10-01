@@ -417,7 +417,7 @@ REPORT_BODY: Final = (
     "</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
 )
 _ICLOUD_HOST: Final = "caldav.icloud.com"
-_ICLOUD_PARTITION: Final = re.compile(r"^p\d{1,3}-caldav\.icloud\.com$")
+_ICLOUD_PARTITION: Final = re.compile(r"^p[0-9]{1,3}-caldav\.icloud\.com$")  # ASCII digits only
 _MAX_REDIRECTS: Final = 3
 _REDIRECTS: Final = frozenset({301, 302, 307, 308})
 _log = logging.getLogger("mcp_hub.providers.caldav")
@@ -431,21 +431,32 @@ class CalendarRef:
     name: str | None
 
 
+_DEFAULT_PORTS: Final = {"https": 443, "http": 80}
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """(scheme, host, port) with the scheme's default port filled in; None when the URL has no usable host or port."""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:  # e.g. "+443" or "443.evil.example": refused, never guessed
+        return None
+    if not parts.hostname or parts.scheme not in _DEFAULT_PORTS:
+        return None
+    return parts.scheme, parts.hostname, port if port is not None else _DEFAULT_PORTS[parts.scheme]
+
+
 def allowed_host(configured: str, target: str) -> bool:
     """Credentials go only to the configured scheme/host/port, or - for iCloud - to its pNN-caldav partition hosts
     on port 443 (spec 080 rev. 4.4 §6.1, D58). Checked before every request, including redirects and discovered
-    hrefs."""
-    a, b = urlsplit(configured), urlsplit(target)
-    if a.scheme != b.scheme or not b.hostname:
+    hrefs. An explicit default port equals no port (iCloud returns absolute hrefs with ":443"); any other port must
+    match the configured one. The registry only accepts https URLs, so targets are https in production."""
+    a, b = _origin(configured), _origin(target)
+    if a is None or b is None or a[0] != b[0]:
         return False
-    if (a.hostname, a.port) == (b.hostname, b.port):
+    if a == b:
         return True
-    return (
-        a.hostname == _ICLOUD_HOST
-        and a.scheme == "https"
-        and b.port in (None, 443)
-        and bool(_ICLOUD_PARTITION.fullmatch(b.hostname))
-    )
+    return a[:2] == ("https", _ICLOUD_HOST) and b[2] == 443 and bool(_ICLOUD_PARTITION.fullmatch(b[1]))
 
 
 def default_client(username: str, password: str, timeout: float) -> httpx2.Client:

@@ -1,5 +1,7 @@
 import logging
+import re
 from datetime import datetime
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import httpx2
@@ -244,7 +246,9 @@ def test_icloud_shaped_discovery_crosses_to_the_partition_host() -> None:
     def run(home: str) -> tuple[RecordingTransport, list[object] | ProviderError]:
         recorder = RecordingTransport(
             {
-                ("PROPFIND", "https://caldav.icloud.com:443/"): dav(principal("/123/principal/")),
+                ("PROPFIND", "https://caldav.icloud.com:443/"): dav(
+                    principal("https://caldav.icloud.com:443/123/principal/")
+                ),
                 ("PROPFIND", "https://caldav.icloud.com:443/123/principal/"): dav(home_set(home)),
                 ("PROPFIND", "https://p42-caldav.icloud.com:443/123/calendars/"): dav(
                     multistatus(collection("/123/calendars/home/", "Home", components=("VEVENT",)))
@@ -335,7 +339,7 @@ def test_invalid_utf8_in_a_multistatus_is_replaced_once(
     with caplog.at_level(logging.INFO, logger="mcp_hub"):
         events = source(httpserver, ["Home"]).events(START, END, ZURICH, ZURICH).events
     titles = sorted(e.title or "" for e in events)
-    assert titles == ["M�ller � away", "Weekly DST", "Weekly DST", "Weekly DST"]
+    assert titles == ["M\ufffdller \ufffd away", "Weekly DST", "Weekly DST", "Weekly DST"]
     repaired = [r for r in caplog.records if r.getMessage() == "xml_encoding_repaired"]
     assert len(repaired) == 1
     assert repaired[0].fields == {"account": "icloud", "capability": "calendar"}  # type: ignore[attr-defined]
@@ -371,3 +375,70 @@ def test_the_utf8_retry_is_no_bypass(httpserver: HTTPServer, body: bytes) -> Non
     httpserver.expect_request("/", method="PROPFIND").respond_with_data(body, status=207, content_type=XML)
     error = code_of(source(httpserver).check)
     assert (error.code, error.cause) == ("upstream_error", "XmlRefused")
+
+
+def test_default_port_is_normalised_before_the_host_comparison() -> None:
+    # iCloud returns absolute hrefs with an explicit :443 (review 19 F6).
+    assert allowed_host("https://caldav.icloud.com/", "https://caldav.icloud.com:443/123/principal/")
+    assert allowed_host("https://caldav.icloud.com:443/", "https://caldav.icloud.com/123/principal/")
+    assert allowed_host("https://dav.example.test/", "https://dav.example.test:443/cal/")
+    for target in (
+        "https://caldav.icloud.com:8443/",
+        "https://p42-caldav.icloud.com:444/",
+        "http://caldav.icloud.com:443/",
+        "https://caldav.icloud.com:+443/",
+    ):
+        assert not allowed_host("https://caldav.icloud.com/", target), target
+    assert not allowed_host("https://dav.example.test/", "https://dav.example.test:8443/cal/")
+
+
+HOSTILE_HREFS = [
+    "//evil.example.test/x",
+    "https://evil.example.test\\@caldav.icloud.com/",
+    "https://evil.example.test#@caldav.icloud.com/",
+    "https://evil.example.test?@caldav.icloud.com/",
+    "https://caldav.icloud.com:443@evil.example.test/",
+    "https://caldav.icloud.com%2F@evil.example.test/",
+    "https://caldav.icloud.com%00@evil.example.test/",
+    "https://a@b@evil.example.test/",
+    "https://caldav.icloud.com@evil.example.test/",
+    "https://evil.example.test\t.caldav.icloud.com/",
+    "https://evil.example.test\n.caldav.icloud.com/",
+    "https://caldav.icloud.com./",
+    "https://CALDAV.ICLOUD.COM/",
+    "https://p\u0661-caldav.icloud.com/",
+    "https://p\uff14\uff12-caldav.icloud.com/",
+    "https://169.254.169.254/",
+    "https://[::1]/",
+    "https://127.0.0.1/",
+    "https://10.0.0.1/",
+    "https://caldav.icloud.com:0443/",
+    "https://caldav.icloud.com:+443/",
+    "https://p42-caldav.icloud.com.evil.example.test/",
+    "https://evil.example.test/p42-caldav.icloud.com/",
+    "https://p42-caldav.icloud.com:443.evil.example.test/",
+    "http://p42-caldav.icloud.com/",
+    "https://xp42-caldav.icloud.com/",
+    "https://p42-caldav-icloud.com/",
+    "https://p4242-caldav.icloud.com/",
+]
+
+
+@pytest.mark.parametrize("href", HOSTILE_HREFS)
+def test_an_accepted_href_is_the_host_httpx2_will_contact(href: str) -> None:
+    # Differential check: whenever allowed_host accepts a URL, httpx2's own parser must see an allowed host on 443.
+    target = urljoin("https://caldav.icloud.com/123/principal/", href)
+    if not allowed_host("https://caldav.icloud.com/", target):
+        return
+    try:
+        url = httpx2.URL(target)
+    except Exception:
+        return  # httpx2 refuses the URL: nothing is sent
+    assert url.scheme == "https"
+    assert url.port in (None, 443)
+    assert url.host == "caldav.icloud.com" or re.fullmatch(r"p[0-9]{1,3}-caldav\.icloud\.com", url.host)
+
+
+def test_partition_host_digits_are_ascii_only() -> None:
+    for host in ("p\u0661", "p\uff14\uff12", "p\u0664\u0662"):
+        assert not allowed_host("https://caldav.icloud.com/", f"https://{host}-caldav.icloud.com/"), host
