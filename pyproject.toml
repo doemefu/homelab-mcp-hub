@@ -16,6 +16,10 @@ dependencies = [
     "IMAPClient==4.1.0",
     "icalendar==7.3.0",
     "recurring-ical-events==3.8.2",
+    # Token store (spec 080 §7.2, #171): AES-256-GCM via cryptography (approved runtime, transitive of pyjwt[crypto]),
+    # PostgreSQL driver psycopg[binary] (approved D34).
+    "cryptography==50.0.1",
+    "psycopg[binary]==3.3.6",
 ]
 
 [dependency-groups]
