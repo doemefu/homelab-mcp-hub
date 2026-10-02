@@ -1,0 +1,3 @@
+#!/bin/sh
+# Spec 080 §7.3: owner commands inside the hub container (the image runs from source, no entry point).
+exec python -m mcp_hub "$@"
