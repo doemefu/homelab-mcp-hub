@@ -55,7 +55,7 @@ Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The f
 
 **Signing-key revocation.** The hub caches auth-service's signing keys and re-reads them at most every hour; a key that auth-service withdraws stops being accepted at the hub within 1 hour, or immediately after `kubectl -n apps delete pod -l app=mcp-hub`.
 
-**Resources.** The container's CPU limit is 1 core: calendar expansion is single-threaded and CPU-bound, and at 500m one busy worker would run at half speed in wall time (5 s expansion budget, 20 s call timeout). Memory limit 256 Mi; measured worst cases stay below about 160 MB (spec 080 rev. 4.5 D62).
+**Resources.** The container's CPU limit is 1 core: calendar expansion is single-threaded and CPU-bound, and at 500m one busy worker would run at half speed in wall time (5 s expansion budget, 20 s call timeout). Memory limit 256 Mi; measured in this image under these limits (Linux/arm64, `scripts/memory_probe.py`), one account stays at or below 165 MiB with no OOM kill; two accounts queried concurrently with emoji-heavy time-zone data reach 256 MiB (INTERFACES.md, memory table; spec 080 rev. 4.5 D62).
 
 **Verification**
 

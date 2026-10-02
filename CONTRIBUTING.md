@@ -62,6 +62,19 @@ uv run pytest tests/contract -v      # gate G6
 uv run pytest tests/integration -v   # starts python -m mcp_hub as a subprocess
 ```
 
+### Memory probe
+
+`scripts/memory_probe.py` measures `get_events` memory and CPU against an in-process fake CalDAV server (synthetic data only, no network). Run it in the production image under the pod's limits; the repository is mounted read-only and the script is not part of the image:
+
+```bash
+docker build -t mcp-hub:dev .
+docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /tmp \
+  -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \
+  python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
+```
+
+It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` and `memory.events`; `--accounts 2` queries two accounts concurrently. Re-run the scenarios in INTERFACES.md's memory table after any change to the calendar limits.
+
 ### Provider integration tests
 
 The IMAP adapter is tested against a local GreenMail container and the CalDAV adapter against a local Radicale container (both pinned by digest). `scripts/provider_services.sh up` starts both on `127.0.0.1` with neutral `example.test` users and passwords generated per run (written to `$HUB_PROVIDER_STATE_DIR` or `$TMPDIR`, never committed; Radicale reads a per-run copy of `tests/fixtures/radicale/config`); `down` stops and removes them. The calendar fixtures in `tests/fixtures/ics/` (DST change, overrides, `EXDATE`, `RDATE`, cancellations, all-day, floating, cross-zone, window edge, hostile text) are checked in unit tests and again through Radicale; `tests/support/ics.py` loads them with CRLF line endings and turns the `{ZWSP}` placeholder into a zero-width space, so no invisible character is committed.
