@@ -24,6 +24,7 @@ ALLOWED_FIELDS = frozenset(
         "capability",
         "key",
         "item",
+        "error_code",  # (spec 080 rev. 4.6 S12)
     }
 )
 EVENT_FIELDS: dict[str, frozenset[str]] = {"startup_failed": frozenset({"reason"})}
