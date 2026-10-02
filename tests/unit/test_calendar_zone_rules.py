@@ -252,6 +252,33 @@ def test_many_late_rules_cannot_add_up_through_a_far_lookup() -> None:
     assert caught.value.reason == "rule_refused"
 
 
+# Below the iteration limit, so only the shape rule itself refuses (review of PR #15, G3).
+
+
+def test_a_second_rule_in_one_sub_component_is_refused() -> None:
+    zone_text = sub_components(OUTLOOK_RULE, 1, start="20200101T000000").replace(
+        f"RRULE:{OUTLOOK_RULE}", f"RRULE:{OUTLOOK_RULE}\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU"
+    )  # 2 x 7,980 occurrences up to 9999
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(zone_text))
+    assert caught.value.reason == "rule_refused"
+
+
+def test_more_than_seven_month_days_are_refused() -> None:
+    rule = "FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=1,2,3,4,5,6,7,8"
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(sub_components(rule, 1, start="99900101T000000")))  # 10 years x 8
+    assert caught.value.reason == "rule_refused"
+
+
+def test_the_rule_icalendar_serialises_is_checked_too() -> None:
+    # The raw value has one BYMONTH entry ("10 BYDAY=-1SU"); icalendar drops the unreadable part, so the text the
+    # time-zone builder evaluates is FREQ=YEARLY without BYMONTH.
+    with pytest.raises(ObjectSkippedError) as caught:
+        run(obj(sub_components("FREQ=YEARLY;BYMONTH=10 BYDAY=-1SU", 1, start="99900101T000000")))
+    assert caught.value.reason == "rule_refused"
+
+
 def test_the_limit_applies_per_vtimezone() -> None:
     # Outlook adds one VTIMEZONE per zone the event uses (start and end in different zones).
     zones = sub_components(OUTLOOK_RULE, 2) + sub_components(OUTLOOK_RULE, 2, tzid="Custom/Other")
@@ -361,7 +388,7 @@ def test_a_hostile_rule_under_an_iana_tzid_is_never_evaluated(
     tzid: str, monkeypatch: pytest.MonkeyPatch, zone_builds: list[int]
 ) -> None:
     # The zone screen is switched off to pin the library behaviour underneath it: zoneinfo's own data is used.
-    monkeypatch.setattr(caldav, "_screen_zones", lambda text: None)
+    monkeypatch.setattr(caldav, "_screen_zones", lambda text: set())
     raw = obj(zone(f"RRULE:{DENSE}", tzid=tzid), tzid=tzid)
     assert peak_of(lambda: run(raw)) < 2 * 1024 * 1024
     assert [event.start.isoformat() for event in run(raw)] == ["2026-10-20T10:00:00+02:00"]

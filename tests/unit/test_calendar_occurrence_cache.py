@@ -124,7 +124,8 @@ def test_results_are_identical_on_the_property_corpus() -> None:
 def test_memory_stays_flat_without_the_screen(monkeypatch: pytest.MonkeyPatch) -> None:
     # With the occurrence screen DISABLED, the review's 1800 shape iterated ~1.9 M occurrences into dateutil's cache
     # (187 MiB RSS). Without the cache only CPU grows; the 4 s deadline bounds that.
-    monkeypatch.setattr(caldav, "_screen", lambda calendar, window_end: None)
+    monkeypatch.setattr(caldav, "_screen", lambda calendar, window_end: set())
+    monkeypatch.setattr(caldav, "check_rule_text", lambda text, approved, *, multi_line: None)  # guard off too
     raw = obj(
         f"FREQ=YEARLY;BYMONTH=1,2,3,4,5,6,7,8,9,10,11,12;BYMONTHDAY={','.join(map(str, range(1, 32)))};BYHOUR={HOURS}",
         "18000101T000000Z",
