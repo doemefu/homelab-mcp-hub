@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import threading
+from collections.abc import Callable
 
 import httpx2
 import pytest
@@ -251,3 +252,78 @@ def test_no_secret_in_logs_or_exceptions() -> None:
             assert set(e) <= allowed_fields(e["event"])
     finally:
         logging.getLogger().removeHandler(capture)
+
+
+def refresh_lines(
+    make: Callable[[], GraphTokenSource], deadline: float = 1020.0
+) -> tuple[str, list[dict[str, object]]]:
+    """Run one access_token call; return the ProviderError cause and the token_refresh lines it wrote."""
+    configure_logging("INFO")
+    capture = Capture()
+    logging.getLogger("mcp_hub").addHandler(capture)
+    try:
+        with pytest.raises(ProviderError) as info:
+            make().access_token(deadline=deadline)
+    finally:
+        logging.getLogger("mcp_hub").removeHandler(capture)
+    events = [json.loads(line) for line in capture.lines if '"token_refresh"' in line]
+    return info.value.cause, events
+
+
+def raising(error: Exception) -> MsTransport:
+    t = MsTransport({})
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        raise error
+
+    t.handle = handle  # type: ignore[method-assign]
+    return t
+
+
+@pytest.mark.parametrize(
+    ("transport", "cause"),
+    [
+        (raising(httpx2.ConnectError("boom")), "ConnectError"),
+        (raising(httpx2.ConnectTimeout("slow")), "ConnectTimeout"),
+        (MsTransport({TOKEN_PATH: [json_answer(503, {})]}), "TokenEndpointStatus"),
+        (MsTransport({TOKEN_PATH: [httpx2.Response(200, content=b"not json")]}), "MalformedJson"),
+        (MsTransport({TOKEN_PATH: [json_answer(200, {"access_token": "AT-SENTINEL-1"})]}), "BadTokenAnswer"),
+    ],
+)
+def test_transport_and_answer_failures_write_a_token_refresh_line(transport: MsTransport, cause: str) -> None:
+    store = FakeStore()
+    got, events = refresh_lines(lambda: source(store, transport))
+    assert got == cause
+    assert [(e["outcome"], e["level"], e.get("exception")) for e in events] == [("error", "WARNING", cause)]
+    assert store.current() == "RT-SENTINEL-0"
+
+
+def test_deadline_store_and_lock_failures_write_a_token_refresh_line() -> None:
+    t = MsTransport({TOKEN_PATH: [ok(1)]})
+    cases: list[tuple[Callable[[], GraphTokenSource], float, str]] = [
+        (lambda: source(FakeStore(), t), 1000.5, "CallDeadline"),
+        (lambda: source(FakeStore(configured=False), t), 1020.0, "TokenStoreNotConfigured"),
+    ]
+    cache = AccessTokenCache()
+    lock = cache.lock_for("outlook")
+    lock.acquire()
+    try:
+        cases.append((lambda: source(FakeStore(), t, cache=cache), 1002.5, "TokenLock"))
+        for make, deadline, cause in cases:
+            got, events = refresh_lines(make, deadline)
+            assert got == cause
+            assert [(e["outcome"], e.get("exception")) for e in events] == [("error", cause)]
+    finally:
+        lock.release()
+    assert t.seen == []
+
+
+@pytest.mark.parametrize("cause", ["KeyUnreadable", "KeyLength", "SameKey"])
+def test_key_failures_log_their_specific_cause(cause: str) -> None:
+    class NoKey(FakeStore):
+        def cipher(self) -> TokenCipher:
+            raise KeyUnavailableError(cause)
+
+    got, events = refresh_lines(lambda: source(NoKey(), MsTransport({TOKEN_PATH: [ok(1)]})))
+    assert got == "KeyUnavailable"
+    assert [(e["outcome"], e.get("exception")) for e in events] == [("error", cause)]

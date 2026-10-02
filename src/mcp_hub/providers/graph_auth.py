@@ -104,6 +104,7 @@ class GraphTokenSource:
             return cached
         lock = self._cache.lock_for(self._account.account_id)
         if not lock.acquire(timeout=self.lock_wait(deadline, self._clock())):
+            self._log(logging.WARNING, "error", "TokenLock")
             raise ProviderError("upstream_timeout", "TokenLock")
         try:
             cached = self._cache.get(key, self._clock())
@@ -122,6 +123,7 @@ class GraphTokenSource:
     def _refresh(self, deadline: float) -> str:
         acct = self._account
         if not self._store.configured():
+            self._log(logging.WARNING, "error", "TokenStoreNotConfigured")
             raise ProviderError("upstream_error", "TokenStoreNotConfigured")
         try:
             cipher = self._store.cipher()
@@ -147,23 +149,28 @@ class GraphTokenSource:
                     raise ProviderError("auth_expired", "TokenDecrypt") from None
                 remaining = deadline - self._clock()
                 if remaining <= 1.0:
-                    raise ProviderError("upstream_timeout", "CallDeadline")
-                try:
-                    with self._client_factory(remaining) as client:
-                        answer = msidentity.refresh(client, acct, refresh_token, deadline=deadline, clock=self._clock)
-                except GrantError as exc:
-                    failure_code = exc.error_code
-                    if exc.status == 400 and exc.error in REVOKED_GRANT_ERRORS:  # sticky only for 400 (P6)
-                        row.mark_invalid_grant()  # committed when the block ends normally
-                        failure = ProviderError("auth_expired", "InvalidGrant")
-                    elif exc.error in CLIENT_ERRORS:
-                        failure = ProviderError("upstream_error", "ClientRejected")
-                    else:
-                        failure = ProviderError("upstream_error", "TokenEndpoint")
+                    failure = ProviderError("upstream_timeout", "CallDeadline")
                 else:
-                    sealed = cipher.seal(answer.refresh_token, account_id=acct.account_id, provider=acct.provider)
-                    persisting = True
-                    row.rotate(sealed, answer.scope)  # a row under the previous key is re-encrypted here
+                    try:
+                        with self._client_factory(remaining) as client:
+                            answer = msidentity.refresh(
+                                client, acct, refresh_token, deadline=deadline, clock=self._clock
+                            )
+                    except ProviderError as exc:  # transport, status, size, JSON or answer shape: logged below
+                        failure = exc
+                    except GrantError as exc:
+                        failure_code = exc.error_code
+                        if exc.status == 400 and exc.error in REVOKED_GRANT_ERRORS:  # sticky only for 400 (P6)
+                            row.mark_invalid_grant()  # committed when the block ends normally
+                            failure = ProviderError("auth_expired", "InvalidGrant")
+                        elif exc.error in CLIENT_ERRORS:
+                            failure = ProviderError("upstream_error", "ClientRejected")
+                        else:
+                            failure = ProviderError("upstream_error", "TokenEndpoint")
+                    else:
+                        sealed = cipher.seal(answer.refresh_token, account_id=acct.account_id, provider=acct.provider)
+                        persisting = True
+                        row.rotate(sealed, answer.scope)  # a row under the previous key is re-encrypted here
             # The transaction is committed here; only now may the new tokens be used.
         except TokenStoreUnavailableError as exc:
             if persisting:
