@@ -1,0 +1,144 @@
+import io
+import logging
+import shutil
+from pathlib import Path
+
+import httpx2
+import pytest
+
+from mcp_hub import cli
+from tests.support.logcapture import Capture
+from tests.support.ms_transport import FAKE_CLIENT_ID, MsTransport, json_answer
+from tests.support.token_fakes import FakeStore
+
+FIXTURES = Path(__file__).parent.parent / "fixtures"
+DEVICE = {
+    "device_code": "DC-SENTINEL",
+    "user_code": "WXYZ-1234",
+    "verification_uri": "https://microsoft.com/devicelogin",
+    "expires_in": 900,
+    "interval": 1,
+}
+TOKENS = {"access_token": "AT-SENTINEL", "refresh_token": "RT-SENTINEL", "expires_in": 3600, "scope": "Mail.Read"}
+
+
+class Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.fixture
+def secrets(tmp_path: Path) -> Path:
+    shutil.copy(FIXTURES / "accounts.example.json", tmp_path / "accounts.json")
+    (tmp_path / "allowed-subjects").write_text("someone\n")
+    (tmp_path / "outlook-ms-client-id").write_text(FAKE_CLIENT_ID + "\n")
+    return tmp_path
+
+
+def run(
+    secrets: Path, t: MsTransport, argv: list[str], store: FakeStore | None = None, out: io.StringIO | None = None
+) -> tuple[int, str, str, FakeStore]:
+    terminal, err = out if out is not None else Terminal(), io.StringIO()
+    holder = store or FakeStore(None)
+    code = cli.main(
+        argv,
+        {"HUB_SECRETS_DIR": str(secrets)},
+        out=terminal,
+        err=err,
+        client_factory=lambda timeout: httpx2.Client(transport=t.transport(), trust_env=False, follow_redirects=False),
+        store_factory=lambda config: holder,
+        sleep=lambda s: None,
+        clock=lambda: 0.0,
+    )
+    return code, terminal.getvalue(), err.getvalue(), holder
+
+
+def happy() -> MsTransport:
+    return MsTransport(
+        {
+            "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE)],
+            "/consumers/oauth2/v2.0/token": [
+                json_answer(400, {"error": "authorization_pending"}),
+                json_answer(200, TOKENS),
+            ],
+        }
+    )
+
+
+def test_login_stores_encrypted_token_and_requests_registry_scopes(secrets: Path) -> None:
+    t = happy()
+    code, out, _, store = run(secrets, t, ["login", "outlook"])
+    assert code == 0
+    assert store.current() == "RT-SENTINEL"
+    assert t.seen[0][4]["scope"] == "Mail.Read offline_access"
+    assert "WXYZ-1234" in out
+    assert "https://microsoft.com/devicelogin" in out
+
+
+def test_login_prints_code_only_to_terminal(secrets: Path) -> None:
+    capture = Capture()  # on the hub logger: cli.main calls configure_logging, which replaces the root handlers
+    logging.getLogger("mcp_hub").addHandler(capture)
+    try:
+        code, out, err, _ = run(secrets, happy(), ["login", "outlook"])
+    finally:
+        logging.getLogger("mcp_hub").removeHandler(capture)
+    logs = "\n".join(capture.lines + [m for _, _, m in capture.raw])
+    for secret in ("WXYZ-1234", "DC-SENTINEL", "AT-SENTINEL", "RT-SENTINEL", FAKE_CLIENT_ID):
+        assert secret not in logs
+        assert secret not in err
+    for secret in ("DC-SENTINEL", "AT-SENTINEL", "RT-SENTINEL", FAKE_CLIENT_ID):
+        assert secret not in out
+    assert code == 0
+    assert '"event": "login"' in logs
+    assert '"outcome": "ok"' in logs
+
+
+def test_login_refuses_without_a_terminal(secrets: Path) -> None:
+    t = happy()
+    code, out, err, store = run(secrets, t, ["login", "outlook"], out=io.StringIO())
+    assert code == 2
+    assert t.seen == []
+    assert store.sealed is None
+    assert "terminal" in err
+    assert out == ""
+
+
+@pytest.mark.parametrize("argv", [[], ["login"], ["login", "nope"], ["login", "icloud"], ["serve"]])
+def test_usage_and_config_errors_exit_2(secrets: Path, argv: list[str]) -> None:
+    assert run(secrets, happy(), argv)[0] == 2
+
+
+def test_token_store_not_configured_exits_2(secrets: Path) -> None:
+    code, _, err, _ = run(secrets, happy(), ["login", "outlook"], FakeStore(None, configured=False))
+    assert code == 2
+    assert "token store is not configured" in err
+
+
+@pytest.mark.parametrize("error", ["authorization_declined", "access_denied", "expired_token", "invalid_client"])
+def test_failed_login_exits_1_and_stores_nothing(secrets: Path, error: str) -> None:
+    t = MsTransport(
+        {
+            "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE)],
+            "/consumers/oauth2/v2.0/token": [json_answer(400, {"error": error})],
+        }
+    )
+    code, _, _, store = run(secrets, t, ["login", "outlook"])
+    assert code == 1
+    assert store.sealed is None
+
+
+def test_unexpected_host_prints_only_the_host(secrets: Path) -> None:
+    bad = DEVICE | {"verification_uri": "https://evil.example.test/x?code=WXYZ-1234"}
+    t = MsTransport({"/consumers/oauth2/v2.0/devicecode": [json_answer(200, bad)]})
+    code, out, err, _ = run(secrets, t, ["login", "outlook"])
+    assert code == 1
+    assert "evil.example.test" in err
+    assert "WXYZ" not in out + err
+    assert "code=" not in err
+
+
+def test_store_failure_after_sign_in_exits_1(secrets: Path) -> None:
+    code, _, err, store = run(secrets, happy(), ["login", "outlook"], FakeStore(None, fail_commit=True))
+    assert code == 1
+    assert "could not be stored" in err
+    assert store.sealed is None

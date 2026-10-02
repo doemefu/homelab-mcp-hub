@@ -14,7 +14,8 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 | WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | Done |
 | WP5c | CalDAV adapter, `get_events`, background status check | In review |
 | WP5d | `search_mail`, paging, metrics on the internal port | Planned |
-| WP8–WP10 | Further accounts (IMAP folder handling, Microsoft Graph, calendar feed) | Planned |
+| WP9 | Microsoft Graph for `outlook`: token store and `mcp-hub login` (PR A), mail adapter (PR B) | In progress |
+| WP8, WP10 | Further accounts (IMAP folder handling, calendar feed) | Planned |
 
 ## Quick reference
 
@@ -37,7 +38,7 @@ uv sync --locked
 uv run ruff check && uv run ruff format --check
 uv run mypy --strict src
 uv run pytest -m "not provider"    # unit, contract (gate G6) and integration tests
-# provider tests against local GreenMail and Radicale containers (see CONTRIBUTING.md)
+# provider tests against local GreenMail, Radicale and PostgreSQL containers (see CONTRIBUTING.md)
 scripts/provider_services.sh up && HUB_PROVIDER_TESTS=1 uv run pytest -m provider; scripts/provider_services.sh down
 ```
 

@@ -5,10 +5,11 @@ import os
 import signal
 import socket
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import uvicorn
 
+from mcp_hub import cli
 from mcp_hub.app import create_app
 from mcp_hub.config import REGISTRY_FILE, ConfigError, load_settings
 from mcp_hub.logging import configure_logging, log_event
@@ -69,5 +70,10 @@ def main(env: Mapping[str, str] | None = None) -> int:
     return 0
 
 
+def run(argv: Sequence[str]) -> int:
+    """No arguments: the server. Otherwise an owner command (spec 080 §7.3)."""
+    return cli.main(argv, os.environ) if argv else main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run(sys.argv[1:]))
