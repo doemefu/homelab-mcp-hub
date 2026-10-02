@@ -31,3 +31,5 @@ All notable changes to this project are documented in this file. The format is b
 - `get_message` stays within `HUB_RESPONSE_BUDGET_CHARS` when recipients and attachments alone exceed it.
 - HTML with many unclosed tags converts in linear time.
 - A failing snippet fetch or a deeply nested MIME structure degrades only the affected messages; a text part of exactly 256 KiB is not reported as truncated.
+- Hidden HTML content is removed by a region rule with constant state that errs towards hiding: a hidden element hides everything up to its balancing end tag (out-of-scope end tags, self-closing hidden elements and script escapes included), and an unterminated comment or declaration hides the rest. Hidden-content removal is best effort; its known limits are listed in INTERFACES.md.
+- `scripts/smoke_image.sh` checks on the image's own interpreter that HTML conversion scales linearly on malformed input and keeps unterminated constructs hidden (`scripts/html_scaling_check.py`).
