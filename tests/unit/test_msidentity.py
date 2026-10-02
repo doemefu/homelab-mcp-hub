@@ -4,6 +4,7 @@ import json
 import httpx2
 import pytest
 
+from mcp_hub.providers import msidentity
 from mcp_hub.providers.base import ProviderError, load_json_object
 from mcp_hub.providers.msidentity import (
     GrantError,
@@ -77,6 +78,41 @@ def test_redirect_is_not_followed() -> None:
         do_refresh(t)
     assert (info.value.code, info.value.cause) == ("upstream_error", "Redirect")
     assert len(t.seen) == 1
+
+
+def test_default_client_never_follows_redirects_or_reads_proxies() -> None:
+    with msidentity.default_client(5.0) as c:
+        assert c.follow_redirects is False
+        assert c.trust_env is False
+
+
+def test_redirect_is_not_followed_even_by_a_following_client() -> None:
+    """The refresh-token form must never be re-sent to a Location host, whatever the client factory sets (F2)."""
+    t = MsTransport({TOKEN: [httpx2.Response(307, headers={"Location": "https://evil.example.test/t"})]})
+    following = httpx2.Client(transport=t.transport(), trust_env=False, follow_redirects=True)
+    with pytest.raises(ProviderError) as info:
+        refresh(following, ACCOUNT, RT, deadline=FAR, clock=lambda: 0.0)
+    assert info.value.cause == "Redirect"
+    assert [(host, path) for host, _, _, path, _, _ in t.seen] == [("login.microsoftonline.com", TOKEN)]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example.test/consumers/oauth2/v2.0/token",
+        "https://login.microsoftonline.com.evil.test/consumers/oauth2/v2.0/token",
+        "https://evilmicrosoftonline.com/consumers/oauth2/v2.0/token",
+        "https://other.microsoftonline.com/consumers/oauth2/v2.0/token",
+        "https://login.microsoftonline.com:8443/consumers/oauth2/v2.0/token",
+        "http://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+    ],
+)
+def test_post_refuses_foreign_hosts_before_sending(url: str) -> None:
+    t = MsTransport({TOKEN: [json_answer(200, OK)]})
+    with pytest.raises(ProviderError) as info:
+        msidentity._post(client(t), url, {"refresh_token": RT}, 65_536, FAR, lambda: 0.0)
+    assert (info.value.code, info.value.cause) == ("upstream_error", "ForeignHost")
+    assert t.seen == []
 
 
 def test_compressed_answer_refused_before_reading() -> None:

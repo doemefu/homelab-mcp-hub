@@ -128,7 +128,11 @@ def _post(
             read=phase,
             write=phase,
         )
-        with client.stream("POST", url, data=form, headers=headers, timeout=timeout) as response:
+        # Per request, not only in default_client: a following client would re-send the form (refresh token) to the
+        # Location host before the 3xx check below could refuse it (F2).
+        with client.stream(
+            "POST", url, data=form, headers=headers, timeout=timeout, follow_redirects=False
+        ) as response:
             status = response.status_code
             if 300 <= status < 400:
                 raise ProviderError("upstream_error", "Redirect")
