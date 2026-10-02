@@ -4,6 +4,7 @@ The hub and icalendar split lines on CR/LF only; dateutil's tzical builds each c
 which also splits on other characters. Layer 1 replaces those characters with a space before anything else reads
 the object. Layer 2 lets dateutil evaluate only rule text the screens approved for this object."""
 
+import contextlib
 import inspect
 from datetime import datetime
 from typing import Any
@@ -226,3 +227,53 @@ def test_results_are_identical_with_the_guard(name: str) -> None:
     calendar = icalendar.Calendar.from_ical(raw)  # the libraries as shipped, outside the hub's guard
     reference = caldav._instances(calendar, href="/h/", name="Home", start=START, end=END, zone=ZURICH, floating=ZURICH)
     assert [e.sort_key for e in run(raw)] == sorted(e.sort_key for e in reference)
+
+
+# --- the hunt for other differences between the screened text and the evaluated text --------------------------
+
+
+def event_obj(lines: str) -> bytes:
+    return (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\nBEGIN:VEVENT\r\nUID:hunt@example.test\r\n"
+        f"DTSTAMP:20260901T000000Z\r\nDTSTART:20261020T100000Z\r\nDURATION:PT1H\r\n{lines}\r\nSUMMARY:h\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    ).encode()
+
+
+HUNT = {
+    # icalendar unescapes TEXT values and escapes them again when it serialises the zone for dateutil.
+    "escaped-newline-in-comment": obj(comment=f"COMMENT:x\\n{SMUGGLED}"),
+    "escaped-capital-newline-in-tzname": obj(comment=f"TZNAME:CET\\N{SMUGGLED}"),
+    "escaped-newline-in-x-property": obj(comment=f"X-NOTE:x\\n{SMUGGLED}"),
+    "escaped-semicolon-in-zone-rule": obj(comment=r"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\;FREQ=SECONDLY"),
+    "escaped-semicolon-in-event-rule": event_obj(r"RRULE:FREQ=DAILY;COUNT=2\;FREQ=SECONDLY"),
+    "escaped-comma-in-zone-rdate": obj(comment="RDATE:20261025T030000\\,20261026T030000"),
+    # RFC 6868 caret encoding in parameter values.
+    "caret-newline-in-quoted-parameter": obj(comment=f'COMMENT;X-A="a^n{SMUGGLED}":x'),
+    "caret-newline-in-tzname-language": obj(comment=f"TZNAME;LANGUAGE=a^n{SMUGGLED}:CET"),
+    "caret-newline-in-event-parameter": event_obj(f'SUMMARY;X-A="a^n{SMUGGLED}":x'),
+    # Bare CR (XML turns it into LF before the hub sees it; the pre-screen treats it as a line end).
+    "bare-cr-in-comment": obj(comment=f"COMMENT:x\r{SMUGGLED}"),
+    "bare-cr-in-event-text": event_obj(f"SUMMARY:x\r{SMUGGLED}"),
+    # Tab continuation, parameters, case, repeated properties, rules under other names.
+    "tab-fold-in-zone-rule": obj(comment="RRULE:FREQ=YEARLY;BYMONTH=10;BY\r\n\tHOUR=1;BYDAY=-1SU"),
+    "zone-rule-with-parameter": obj(comment="RRULE;X-A=1:FREQ=SECONDLY"),
+    "lower-case-zone-rule": obj(comment="rrule:freq=secondly"),
+    "second-dtstart-in-zone": obj(comment="DTSTART:20200101T000000"),
+    "rule-under-an-x-name-in-zone": obj(comment="X-RRULE:FREQ=SECONDLY"),
+    "event-rule-with-parameter": event_obj("RRULE;X-A=1:FREQ=SECONDLY"),
+    "event-exrule": event_obj("RRULE:FREQ=DAILY;COUNT=2\r\nEXRULE:FREQ=SECONDLY"),
+    "rule-under-an-x-name-in-event": event_obj("X-WR-RRULE:FREQ=SECONDLY"),
+}
+
+
+@pytest.mark.parametrize("guard", [True, False], ids=["guard-on", "guard-off"])
+@pytest.mark.parametrize("case", list(HUNT))
+def test_no_other_text_difference_reaches_dateutil_as_a_rule(
+    case: str, guard: bool, monkeypatch: pytest.MonkeyPatch, parsed_rules: list[str]
+) -> None:
+    if not guard:  # the screens and icalendar's own escaping hold on their own too
+        monkeypatch.setattr(caldav, "check_rule_text", lambda text, approved, *, multi_line: None)
+    with contextlib.suppress(ObjectSkippedError, ValueError):  # refused, or unparseable for icalendar
+        run(HUNT[case])
+    assert not smuggled(parsed_rules)
