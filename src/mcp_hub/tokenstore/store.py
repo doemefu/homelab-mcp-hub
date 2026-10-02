@@ -41,8 +41,9 @@ class TokenStoreUnavailableError(Exception):
 
 
 def _cause(exc: BaseException) -> str:
-    # Whether psycopg sets sqlstate for a *connection* failure is not documented (review 01 delta): Task 5 Step 2a
-    # probes it. getattr keeps this safe either way; without it the cause is the class name (weaker log cause).
+    # psycopg 3.3.6 reports no SQLSTATE for a failed connection: a missing database, wrong credentials and an
+    # unreachable server all give the class name OperationalError (probe, PR A). The 3D000 branch stays for a
+    # driver that does report it (spec 080 §7.2); tests/unit/test_tokenstore_causes.py covers both paths.
     if isinstance(exc, psycopg.Error) and getattr(exc, "sqlstate", None) == _DATABASE_MISSING:
         return "DatabaseMissing"
     return type(exc).__name__
