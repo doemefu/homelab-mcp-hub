@@ -40,6 +40,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 | Validation / tokens | pydantic 2.13.5, PyJWT 2.15.0 (`[crypto]`) |
 | Mail | IMAPClient 4.1.0 |
 | Calendar | icalendar 7.3.0, recurring-ical-events 3.8.2 (CalDAV requests over httpx2) |
+| Token store | psycopg[binary] 3.3.6 (sync API), cryptography 50.0.1 (AES-256-GCM; direct runtime pin) |
 | Tooling | uv 0.12.19, ruff 0.16.9, mypy 2.3.1 `--strict`, pytest 9.1.1, pytest-httpserver 1.1.5 |
 
 ## Conventions
