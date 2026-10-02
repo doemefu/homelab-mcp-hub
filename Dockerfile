@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Base images are pinned by tag + multi-arch index digest; Dependabot's docker ecosystem bumps both.
-FROM ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc AS uv
 
 FROM python:3.13-slim@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b AS build
 COPY --from=uv /uv /bin/uv
