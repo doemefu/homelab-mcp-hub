@@ -9,6 +9,7 @@ import psycopg
 import pytest
 
 from mcp_hub.config import load_settings
+from mcp_hub.tokenstore.migrate import ensure_schema
 from mcp_hub.tokenstore.store import (
     LOGIN_WAIT_MS,
     StoreConfig,
@@ -219,3 +220,34 @@ def test_configured_needs_all_three_files(tmp_path: Path) -> None:
     assert not store.configured()
     (tmp_path / "token-encryption-key").write_text(base64.b64encode(os.urandom(32)).decode())
     assert store.configured()
+
+
+def migrate_concurrently(connections: int) -> tuple[list[str], list[int]]:
+    barrier = threading.Barrier(connections)
+    errors: list[str] = []
+    applied: list[int] = []
+
+    def migrate() -> None:
+        with postgres.connect() as conn:
+            barrier.wait(5)
+            try:
+                applied.append(ensure_schema(conn))
+            except psycopg.Error as exc:
+                errors.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=migrate) for _ in range(connections)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(15)
+    return errors, applied
+
+
+def test_concurrent_first_use_migrates_once(store: TokenStore) -> None:
+    """Server and login process migrating a fresh database at the same moment: the advisory lock serialises them
+    (without it, concurrent CREATE SCHEMA/TABLE fail with unique violations; review F4)."""
+    for _ in range(3):
+        postgres.reset_schema()
+        errors, applied = migrate_concurrently(4)
+        assert errors == []
+        assert sorted(applied) == [0, 0, 0, 1]
