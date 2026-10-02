@@ -18,9 +18,9 @@ import time as clocks
 import warnings
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from types import FrameType
 from typing import Any, Final, Literal, NoReturn, cast
@@ -89,6 +89,13 @@ _PARTS_NOT_ALLOWED: Final = {
     "YEARLY": frozenset(),
 }
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
+# Rules inside a VTIMEZONE (PR #15 review F1). icalendar builds every VTIMEZONE whose TZID zoneinfo does not know
+# while it parses the object, with dateutil's tzical, which compiles each STANDARD/DAYLIGHT rule with the occurrence
+# cache on; every UTC-offset lookup then iterates that rule from the sub-component's DTSTART. Real zones change at
+# most twice a year: one month, one weekday (-1SU, 2SU, SU) and at most a week of month days.
+ZONE_RULE_PARTS: Final = frozenset({"FREQ", "INTERVAL", "BYMONTH", "BYDAY", "BYMONTHDAY", "UNTIL", "COUNT", "WKST"})
+MAX_ZONE_MONTH_DAYS: Final = 7  # BYMONTHDAY=8,9,10,11,12,13,14;BYDAY=SU, older generators' "second Sunday"
+MAX_ZONE_RECURRENCE_DATES: Final = 200  # RDATE values per VTIMEZONE; they also count towards MAX_RECURRENCE_DATES
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
 # Thread CPU time per object (parse, screening, expansion). 4 s rather than 2 s: the cluster's slowest nodes are
@@ -105,9 +112,13 @@ MAX_REPORT_BYTES_PER_CALL: Final = 5 * 1024 * 1024  # one maximal response uses 
 _UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*+[ \t]")
 _LINE: Final = re.compile(rb"[^\r\n]+")
 _RECURRING_SEARCH: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
-_BEGIN_VEVENT: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VEVENT[ \t]*$")
-_BEGIN_VTIMEZONE: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VTIMEZONE[ \t]*$")
+# Parameters may be quoted and contain ":" or ";" (icalendar splits at the first unquoted colon).
+_BEGIN_VEVENT: Final = re.compile(rb'(?i)^BEGIN(?:;(?:[^;:"]|"[^"]*+")*+)*+:VEVENT[ \t]*$')
+_BEGIN_VTIMEZONE: Final = re.compile(rb'(?i)^BEGIN(?:;(?:[^;:"]|"[^"]*+")*+)*+:VTIMEZONE[ \t]*$')
 _DATE_LINE: Final = re.compile(rb"(?i)^(RDATE|EXDATE)[;:]")
+_PROPERTY_NAME: Final = re.compile(rb"[^;:]*")
+_PROPERTY_VALUE: Final = re.compile(rb'[^;:]*(?:;(?:[^;:"]|"[^"]*+")*+)*+:(.*)')  # after the first unquoted colon
+_ZONE_START: Final = re.compile(rb"\s*(\d{4})(\d{2})(\d{2})")
 # Properties the hub never reads: HTML alternative descriptions and inline (base64/binary) attachments; URL
 # attachments stay. Dropped before the size check and before parsing (spec 080 rev. 4.5 D62).
 _ALT_DESC: Final = re.compile(rb"(?i)^X-ALT-DESC[;:]")
@@ -421,6 +432,134 @@ def _prescreen(ics: bytes) -> bytes:
     return bytes(kept)
 
 
+def _zone_rule_parts(text: str) -> dict[str, list[str]]:
+    """The parts of a rule by name, with their comma-separated values; a repeated or unknown part refuses."""
+    parts: dict[str, list[str]] = {}
+    for part in text.split(";"):
+        if not part.strip():
+            continue
+        name, _, values = part.partition("=")
+        name = name.strip().upper()
+        if name in parts or name not in ZONE_RULE_PARTS:
+            raise ObjectSkippedError("rule_refused")
+        parts[name] = [value.strip().upper() for value in values.split(",")]
+    return parts
+
+
+def _zone_rule(value: bytes) -> icalendar.vRecur:
+    """The rule of a VTIMEZONE sub-component if it has the shape real zones use, else refuses. Checked on the raw
+    value and on icalendar's serialisation of it, which is the text dateutil evaluates."""
+    text = value.decode("utf-8", "replace")
+    try:
+        rule = cast(icalendar.vRecur, icalendar.vRecur.from_ical(text))
+    except ValueError:
+        raise ObjectSkippedError("rule_refused") from None
+    for parts in (_zone_rule_parts(text), _zone_rule_parts(cast(Callable[[], bytes], rule.to_ical)().decode())):
+        if (
+            parts.get("FREQ") != ["YEARLY"]
+            or parts.get("INTERVAL", ["1"]) != ["1"]
+            or len(parts.get("BYMONTH", [])) != 1
+            or len(parts.get("BYDAY", [""])) != 1
+            or len(parts.get("BYMONTHDAY", [])) > MAX_ZONE_MONTH_DAYS
+            or any(len(parts.get(name, [""])) != 1 for name in ("UNTIL", "COUNT", "WKST"))
+        ):
+            raise ObjectSkippedError("rule_refused")
+    return rule
+
+
+@dataclass(slots=True)
+class _ZoneComponent:
+    rules: list[icalendar.vRecur] = field(default_factory=list)
+    start: date | None = None
+
+
+def zone_iteration_bound(rule: icalendar.vRecur, start: date, end: date = date.max) -> int:
+    """Upper bound of the occurrences of a screened zone rule (yearly, one month) from DTSTART up to `end`. A
+    UTC-offset lookup iterates up to the looked-up time, which an event may place in the year 9999, hence the default.
+    Per year the month holds one ordinal weekday (-1SU), at most five of one weekday (SU), or the listed month days
+    that can fall on one weekday: days 7 apart, counted for positive and negative days separately (8,...,14 and SU:
+    one). A property test compares it with dateutil."""
+    last_year = end.year
+    for until in _values(rule.get("UNTIL")):
+        day = until.date() if isinstance(until, datetime) else until
+        if isinstance(day, date):
+            last_year = min(last_year, day.year + 1)  # a year of slack for UTC vs. local dates
+    years = max(1, last_year - start.year + 1)
+    ordinals, weekdays = _byday_entries(rule)
+    month_days = [int(cast(int, value)) for value in _values(rule.get("BYMONTHDAY"))]
+    if ordinals:
+        per_year = 1
+    elif weekdays and month_days:
+        per_year = sum(
+            max(Counter(day % 7 for day in group).values(), default=0)
+            for group in ([day for day in month_days if day > 0], [day for day in month_days if day < 0])
+        )
+    elif weekdays:
+        per_year = 5
+    else:
+        per_year = len(month_days) or 1  # without BYMONTHDAY the day of DTSTART
+    bound = years * per_year
+    counts = _values(rule.get("COUNT"))
+    if counts:
+        bound = min(bound, cast(int, counts[0]))
+    return max(1, bound)
+
+
+def _zone_iterations(components: list[_ZoneComponent]) -> int:
+    # A DTSTART that cannot be read counts from the year 1, which still bounds the iteration from above.
+    return sum(zone_iteration_bound(rule, c.start or date.min) for c in components for rule in c.rules)
+
+
+def _screen_zones(text: bytes) -> None:
+    """Refuse VTIMEZONE rules outside the shape real zones use, before icalendar parses the object and builds the
+    zones (spec 080 rev. 4.5 D62 B, PR #15 review F1). Works on the pre-screened text, which is what icalendar
+    parses: every component nested in a VTIMEZONE (STANDARD, DAYLIGHT or anything else) holds at most one RRULE of
+    that shape and no EXRULE; RDATE values are limited per VTIMEZONE; sub-components count towards the component
+    limit; and the rules of one VTIMEZONE together are held to the iteration limit up to the year 9999, the farthest
+    a lookup can reach. Every VTIMEZONE is screened, including those icalendar never builds because zoneinfo knows
+    the TZID."""
+    open_components: list[_ZoneComponent] = []  # the VTIMEZONE itself, then the components nested in it
+    closed: list[_ZoneComponent] = []
+    sub_components = rdates = 0
+    for match in _LINE.finditer(text):
+        line = match.group(0)
+        if not open_components:
+            if _BEGIN_VTIMEZONE.match(line):
+                open_components, closed, rdates = [_ZoneComponent()], [], 0
+            continue
+        name = cast(re.Match[bytes], _PROPERTY_NAME.match(line)).group(0).strip().upper()
+        if name == b"BEGIN":
+            open_components.append(_ZoneComponent())
+            sub_components += 1
+            if sub_components > MAX_COMPONENTS_PER_OBJECT:
+                raise ObjectSkippedError("too_many_components")
+        elif name == b"END":
+            closed.append(open_components.pop())
+            # icalendar builds a zone when its END line arrives; a VTIMEZONE left open is never built.
+            if not open_components and _zone_iterations(closed) > MAX_ITERATED_OCCURRENCES:
+                raise ObjectSkippedError("rule_refused")
+        elif name in (b"RRULE", b"EXRULE", b"RDATE", b"DTSTART"):
+            content = _PROPERTY_VALUE.fullmatch(line)
+            if content is None or name == b"EXRULE":
+                raise ObjectSkippedError("rule_refused")
+            component = open_components[-1]
+            if name == b"RRULE":
+                if component.rules:
+                    raise ObjectSkippedError("rule_refused")
+                component.rules.append(_zone_rule(content.group(1)))
+            elif name == b"RDATE":
+                rdates += line.count(b",") + 1
+                if rdates > MAX_ZONE_RECURRENCE_DATES:
+                    raise ObjectSkippedError("too_many_dates")
+            else:
+                found = _ZONE_START.match(content.group(1))
+                try:
+                    begin = date(*map(int, found.groups())) if found else date.min
+                except ValueError:
+                    begin = date.min
+                component.start = begin if component.start is None else min(component.start, begin)
+
+
 def _count(rule: icalendar.vRecur, part: str) -> int:
     return len(_values(rule.get(part)))
 
@@ -587,9 +726,13 @@ def _expand_object(
 ) -> tuple[list[RawEvent], bool]:
     """The object's instances sorted by start, at most MAX_INSTANCES_PER_OBJECT, and whether that cap cut them."""
 
+    window_end = (end + _WIDEN).astimezone(UTC).date() + timedelta(days=1)
+
     def work() -> list[RawEvent]:
-        calendar = icalendar.Calendar.from_ical(_prescreen(ics))
-        _screen(calendar, (end + _WIDEN).astimezone(UTC).date() + timedelta(days=1))
+        text = _prescreen(ics)
+        _screen_zones(text)  # icalendar builds the zones while it parses
+        calendar = icalendar.Calendar.from_ical(text)
+        _screen(calendar, window_end)
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
 
     try:

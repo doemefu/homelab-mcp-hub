@@ -639,10 +639,11 @@ def test_the_size_limit_applies_to_the_text_the_hub_uses() -> None:
     ("raw", "reason"),
     [
         (series_with_overrides(1000).replace(b"BEGIN:VEVENT", b"BEGIN;X-HIDE=1:VEVENT"), "too_many_components"),
+        (series_with_overrides(1000).replace(b"BEGIN:VEVENT", b'BEGIN;X-HIDE="a:b":VEVENT'), "too_many_components"),
         (series_with_overrides(1000).replace(b"BEGIN:VEVENT", b"BEGIN:VEV\r\n\r\n ENT"), "too_many_components"),
         (folded_rdates(1001).replace(b"RDATE:", b"RDATE\r\n\r\n :"), "too_many_dates"),
     ],
-    ids=["begin-with-parameter", "begin-blank-line-fold", "rdate-blank-line-fold"],
+    ids=["begin-with-parameter", "begin-with-quoted-colon", "begin-blank-line-fold", "rdate-blank-line-fold"],
 )
 def test_the_prescreen_sees_what_the_parser_sees(raw: bytes, reason: str, parser_calls: list[int]) -> None:
     with pytest.raises(ObjectSkippedError) as caught:
