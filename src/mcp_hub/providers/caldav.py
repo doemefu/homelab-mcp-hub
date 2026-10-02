@@ -18,18 +18,20 @@ import time as clocks
 import warnings
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from types import FrameType
-from typing import Final, Literal, NoReturn, cast
+from typing import Any, Final, Literal, NoReturn, cast
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
+import dateutil.rrule
 import httpx2
 import icalendar
 import recurring_ical_events
+import recurring_ical_events.series.rrule as _library_rrule
 from icalendar.error import GloballyUniqueTZIDGuessed
 from icalendar.timezone import tzp
 
@@ -60,7 +62,40 @@ EARLIEST_START: Final = date(1900, 1, 1)  # only for DAILY and WEEKLY rules (ite
 # dateutil keeps every occurrence it iterates from DTSTART (60-90 bytes each) and the CPU deadline does not bound
 # memory: a rule whose estimated occurrences up to the window end exceed this is refused before expansion.
 MAX_ITERATED_OCCURRENCES: Final = 20_000
+# Only RFC 5545 rule parts (dateutil also understands BYEASTER and others the bound does not model), and only where
+# RFC 5545 allows them for the frequency (second confirmation pass of PR #11, E1/E2).
+RFC5545_RULE_PARTS: Final = frozenset(
+    {
+        "FREQ",
+        "UNTIL",
+        "COUNT",
+        "INTERVAL",
+        "BYSECOND",
+        "BYMINUTE",
+        "BYHOUR",
+        "BYDAY",
+        "BYMONTHDAY",
+        "BYYEARDAY",
+        "BYWEEKNO",
+        "BYMONTH",
+        "BYSETPOS",
+        "WKST",
+    }
+)
+_PARTS_NOT_ALLOWED: Final = {
+    "DAILY": frozenset({"BYWEEKNO", "BYYEARDAY"}),
+    "WEEKLY": frozenset({"BYWEEKNO", "BYYEARDAY", "BYMONTHDAY"}),
+    "MONTHLY": frozenset({"BYWEEKNO", "BYYEARDAY"}),
+    "YEARLY": frozenset(),
+}
 _EARLY_START_FREQUENCIES: Final = frozenset({"DAILY", "WEEKLY"})
+# Rules inside a VTIMEZONE (PR #15 review F1). icalendar builds every VTIMEZONE whose TZID zoneinfo does not know
+# while it parses the object, with dateutil's tzical, which compiles each STANDARD/DAYLIGHT rule with the occurrence
+# cache on; every UTC-offset lookup then iterates that rule from the sub-component's DTSTART. Real zones change at
+# most twice a year: one month, one weekday (-1SU, 2SU, SU) and at most a week of month days.
+ZONE_RULE_PARTS: Final = frozenset({"FREQ", "INTERVAL", "BYMONTH", "BYDAY", "BYMONTHDAY", "UNTIL", "COUNT", "WKST"})
+MAX_ZONE_MONTH_DAYS: Final = 7  # BYMONTHDAY=8,9,10,11,12,13,14;BYDAY=SU, older generators' "second Sunday"
+MAX_ZONE_RECURRENCE_DATES: Final = 200  # RDATE values per VTIMEZONE; they also count towards MAX_RECURRENCE_DATES
 MAX_INSTANCES_PER_OBJECT: Final = 1000
 MAX_INSTANCES_PER_CALL: Final = 2000  # per account and call
 # Thread CPU time per object (parse, screening, expansion). 4 s rather than 2 s: the cluster's slowest nodes are
@@ -77,9 +112,19 @@ MAX_REPORT_BYTES_PER_CALL: Final = 5 * 1024 * 1024  # one maximal response uses 
 _UNFOLD: Final = re.compile(rb"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*+[ \t]")
 _LINE: Final = re.compile(rb"[^\r\n]+")
 _RECURRING_SEARCH: Final = re.compile(rb"(?im)^(?:RRULE|RDATE)[;:]")
-_BEGIN_VEVENT: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VEVENT[ \t]*$")
-_BEGIN_VTIMEZONE: Final = re.compile(rb"(?i)^BEGIN(?:;[^:]*)?:VTIMEZONE[ \t]*$")
+# Parameters may be quoted and contain ":" or ";" (icalendar splits at the first unquoted colon).
+_BEGIN_VEVENT: Final = re.compile(rb'(?i)^BEGIN(?:;(?:[^;:"]|"[^"]*+")*+)*+:VEVENT[ \t]*$')
+_BEGIN_VTIMEZONE: Final = re.compile(rb'(?i)^BEGIN(?:;(?:[^;:"]|"[^"]*+")*+)*+:VTIMEZONE[ \t]*$')
 _DATE_LINE: Final = re.compile(rb"(?i)^(RDATE|EXDATE)[;:]")
+# Characters str.splitlines() treats as line boundaries besides CR and LF (review of PR #15, G1). The hub and icalendar
+# split lines on CR/LF only, dateutil's tzical with str.splitlines(): such a character inside a value would be one
+# line to the screens and two to dateutil. Calendar data is UTF-8 (encoded from the XML text), so each is one fixed
+# byte sequence; a test derives the set from Python itself.
+LINE_BOUNDARIES: Final = "".join(map(chr, (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)))
+_LINE_BOUNDARY: Final = re.compile(b"|".join(re.escape(c.encode()) for c in LINE_BOUNDARIES))
+_PROPERTY_NAME: Final = re.compile(rb"[^;:]*")
+_PROPERTY_VALUE: Final = re.compile(rb'[^;:]*(?:;(?:[^;:"]|"[^"]*+")*+)*+:(.*)')  # after the first unquoted colon
+_ZONE_START: Final = re.compile(rb"\s*(\d{4})(\d{2})(\d{2})")
 # Properties the hub never reads: HTML alternative descriptions and inline (base64/binary) attachments; URL
 # attachments stay. Dropped before the size check and before parsing (spec 080 rev. 4.5 D62).
 _ALT_DESC: Final = re.compile(rb"(?i)^X-ALT-DESC[;:]")
@@ -317,12 +362,95 @@ ignore_icalendar_tzid_guess_warnings()
 EXPANSION_LOCK: Final = threading.Lock()
 
 
-def _isolated[T](func: Callable[[], T]) -> T:
+DATEUTIL_RRULESTR: Final = dateutil.rrule.rrulestr  # the original, before the guard is installed
+_UNTIL_VALUE: Final = re.compile(r"UNTIL=\d{8}(?:T\d{6}Z?)?")
+_NEGATIVE_COUNT: Final = re.compile(r"COUNT=-\d+")
+
+
+class RuleNotApprovedError(BaseException):
+    """Raised when dateutil is about to evaluate rule text the screens did not approve for this object. A
+    BaseException, so icalendar's `except ValueError` retry when it builds a zone and any `except Exception` in the
+    libraries cannot swallow it; caught only at the per-object boundary in `_expand_object`."""
+
+
+def canonical_rule(text: str) -> tuple[str, ...]:
+    """A rule's parts as dateutil reads them: upper case, in any order. recurring-ical-events re-formats a date or
+    date-time UNTIL and moves it to the end, and drops negative COUNT parts, so those compare as such."""
+    parts = []
+    for part in text.upper().split(";"):
+        if not part or _NEGATIVE_COUNT.fullmatch(part):
+            continue
+        parts.append("UNTIL" if _UNTIL_VALUE.fullmatch(part) else part)
+    return tuple(sorted(parts))
+
+
+def check_rule_text(text: str, approved: set[tuple[str, ...]], *, multi_line: bool) -> None:
+    """Raise RuleNotApprovedError unless every rule dateutil would read from `text` was approved by the screens
+    (review of PR #15, G1, runtime guard). Reads the text as dateutil's rrulestr does: upper case; a single rule is
+    split on any whitespace, the multi-line form (time zones) with str.splitlines() and continuation lines joined; a
+    line without a colon is a rule. Besides approved RRULE lines a zone may only hold DTSTART, RDATE and EXDATE."""
+    upper = text.upper()
+    if multi_line:
+        lines: list[str] = []
+        for raw_line in upper.splitlines():
+            line = raw_line.rstrip()
+            if line and lines and line[0] == " ":
+                lines[-1] += line[1:]
+            elif line:
+                lines.append(line)
+    else:
+        lines = upper.split()
+        if len(lines) != 1:
+            raise RuleNotApprovedError
+    for line in lines:
+        name, colon, value = line.partition(":")
+        if not colon:
+            name, value = "RRULE", line
+        name = name.split(";")[0]
+        if name == "RRULE":
+            if canonical_rule(value) not in approved:
+                raise RuleNotApprovedError
+        elif not multi_line or name not in ("DTSTART", "RDATE", "EXDATE"):
+            raise RuleNotApprovedError
+
+
+def _rruleset_without_cache(*args: Any, **kwargs: Any) -> dateutil.rrule.rruleset:
+    return dateutil.rrule.rruleset(*args, **{**kwargs, "cache": False})
+
+
+def _isolated[T](func: Callable[[], T], approved: set[tuple[str, ...]]) -> T:
+    """One object at a time, with an empty time-zone cache, without dateutil's occurrence cache for event rules, and
+    with dateutil evaluating only rule text in `approved` (filled by the screens while `func` runs).
+
+    recurring-ical-events builds its rules with rrulestr(..., cache=True) and rruleset(cache=True), so dateutil keeps
+    every occurrence it iterates from DTSTART (60-90 bytes each): memory, not only CPU, grew with old or dense rules.
+    The hub swaps those two names in the library module for cache=False versions while it holds the lock, and puts
+    the originals back on every exit path; results are identical, memory stays flat and only CPU grows, which the
+    deadline bounds (second confirmation pass of PR #11). A test pins the patch point for the pinned library.
+
+    The guard (review of PR #15, G1) sits at both places rule text enters dateutil: that same name for event rules,
+    and `dateutil.rrule.rrulestr`, which dateutil's tzical looks up on the module when icalendar builds a zone (its
+    rules keep the cache: without it legitimate Outlook series reached the CPU limit). Tests pin both patch points."""
+
+    def event_rule(text: str, **kwargs: Any) -> Any:
+        check_rule_text(text, approved, multi_line=bool(kwargs.get("unfold") or kwargs.get("compatible")))
+        return DATEUTIL_RRULESTR(text, **{**kwargs, "cache": False})
+
+    def zone_rules(text: str, **kwargs: Any) -> Any:
+        check_rule_text(text, approved, multi_line=bool(kwargs.get("unfold") or kwargs.get("compatible")))
+        return DATEUTIL_RRULESTR(text, **kwargs)
+
     with EXPANSION_LOCK:
         tzp.use_zoneinfo()  # public API: a fresh, empty time-zone cache
+        original_rrulestr, original_rruleset = _library_rrule.rrulestr, _library_rrule.rruleset
+        _library_rrule.rrulestr = event_rule  # same call shape
+        _library_rrule.rruleset = _rruleset_without_cache  # same call shape
+        dateutil.rrule.rrulestr = zone_rules
         try:
             return func()
         finally:
+            _library_rrule.rrulestr, _library_rrule.rruleset = original_rrulestr, original_rruleset
+            dateutil.rrule.rrulestr = DATEUTIL_RRULESTR
             tzp.use_zoneinfo()  # every exit path: normal, library error, refusal, injected deadline
 
 
@@ -341,6 +469,11 @@ def _unused(line: bytes) -> bool:
     return attach is not None and _INLINE_DATA.search(attach.group(1)) is not None
 
 
+def _normalise_line_boundaries(ics: bytes) -> bytes:
+    """Every LINE_BOUNDARIES character replaced by a space (review of PR #15, G1)."""
+    return _LINE_BOUNDARY.sub(b" ", ics)
+
+
 def _prescreen(ics: bytes) -> bytes:
     """Cheap checks on the object before icalendar parses it (spec 080 rev. 4.5 D62 A); returns the unfolded text
     without the properties the hub never reads, which is what gets parsed. Lines are processed one at a time and the
@@ -348,6 +481,7 @@ def _prescreen(ics: bytes) -> bytes:
     inside a parameter only makes a count larger (refuses earlier)."""
     if len(ics) > MAX_RAW_OBJECT_BYTES:
         raise ObjectSkippedError("object_too_large")
+    ics = _normalise_line_boundaries(ics)  # before anything reads it; the result is also what gets parsed
     kept = bytearray()
     vevents = vtimezones = rdates = exdates = 0
     for match in _LINE.finditer(_UNFOLD.sub(b"", ics)):
@@ -372,6 +506,138 @@ def _prescreen(ics: bytes) -> bytes:
     if max(rdates, exdates) > MAX_RECURRENCE_DATES:
         raise ObjectSkippedError("too_many_dates")
     return bytes(kept)
+
+
+def _zone_rule_parts(text: str) -> dict[str, list[str]]:
+    """The parts of a rule by name, with their comma-separated values; a repeated or unknown part refuses."""
+    parts: dict[str, list[str]] = {}
+    for part in text.split(";"):
+        if not part.strip():
+            continue
+        name, _, values = part.partition("=")
+        name = name.strip().upper()
+        if name in parts or name not in ZONE_RULE_PARTS:
+            raise ObjectSkippedError("rule_refused")
+        parts[name] = [value.strip().upper() for value in values.split(",")]
+    return parts
+
+
+def _zone_rule(value: bytes) -> icalendar.vRecur:
+    """The rule of a VTIMEZONE sub-component if it has the shape real zones use, else refuses. Checked on the raw
+    value and on icalendar's serialisation of it, which is the text dateutil evaluates."""
+    text = value.decode("utf-8", "replace")
+    try:
+        rule = cast(icalendar.vRecur, icalendar.vRecur.from_ical(text))
+    except ValueError:
+        raise ObjectSkippedError("rule_refused") from None
+    for parts in (_zone_rule_parts(text), _zone_rule_parts(cast(Callable[[], bytes], rule.to_ical)().decode())):
+        if (
+            parts.get("FREQ") != ["YEARLY"]
+            or parts.get("INTERVAL", ["1"]) != ["1"]
+            or len(parts.get("BYMONTH", [])) != 1
+            or len(parts.get("BYDAY", [""])) != 1
+            or len(parts.get("BYMONTHDAY", [])) > MAX_ZONE_MONTH_DAYS
+            or any(len(parts.get(name, [""])) != 1 for name in ("UNTIL", "COUNT", "WKST"))
+        ):
+            raise ObjectSkippedError("rule_refused")
+    return rule
+
+
+@dataclass(slots=True)
+class _ZoneComponent:
+    rules: list[icalendar.vRecur] = field(default_factory=list)
+    start: date | None = None
+
+
+def zone_iteration_bound(rule: icalendar.vRecur, start: date, end: date = date.max) -> int:
+    """Upper bound of the occurrences of a screened zone rule (yearly, one month) from DTSTART up to `end`. A
+    UTC-offset lookup iterates up to the looked-up time, which an event may place in the year 9999, hence the default.
+    Per year the month holds one ordinal weekday (-1SU), at most five of one weekday (SU), or the listed month days
+    that can fall on one weekday: days 7 apart, counted for positive and negative days separately (8,...,14 and SU:
+    one). A property test compares it with dateutil."""
+    last_year = end.year
+    for until in _values(rule.get("UNTIL")):
+        day = until.date() if isinstance(until, datetime) else until
+        if isinstance(day, date):
+            last_year = min(last_year, day.year + 1)  # a year of slack for UTC vs. local dates
+    years = max(1, last_year - start.year + 1)
+    ordinals, weekdays = _byday_entries(rule)
+    month_days = [int(cast(int, value)) for value in _values(rule.get("BYMONTHDAY"))]
+    if ordinals:
+        per_year = 1
+    elif weekdays and month_days:
+        per_year = sum(
+            max(Counter(day % 7 for day in group).values(), default=0)
+            for group in ([day for day in month_days if day > 0], [day for day in month_days if day < 0])
+        )
+    elif weekdays:
+        per_year = 5
+    else:
+        per_year = len(month_days) or 1  # without BYMONTHDAY the day of DTSTART
+    bound = years * per_year
+    counts = _values(rule.get("COUNT"))
+    if counts:
+        bound = min(bound, cast(int, counts[0]))
+    return max(1, bound)
+
+
+def _zone_iterations(components: list[_ZoneComponent]) -> int:
+    # A DTSTART that cannot be read counts from the year 1, which still bounds the iteration from above.
+    return sum(zone_iteration_bound(rule, c.start or date.min) for c in components for rule in c.rules)
+
+
+def _screen_zones(text: bytes) -> set[tuple[str, ...]]:
+    """Refuse VTIMEZONE rules outside the shape real zones use, before icalendar parses the object and builds the
+    zones (spec 080 rev. 4.5 D62 B, PR #15 review F1). Works on the pre-screened text, which is what icalendar
+    parses: every component nested in a VTIMEZONE (STANDARD, DAYLIGHT or anything else) holds at most one RRULE of
+    that shape and no EXRULE; RDATE values are limited per VTIMEZONE; sub-components count towards the component
+    limit; and the rules of one VTIMEZONE together are held to the iteration limit up to the year 9999, the farthest
+    a lookup can reach. Every VTIMEZONE is screened, including those icalendar never builds because zoneinfo knows
+    the TZID. Returns the approved rules (canonical_rule) for the runtime guard."""
+    approved: set[tuple[str, ...]] = set()
+    open_components: list[_ZoneComponent] = []  # the VTIMEZONE itself, then the components nested in it
+    closed: list[_ZoneComponent] = []
+    sub_components = rdates = 0
+    for match in _LINE.finditer(text):
+        line = match.group(0)
+        if not open_components:
+            if _BEGIN_VTIMEZONE.match(line):
+                open_components, closed, rdates = [_ZoneComponent()], [], 0
+            continue
+        name = cast(re.Match[bytes], _PROPERTY_NAME.match(line)).group(0).strip().upper()
+        if name == b"BEGIN":
+            open_components.append(_ZoneComponent())
+            sub_components += 1
+            if sub_components > MAX_COMPONENTS_PER_OBJECT:
+                raise ObjectSkippedError("too_many_components")
+        elif name == b"END":
+            closed.append(open_components.pop())
+            # icalendar builds a zone when its END line arrives; a VTIMEZONE left open is never built.
+            if not open_components and _zone_iterations(closed) > MAX_ITERATED_OCCURRENCES:
+                raise ObjectSkippedError("rule_refused")
+        elif name in (b"RRULE", b"EXRULE", b"RDATE", b"DTSTART"):
+            content = _PROPERTY_VALUE.fullmatch(line)
+            if content is None or name == b"EXRULE":
+                raise ObjectSkippedError("rule_refused")
+            component = open_components[-1]
+            if name == b"RRULE":
+                if component.rules:
+                    raise ObjectSkippedError("rule_refused")
+                rule = _zone_rule(content.group(1))
+                component.rules.append(rule)
+                approved.add(canonical_rule(cast(Callable[[], bytes], rule.to_ical)().decode()))
+            elif name == b"RDATE":
+                rdates += line.count(b",") + 1
+                if rdates > MAX_ZONE_RECURRENCE_DATES:
+                    raise ObjectSkippedError("too_many_dates")
+            else:
+                found = _ZONE_START.match(content.group(1))
+                try:
+                    begin = date(*map(int, found.groups())) if found else date.min
+                except ValueError:
+                    begin = date.min
+                component.start = begin if component.start is None else min(component.start, begin)
+    return approved
 
 
 def _count(rule: icalendar.vRecur, part: str) -> int:
@@ -436,11 +702,13 @@ def iteration_bound(rule: icalendar.vRecur, start: date, window_end: date) -> in
     return max(1, bound)
 
 
-def _screen(calendar: icalendar.Calendar, window_end: date) -> None:
+def _screen(calendar: icalendar.Calendar, window_end: date) -> set[tuple[str, ...]]:
     """Refuse shapes whose expansion cost is unbounded, by inspection only, before the expansion library runs: with
     FREQ at least daily and at most one value per time-of-day part, a rule yields at most a few dozen instances in a
     widened 31-day window (spec 080 rev. 4.5 D62 B). One object holds one series: one UID (one per CalDAV resource,
-    RFC 4791 §4.1) and at most one component with an RRULE (the master; overrides never carry one)."""
+    RFC 4791 §4.1) and at most one component with an RRULE (the master; overrides never carry one). Returns the
+    approved rules (canonical_rule of the exact text the expansion library hands to dateutil) for the runtime guard."""
+    approved: set[tuple[str, ...]] = set()
     components = calendar.walk("VEVENT")
     # The raw counts again, on the parsed object (belt and braces, delta review D4).
     if len(components) > MAX_COMPONENTS_PER_OBJECT or len(calendar.walk("VTIMEZONE")) > MAX_TIMEZONES_PER_OBJECT:
@@ -464,6 +732,13 @@ def _screen(calendar: icalendar.Calendar, window_end: date) -> None:
             frequencies = {str(value).upper() for value in _values(cast(dict[str, object], rule).get("FREQ"))}
             if len(frequencies) != 1 or not frequencies <= ALLOWED_FREQUENCIES:
                 raise ObjectSkippedError("rule_refused")
+            # The part names of the exact string recurring-ical-events hands to dateutil (rrule.to_ical()).
+            received = cast(Callable[[], bytes], rule.to_ical)().decode()
+            names = [part.split("=", 1)[0].strip().upper() for part in received.split(";") if part]
+            if len(set(names)) != len(names) or not set(names) <= RFC5545_RULE_PARTS:
+                raise ObjectSkippedError("rule_refused")
+            if set(names) & _PARTS_NOT_ALLOWED[next(iter(frequencies))]:
+                raise ObjectSkippedError("rule_refused")
             parts = cast(dict[str, object], rule)
             if any(len(_values(parts.get(part))) > 1 for part in _TIME_OF_DAY_PARTS):
                 raise ObjectSkippedError("rule_refused")
@@ -476,6 +751,8 @@ def _screen(calendar: icalendar.Calendar, window_end: date) -> None:
                     raise ObjectSkippedError("start_out_of_range")
                 if iteration_bound(rule, first, window_end) > MAX_ITERATED_OCCURRENCES:
                     raise ObjectSkippedError("rule_refused")
+            approved.add(canonical_rule(received))
+    return approved
 
 
 def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Callable[[], float]) -> T:
@@ -533,15 +810,22 @@ def _expand_object(
 ) -> tuple[list[RawEvent], bool]:
     """The object's instances sorted by start, at most MAX_INSTANCES_PER_OBJECT, and whether that cap cut them."""
 
+    window_end = (end + _WIDEN).astimezone(UTC).date() + timedelta(days=1)
+    approved: set[tuple[str, ...]] = set()  # the rule text dateutil may evaluate for this object
+
     def work() -> list[RawEvent]:
-        calendar = icalendar.Calendar.from_ical(_prescreen(ics))
-        _screen(calendar, (end + _WIDEN).astimezone(UTC).date() + timedelta(days=1))
+        text = _prescreen(ics)
+        approved.update(_screen_zones(text))  # icalendar builds the zones while it parses
+        calendar = icalendar.Calendar.from_ical(text)
+        approved.update(_screen(calendar, window_end))
         return _instances(calendar, href=href, name=name, start=start, end=end, zone=zone, floating=floating)
 
-    try:
-        found = _isolated(lambda: _with_cpu_deadline(work, cpu_seconds, cpu_clock))  # lock outside, hook inside
+    try:  # lock outside, hook inside
+        found = _isolated(lambda: _with_cpu_deadline(work, cpu_seconds, cpu_clock), approved)
     except _ExpansionTooSlow:
         raise ObjectSkippedError("expansion_too_slow") from None
+    except RuleNotApprovedError:
+        raise ObjectSkippedError("rule_refused") from None
     found.sort(key=lambda event: event.sort_key)
     return found[:MAX_INSTANCES_PER_OBJECT], len(found) > MAX_INSTANCES_PER_OBJECT
 
