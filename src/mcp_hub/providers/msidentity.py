@@ -71,7 +71,7 @@ class TokenAnswer:
 @dataclass(frozen=True, slots=True)
 class DeviceCode:
     device_code: str = field(repr=False)
-    user_code: str
+    user_code: str = field(repr=False)
     verification_uri: str
     expires_in: int
     interval: int
@@ -206,8 +206,12 @@ def _verification_uri(value: object) -> str:
         raise LoginFailedError("error") from None
     if parts.scheme != "https" or port not in (None, 443):
         raise LoginFailedError("error")
+    # Browsers read a backslash as "/" in https URLs (WHATWG) and userinfo hides the real host from a reader: refuse
+    # both, and require a plain host name before the suffix check, so the printed address opens the host checked (F1).
+    if "\\" in value or "@" in parts.netloc or not _PRINTABLE_HOST.fullmatch(host):
+        raise LoginFailedError("unexpected_host")
     if not any(host == s or host.endswith("." + s) for s in _VERIFICATION_SUFFIXES):
-        raise LoginFailedError("unexpected_host", host if _PRINTABLE_HOST.fullmatch(host) else None)
+        raise LoginFailedError("unexpected_host", host)
     return value
 
 

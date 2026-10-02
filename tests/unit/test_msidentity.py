@@ -292,8 +292,26 @@ def test_load_json_object_rejects_non_objects() -> None:
             load_json_object(raw)
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://evil.example\\@microsoft.com/devicelogin",  # urlsplit: microsoft.com; a browser: evil.example
+        "https://evil.example\\.microsoft.com/x",
+        "https://someone@microsoft.com/devicelogin",
+        "https://user:pw@login.live.com/x",
+        "https://microsoft.com\\@evil.example.test/x",
+    ],
+)
+def test_backslash_and_userinfo_are_refused_before_the_host_check(uri: str) -> None:
+    t = MsTransport({DEVICE: [json_answer(200, device(verification_uri=uri))]})
+    with pytest.raises(LoginFailedError) as info:
+        start(t)
+    assert info.value.reason == "unexpected_host"
+    assert info.value.host is None
+
+
 def test_secrets_absent_from_reprs() -> None:
     t = MsTransport({TOKEN: [json_answer(200, OK)], DEVICE: [json_answer(200, device())]})
     text = repr(do_refresh(t)) + repr(start(t)[1]) + repr(ACCOUNT)
-    for secret in ("AT-SENTINEL-1", "RT-SENTINEL-2", "DC-SENTINEL", FAKE_CLIENT_ID):
+    for secret in ("AT-SENTINEL-1", "RT-SENTINEL-2", "DC-SENTINEL", "ABCD-EFGH", FAKE_CLIENT_ID):
         assert secret not in text
