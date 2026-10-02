@@ -19,6 +19,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      codeql:
+        patterns: ["github/codeql-action*"]
 
   # Base images (python, uv builder) are pinned by tag + index digest. When the uv image moves,
   # bump setup-uv's `version:` in ci.yml/build.yml in the same PR.
