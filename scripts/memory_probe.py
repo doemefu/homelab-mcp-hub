@@ -1,7 +1,10 @@
-"""Memory and CPU probe for get_events under the pod's limits (review of PR #15, H1).
+"""Memory and CPU probe for get_events and the Graph get_message under the pod's limits (review of PR #15, H1; L27).
 
 Drives run_get_events through an in-process fake CalDAV server (no network): each calendar's REPORT body is built per
 request from synthetic objects that fill the 5 MiB byte budget, so the process holds only what the adapter holds.
+`--scenario graph-message` drives run_get_message for an `outlook` entry through an in-process Graph transport whose
+message answer fills the 2 MiB message cap (non-ASCII body plus 5,000 recipients) and whose attachment answer fills the
+1 MiB list cap; `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process.
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
@@ -9,10 +12,12 @@ Run inside the production image with the repository mounted read-only (see CONTR
     docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /tmp \\
       -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \\
       python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
+    ... python /work/scripts/memory_probe.py --scenario graph-message --with-calendar nonascii-240k --calls 10
 """
 
 import argparse
 import asyncio
+import base64
 import gc
 import json
 import resource
@@ -23,16 +28,24 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import anyio
 import httpx2
 from tests.support.dav_transport import RecordingTransport, collection, dav, home_set, multistatus, principal, report
+from tests.support.ms_transport import FAKE_CLIENT_ID, MsTransport, json_answer
+from tests.support.token_fakes import KEY, FakeStore
 
 from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
+from mcp_hub.ids import GraphMessageRef, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.caldav import MAX_REPORT_BYTES_PER_CALL, CalDavCalendarSource, SlowObjectCache
-from mcp_hub.registry import load_registry
+from mcp_hub.providers.graph import MAX_LIST_RESPONSE_BYTES, MAX_MESSAGE_RESPONSE_BYTES, Backoff, GraphMailbox
+from mcp_hub.providers.graph_auth import AccessTokenCache, GraphTokenSource
+from mcp_hub.providers.msidentity import GraphAccount
+from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
+from mcp_hub.tools.mail import run_get_message
 
 BASE = "https://dav.example.test:443"
 HEAD = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub probe//EN\r\n"
@@ -171,21 +184,95 @@ def source(account: str, scenario: str, calendars: int) -> CalDavCalendarSource:
     )
 
 
-def context(accounts: int, scenario: str, calendars: int) -> HubContext:
+GRAPH = "https://graph.microsoft.com:443/v1.0"
+GRAPH_ID = "AAMkPROBE0001="
+INBOX_ID = "AQMkPROBEINBOX"
+
+
+def graph_message_body() -> bytes:
+    """2,097,000 bytes of message JSON: 5,000 recipients and a non-ASCII text body ("ä😀", 4-byte code points)."""
+    recipients = [{"emailAddress": {"name": f"Recipient {i}", "address": f"r{i}@example.test"}} for i in range(5000)]
+    head: dict[str, object] = {
+        "id": GRAPH_ID,
+        "receivedDateTime": "2026-10-17T08:00:00Z",
+        "isRead": False,
+        "hasAttachments": True,
+        "from": {"emailAddress": {"name": "Probe", "address": "probe@example.test"}},
+        "toRecipients": recipients,
+        "ccRecipients": recipients[:100],
+        "subject": "Probe " + EMOJI * 100,
+        "parentFolderId": INBOX_ID,
+    }
+    raw = json.dumps(head | {"body": {"contentType": "text", "content": ""}}, ensure_ascii=False).encode()
+    count = (MAX_MESSAGE_RESPONSE_BYTES - 152 - len(raw)) // len(("ä" + EMOJI).encode())
+    body = json.dumps(
+        head | {"body": {"contentType": "text", "content": ("ä" + EMOJI) * count}}, ensure_ascii=False
+    ).encode()
+    if len(body) > MAX_MESSAGE_RESPONSE_BYTES:
+        raise SystemExit("probe message body exceeds the 2 MiB cap")
+    return body
+
+
+def graph_attachments_body() -> bytes:
+    """Just below the 1 MiB list cap: as many attachment entries as fit, so every one is parsed."""
+    entry = {"name": "file-" + EMOJI * 20 + ".pdf", "contentType": "application/pdf", "size": 1000, "isInline": False}
+    one = len(json.dumps(entry, ensure_ascii=False).encode()) + 2
+    body = json.dumps({"value": [entry] * ((MAX_LIST_RESPONSE_BYTES - 1000) // one)}, ensure_ascii=False).encode()
+    if len(body) > MAX_LIST_RESPONSE_BYTES:
+        raise SystemExit("probe attachment body exceeds the 1 MiB cap")
+    return body
+
+
+def graph_mailbox(account: Account) -> GraphMailbox:
+    """Real GraphMailbox + GraphTokenSource; the refresh token lives in the in-memory fake store (no PostgreSQL)."""
+    answers = {
+        ("GET", f"{GRAPH}/me/mailFolders/inbox"): lambda r: httpx2.Response(200, json={"id": INBOX_ID}),
+        # Built per request, so nothing is held between calls.
+        ("GET", f"{GRAPH}/me/messages/{GRAPH_ID}"): lambda r: httpx2.Response(200, content=graph_message_body()),
+        ("GET", f"{GRAPH}/me/messages/{GRAPH_ID}/attachments"): lambda r: httpx2.Response(
+            200, content=graph_attachments_body()
+        ),
+    }
+    graph = RecordingTransport(answers).transport()
+    token = {"access_token": "AT-PROBE", "refresh_token": "RT-PROBE", "expires_in": 3600, "scope": "Mail.Read"}
+    ms = MsTransport({"/consumers/oauth2/v2.0/token": [json_answer(200, token)]}).transport()
+    tokens = GraphTokenSource(
+        GraphAccount(account.id, account.provider, "consumers", FAKE_CLIENT_ID, ("Mail.Read", "offline_access")),
+        FakeStore(),
+        cache=AccessTokenCache(),
+        client_factory=lambda timeout: httpx2.Client(transport=ms, trust_env=False),
+    )
+    return GraphMailbox(
+        account.id,
+        tokens,
+        client_factory=lambda timeout: httpx2.Client(transport=graph, trust_env=False),
+        backoff=Backoff(),
+        inbox_ids={},
+    )
+
+
+def context(accounts: int, scenario: str | None, calendars: int, graph: bool = False) -> HubContext:
     secrets = Path(tempfile.mkdtemp()) / "secrets"
     secrets.mkdir()
     example = json.loads((Path(__file__).parents[1] / "tests/fixtures/accounts.example.json").read_text())
     template = next(a for a in example["accounts"] if a["id"] == "icloud")
-    example["accounts"] = [template | {"id": f"icloud{i}" if i else "icloud"} for i in range(accounts)]
+    icloud = [template | {"id": f"icloud{i}" if i else "icloud"} for i in range(accounts if scenario else 0)]
+    example["accounts"] = icloud + [a for a in example["accounts"] if graph and a["id"] == "outlook"]
     (secrets / "accounts.json").write_text(json.dumps(example))
-    for ref in ("icloud-username", "icloud-app-password"):
+    for ref in ("icloud-username", "icloud-app-password", "outlook-ms-client-id", "db-username", "db-password"):
         (secrets / ref).write_text("placeholder")
-    sources = {a["id"]: source(a["id"], scenario, calendars) for a in example["accounts"]}
+    (secrets / "token-encryption-key").write_text(base64.b64encode(KEY).decode())
+    sources = {a["id"]: source(a["id"], scenario, calendars) for a in icloud} if scenario else {}
+    registry = load_registry(secrets / "accounts.json")
+    mailboxes = {a.id: graph_mailbox(a) for a in registry.accounts if a.id == "outlook"}
     return HubContext(
         load_settings({"HUB_SECRETS_DIR": str(secrets)}),
-        load_registry(secrets / "accounts.json"),
+        registry,
         StatusStore(),
-        Adapters(calendar=lambda account, deadline: sources[account.id]),
+        Adapters(
+            mailbox=lambda account, directory: mailboxes[account.id],
+            calendar=lambda account, deadline: sources[account.id],
+        ),
     )
 
 
@@ -196,31 +283,60 @@ def cgroup(name: str) -> str:
         return "n/a"
 
 
+async def one_call(ctx: HubContext, calendar: bool, graph: bool) -> list[str]:
+    """One get_events and/or one get_message, concurrently; returns one summary per tool."""
+    notes: list[str] = []
+
+    async def events() -> None:
+        result, _, _ = await run_get_events(
+            ctx,
+            start="2026-10-17T00:00:00+02:00",
+            end="2026-11-16T23:00:00+01:00",
+            account=None,
+            timezone=None,
+            limit=200,
+        )
+        notes.append(f"items {len(result.items)}, truncated {result.truncated}, skipped {result.skipped_objects}")
+
+    async def message() -> None:
+        result, _ = await run_get_message(
+            ctx, message_id=encode_message_id(GraphMessageRef("outlook", GRAPH_ID)), max_chars=20000
+        )
+        notes.append(
+            f"message body {len(result.untrusted.body)} chars, to {len(result.untrusted.to_addresses)}, "
+            f"attachments {result.attachment_count}, body_truncated {result.body_truncated}"
+        )
+
+    async with anyio.create_task_group() as tg:
+        if calendar:
+            tg.start_soon(events)
+        if graph:
+            tg.start_soon(message)
+    return notes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--scenario", choices=sorted(SCENARIOS), required=True)
+    parser.add_argument("--scenario", choices=[*sorted(SCENARIOS), "graph-message"], required=True)
+    parser.add_argument(
+        "--with-calendar", choices=sorted(SCENARIOS), help="calendar scenario run next to graph-message"
+    )
     parser.add_argument("--accounts", type=int, default=1)
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
     args = parser.parse_args()
-    ctx = context(args.accounts, args.scenario, args.calendars)
+    graph = args.scenario == "graph-message"
+    if args.with_calendar and not graph:
+        parser.error("--with-calendar needs --scenario graph-message")
+    calendar = args.with_calendar if graph else args.scenario
+    ctx = context(args.accounts, calendar, args.calendars, graph=graph)
     for call in range(1, args.calls + 1):
         cpu = time.process_time()
-        result, _, _ = asyncio.run(
-            run_get_events(
-                ctx,
-                start="2026-10-17T00:00:00+02:00",
-                end="2026-11-16T23:00:00+01:00",
-                account=None,
-                timezone=None,
-                limit=200,
-            )
-        )
+        notes = asyncio.run(one_call(ctx, calendar is not None, graph))
         gc.collect()
         peak_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
         print(
-            f"call {call}: peak RSS {peak_mib:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, "
-            f"items {len(result.items)}, truncated {result.truncated}, skipped {result.skipped_objects}",
+            f"call {call}: peak RSS {peak_mib:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, {'; '.join(notes)}",
             flush=True,
         )
     print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
