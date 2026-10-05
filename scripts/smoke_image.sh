@@ -74,6 +74,12 @@ LOGS="$(docker logs "hub-$$" 2>&1)"
 ! grep -q "$VALID" <<<"$LOGS" || fail "token in logs"
 ! grep -q 'HTTP Request' <<<"$LOGS" || fail "httpx2 request line in logs"
 ! grep -q 'evil.example.org' <<<"$LOGS" || fail "header value in logs"
+# Owner-command wrapper (spec 080 §7.3): present, runs as uid 10001 on a read-only root FS, prints usage and exits 2.
+rc=0
+USAGE_OUT="$(docker run --rm --label org.furchert.homelab.workpackage=mcp-hub-wp5a --read-only --user 10001:10001 \
+  --network none "$IMAGE" mcp-hub login 2>&1)" || rc=$?  # no arguments would start the server
+[ "$rc" = "2" ] || fail "mcp-hub wrapper exit code $rc (expected 2)"
+grep -q 'usage: mcp-hub login <account-id>' <<<"$USAGE_OUT" || fail "mcp-hub wrapper usage text"
 # HTML converter on the image's own interpreter: linear growth on malformed input, unterminated comments hidden.
 docker run --rm -i --label org.furchert.homelab.workpackage=mcp-hub-wp5a --read-only --user 10001:10001 \
   --network none "$IMAGE" python - <"$ROOT/scripts/html_scaling_check.py" || fail "html scaling check"

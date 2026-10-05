@@ -24,6 +24,7 @@ All notable changes to this project are documented in this file. The format is b
 - `get_events` reports `skipped_objects`: calendar entries that could not be read and are missing from the result. Heavy unused properties (`X-ALT-DESC`, inline attachments) are dropped before the 1 MiB object limit; up to 1,000 events per object; year-less birthdays and other early yearly/monthly series, and `BYHOUR` lists, are accepted; text is cut and cleaned off the event loop.
 - Background status check for IMAP and CalDAV accounts (`HUB_STATUS_CHECK_ENABLED`, `HUB_HEALTH_CHECK_INTERVAL_SECONDS`), feeding `list_accounts`.
 - CalDAV integration tests against Radicale in the `providers` job.
+- Token store and `mcp-hub login` for Graph accounts (inert until the token-store keys and the `outlook` account exist): refresh tokens AES-256-GCM-encrypted in PostgreSQL (`psycopg[binary]` 3.3.6) with key ids derived from the key, built-in migrations, a row-locked rotation that commits before a new token is used, a Microsoft identity client for the device-code and refresh grants (one call deadline, capped streamed answers, no redirects), the `mcp-hub` wrapper in the image, and a PostgreSQL 17 container for the provider tests.
 
 ### Fixed
 

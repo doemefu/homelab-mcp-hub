@@ -57,6 +57,20 @@ Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The f
 
 **Resources.** The container's CPU limit is 1 core: calendar expansion is single-threaded and CPU-bound, and at 500m one busy worker would run at half speed in wall time (5 s expansion budget, 20 s call timeout). Memory limit 256 Mi; measured in this image under these limits (Linux/arm64, `scripts/memory_probe.py`), one account stays at or below 165 MiB with no OOM kill; two accounts queried concurrently with emoji-heavy time-zone data reach 256 MiB (INTERFACES.md, memory table; spec 080 rev. 4.5 D62).
 
+**Graph login (owner).** Once the token-store keys (`db-username`, `db-password`, `token-encryption-key`) are in `mcp-hub-secrets` and a Graph account (`outlook`) is enabled in the registry, the owner signs in once with the device code (spec 080 [§7.3](https://github.com/doemefu/homelab/blob/main/docs/080-mcp-hub.md); a cluster action, so it needs the owner's go):
+
+```bash
+kubectl -n apps exec -it deploy/mcp-hub -- mcp-hub login outlook
+# off the LAN, as a one-shot over SSH:
+ssh -t -i ~/.ssh/homelab -o IdentitiesOnly=yes -o ProxyCommand="cloudflared access ssh --hostname %h" ansible@ssh.furchert.ch 'sudo k3s kubectl -n apps exec -it deploy/mcp-hub -- mcp-hub login outlook'
+```
+
+- `-it` is required: the command refuses to run without a terminal, so the sign-in code never lands in a collected log.
+- It prints a Microsoft address and a code. Open the address in a private browser window, enter the code, and before approving check that the app name is yours and that only mail read and "Maintain access" are requested.
+- Exit codes: 0 stored; 1 declined, expired, timed out, refused by Microsoft, token endpoint unreachable or not stored (run it again; a "refused" message names the app-registration settings to check); 2 usage or configuration error (no terminal, unknown account, not a Graph account, token store not configured).
+- Re-login: the same command whenever the account shows `auth_expired`; it replaces the stored token and clears a recorded `invalid_grant`. `list_accounts` shows the new status at the next status check or the next call.
+- Key rotation: key ids are derived from the key bytes, so a rotation needs no change to these manifests; the procedure (old key → `token-encryption-key-previous`, new key → `token-encryption-key`, remove the previous key only after every Graph row is under the current key) is in the infrastructure runbook of `doemefu/homelab`.
+
 **Verification**
 
 ```bash
@@ -78,6 +92,8 @@ Revert the Flux image-update commit on `main` (or the offending code commit) thr
 | Every token gets 401 | `token_rejected` lines: the `check` value names the failing rule (`signature` with `jwks_fetch_failed` → auth-service JWKS unreachable; `subject` → `allowed-subjects` empty or missing, see `allowlist_empty` / `allowlist_unavailable`) |
 | An account shows `disabled` | `credential_missing` warnings at start-up name the missing or unreadable key; if every credential is unreadable, try `defaultMode: 0440` on the Secret volume |
 | Pod restarts with exit code 2 | `startup_failed` line: `reason` names the invalid variable or registry field |
+| A Graph account shows `auth_expired` | `token_refresh` lines for that `account`: `no_token` (never signed in), `invalid_grant` / `invalid_grant_recorded` (Microsoft revoked the grant) or `decrypt_failed` (key changed without rotation) → run the Graph login above |
+| A Graph account shows `error` | `token_refresh` with `outcome=error` or `persist_failed`: `exception` names the cause (`KeyUnreadable` = key file missing, unreadable or not strict base64, `KeyLength` = the key is not exactly 32 bytes, `SameKey` = current and previous key are identical; `TokenStoreNotConfigured` = a token-store file is missing; `OperationalError` = the connection failed — with psycopg 3.3.6 a missing database `mcp_hub`, wrong credentials and an unreachable server all show as this cause, the driver does not distinguish them; `ClientRejected` = app registration refused; `ConnectError`, `ConnectTimeout`, `TokenEndpointStatus` and similar = Microsoft's token endpoint unreachable, slow or failing; `CallDeadline` / `TokenLock` = the call ran out of time before or while waiting for a refresh) |
 | `/readyz` 503 | The process has not finished start-up; check the log for `startup_failed` |
 | An account shows `auth_expired` | `status_check_failed` line with `outcome=auth_expired` for that `account` and `capability`: the provider rejected the credential (for iCloud: create a new app-specific password, update the credential in SOPS, run playbook 59, delete the pod) |
 | An account shows `unreachable` or `error` | `status_check_failed` / `provider_call_failed` lines: `unreachable` = connection or timeout (egress, provider outage), `error` with `outcome=too_large` = a provider answer above 5 MiB (narrow `include_calendars`), other `upstream_error` = an unexpected provider answer |

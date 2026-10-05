@@ -1,5 +1,6 @@
 """Environment configuration (spec 080 §8.1)."""
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,12 @@ _DEFAULTS: Final[dict[str, str]] = {
     "HUB_RESPONSE_BUDGET_CHARS": "30000",
     "HUB_HEALTH_CHECK_INTERVAL_SECONDS": "1800",
     "HUB_STATUS_CHECK_ENABLED": "false",
+    "DB_HOST": "postgresql.apps.svc.cluster.local",
+    "DB_PORT": "5432",
+    "DB_NAME": "mcp_hub",
 }
+_HOST: Final = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+_DB_NAME: Final = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
 class ConfigError(ValueError):
@@ -48,6 +54,9 @@ class Settings:
     response_budget_chars: int
     health_check_interval_seconds: int
     status_check_enabled: bool
+    db_host: str
+    db_port: int
+    db_name: str
 
     @property
     def mcp_path(self) -> str:
@@ -90,6 +99,12 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     log_level = get("LOG_LEVEL").upper()
     if log_level not in _LOG_LEVELS:
         raise ConfigError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR")
+    db_host = get("DB_HOST")
+    if not _HOST.fullmatch(db_host):
+        raise ConfigError("DB_HOST must be a host name")
+    db_name = get("DB_NAME")
+    if not _DB_NAME.fullmatch(db_name):
+        raise ConfigError("DB_NAME must be a lower-case PostgreSQL identifier")
     return Settings(
         public_host=public_host,
         resource=resource,
@@ -110,6 +125,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         ),
         # The background check contacts providers; only the deployment turns it on (spec 080 rev. 4.4 §8.1, D57).
         status_check_enabled=_bool("HUB_STATUS_CHECK_ENABLED", get("HUB_STATUS_CHECK_ENABLED")),
+        # Token store (spec 080 §7.2, §8.1); credentials come from HUB_SECRETS_DIR at connection time.
+        db_host=db_host,
+        db_port=_int("DB_PORT", get("DB_PORT"), 1, 65535),
+        db_name=db_name,
     )
 
 

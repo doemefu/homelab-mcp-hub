@@ -1,6 +1,7 @@
 """Provider-call plumbing shared by every adapter (spec 080 §5.1 timeouts, §5.4 inbound limits, §6 common rules)."""
 
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -181,14 +182,34 @@ async def run_blocking[T](
                 slot.threads.release()
 
 
-def read_capped(chunks: Iterable[bytes], limit: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
-    """Read a streamed body and abort as soon as it exceeds `limit` (spec 080 §5.4)."""
+def read_capped(
+    chunks: Iterable[bytes],
+    limit: int = MAX_HTTP_RESPONSE_BYTES,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bytes:
+    """Read a streamed body; abort as soon as it exceeds `limit` (spec 080 §5.4) or, with a deadline, as soon as a
+    chunk arrives after it (one deadline per provider call, rev. 4.6 S4)."""
     buffer = bytearray()
     for chunk in chunks:
+        if deadline is not None and clock() > deadline:
+            raise ProviderError("upstream_timeout", "CallDeadline")
         buffer += chunk
         if len(buffer) > limit:
             raise ProviderError("too_large", "ResponseTooLarge")
     return bytes(buffer)
+
+
+def load_json_object(raw: bytes) -> dict[str, object]:
+    """Third-party JSON: any parse problem, deep nesting or a non-object is upstream_error (never a crash)."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ProviderError("upstream_error", "MalformedJson") from None
+    if not isinstance(value, dict):
+        raise ProviderError("upstream_error", "MalformedJson")
+    return value
 
 
 def item_hash(opaque_id: str) -> str:

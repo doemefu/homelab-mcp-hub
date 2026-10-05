@@ -24,3 +24,11 @@ def test_unexpected_startup_error_is_one_json_line(
     failed = [e for e in events if e["event"] == "startup_failed"]
     assert len(failed) == 1
     assert (failed[0]["reason"], failed[0]["exception"]) == ("unexpected_error", "RuntimeError")
+
+
+def test_run_dispatches_subcommands_without_starting_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(entry.cli, "main", lambda argv, env: calls.append(list(argv)) or 0)
+    monkeypatch.setattr(entry, "main", lambda env=None: pytest.fail("server must not start"))
+    assert entry.run(["login", "outlook"]) == 0
+    assert calls == [["login", "outlook"]]
