@@ -17,7 +17,7 @@ from mcp_hub.providers.base import ProviderError, load_json_object, read_capped
 LOGIN_HOST: Final = "login.microsoftonline.com"
 MAX_TOKEN_RESPONSE_BYTES: Final = 65_536  # L3
 MAX_DEVICE_RESPONSE_BYTES: Final = 16_384  # L4
-MAX_TOKEN_CHARS: Final = 16_384  # L14
+MAX_TOKEN_BYTES: Final = 16_384  # L14: UTF-8 bytes, the same limit as crypto.seal
 MAX_SCOPE_CHARS: Final = 1_024
 REQUEST_TIMEOUT_SECONDS: Final = 20.0
 TOKEN_CONNECT_TIMEOUT_SECONDS: Final = 5.0  # N3: short per-phase timeouts bound the overshoot past the deadline
@@ -153,9 +153,19 @@ def _post(
     return status, load_json_object(raw)
 
 
+def _fits(value: object, limit: int) -> bool:
+    """A non-empty string of at most `limit` UTF-8 bytes; a lone surrogate (valid in JSON) cannot be encoded."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return 0 < len(value.encode()) <= limit
+    except UnicodeEncodeError:
+        return False
+
+
 def _token_string(body: dict[str, object], name: str, limit: int) -> str:
     value = body.get(name)
-    if not isinstance(value, str) or not 0 < len(value) <= limit:
+    if not isinstance(value, str) or not _fits(value, limit):
         raise ProviderError("upstream_error", "BadTokenAnswer")
     return value
 
@@ -171,8 +181,8 @@ def _int(value: object, low: int, high: int, default: int) -> int:
 def _answer(body: dict[str, object]) -> TokenAnswer:
     scope = body.get("scope")
     return TokenAnswer(
-        access_token=_token_string(body, "access_token", MAX_TOKEN_CHARS),
-        refresh_token=_token_string(body, "refresh_token", MAX_TOKEN_CHARS),
+        access_token=_token_string(body, "access_token", MAX_TOKEN_BYTES),
+        refresh_token=_token_string(body, "refresh_token", MAX_TOKEN_BYTES),
         expires_in=_int(body.get("expires_in"), 60, 86_400, 3_600),  # L13
         scope=scope if isinstance(scope, str) and len(scope) <= MAX_SCOPE_CHARS else "",  # L14: informational
     )
@@ -237,7 +247,7 @@ def start_device_code(
             raise LoginFailedError("refused")
         raise LoginFailedError("error", cause="TokenEndpoint")
     device_code, user_code = body.get("device_code"), body.get("user_code")
-    if not (isinstance(device_code, str) and 0 < len(device_code) <= MAX_TOKEN_CHARS):
+    if not (isinstance(device_code, str) and _fits(device_code, MAX_TOKEN_BYTES)):
         raise LoginFailedError("error")
     if not (isinstance(user_code, str) and _USER_CODE.fullmatch(user_code)):
         raise LoginFailedError("error")

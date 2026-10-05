@@ -449,3 +449,34 @@ def test_refused_device_code_request_has_no_cause() -> None:
     with pytest.raises(LoginFailedError) as info:
         start(t)
     assert (info.value.reason, info.value.cause) == ("refused", None)
+
+
+def utf8_answer(body: dict[str, object]) -> httpx2.Response:
+    return httpx2.Response(200, content=json.dumps(body, ensure_ascii=False).encode())
+
+
+@pytest.mark.parametrize("name", ["access_token", "refresh_token"])
+def test_token_limit_counts_utf8_bytes_like_seal(name: str) -> None:
+    """16,384 characters of 'é' are 32,768 bytes: refused here, not by seal's ValueError inside the row lock (F7)."""
+    t = MsTransport({TOKEN: [utf8_answer(OK | {name: "é" * 16_384})]})
+    with pytest.raises(ProviderError) as info:
+        do_refresh(t)
+    assert (info.value.code, info.value.cause) == ("upstream_error", "BadTokenAnswer")
+
+
+def test_token_of_exactly_the_byte_limit_is_accepted() -> None:
+    t = MsTransport({TOKEN: [utf8_answer(OK | {"refresh_token": "é" * 8_192})]})
+    assert do_refresh(t).refresh_token == "é" * 8_192
+
+
+def test_token_byte_limit_matches_the_seal_limit() -> None:
+    from mcp_hub.tokenstore.crypto import MAX_PLAINTEXT_BYTES
+
+    assert msidentity.MAX_TOKEN_BYTES == MAX_PLAINTEXT_BYTES
+
+
+def test_token_with_a_lone_surrogate_is_a_bad_answer() -> None:
+    t = MsTransport({TOKEN: [httpx2.Response(200, content=json.dumps(OK | {"refresh_token": "\ud800"}).encode())]})
+    with pytest.raises(ProviderError) as info:
+        do_refresh(t)
+    assert (info.value.code, info.value.cause) == ("upstream_error", "BadTokenAnswer")
