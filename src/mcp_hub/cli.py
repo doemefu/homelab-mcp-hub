@@ -208,7 +208,7 @@ def _check_registry(
             if not account.has(capability):
                 continue
             missing = missing_credentials(account, capability, settings.secrets_dir)
-            status = "ok" if not missing else "missing " + " ".join(missing)
+            status = "ok" if not missing else f"missing_credentials count={len(missing)}"
             failed |= bool(missing)
             print(f"account {account.id} {capability} {account.protocol(capability)} {status}", file=out)
         if account.graph is None:
