@@ -161,6 +161,7 @@ class GraphMailbox:
                 try:
                     return work(client, token, deadline)
                 except _UnauthorizedError:
+                    self._tokens.invalidate()  # Graph rejected the refreshed token too: the next call refreshes first
                     raise ProviderError("auth_expired", "GraphUnauthorized") from None
         except Exception as exc:
             raise _provider_error(exc) from None

@@ -197,9 +197,39 @@ def test_401_refreshes_once_then_auth_expired() -> None:
     with pytest.raises(ProviderError) as info:
         list_unread(t, tokens=tokens)
     assert (info.value.code, info.value.cause) == ("auth_expired", "GraphUnauthorized")
-    assert tokens.invalidated == 1
+    assert tokens.invalidated == 2  # the refreshed token Graph also rejected is dropped too (review round 1 F7)
     assert tokens.issued == 2
     assert len(t.seen) == 2
+
+
+def test_after_a_second_401_the_next_call_starts_with_a_refresh() -> None:
+    class CachingTokens(FakeTokens):
+        """Hands out the cached token until it is invalidated, like GraphTokenSource with AccessTokenCache."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.cached: str | None = None
+
+        def access_token(self, deadline: float) -> str:
+            if self.cached is None:
+                self.cached = super().access_token(deadline)
+            return self.cached
+
+        def invalidate(self) -> None:
+            super().invalidate()
+            self.cached = None
+
+    sent: list[str] = []
+
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request.headers["authorization"])
+        return httpx2.Response(401, content=b"{}")
+
+    tokens, t = CachingTokens(), RecordingTransport({LIST: reject})
+    for _ in range(2):
+        with pytest.raises(ProviderError):
+            list_unread(t, tokens=tokens)
+    assert sent == [f"Bearer AT-SENTINEL-{n}" for n in (1, 2, 3, 4)]  # AT-SENTINEL-2 is never sent twice
 
 
 def test_401_then_success_uses_the_refreshed_token() -> None:
