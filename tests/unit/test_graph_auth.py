@@ -288,6 +288,7 @@ def raising(error: Exception) -> MsTransport:
         (MsTransport({TOKEN_PATH: [json_answer(503, {})]}), "TokenEndpointStatus"),
         (MsTransport({TOKEN_PATH: [httpx2.Response(200, content=b"not json")]}), "MalformedJson"),
         (MsTransport({TOKEN_PATH: [json_answer(200, {"access_token": "AT-SENTINEL-1"})]}), "BadTokenAnswer"),
+        (MsTransport({TOKEN_PATH: [httpx2.Response(200, content=b"x" * 70_000)]}), "ResponseTooLarge"),
     ],
 )
 def test_transport_and_answer_failures_write_a_token_refresh_line(transport: MsTransport, cause: str) -> None:
