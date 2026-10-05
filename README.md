@@ -8,13 +8,15 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 
 ## Status
 
+Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch.
+
 | Work package | Scope | Status |
 |--------------|-------|--------|
 | WP5a | Repository bootstrap, authorization layer, `list_accounts`, image, CI, `k8s/` | Done |
 | WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | Done |
-| WP5c | CalDAV adapter, `get_events`, background status check | In review |
+| WP5c | CalDAV adapter, `get_events`, background status check | Done |
 | WP5d | `search_mail`, paging, metrics on the internal port | Planned |
-| WP9 | Microsoft Graph for `outlook`: token store and `mcp-hub login` (PR A), mail adapter (PR B) | In progress |
+| WP9 | Microsoft Graph for `outlook`: token store and `mcp-hub login` (PR A, done), mail adapter and `mcp-hub check-registry` (PR B, in review) | In progress |
 | WP8, WP10 | Further accounts (IMAP folder handling, calendar feed) | Planned |
 
 ## Quick reference
@@ -27,7 +29,7 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 | Protocol versions | `2026-07-28` (stateless) and `2025-11-25` (initialize handshake) |
 | Scopes | `mail:read calendar:read` (both required) |
 | Image | `ghcr.io/doemefu/homelab-mcp-hub:main-<UTC timestamp>` (linux/amd64 + linux/arm64) |
-| Tools | `list_accounts`, `list_unread`, `get_message`, `get_events` (all read-only) |
+| Tools | `list_accounts`, `list_unread`, `get_message`, `get_events` (all read-only); mail over IMAP or Microsoft Graph (`outlook`), calendars over CalDAV |
 | Stack | Python 3.13, `mcp` 2.2.0, uvicorn, starlette, pydantic, PyJWT, IMAPClient, icalendar, recurring-ical-events |
 | Deployment | Flux from `k8s/` into namespace `apps` (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
 

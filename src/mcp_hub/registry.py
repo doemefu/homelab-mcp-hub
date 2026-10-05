@@ -23,6 +23,8 @@ RESERVED_SECRET_KEYS: Final[frozenset[str]] = frozenset(
         "token-encryption-key-previous",
     }
 )
+# Secret keys every Graph account needs besides its client id: the token store (spec 080 rev. 4.6 §7.2).
+TOKEN_STORE_REFS: Final[tuple[str, ...]] = ("db-username", "db-password", "token-encryption-key")
 
 
 def _not_reserved(ref: str) -> str:
@@ -35,6 +37,12 @@ def _not_reserved(ref: str) -> str:
 # excludes ".", ".." and the Secret volume's "..data" entries, so it cannot leave the directory.
 SecretRef = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9.-]{0,252}$"), AfterValidator(_not_reserved)]
 Tenant = Annotated[str, StringConstraints(pattern=r"^(consumers|organizations|[0-9a-f-]{36})$")]
+Scope = Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9._]{0,63}$")]
+# Delegated scopes a Graph account may request, per provider (spec 080 rev. 4.6 §8.2): no write scope can enter.
+GRAPH_SCOPES: Final[dict[str, frozenset[str]]] = {
+    "microsoft": frozenset({"Mail.Read", "offline_access"}),
+    "microsoft-org": frozenset({"Mail.Read", "Calendars.Read", "offline_access"}),
+}
 
 
 class _Strict(BaseModel):
@@ -72,7 +80,13 @@ class GraphBlock(_Strict):
 class GraphSettings(_Strict):
     tenant: Tenant
     client_id_ref: SecretRef
-    scopes: Annotated[list[Annotated[str, StringConstraints(min_length=1)]], Field(min_length=1)]
+    scopes: Annotated[list[Scope], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def _offline_access(self) -> Self:
+        if "offline_access" not in self.scopes:
+            raise ValueError("graph scopes must include offline_access")
+        return self
 
 
 class Capabilities(_Strict):
@@ -107,6 +121,14 @@ class Account(_Strict):
         uses_graph = any(isinstance(b, GraphBlock) for b in (self.mail, self.calendar))
         if uses_graph and self.graph is None:
             raise ValueError("graph settings are required for protocol graph")
+        if uses_graph and self.graph is not None:
+            allowed = GRAPH_SCOPES.get(self.provider)
+            if allowed is None:
+                raise ValueError("protocol graph needs provider microsoft or microsoft-org")
+            if not set(self.graph.scopes) <= allowed:
+                raise ValueError("graph scopes outside the provider's allow-list")
+            if isinstance(self.mail, GraphBlock) and "Mail.Read" not in self.graph.scopes:
+                raise ValueError("graph mail needs the Mail.Read scope")
         return self
 
     def has(self, capability: Capability) -> bool:
@@ -128,7 +150,7 @@ class Account(_Strict):
         if isinstance(block, IcsCalendar):
             return (block.url_ref,)
         if isinstance(block, GraphBlock) and self.graph is not None:
-            return (self.graph.client_id_ref,)
+            return (self.graph.client_id_ref, *TOKEN_STORE_REFS)
         return ()
 
 
@@ -159,10 +181,10 @@ def load_registry(path: Path) -> Registry:
     try:
         return Registry.model_validate_json(raw)
     except ValidationError as exc:
-        raise RegistryError(f"accounts.json is invalid: {_describe(exc)}") from None
+        raise RegistryError(f"accounts.json is invalid: {describe_validation_error(exc)}") from None
 
 
-def _describe(exc: ValidationError) -> str:
+def describe_validation_error(exc: ValidationError) -> str:
     """Schema paths and error types only. Unknown keys are operator-typed text, so they are never echoed (§9.7)."""
     problems: list[str] = []
     unknown: dict[str, int] = {}

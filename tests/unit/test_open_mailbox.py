@@ -70,3 +70,44 @@ def test_default_client_connects_with_tls_and_the_given_context(recording: type[
     [client] = recording.instances
     assert client.host == "imap.example.test"
     assert client.kwargs == {"port": 993, "ssl": True, "ssl_context": context, "timeout": 20.0}
+
+
+def _graph_ready(secrets_dir: Path) -> None:
+    for ref in ("outlook-ms-client-id", "db-username", "db-password", "token-encryption-key"):
+        (secrets_dir / ref).write_text("placeholder")
+
+
+def test_graph_account_opens_a_graph_mailbox_without_contacting_anything(secrets_dir: Path) -> None:
+    from mcp_hub.config import load_settings
+    from mcp_hub.providers import MailboxOpener
+    from mcp_hub.providers.graph import GraphMailbox
+    from mcp_hub.tokenstore.store import StoreConfig
+
+    _graph_ready(secrets_dir)
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    outlook = load_registry(secrets_dir / "accounts.json").get("outlook")
+    assert outlook is not None
+    opener = MailboxOpener(StoreConfig.from_settings(settings))
+    assert isinstance(opener(outlook, secrets_dir), GraphMailbox)
+
+
+def test_graph_account_without_a_store_configuration_is_refused(secrets_dir: Path) -> None:
+    _graph_ready(secrets_dir)
+    outlook = load_registry(secrets_dir / "accounts.json").get("outlook")
+    assert outlook is not None
+    with pytest.raises(ValueError, match="no supported mail block"):
+        open_mailbox(outlook, secrets_dir)
+
+
+def test_graph_client_id_is_read_when_the_mailbox_opens(secrets_dir: Path) -> None:
+    from mcp_hub.config import load_settings
+    from mcp_hub.providers import MailboxOpener
+    from mcp_hub.providers.base import ProviderError
+    from mcp_hub.tokenstore.store import StoreConfig
+
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    outlook = load_registry(secrets_dir / "accounts.json").get("outlook")
+    assert outlook is not None
+    with pytest.raises(ProviderError) as info:
+        MailboxOpener(StoreConfig.from_settings(settings))(outlook, secrets_dir)
+    assert (info.value.code, info.value.cause) == ("upstream_error", "FileNotFoundError")

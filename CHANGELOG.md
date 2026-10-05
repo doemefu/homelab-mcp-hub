@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + calendar enabled, 2026-10-02).
+
 ### Added
 
 - Authorization layer: offline validation of auth-service access tokens (RS256 via a throttled JWKS cache, `typ`, issuer, audience, client, time with 60 s leeway, required claims, subject allowlist re-read every 60 s), both scopes required, Bearer challenges with `resource_metadata` and `scope`, protected-resource metadata, Host/Origin checks.
@@ -25,6 +27,9 @@ All notable changes to this project are documented in this file. The format is b
 - Background status check for IMAP and CalDAV accounts (`HUB_STATUS_CHECK_ENABLED`, `HUB_HEALTH_CHECK_INTERVAL_SECONDS`), feeding `list_accounts`.
 - CalDAV integration tests against Radicale in the `providers` job.
 - Token store and `mcp-hub login` for Graph accounts (inert until the token-store keys and the `outlook` account exist): refresh tokens AES-256-GCM-encrypted in PostgreSQL (`psycopg[binary]` 3.3.6) with key ids derived from the key, built-in migrations, a row-locked rotation that commits before a new token is used, a Microsoft identity client for the device-code and refresh grants (one call deadline, capped streamed answers, no redirects), the `mcp-hub` wrapper in the image, and a PostgreSQL 17 container for the provider tests.
+- Microsoft Graph mail adapter for `outlook` (`list_unread`, `get_message`, background status check): inbox only, `GET` only to `graph.microsoft.com:443`, no redirects, `@odata.nextLink` never followed (first page only), uncompressed answers capped at 1 MiB (lists) and 2 MiB (one message, with a preview fallback above it), one 20 s deadline per call including a token refresh, Graph message ids (kind `g`, folder `inbox`) bound to the inbox through `parentFolderId`; 401 → one refresh and retry, then `auth_expired`; 403 → `upstream_error` (`Forbidden`); 429/503 → a per-account back-off from `Retry-After`. Registry rules for Graph accounts: scope pattern, `offline_access` required, per-provider scope allow-lists, token-store files counted as credentials.
+- `mcp-hub check-registry [--expect-sha <12 hex>]`: validates the mounted `accounts.json` with the server's own model before a pod deletion, proves its freshness by hash, checks credential files, the token key and the key id of each Graph account's stored token.
+- `scripts/memory_probe.py --scenario graph-message [--with-calendar <scenario>]`: memory gate for the Graph caps next to the worst calendar call.
 
 ### Fixed
 

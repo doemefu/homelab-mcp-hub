@@ -1,26 +1,46 @@
-"""Owner commands inside the hub container (spec 080 §7.3, rev. 4.6 S9): `mcp-hub login <account-id>` (device-code
-login for a Graph account). The user code and verification address go to this terminal only, never to the log; the
-command refuses to run without a terminal so the code cannot land in a collected log."""
+"""Owner commands inside the hub container.
 
+`mcp-hub login <account-id>` (spec 080 §7.3, rev. 4.6 S9): device-code login for a Graph account. The user code and
+verification address go to this terminal only, never to the log; the command refuses to run without a terminal so
+the code cannot land in a collected log.
+
+`mcp-hub check-registry [--expect-sha <12 hex>]` (spec 080 §7.3, §9.6, D66): validates the mounted accounts.json
+with the server's own model before a pod deletion. It prints account ids, capability names, protocols, Secret key
+names and error types with their field paths only, never input values, key bytes or lengths; it only reads."""
+
+import hashlib
 import logging
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TextIO
+from pathlib import Path
+from typing import Final, TextIO
 
 import httpx2
+from pydantic import ValidationError
 
 from mcp_hub.config import REGISTRY_FILE, ConfigError, load_settings
+from mcp_hub.health import missing_credentials
 from mcp_hub.logging import configure_logging, log_event
 from mcp_hub.providers import msidentity
 from mcp_hub.providers.base import ProviderError, read_credential
 from mcp_hub.providers.graph_auth import TokenStoreLike
 from mcp_hub.providers.msidentity import GraphAccount, LoginFailedError
-from mcp_hub.registry import GraphBlock, RegistryError, load_registry
-from mcp_hub.tokenstore.crypto import KeyUnavailableError
+from mcp_hub.registry import (
+    CAPABILITIES,
+    GraphBlock,
+    Registry,
+    RegistryError,
+    describe_validation_error,
+    load_registry,
+)
+from mcp_hub.tokenstore.crypto import KeyUnavailableError, TokenCipher, snapshot_dir
 from mcp_hub.tokenstore.store import LOGIN_WAIT_MS, StoreConfig, TokenStore, TokenStoreUnavailableError
 
-USAGE = "usage: mcp-hub login <account-id>"
+USAGE = "usage: mcp-hub login <account-id> | mcp-hub check-registry [--expect-sha <12 hex>]"
+_SHA: Final = re.compile(r"^[0-9a-f]{12}$")
+_SNAPSHOT: Final = re.compile(r"^\.\.(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})\.\d+$")
 _log = logging.getLogger("mcp_hub.cli")
 _MESSAGES = {
     "declined": "Sign-in was declined.",
@@ -50,6 +70,8 @@ def main(
     configure_logging("INFO")
     if len(argv) == 2 and argv[0] == "login":
         return _login(argv[1], env, out, err, client_factory, store_factory, sleep, clock)
+    if argv and argv[0] == "check-registry":
+        return _check_registry(list(argv[1:]), env, out, err, store_factory)
     print(USAGE, file=err)
     return 2
 
@@ -131,3 +153,79 @@ def _login(
     log_event(_log, logging.INFO, "login", account=account.id, outcome="ok")
     out.write("Signed in. The hub uses the new token at its next refresh (within 30 minutes) or the next call.\n")
     return 0
+
+
+def _projected(secrets_dir: Path) -> str:
+    """Projection time of the Secret volume, from the name of the snapshot directory `..data` points to."""
+    match = _SNAPSHOT.fullmatch(snapshot_dir(secrets_dir).name)
+    return "{}-{}-{}T{}:{}:{}Z".format(*match.groups()) if match else "unknown"
+
+
+def _check_registry(
+    args: list[str],
+    env: Mapping[str, str],
+    out: TextIO,
+    err: TextIO,
+    store_factory: Callable[[StoreConfig], TokenStoreLike],
+) -> int:
+    expect: str | None = None
+    if args:
+        if len(args) != 2 or args[0] != "--expect-sha" or not _SHA.fullmatch(args[1]):
+            print(USAGE, file=err)
+            return 2
+        expect = args[1]
+    try:
+        settings = load_settings(env)
+    except ConfigError:
+        print("The hub configuration is invalid.", file=err)
+        return 2
+    try:
+        raw = (snapshot_dir(settings.secrets_dir) / REGISTRY_FILE).read_bytes()
+    except OSError:
+        print("registry missing", file=out)
+        return 1
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    print(f"registry sha={digest} projected={_projected(settings.secrets_dir)}", file=out)
+    if expect is not None and digest != expect:
+        print(
+            "registry file is not the expected one yet (kubelet refresh pending): wait a minute and run again", file=out
+        )
+        return 1
+    try:
+        registry = Registry.model_validate_json(raw)  # the server's own model (load_registry), no second schema
+    except ValidationError as exc:
+        for problem in describe_validation_error(exc).split("; "):
+            print(f"registry error {problem}", file=out)
+        return 1
+    print("registry ok", file=out)
+    failed = False
+    store = store_factory(StoreConfig.from_settings(settings))
+    for account in registry.accounts:
+        if not account.enabled:
+            print(f"account {account.id} disabled (not checked)", file=out)
+            continue
+        for capability in CAPABILITIES:
+            if not account.has(capability):
+                continue
+            missing = missing_credentials(account, capability, settings.secrets_dir)
+            # Key names only, never values (spec 080 §9.7); the CodeQL clear-text-logging alert is a false positive.
+            status = "ok" if not missing else "missing " + " ".join(missing)
+            failed |= bool(missing)
+            print(f"account {account.id} {capability} {account.protocol(capability)} {status}", file=out)
+        if account.graph is None:
+            continue
+        try:
+            cipher = TokenCipher.from_files(settings.secrets_dir)  # the mounted key, as production reads it
+        except KeyUnavailableError:
+            print(f"account {account.id} key invalid", file=out)
+            failed = True
+            continue
+        print(f"account {account.id} key ok", file=out)
+        state: str
+        try:
+            key_id = store.stored_key_id(account.id)
+            state = "none" if key_id is None else cipher.key_state(key_id)
+        except TokenStoreUnavailableError:
+            state, failed = "unreachable", True
+        print(f"account {account.id} token {state}", file=out)
+    return 1 if failed else 0
