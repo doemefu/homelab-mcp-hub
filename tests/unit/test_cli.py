@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -142,3 +143,73 @@ def test_store_failure_after_sign_in_exits_1(secrets: Path) -> None:
     assert code == 1
     assert "could not be stored" in err
     assert store.sealed is None
+
+
+def login_lines(secrets: Path, t: MsTransport) -> tuple[int, str, list[dict[str, object]]]:
+    capture = Capture()
+    logging.getLogger("mcp_hub").addHandler(capture)
+    try:
+        code, _, err, _ = run(secrets, t, ["login", "outlook"])
+    finally:
+        logging.getLogger("mcp_hub").removeHandler(capture)
+    return code, err, [json.loads(line) for line in capture.lines if '"login"' in line]
+
+
+def test_login_failure_logs_its_cause(secrets: Path) -> None:
+    t = MsTransport(
+        {
+            "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE)],
+            "/consumers/oauth2/v2.0/token": [httpx2.Response(200, content=b"not json")],
+        }
+    )
+    code, _, events = login_lines(secrets, t)
+    assert code == 1
+    assert [(e["outcome"], e.get("exception")) for e in events] == [("error", "MalformedJson")]
+
+
+def test_unreachable_token_endpoint_is_logged_as_error_with_its_cause(secrets: Path) -> None:
+    t = MsTransport(
+        {
+            "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE | {"expires_in": 60})],
+            "/consumers/oauth2/v2.0/token": [json_answer(503, {})],
+        }
+    )
+    capture = Capture()
+    logging.getLogger("mcp_hub").addHandler(capture)
+    now = [0.0]
+
+    def sleep(s: float) -> None:
+        now[0] += s
+
+    try:
+        err = io.StringIO()
+        code = cli.main(
+            ["login", "outlook"],
+            {"HUB_SECRETS_DIR": str(secrets)},
+            out=Terminal(),
+            err=err,
+            client_factory=lambda timeout: httpx2.Client(transport=t.transport(), trust_env=False),
+            store_factory=lambda config: FakeStore(None),
+            sleep=sleep,
+            clock=lambda: now[0],
+        )
+    finally:
+        logging.getLogger("mcp_hub").removeHandler(capture)
+    events = [json.loads(line) for line in capture.lines if '"login"' in line]
+    assert code == 1
+    assert "could not be reached" in err.getvalue()
+    # Spec §9.7 keeps the login outcomes fixed: the internal reason "unreachable" is logged as outcome=error.
+    assert [(e["outcome"], e.get("exception")) for e in events] == [("error", "TokenEndpointStatus")]
+
+
+def test_login_failure_without_a_cause_logs_no_exception_field(secrets: Path) -> None:
+    t = MsTransport(
+        {
+            "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE)],
+            "/consumers/oauth2/v2.0/token": [json_answer(400, {"error": "authorization_declined"})],
+        }
+    )
+    code, err, events = login_lines(secrets, t)
+    assert code == 1
+    assert "declined" in err
+    assert [(e["outcome"], "exception" in e) for e in events] == [("declined", False)]

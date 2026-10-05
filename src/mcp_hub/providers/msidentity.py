@@ -91,12 +91,15 @@ class GrantError(Exception):
 
 
 class LoginFailedError(Exception):
+    """`cause` is a class name or a fixed hub cause, never message text."""
+
     def __init__(
         self,
-        reason: Literal["declined", "expired", "timeout", "refused", "unexpected_host", "error"],
+        reason: Literal["declined", "expired", "timeout", "refused", "unexpected_host", "unreachable", "error"],
         host: str | None = None,
+        cause: str | None = None,
     ) -> None:
-        self.reason, self.host = reason, host
+        self.reason, self.host, self.cause = reason, host, cause
         super().__init__(reason)
 
 
@@ -227,10 +230,12 @@ def start_device_code(
         status, body = _post(
             client, endpoint(account.tenant, "devicecode"), form, MAX_DEVICE_RESPONSE_BYTES, deadline, clock
         )
-    except ProviderError:
-        raise LoginFailedError("error") from None
+    except ProviderError as exc:
+        raise LoginFailedError("error", cause=exc.cause) from None
     if status != 200:
-        raise LoginFailedError("refused" if _grant_error(status, body).error in CLIENT_ERRORS else "error")
+        if _grant_error(status, body).error in CLIENT_ERRORS:
+            raise LoginFailedError("refused")
+        raise LoginFailedError("error", cause="TokenEndpoint")
     device_code, user_code = body.get("device_code"), body.get("user_code")
     if not (isinstance(device_code, str) and 0 < len(device_code) <= MAX_TOKEN_CHARS):
         raise LoginFailedError("error")
@@ -257,8 +262,12 @@ def poll_device_code(
     deadline = clock() + min(code.expires_in, 900)  # L22
     interval = max(code.interval, 1)  # the server's interval is a floor (P8)
     form = {"grant_type": DEVICE_GRANT, "client_id": account.client_id, "device_code": code.device_code}
+    answered = False  # at least one poll got a proper OAuth answer (pending / slow_down)
+    last_failure: str | None = None
     while True:
         if clock() + interval > deadline:
+            if not answered and last_failure is not None:
+                raise LoginFailedError("unreachable", cause=last_failure)
             raise LoginFailedError("timeout")
         sleep(interval)
         try:
@@ -271,22 +280,30 @@ def poll_device_code(
                 clock,
             )
         except ProviderError as exc:
-            if exc.code in ("unreachable", "upstream_timeout"):
-                continue  # transient; the deadline still bounds the loop
-            raise LoginFailedError("error") from None
+            if exc.code in ("unreachable", "upstream_timeout") or exc.cause == "TokenEndpointStatus":
+                last_failure = exc.cause  # transient; the deadline still bounds the loop
+                continue
+            raise LoginFailedError("error", cause=exc.cause) from None
         if status == 200:
             try:
                 return _answer(body)
-            except ProviderError:
-                raise LoginFailedError("error") from None
+            except ProviderError as exc:
+                raise LoginFailedError("error", cause=exc.cause) from None
         error = _grant_error(status, body).error
+        if error == "temporarily_unavailable":
+            last_failure = "TemporarilyUnavailable"
+            continue
         if error == "authorization_pending":
+            answered = True
             continue
         if error == "slow_down":
+            answered = True
             interval += 5
             continue
         if error in ("authorization_declined", "access_denied"):
             raise LoginFailedError("declined")
         if error in ("expired_token", "bad_verification_code"):
             raise LoginFailedError("expired")
-        raise LoginFailedError("refused" if error in CLIENT_ERRORS else "error")
+        if error in CLIENT_ERRORS:
+            raise LoginFailedError("refused")
+        raise LoginFailedError("error", cause="TokenEndpoint")

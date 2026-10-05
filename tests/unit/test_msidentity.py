@@ -351,3 +351,101 @@ def test_secrets_absent_from_reprs() -> None:
     text = repr(do_refresh(t)) + repr(start(t)[1]) + repr(ACCOUNT)
     for secret in ("AT-SENTINEL-1", "RT-SENTINEL-2", "DC-SENTINEL", "ABCD-EFGH", FAKE_CLIENT_ID):
         assert secret not in text
+
+
+def poll_with(answers: list[httpx2.Response], expires_in: int = 900) -> tuple[MsTransport, list[float], object]:
+    """Poll on a fake clock that advances with every sleep; returns the transport, the sleeps and the outcome."""
+    now = [0.0]
+    t = MsTransport({DEVICE: [json_answer(200, device(expires_in=expires_in))], TOKEN: answers})
+    c = client(t)
+    code = start_device_code(c, ACCOUNT, deadline=FAR, clock=lambda: now[0])
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        now[0] += s
+
+    try:
+        outcome: object = poll_device_code(c, ACCOUNT, code, sleep=sleep, clock=lambda: now[0])
+    except LoginFailedError as exc:
+        outcome = exc
+    return t, slept, outcome
+
+
+def connect_error(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ConnectError("down")
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [json_answer(503, {}), json_answer(400, {"error": "temporarily_unavailable"})],
+)
+def test_server_errors_while_polling_are_transient(transient: httpx2.Response) -> None:
+    _, slept, outcome = poll_with([transient, json_answer(200, OK)])
+    assert getattr(outcome, "access_token", None) == AT
+    assert slept == [5, 5]
+
+
+def test_every_poll_failing_is_unreachable_not_timeout() -> None:
+    now = [0.0]
+    t = MsTransport({DEVICE: [json_answer(200, device(expires_in=60))]})
+    c = client(t)
+    code = start_device_code(c, ACCOUNT, deadline=FAR, clock=lambda: now[0])
+    down = httpx2.Client(transport=httpx2.MockTransport(connect_error), trust_env=False)
+
+    def sleep(s: float) -> None:
+        now[0] += s
+
+    with pytest.raises(LoginFailedError) as info:
+        poll_device_code(down, ACCOUNT, code, sleep=sleep, clock=lambda: now[0])
+    assert info.value.reason == "unreachable"
+    assert info.value.cause == "ConnectError"
+
+
+def test_some_polls_failing_still_ends_as_timeout() -> None:
+    _, _, outcome = poll_with([json_answer(503, {}), json_answer(400, {"error": "authorization_pending"})], 60)
+    assert isinstance(outcome, LoginFailedError)
+    assert outcome.reason == "timeout"
+
+
+@pytest.mark.parametrize(
+    ("answer", "cause"),
+    [(httpx2.Response(200, content=b"not json"), "MalformedJson"), (json_answer(200, {"x": 1}), "BadTokenAnswer")],
+)
+def test_bad_poll_answers_carry_their_cause(answer: httpx2.Response, cause: str) -> None:
+    _, _, outcome = poll_with([answer])
+    assert isinstance(outcome, LoginFailedError)
+    assert (outcome.reason, outcome.cause) == ("error", cause)
+
+
+def test_device_code_request_failure_carries_its_cause() -> None:
+    down = httpx2.Client(transport=httpx2.MockTransport(connect_error), trust_env=False)
+    with pytest.raises(LoginFailedError) as info:
+        start_device_code(down, ACCOUNT, deadline=FAR, clock=lambda: 0.0)
+    assert (info.value.reason, info.value.cause) == ("error", "ConnectError")
+
+
+def test_unknown_poll_error_carries_the_token_endpoint_cause() -> None:
+    _, _, outcome = poll_with([json_answer(400, {"error": "weird"})])
+    assert isinstance(outcome, LoginFailedError)
+    assert (outcome.reason, outcome.cause) == ("error", "TokenEndpoint")
+
+
+def test_non_transient_transport_failure_while_polling_stops_with_its_cause() -> None:
+    t, _, outcome = poll_with([httpx2.Response(307, headers={"Location": "https://evil.example.test/t"})])
+    assert isinstance(outcome, LoginFailedError)
+    assert (outcome.reason, outcome.cause) == ("error", "Redirect")
+    assert len([s for s in t.seen if s[3] == TOKEN]) == 1
+
+
+def test_temporarily_unavailable_on_every_poll_is_unreachable() -> None:
+    _, _, outcome = poll_with([json_answer(400, {"error": "temporarily_unavailable"})], 60)
+    assert isinstance(outcome, LoginFailedError)
+    assert (outcome.reason, outcome.cause) == ("unreachable", "TemporarilyUnavailable")
+
+
+def test_refused_device_code_request_has_no_cause() -> None:
+    t = MsTransport({DEVICE: [json_answer(400, {"error": "invalid_client"})]})
+    with pytest.raises(LoginFailedError) as info:
+        start(t)
+    assert (info.value.reason, info.value.cause) == ("refused", None)

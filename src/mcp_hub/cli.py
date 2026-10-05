@@ -31,6 +31,7 @@ _MESSAGES = {
         "or its account types exclude personal accounts)."
     ),
     "unexpected_host": "Microsoft answered with a sign-in address on an unexpected host; nothing was shown or stored.",
+    "unreachable": "Microsoft's token endpoint could not be reached during the sign-in. Run the command again.",
     "error": "The sign-in failed. Run the command again; if it keeps failing, check the hub log.",
 }
 
@@ -112,13 +113,12 @@ def _login(
         if exc.reason == "unexpected_host":
             message += f" Refused host: {exc.host or 'unprintable'}"
         print(message, file=err)
-        log_event(
-            _log,
-            logging.WARNING,
-            "login",
-            account=account.id,
-            outcome="refused" if exc.reason == "unexpected_host" else exc.reason,
-        )
+        # Spec §9.7 fixes the login outcomes: unexpected_host is logged as refused, unreachable as error.
+        outcome = {"unexpected_host": "refused", "unreachable": "error"}.get(exc.reason, exc.reason)
+        fields: dict[str, object] = {"account": account.id, "outcome": outcome}
+        if exc.cause is not None:  # absent rather than null, like the other events
+            fields["exception"] = exc.cause
+        log_event(_log, logging.WARNING, "login", **fields)
         return 1
     try:
         sealed = cipher.seal(answer.refresh_token, account_id=account.id, provider=account.provider)
