@@ -79,7 +79,7 @@ docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /t
 
 It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` and `memory.events`; `--accounts 2` queries two accounts concurrently. Re-run the scenarios in INTERFACES.md's memory table after any change to the calendar limits.
 
-`--scenario graph-message` drives `get_message` for an `outlook` entry through the real Graph adapter and token source (in-memory token store, in-process Graph transport): the message answer fills the 2 MiB cap with a non-ASCII body and 5,000 recipients, the attachment answer fills the 1 MiB list cap. `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process; the gate for the Graph limits is `--scenario graph-message --with-calendar nonascii-240k --calls 10` with cgroup `memory.peak` at most 230 MiB and `oom_kill 0`. Re-run it after any change to the Graph response caps.
+`--scenario graph-message` drives `get_message` for an `outlook` entry through the real Graph adapter and token source (in-memory token store, in-process Graph transport): the message answer fills the 2 MiB cap with a non-ASCII body and 5,000 recipients, the attachment answer fills the 1 MiB list cap. `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process; the gate for the Graph limits is `--scenario graph-message --with-calendar nonascii-240k --calls 10` with cgroup `memory.peak` at most 230 MiB and `oom_kill 0`. Record both cgroup `memory.peak` and the last call's peak RSS: the cgroup figure also counts page cache and varies between runs and hosts, while peak RSS is the process alone. Re-run it after any change to the Graph response caps.
 
 ### Provider integration tests
 
