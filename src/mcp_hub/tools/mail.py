@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_or_drop
 from mcp_hub.errors import ToolError
-from mcp_hub.ids import decode_message_id, encode_message_id
+from mcp_hub.ids import MessageRef, decode_message_id, encode_message_id
 from mcp_hub.providers.base import (
     ACCOUNT_ERROR_MESSAGES,
     MailDetail,
@@ -22,7 +22,7 @@ from mcp_hub.providers.base import (
     placeholder_summary,
     run_blocking,
 )
-from mcp_hub.registry import Account, ImapMail
+from mcp_hub.registry import Account, GraphBlock, ImapMail
 from mcp_hub.sanitize import FIELD_LIMITS, clean, clean_flagged, validate_content_type
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import (
@@ -191,9 +191,13 @@ async def run_get_message(ctx: HubContext, *, message_id: str, max_chars: int | 
     if ctx.registry.get(ref.account) is None:
         raise ToolError("unknown_account", "No account with that id")
     [target] = ready_accounts(ctx, "mail", ref.account)
-    # The id is client-supplied and forgeable: the folder must be the registry's inbox, so a crafted id cannot open
-    # another mailbox (spec 080 rev. 4.4 §5.1, D56). No provider call for a mismatch.
-    if not isinstance(target.mail, ImapMail) or ref.folder != target.mail.inbox:
+    # The id is client-supplied and forgeable (spec 080 rev. 4.6 §5.1, D56): an IMAP id must name the registry inbox,
+    # a Graph id must belong to a Graph account; the Graph adapter then checks parentFolderId against the inbox.
+    # No provider call for a mismatch.
+    if isinstance(ref, MessageRef):
+        if not isinstance(target.mail, ImapMail) or ref.folder != target.mail.inbox:
+            raise ToolError("not_found", ACCOUNT_ERROR_MESSAGES["not_found"])
+    elif not isinstance(target.mail, GraphBlock):
         raise ToolError("not_found", ACCOUNT_ERROR_MESSAGES["not_found"])
 
     async def call(account: Account) -> MailDetail:

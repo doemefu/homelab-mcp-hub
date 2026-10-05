@@ -25,8 +25,9 @@ from mcp_hub.config import ALLOWLIST_FILE, Settings
 from mcp_hub.health import StatusStore, missing_credentials
 from mcp_hub.jwks import JwksCache
 from mcp_hub.logging import apply_logger_levels, log_event
-from mcp_hub.providers import Adapters
+from mcp_hub.providers import Adapters, MailboxOpener
 from mcp_hub.registry import CAPABILITIES, Registry
+from mcp_hub.tokenstore.store import StoreConfig
 from mcp_hub.tools import HubContext, register_tools
 
 REQUIRED_SCOPES: Final = ("mail:read", "calendar:read")
@@ -230,7 +231,10 @@ def create_app(
     )
     apply_logger_levels(settings.log_level)  # MCPServer() calls logging.basicConfig (spec 080 §9.7)
     context = HubContext(
-        settings=settings, registry=registry, status=status or StatusStore(), adapters=adapters or Adapters()
+        settings=settings,
+        registry=registry,
+        status=status or StatusStore(),
+        adapters=adapters or Adapters(mailbox=MailboxOpener(StoreConfig.from_settings(settings))),
     )
     register_tools(server, context)
     _warn_missing_credentials(settings, registry)
