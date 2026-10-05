@@ -316,6 +316,7 @@ def test_allowed_verification_hosts(uri: str) -> None:
         ({"verification_uri": "http://microsoft.com/devicelogin"}, "error", None),
         ({"verification_uri": "https://microsoft.com/\x1b[2J"}, "error", None),
         ({"verification_uri": "https://microsoft.com:8443/x"}, "error", None),
+        ({"verification_uri": "https://microsoft.com:99999/x"}, "error", None),
         ({"user_code": "AB\x1b[2J"}, "error", None),
         ({"user_code": "x" * 40}, "error", None),
         ({"device_code": 7}, "error", None),
@@ -326,6 +327,8 @@ def test_device_answer_validated_before_printing(patch: dict[str, object], reaso
     with pytest.raises(LoginFailedError) as info:
         start(t)
     assert (info.value.reason, info.value.host) == (reason, host)
+    # Every malformed device answer that ends as "error" names one fixed cause for the login line (delta review N1).
+    assert info.value.cause == ("BadDeviceAnswer" if reason == "error" else None)
     assert "ABCD" not in str(info.value)
     assert "DC-SENTINEL" not in str(info.value)
 

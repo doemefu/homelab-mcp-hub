@@ -45,6 +45,7 @@ _USER_CODE: Final = re.compile(r"^[A-Za-z0-9-]{4,32}$")  # L23
 _PRINTABLE_URI: Final = re.compile(r"^[\x21-\x7e]{1,200}$")
 _PRINTABLE_HOST: Final = re.compile(r"^[a-z0-9.-]{1,253}$")
 _VERIFICATION_SUFFIXES: Final = ("microsoft.com", "live.com", "microsoftonline.com")  # P3: exact or subdomain
+BAD_DEVICE_ANSWER: Final = "BadDeviceAnswer"  # one fixed login cause for every malformed device-code answer
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,15 +215,15 @@ def refresh(
 
 def _verification_uri(value: object) -> str:
     if not isinstance(value, str) or not _PRINTABLE_URI.fullmatch(value):
-        raise LoginFailedError("error")
+        raise LoginFailedError("error", cause=BAD_DEVICE_ANSWER)
     parts = urlsplit(value)
     host = (parts.hostname or "").lower()
     try:
         port = parts.port
     except ValueError:
-        raise LoginFailedError("error") from None
+        raise LoginFailedError("error", cause=BAD_DEVICE_ANSWER) from None
     if parts.scheme != "https" or port not in (None, 443):
-        raise LoginFailedError("error")
+        raise LoginFailedError("error", cause=BAD_DEVICE_ANSWER)
     # Browsers read a backslash as "/" in https URLs (WHATWG) and userinfo hides the real host from a reader: refuse
     # both, and require a plain host name before the suffix check, so the printed address opens the host checked (F1).
     if "\\" in value or "@" in parts.netloc or not _PRINTABLE_HOST.fullmatch(host):
@@ -248,9 +249,9 @@ def start_device_code(
         raise LoginFailedError("error", cause="TokenEndpoint")
     device_code, user_code = body.get("device_code"), body.get("user_code")
     if not (isinstance(device_code, str) and _fits(device_code, MAX_TOKEN_BYTES)):
-        raise LoginFailedError("error")
+        raise LoginFailedError("error", cause=BAD_DEVICE_ANSWER)
     if not (isinstance(user_code, str) and _USER_CODE.fullmatch(user_code)):
-        raise LoginFailedError("error")
+        raise LoginFailedError("error", cause=BAD_DEVICE_ANSWER)
     uri = _verification_uri(body.get("verification_uri"))
     return DeviceCode(
         device_code,

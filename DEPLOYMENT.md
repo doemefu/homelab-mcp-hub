@@ -67,7 +67,7 @@ ssh -t -i ~/.ssh/homelab -o IdentitiesOnly=yes -o ProxyCommand="cloudflared acce
 
 - `-it` is required: the command refuses to run without a terminal, so the sign-in code never lands in a collected log.
 - It prints a Microsoft address and a code. Open the address in a private browser window, enter the code, and before approving check that the app name is yours and that only mail read and "Maintain access" are requested.
-- Exit codes: 0 stored; 1 declined, expired, timed out, refused by Microsoft or not stored (run it again; a "refused" message names the app-registration settings to check); 2 usage or configuration error (no terminal, unknown account, not a Graph account, token store not configured).
+- Exit codes: 0 stored; 1 declined, expired, timed out, refused by Microsoft, token endpoint unreachable or not stored (run it again; a "refused" message names the app-registration settings to check); 2 usage or configuration error (no terminal, unknown account, not a Graph account, token store not configured).
 - Re-login: the same command whenever the account shows `auth_expired`; it replaces the stored token and clears a recorded `invalid_grant`. `list_accounts` shows the new status at the next status check or the next call.
 - Key rotation: key ids are derived from the key bytes, so a rotation needs no change to these manifests; the procedure (old key → `token-encryption-key-previous`, new key → `token-encryption-key`, remove the previous key only after every Graph row is under the current key) is in the infrastructure runbook of `doemefu/homelab`.
 

@@ -243,3 +243,12 @@ def test_login_failure_without_a_cause_logs_no_exception_field(secrets: Path) ->
     assert code == 1
     assert err == cli._MESSAGES["declined"] + "\n"
     assert [(e["outcome"], "exception" in e) for e in events] == [("declined", False)]
+
+
+@pytest.mark.parametrize("patch", [{"user_code": "AB\x1b[2J"}, {"verification_uri": "https://microsoft.com/\x1b[2J"}])
+def test_malformed_device_answer_logs_bad_device_answer(secrets: Path, patch: dict[str, object]) -> None:
+    t = MsTransport({"/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE | patch)]})
+    code, err, events = login_lines(secrets, t)
+    assert code == 1
+    assert err == cli._MESSAGES["error"] + "\n"
+    assert [(e["outcome"], e.get("exception")) for e in events] == [("error", "BadDeviceAnswer")]
