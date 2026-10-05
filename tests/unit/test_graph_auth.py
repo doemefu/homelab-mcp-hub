@@ -84,11 +84,11 @@ def test_revoked_grant_with_400_is_recorded_and_short_circuits(error: str) -> No
     s = source(store, t)
     with pytest.raises(ProviderError) as info:
         s.access_token(deadline=1020.0)
-    assert info.value.code == "auth_expired"
+    assert (info.value.code, info.value.cause) == ("auth_expired", "InvalidGrant")
     assert store.invalid_grant
     with pytest.raises(ProviderError) as again:
         s.access_token(deadline=1020.0)
-    assert again.value.code == "auth_expired"
+    assert (again.value.code, again.value.cause) == ("auth_expired", "InvalidGrantRecorded")
     assert len(t.seen) == 1
 
 
@@ -96,7 +96,7 @@ def test_revoked_grant_text_with_other_status_is_not_sticky() -> None:
     store, t = FakeStore(), MsTransport({TOKEN_PATH: [json_answer(401, {"error": "invalid_grant"})]})
     with pytest.raises(ProviderError) as info:
         source(store, t).access_token(deadline=1020.0)
-    assert info.value.code == "upstream_error"
+    assert (info.value.code, info.value.cause) == ("upstream_error", "TokenEndpoint")
     assert not store.invalid_grant
 
 
@@ -112,12 +112,12 @@ def test_no_row_and_undecryptable_row_are_auth_expired() -> None:
     t = MsTransport({TOKEN_PATH: [ok(1)]})
     with pytest.raises(ProviderError) as info:
         source(FakeStore(None), t).access_token(deadline=1020.0)
-    assert info.value.code == "auth_expired"
+    assert (info.value.code, info.value.cause) == ("auth_expired", "NoToken")
     store = FakeStore()
     store.cipher_ = TokenCipher(b"\x07" * 32)  # key changed without rotation: unknown key id
     with pytest.raises(ProviderError) as info:
         source(store, t).access_token(deadline=1020.0)
-    assert info.value.code == "auth_expired"
+    assert (info.value.code, info.value.cause) == ("auth_expired", "TokenDecrypt")
     assert t.seen == []
 
 
@@ -135,7 +135,7 @@ def test_no_token_call_when_the_deadline_is_nearly_used_up() -> None:
     store, t = FakeStore(), MsTransport({TOKEN_PATH: [ok(1)]})
     with pytest.raises(ProviderError) as info:
         source(store, t).access_token(deadline=1000.5)
-    assert info.value.code == "upstream_timeout"
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
     assert t.seen == []
 
 
@@ -147,7 +147,7 @@ def test_lock_wait_is_bounded_even_for_a_far_deadline() -> None:
         s = source(FakeStore(), MsTransport({TOKEN_PATH: [ok(1)]}), cache=cache)
         with pytest.raises(ProviderError) as info:  # deadline 10**12 would overflow threading.TIMEOUT_MAX
             s.access_token(deadline=1000.0 + 2.5)
-        assert info.value.cause == "TokenLock"
+        assert (info.value.code, info.value.cause) == ("upstream_timeout", "TokenLock")
         GraphTokenSource.lock_wait(10.0**12, 0.0)  # clamped, no OverflowError
     finally:
         lock.release()

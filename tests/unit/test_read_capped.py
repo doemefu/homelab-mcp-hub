@@ -13,7 +13,7 @@ def test_cap_stops_after_first_chunk_beyond_limit() -> None:
 
     with pytest.raises(ProviderError) as info:
         read_capped(chunks(), 65_536)
-    assert info.value.code == "too_large"
+    assert (info.value.code, info.value.cause) == ("too_large", "ResponseTooLarge")
     assert len(served) == 5
 
 

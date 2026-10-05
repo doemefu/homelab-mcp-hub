@@ -104,9 +104,21 @@ def test_login_refuses_without_a_terminal(secrets: Path) -> None:
     assert out == ""
 
 
-@pytest.mark.parametrize("argv", [[], ["login"], ["login", "nope"], ["login", "icloud"], ["serve"]])
-def test_usage_and_config_errors_exit_2(secrets: Path, argv: list[str]) -> None:
-    assert run(secrets, happy(), argv)[0] == 2
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        ([], cli.USAGE),
+        (["login"], cli.USAGE),
+        (["login", "nope"], "No account with that id."),
+        (["login", "icloud"], "That account does not use Microsoft Graph."),
+        (["serve"], cli.USAGE),
+    ],
+)
+def test_usage_and_config_errors_exit_2(secrets: Path, argv: list[str], message: str) -> None:
+    t = happy()
+    code, _, err, _ = run(secrets, t, argv)
+    assert (code, err) == (2, message + "\n")
+    assert t.seen == []
 
 
 def test_token_store_not_configured_exits_2(secrets: Path) -> None:
@@ -115,16 +127,33 @@ def test_token_store_not_configured_exits_2(secrets: Path) -> None:
     assert "token store is not configured" in err
 
 
-@pytest.mark.parametrize("error", ["authorization_declined", "access_denied", "expired_token", "invalid_client"])
-def test_failed_login_exits_1_and_stores_nothing(secrets: Path, error: str) -> None:
+@pytest.mark.parametrize(
+    ("error", "outcome"),
+    [
+        ("authorization_declined", "declined"),
+        ("access_denied", "declined"),
+        ("expired_token", "expired"),
+        ("invalid_client", "refused"),
+    ],
+)
+def test_failed_login_exits_1_and_stores_nothing(secrets: Path, error: str, outcome: str) -> None:
     t = MsTransport(
         {
             "/consumers/oauth2/v2.0/devicecode": [json_answer(200, DEVICE)],
             "/consumers/oauth2/v2.0/token": [json_answer(400, {"error": error})],
         }
     )
-    code, _, _, store = run(secrets, t, ["login", "outlook"])
+    store = FakeStore(None)
+    capture = Capture()
+    logging.getLogger("mcp_hub").addHandler(capture)
+    try:
+        code, _, err, _ = run(secrets, t, ["login", "outlook"], store)
+    finally:
+        logging.getLogger("mcp_hub").removeHandler(capture)
+    events = [json.loads(line) for line in capture.lines if '"login"' in line]
     assert code == 1
+    assert err == cli._MESSAGES[outcome] + "\n"
+    assert [e["outcome"] for e in events] == [outcome]
     assert store.sealed is None
 
 
@@ -133,7 +162,7 @@ def test_unexpected_host_prints_only_the_host(secrets: Path) -> None:
     t = MsTransport({"/consumers/oauth2/v2.0/devicecode": [json_answer(200, bad)]})
     code, out, err, _ = run(secrets, t, ["login", "outlook"])
     assert code == 1
-    assert "evil.example.test" in err
+    assert err == cli._MESSAGES["unexpected_host"] + " Refused host: evil.example.test\n"
     assert "WXYZ" not in out + err
     assert "code=" not in err
 
@@ -197,6 +226,7 @@ def test_unreachable_token_endpoint_is_logged_as_error_with_its_cause(secrets: P
         logging.getLogger("mcp_hub").removeHandler(capture)
     events = [json.loads(line) for line in capture.lines if '"login"' in line]
     assert code == 1
+    assert err.getvalue() == cli._MESSAGES["unreachable"] + "\n"
     assert "could not be reached" in err.getvalue()
     # Spec §9.7 keeps the login outcomes fixed: the internal reason "unreachable" is logged as outcome=error.
     assert [(e["outcome"], e.get("exception")) for e in events] == [("error", "TokenEndpointStatus")]
@@ -211,5 +241,5 @@ def test_login_failure_without_a_cause_logs_no_exception_field(secrets: Path) ->
     )
     code, err, events = login_lines(secrets, t)
     assert code == 1
-    assert "declined" in err
+    assert err == cli._MESSAGES["declined"] + "\n"
     assert [(e["outcome"], "exception" in e) for e in events] == [("declined", False)]

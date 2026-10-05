@@ -15,7 +15,7 @@ def test_bundled_migrations_are_contiguous() -> None:
 def test_gaps_and_duplicates_refused(tmp_path: Path, names: list[str]) -> None:
     for name in names:
         (tmp_path / name).write_text("SELECT 1;")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=r"^migration versions must be 1\.\.n without gaps or duplicates$"):
         migration_files(tmp_path)
 
 

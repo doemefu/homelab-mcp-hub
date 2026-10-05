@@ -82,9 +82,10 @@ def test_invalid_grant_recorded_then_cleared_by_login(secrets: Path) -> None:
     t = MsTransport({PATH: [json_answer(400, {"error": "invalid_grant"})]})
     with pytest.raises(ProviderError) as info:
         source(store, t.transport()).access_token(deadline=soon())
-    assert info.value.code == "auth_expired"
-    with pytest.raises(ProviderError):
+    assert (info.value.code, info.value.cause) == ("auth_expired", "InvalidGrant")
+    with pytest.raises(ProviderError) as again:
         source(store, t.transport()).access_token(deadline=soon())
+    assert (again.value.code, again.value.cause) == ("auth_expired", "InvalidGrantRecorded")
     assert len(t.seen) == 1
     seed(store, "RT-9")
     t2 = MsTransport({PATH: [answer(2)]})

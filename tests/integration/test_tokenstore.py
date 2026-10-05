@@ -95,7 +95,7 @@ def test_rotation_is_visible_from_a_new_connection(store: TokenStore) -> None:
 
 def test_exception_inside_rolls_back(store: TokenStore) -> None:
     login(store, "rt-1")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=r"^caller failed after the write$"):
         rotate_then_fail(store)
     assert current(store) == "rt-1"
 
@@ -113,7 +113,7 @@ def test_commit_failure_keeps_old_row(store: TokenStore) -> None:
         )
     with pytest.raises(TokenStoreUnavailableError) as info:
         rotate_once(store)
-    assert "test commit failure" not in str(info.value)
+    assert str(info.value) == "RaiseException"  # the class name of the trigger's error, never its text
     with postgres.connect() as conn:
         conn.execute("DROP TRIGGER fail_commit ON mcp_hub.provider_tokens")
     assert current(store) == "rt-1"
@@ -181,8 +181,10 @@ def test_login_waits_longer_than_the_server_default(store: TokenStore) -> None:
     thread = threading.Thread(target=holder)
     thread.start()
     assert entered.wait(5)
-    with pytest.raises(TokenStoreUnavailableError):
+    with pytest.raises(TokenStoreUnavailableError) as info:
         login(store, "rt-server-default")  # 5 s wait < 6 s hold
+    # lock_timeout and statement_timeout are both set to the wait: either ends the wait, nothing else may.
+    assert str(info.value) in ("LockNotAvailable", "QueryCanceled")
     login(store, "rt-login", wait_ms=LOGIN_WAIT_MS)  # 35 s wait > remaining hold
     thread.join(10)
     assert current(store) == "rt-login"
@@ -202,6 +204,7 @@ def test_unreachable_database_is_unavailable(tmp_path: Path) -> None:
     store = make_store(tmp_path, DB_PORT="1")
     with pytest.raises(TokenStoreUnavailableError) as info:
         enter(store)
+    assert str(info.value) == "OperationalError"
     assert postgres.password() not in str(info.value)
 
 

@@ -15,7 +15,7 @@ def test_db_defaults_follow_spec() -> None:
 def test_invalid_values_refuse_start(name: str, value: str) -> None:
     with pytest.raises(ConfigError) as info:
         load_settings({name: value})
-    assert name in str(info.value)
+    assert str(info.value).startswith(name)
 
 
 def test_key_id_variables_do_not_exist() -> None:

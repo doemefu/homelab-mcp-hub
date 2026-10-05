@@ -149,17 +149,26 @@ def test_deadline_crossed_while_reading_stores_nothing() -> None:
 
 def test_no_request_after_deadline() -> None:
     t = MsTransport({TOKEN: [json_answer(200, OK)]})
-    with pytest.raises(ProviderError):
+    with pytest.raises(ProviderError) as info:
         do_refresh(t, deadline=-1.0)
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
     assert t.seen == []
 
 
-@pytest.mark.parametrize("raw", [b"[" * 100_000, b"not json", b"[1]"])
-def test_malformed_answers(raw: bytes) -> None:
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (b"[" * 100_000, ("too_large", "ResponseTooLarge")),
+        (b"[" * 50_000, ("upstream_error", "MalformedJson")),  # deep nesting within the cap
+        (b"not json", ("upstream_error", "MalformedJson")),
+        (b"[1]", ("upstream_error", "MalformedJson")),
+    ],
+)
+def test_malformed_answers(raw: bytes, expected: tuple[str, str]) -> None:
     t = MsTransport({TOKEN: [httpx2.Response(200, content=raw)]})
     with pytest.raises(ProviderError) as info:
         do_refresh(t)
-    assert info.value.code in ("too_large", "upstream_error")
+    assert (info.value.code, info.value.cause) == expected
 
 
 @pytest.mark.parametrize(
@@ -169,8 +178,9 @@ def test_malformed_answers(raw: bytes) -> None:
 def test_bad_token_fields_store_nothing(patch: dict[str, object]) -> None:
     body = {k: v for k, v in (OK | patch).items() if v is not None}
     t = MsTransport({TOKEN: [json_answer(200, body)]})
-    with pytest.raises(ProviderError):
+    with pytest.raises(ProviderError) as info:
         do_refresh(t)
+    assert (info.value.code, info.value.cause) == ("upstream_error", "BadTokenAnswer")
 
 
 def test_long_scope_is_stored_empty() -> None:
@@ -298,25 +308,24 @@ def test_allowed_verification_hosts(uri: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("patch", "host"),
+    ("patch", "reason", "host"),
     [
-        ({"verification_uri": "https://evil.example.test/devicelogin"}, "evil.example.test"),
-        ({"verification_uri": "https://microsoft.com.evil.test/x"}, "microsoft.com.evil.test"),
-        ({"verification_uri": "https://notmicrosoft.com/x"}, "notmicrosoft.com"),
-        ({"verification_uri": "http://microsoft.com/devicelogin"}, None),
-        ({"verification_uri": "https://microsoft.com/\x1b[2J"}, None),
-        ({"verification_uri": "https://microsoft.com:8443/x"}, None),
-        ({"user_code": "AB\x1b[2J"}, None),
-        ({"user_code": "x" * 40}, None),
-        ({"device_code": 7}, None),
+        ({"verification_uri": "https://evil.example.test/devicelogin"}, "unexpected_host", "evil.example.test"),
+        ({"verification_uri": "https://microsoft.com.evil.test/x"}, "unexpected_host", "microsoft.com.evil.test"),
+        ({"verification_uri": "https://notmicrosoft.com/x"}, "unexpected_host", "notmicrosoft.com"),
+        ({"verification_uri": "http://microsoft.com/devicelogin"}, "error", None),
+        ({"verification_uri": "https://microsoft.com/\x1b[2J"}, "error", None),
+        ({"verification_uri": "https://microsoft.com:8443/x"}, "error", None),
+        ({"user_code": "AB\x1b[2J"}, "error", None),
+        ({"user_code": "x" * 40}, "error", None),
+        ({"device_code": 7}, "error", None),
     ],
 )
-def test_device_answer_validated_before_printing(patch: dict[str, object], host: str | None) -> None:
+def test_device_answer_validated_before_printing(patch: dict[str, object], reason: str, host: str | None) -> None:
     t = MsTransport({DEVICE: [json_answer(200, device(**patch))]})
     with pytest.raises(LoginFailedError) as info:
         start(t)
-    if host is not None:
-        assert (info.value.reason, info.value.host) == ("unexpected_host", host)
+    assert (info.value.reason, info.value.host) == (reason, host)
     assert "ABCD" not in str(info.value)
     assert "DC-SENTINEL" not in str(info.value)
 
@@ -324,8 +333,9 @@ def test_device_answer_validated_before_printing(patch: dict[str, object], host:
 def test_load_json_object_rejects_non_objects() -> None:
     assert load_json_object(json.dumps({"a": 1}).encode()) == {"a": 1}
     for raw in (b"[]", b"1", b"\xff", b"{" * 50_000):
-        with pytest.raises(ProviderError):
+        with pytest.raises(ProviderError) as info:
             load_json_object(raw)
+        assert (info.value.code, info.value.cause) == ("upstream_error", "MalformedJson")
 
 
 @pytest.mark.parametrize(

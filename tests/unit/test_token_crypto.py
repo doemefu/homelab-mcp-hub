@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from mcp_hub.tokenstore import crypto
@@ -48,7 +49,7 @@ def test_aad_carries_the_format_label(tmp_path: Path) -> None:
     unlabeled = f"outlook|microsoft|{sealed.key_id}".encode()
     labeled = f"mcp-hub/token/v1|outlook|microsoft|{sealed.key_id}".encode()
     assert AESGCM(key).decrypt(sealed.nonce, sealed.ciphertext, labeled) == SENTINEL.encode()
-    with pytest.raises(Exception):  # noqa: B017, PT011 - InvalidTag without the label
+    with pytest.raises(InvalidTag):  # the label is part of the associated data
         AESGCM(key).decrypt(sealed.nonce, sealed.ciphertext, unlabeled)
 
 
@@ -57,7 +58,7 @@ def test_ciphertext_moved_to_other_row_fails(tmp_path: Path) -> None:
     cipher = TokenCipher.from_files(tmp_path)
     sealed = seal(cipher)
     for account, provider in (("uzh", "microsoft"), ("outlook", "microsoft-org")):
-        with pytest.raises(TokenDecryptError):
+        with pytest.raises(TokenDecryptError, match=r"^InvalidTag$"):
             cipher.open(sealed, account_id=account, provider=provider)
 
 
@@ -80,7 +81,7 @@ def test_previous_key_decrypts_and_new_writes_use_current(tmp_path: Path) -> Non
 def test_same_key_as_current_and_previous_is_refused(tmp_path: Path) -> None:
     key = write_key(tmp_path, KEY_FILE)
     write_key(tmp_path, PREVIOUS_KEY_FILE, key)
-    with pytest.raises(KeyUnavailableError):
+    with pytest.raises(KeyUnavailableError, match=r"^SameKey$"):
         TokenCipher.from_files(tmp_path)
 
 
@@ -120,29 +121,31 @@ def test_unknown_key_id_is_decrypt_error(tmp_path: Path) -> None:
     write_key(tmp_path, KEY_FILE)
     cipher = TokenCipher.from_files(tmp_path)
     sealed = seal(cipher)
-    with pytest.raises(TokenDecryptError):
+    with pytest.raises(TokenDecryptError, match=r"^UnknownKeyId$"):
         cipher.open(Sealed("f" * 16, sealed.nonce, sealed.ciphertext), account_id="outlook", provider="microsoft")
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("content", "cause"),
     [
-        b"",
-        b"not base64!!",
-        base64.b64encode(os.urandom(16)),
-        base64.b64encode(os.urandom(33)),
-        base64.urlsafe_b64encode(b"\xfb" * 32),
+        (b"", "KeyLength"),
+        (b"not base64!!", "KeyUnreadable"),
+        (base64.b64encode(os.urandom(16)), "KeyLength"),
+        (base64.b64encode(os.urandom(33)), "KeyLength"),
+        (base64.urlsafe_b64encode(b"\xfb" * 32), "KeyUnreadable"),
     ],
 )
-def test_bad_key_files_are_unavailable(tmp_path: Path, content: bytes) -> None:
+def test_bad_key_files_are_unavailable(tmp_path: Path, content: bytes, cause: str) -> None:
     (tmp_path / KEY_FILE).write_bytes(content)
-    with pytest.raises(KeyUnavailableError):
+    with pytest.raises(KeyUnavailableError) as info:
         load_key(tmp_path / KEY_FILE)
+    assert str(info.value) == cause
 
 
 def test_missing_key_file_is_unavailable(tmp_path: Path) -> None:
-    with pytest.raises(KeyUnavailableError):
+    with pytest.raises(KeyUnavailableError) as info:
         TokenCipher.from_files(tmp_path)
+    assert str(info.value) == "KeyUnreadable"
 
 
 def test_no_key_or_token_in_repr_or_errors(tmp_path: Path) -> None:
@@ -154,5 +157,5 @@ def test_no_key_or_token_in_repr_or_errors(tmp_path: Path) -> None:
     assert SENTINEL not in text
     with pytest.raises(TokenDecryptError) as info:
         cipher.open(sealed, account_id="other", provider="microsoft")
-    assert SENTINEL not in str(info.value)
+    assert str(info.value) == "InvalidTag"
     assert info.value.__cause__ is None
