@@ -169,6 +169,21 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
         assert set(event) <= allowed_fields(event["event"])
 
 
+async def test_duplicate_graph_ids_are_listed_once(secrets_dir: Path) -> None:
+    received = (NOW - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entries = [message(n, receivedDateTime=received) for n in (1, 2, 1, 1)]
+    graph = RecordingTransport({("GET", f"{BASE}/me/mailFolders/inbox/messages"): js({"value": entries})})
+    answer = {"access_token": "AT-SENTINEL", "refresh_token": "RT-SENTINEL", "expires_in": 3600, "scope": "Mail.Read"}
+    ms = MsTransport({TOKEN_PATH: [json_answer(200, answer)]})
+    result, _, outcome = await run_list_unread(
+        hub(secrets_dir, FakeStore(), ms, graph), account="outlook", since=None, limit=20, now=NOW
+    )
+    assert outcome == "ok"
+    ids = [i.id for i in result.items]
+    assert len(ids) == 2  # result_count is len(result.items) and the budget is applied to the same list
+    assert len(set(ids)) == 2
+
+
 async def test_check_then_invalid_grant_shows_auth_expired_in_list_accounts(secrets_dir: Path) -> None:
     """Review 01 answer 8: check -> token source -> HTTP 400 invalid_grant -> list_accounts auth_expired."""
     ms = MsTransport({TOKEN_PATH: [json_answer(400, {"error": "invalid_grant", "error_codes": [70000]})]})

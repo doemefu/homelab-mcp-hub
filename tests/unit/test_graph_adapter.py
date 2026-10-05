@@ -83,6 +83,13 @@ def test_more_when_limit_plus_one_or_next_link() -> None:
     assert [s[0] for s in t.seen] == ["graph.microsoft.com"]
 
 
+def test_duplicate_graph_ids_keep_the_first_entry() -> None:
+    first = message(1, subject="first copy")
+    entries = [first, message(2), message(1, subject="second copy", receivedDateTime="2026-09-29T06:59:00Z")]
+    page = list_unread(RecordingTransport({LIST: js({"value": entries})}))
+    assert [(i.ref.graph_id, i.subject) for i in page.items] == [("AAMkMSG0002=", "Subject 2"), (MID, "first copy")]
+
+
 def test_next_link_never_requested() -> None:
     t = RecordingTransport(
         {LIST: js({"value": [], "@odata.nextLink": f"{BASE}/me/mailFolders/inbox/messages?$skip=10"})}

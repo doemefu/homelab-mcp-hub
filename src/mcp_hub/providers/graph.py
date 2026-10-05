@@ -247,7 +247,13 @@ class GraphMailbox:
         values = body.get("value")
         if not isinstance(values, list):
             raise ProviderError("upstream_error", "MalformedList")
-        items = [s for raw in values[:MAX_LIST_ITEMS] if (s := self._summary(raw, since)) is not None]
+        items: list[MailSummary] = []
+        seen: set[AnyMessageRef] = set()
+        for raw in values[:MAX_LIST_ITEMS]:
+            summary = self._summary(raw, since)
+            if summary is not None and summary.ref not in seen:  # a repeated Graph id keeps its first entry
+                seen.add(summary.ref)
+                items.append(summary)
         items.sort(key=lambda s: s.received_at, reverse=True)
         more = len(values) > limit or "@odata.nextLink" in body or len(items) > limit
         return UnreadPage(items=items[:limit], more=more)
