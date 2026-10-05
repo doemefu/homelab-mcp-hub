@@ -394,6 +394,37 @@ def test_attachments_listed_without_inline_and_degrade_alone() -> None:
     assert broken.attachments == []
 
 
+def test_attachments_after_the_deadline_fail_the_whole_call() -> None:
+    now = [100.0]
+
+    def folder_using_up_the_deadline(request: httpx2.Request) -> httpx2.Response:
+        def body() -> Iterator[bytes]:
+            yield json.dumps({"id": INBOX_ID}).encode()
+            now[0] += 25.0  # the inbox-id answer completes, then the 20 s call deadline is over
+
+        return httpx2.Response(200, content=body())
+
+    routes = message_routes(full(hasAttachments=True), attachments=js({"value": []}))
+    routes[FOLDER] = folder_using_up_the_deadline
+    t = RecordingTransport(routes)
+    with pytest.raises(ProviderError) as info:
+        box(t, now=now).get_message(GraphMessageRef("outlook", MID))
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
+    assert [r[3] for r in t.seen] == [f"/v1.0/me/messages/{MID}", "/v1.0/me/mailFolders/inbox"]  # no attachments GET
+
+
+def test_attachments_401_refreshes_the_whole_call_once() -> None:
+    # A 401 on the attachments request is not a ProviderError: it reaches _run, which refreshes once and re-runs the
+    # whole call; a second 401 is auth_expired. So _attachments never sees an auth_expired ProviderError.
+    tokens = FakeTokens()
+    t = RecordingTransport(message_routes(full(hasAttachments=True), attachments=js({}, 401)))
+    with pytest.raises(ProviderError) as info:
+        box(t, tokens).get_message(GraphMessageRef("outlook", MID))
+    assert (info.value.code, info.value.cause) == ("auth_expired", "GraphUnauthorized")
+    assert tokens.issued == 2
+    assert sum(r[3].endswith("/attachments") for r in t.seen) == 2
+
+
 def test_foreign_refs_not_found_before_any_request() -> None:
     t = RecordingTransport({})
     for ref in (MessageRef("outlook", "INBOX", 1, 1), GraphMessageRef("uzh", MID)):

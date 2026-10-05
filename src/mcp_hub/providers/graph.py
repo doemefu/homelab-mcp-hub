@@ -364,7 +364,8 @@ class GraphMailbox:
             if not isinstance(values, list):
                 raise MalformedItemError
         except ProviderError as exc:
-            if exc.code in ("auth_expired", "upstream_timeout"):
+            # The call deadline fails the whole call. A 401 is _UnauthorizedError, not a ProviderError: it reaches _run.
+            if exc.code == "upstream_timeout":
                 raise
             log_message_skipped(ref, "mail", exc)
             return []
