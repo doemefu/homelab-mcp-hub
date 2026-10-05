@@ -23,7 +23,7 @@ Resources are estimates (requests 50m / 128Mi, limits 500m / 256Mi); confirm wit
 
 1. Merge the bootstrap pull request; the first `Build and Push` run on `main` publishes the first image.
 2. Owner: GitHub → Packages → `homelab-mcp-hub` → visibility **Public**; confirm it is linked to this repository.
-3. Owner: add the required status checks (`lint-and-test`, `image-smoke`, `providers`, `Analyze (python)`) and the CodeQL rule to the ruleset `main` once GitHub knows the check names.
+3. Owner: add the required status checks (`lint-and-test`, `image-smoke`, `providers`, `Analyze (python)`) and the CodeQL rule to the ruleset `main` (done: the ruleset requires all four checks).
 4. Owner: create a write deploy key for this repository and the Secret `mcp-hub-flux-auth` in `flux-system` (private key never through chat).
 5. `doemefu/homelab` platform pull request (WP6): Flux bundle `cluster/apps/mcp-hub/`, playbook 59 writes Secret `mcp-hub-secrets` (`accounts.json`, `allowed-subjects`, credential keys).
 6. Flux replaces the placeholder image tag in `k8s/deployment.yaml` (it was never built) with the newest `main-<ts>` tag and pushes an image-update commit to `main`. The ruleset `main` requires pull requests, with bypass for the admin role only; that first Flux commit proves the push works. If image automation reports a rejected push, the owner adds the deploy key as a bypass actor.
@@ -31,13 +31,15 @@ Resources are estimates (requests 50m / 128Mi, limits 500m / 256Mi); confirm wit
 
 ## Operations
 
-**Registry changes.** `accounts.json` is read only at start-up. After the Secret changes, delete the pod:
+**Registry changes.** `accounts.json` is read only at start-up. The Deployment uses `Recreate`, and an invalid registry makes the new pod exit with code 2 and one `startup_failed` line (it restarts until the registry is fixed), which would take every account down. So, after the Secret changes, **always run the registry check before deleting the pod** (spec 080 §9.6, D66), with the hash computed from the Secret's own `accounts.json`:
 
 ```bash
-kubectl -n apps delete pod -l app=mcp-hub
+S=$(kubectl -n apps get secret mcp-hub-secrets -o jsonpath='{.data.accounts\.json}' | base64 -d | shasum -a 256 | cut -c1-12)
+kubectl -n apps exec deploy/mcp-hub -c mcp-hub -- mcp-hub check-registry --expect-sha "$S"; echo "exit $?"
+kubectl -n apps delete pod -l app=mcp-hub   # only after exit 0
 ```
 
-An invalid registry makes the new pod exit with code 2 and one `startup_failed` line (it restarts until the registry is fixed).
+`check-registry` exit codes: 0 every check passed; 1 a check failed (`registry error <path>: <type>`, `… missing <key>`, `key invalid`, `token unreachable`, or "not the expected one yet": the kubelet has not refreshed the volume — wait a minute and run it again); 2 usage or configuration error. A token state `none` (no login yet) is not a failure. Output lines are listed in INTERFACES.md §7.
 
 **Kill switch** (spec §4.6 layer L2, two steps; owner go, because both change the cluster or SOPS):
 
@@ -55,7 +57,9 @@ Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The f
 
 **Signing-key revocation.** The hub caches auth-service's signing keys and re-reads them at most every hour; a key that auth-service withdraws stops being accepted at the hub within 1 hour, or immediately after `kubectl -n apps delete pod -l app=mcp-hub`.
 
-**Resources.** The container's CPU limit is 1 core: calendar expansion is single-threaded and CPU-bound, and at 500m one busy worker would run at half speed in wall time (5 s expansion budget, 20 s call timeout). Memory limit 256 Mi; measured in this image under these limits (Linux/arm64, `scripts/memory_probe.py`), one account stays at or below 165 MiB with no OOM kill; two accounts queried concurrently with emoji-heavy time-zone data reach 256 MiB (INTERFACES.md, memory table; spec 080 rev. 4.5 D62).
+**Resources.** The container's CPU limit is 1 core: calendar expansion is single-threaded and CPU-bound, and at 500m one busy worker would run at half speed in wall time (5 s expansion budget, 20 s call timeout). Memory limit 256 Mi; measured in this image under these limits (Linux/arm64, `scripts/memory_probe.py`), one account stays at or below 165 MiB with no OOM kill; two accounts queried concurrently with emoji-heavy time-zone data reach 256 MiB (INTERFACES.md, memory table; spec 080 rev. 4.5 D62). A maximal Graph message (2 MiB answer, 1 MiB attachment list) next to the 240 KiB non-ASCII calendar scenario peaks at 226.8 MiB with no OOM kill (gate 230 MiB).
+
+**Enabling `outlook` (owner).** The order is fixed by the infrastructure runbook "mcp-hub token store and the Outlook account (#171 onboarding)" in `DEPLOYMENT.md` of `doemefu/homelab`: this repository's Graph mail adapter is merged and rolled out by Flux; SOPS gets the token-store variables and the `outlook` registry entry with its client id; playbook 59 creates the database, the role and the Secret keys; `mcp-hub check-registry --expect-sha …` passes; the pod is deleted; `list_accounts` shows `outlook` mail `auth_expired` (no token yet, expected); then the Graph login below; then a `list_unread` and one `get_message` for `outlook`.
 
 **Graph login (owner).** Once the token-store keys (`db-username`, `db-password`, `token-encryption-key`) are in `mcp-hub-secrets` and a Graph account (`outlook`) is enabled in the registry, the owner signs in once with the device code (spec 080 [§7.3](https://github.com/doemefu/homelab/blob/main/docs/080-mcp-hub.md); a cluster action, so it needs the owner's go):
 
@@ -94,6 +98,9 @@ Revert the Flux image-update commit on `main` (or the offending code commit) thr
 | Pod restarts with exit code 2 | `startup_failed` line: `reason` names the invalid variable or registry field |
 | A Graph account shows `auth_expired` | `token_refresh` lines for that `account`: `no_token` (never signed in), `invalid_grant` / `invalid_grant_recorded` (Microsoft revoked the grant) or `decrypt_failed` (key changed without rotation) → run the Graph login above |
 | A Graph account shows `error` | `token_refresh` with `outcome=error` or `persist_failed`: `exception` names the cause (`KeyUnreadable` = key file missing, unreadable or not strict base64, `KeyLength` = the key is not exactly 32 bytes, `SameKey` = current and previous key are identical; `TokenStoreNotConfigured` = a token-store file is missing; `OperationalError` = the connection failed — with psycopg 3.3.6 a missing database `mcp_hub`, wrong credentials and an unreachable server all show as this cause, the driver does not distinguish them; `ClientRejected` = app registration refused; `ConnectError`, `ConnectTimeout`, `TokenEndpointStatus` and similar = Microsoft's token endpoint unreachable, slow or failing; `CallDeadline` / `TokenLock` = the call ran out of time before or while waiting for a refresh) |
+| A Graph account shows `error` after a call | `provider_call_failed` / `status_check_failed` with `exception`: `Forbidden` = Graph answered 403 (a permission or licence problem on the Microsoft side; a re-login does not help, check the app registration's delegated permissions and the account), `Throttled` = Graph answered 429 or 503 and calls fail fast until `Retry-After` (at most 5 minutes) has passed, `Redirect`, `ContentEncoding` or `MalformedJson` = an unexpected Graph answer, `NoInboxId` = the inbox folder could not be read |
+| A new Graph setup shows `error` with `OperationalError` or `DatabaseMissing` | The token-store database or role does not exist yet: run playbook 59 of `doemefu/homelab` (it creates `mcp_hub`), then the Graph login |
+| `get_message` answers `not_found` for an `outlook` message | The message is no longer in the inbox (moved or deleted; `NotInInbox`), or the id belongs to another account |
 | `/readyz` 503 | The process has not finished start-up; check the log for `startup_failed` |
 | An account shows `auth_expired` | `status_check_failed` line with `outcome=auth_expired` for that `account` and `capability`: the provider rejected the credential (for iCloud: create a new app-specific password, update the credential in SOPS, run playbook 59, delete the pod) |
 | An account shows `unreachable` or `error` | `status_check_failed` / `provider_call_failed` lines: `unreachable` = connection or timeout (egress, provider outage), `error` with `outcome=too_large` = a provider answer above 5 MiB (narrow `include_calendars`), other `upstream_error` = an unexpected provider answer |
