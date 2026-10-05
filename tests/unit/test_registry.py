@@ -32,7 +32,12 @@ def test_example_registry_loads() -> None:
     assert icloud.credential_refs("calendar") == ("icloud-username", "icloud-app-password")
     outlook = registry.get("outlook")
     assert outlook is not None
-    assert outlook.credential_refs("mail") == ("outlook-ms-client-id",)
+    assert outlook.credential_refs("mail") == (
+        "outlook-ms-client-id",
+        "db-username",
+        "db-password",
+        "token-encryption-key",
+    )
     assert outlook.credential_refs("calendar") == ()
 
 
