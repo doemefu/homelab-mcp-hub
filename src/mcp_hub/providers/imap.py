@@ -18,7 +18,7 @@ from typing import Final, Literal, Protocol, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
-from mcp_hub.ids import MessageRef
+from mcp_hub.ids import AnyMessageRef, MessageRef
 from mcp_hub.providers.base import (
     MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
@@ -190,7 +190,9 @@ class ImapMailbox:
     def list_unread(self, since: datetime, limit: int) -> UnreadPage:
         return self._run(lambda client: self._list_unread(client, since, limit))
 
-    def get_message(self, ref: MessageRef) -> MailDetail:
+    def get_message(self, ref: AnyMessageRef) -> MailDetail:
+        if not isinstance(ref, MessageRef):
+            raise ProviderError("not_found", "ForeignRef")
         return self._run(lambda client: self._get_message(client, ref))
 
     def _list_unread(self, client: ImapClientLike, since: datetime, limit: int) -> UnreadPage:

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Final, Protocol
 from zoneinfo import ZoneInfo
 
-from mcp_hub.ids import MessageRef
+from mcp_hub.ids import AnyMessageRef
 from mcp_hub.providers.base import AccountLimiters, MailDetail, UnreadPage, read_credential
 from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
 from mcp_hub.providers.imap import ImapMailbox
@@ -24,7 +24,7 @@ SUPPORTED_PROTOCOLS: Final[dict[Capability, frozenset[WireProtocol]]] = {
 class Mailbox(Protocol):
     def check(self) -> None: ...
     def list_unread(self, since: datetime, limit: int) -> UnreadPage: ...
-    def get_message(self, ref: MessageRef) -> MailDetail: ...
+    def get_message(self, ref: AnyMessageRef) -> MailDetail: ...
 
 
 MailboxFactory = Callable[[Account, Path], Mailbox]

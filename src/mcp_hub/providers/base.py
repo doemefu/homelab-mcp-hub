@@ -15,7 +15,7 @@ import anyio
 import anyio.to_thread
 
 from mcp_hub.errors import ErrorCode
-from mcp_hub.ids import MessageRef, encode_message_id
+from mcp_hub.ids import AnyMessageRef, encode_message_id
 from mcp_hub.logging import log_event
 from mcp_hub.registry import Capability
 
@@ -53,7 +53,7 @@ class ProviderError(Exception):
 class MailSummary:
     """Decoded but not yet sanitised; the tool layer sanitises every string (spec 080 §5.3)."""
 
-    ref: MessageRef
+    ref: AnyMessageRef
     received_at: datetime  # timezone-aware INTERNALDATE
     unread: bool
     has_attachments: bool
@@ -78,7 +78,7 @@ class AttachmentMeta:
 
 @dataclass(frozen=True, slots=True)
 class MailDetail:
-    ref: MessageRef
+    ref: AnyMessageRef
     received_at: datetime
     unread: bool
     attachments: list[AttachmentMeta]  # all of them; the tool returns at most 20
@@ -217,7 +217,7 @@ def item_hash(opaque_id: str) -> str:
     return hashlib.sha256(opaque_id.encode()).hexdigest()[:12]
 
 
-def log_message_skipped(ref: MessageRef, capability: Capability, exc: Exception) -> None:
+def log_message_skipped(ref: AnyMessageRef, capability: Capability, exc: Exception) -> None:
     log_event(
         _log,
         logging.WARNING,
@@ -229,7 +229,7 @@ def log_message_skipped(ref: MessageRef, capability: Capability, exc: Exception)
     )
 
 
-def placeholder_summary(ref: MessageRef, received_at: datetime, unread: bool) -> MailSummary:
+def placeholder_summary(ref: AnyMessageRef, received_at: datetime, unread: bool) -> MailSummary:
     """A message the hub could not decode: listed with empty third-party fields and a fixed note (spec 080 §10.2)."""
     return MailSummary(
         ref=ref,

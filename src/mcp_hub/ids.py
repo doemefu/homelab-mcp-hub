@@ -1,7 +1,9 @@
 """Opaque MessageId / EventId (spec 080 §5.1): 'v1.' + unpadded base64url of a compact JSON list, ≤ 512 chars.
 
 An EventId carries a 128-bit SHA-256 digest over calendar URL path, UID and recurrence id, not the values
-(spec 080 rev. 4.4, D56); a MessageId's folder is checked against the registry inbox by the tool layer.
+(spec 080 rev. 4.4, D56); an IMAP MessageId (kind "m") carries folder, UIDVALIDITY and UID, and its folder is checked
+against the registry inbox by the tool layer. A Graph MessageId (kind "g", rev. 4.6) carries the immutable Graph id
+(charset and length checked here, so it can never change the request path); its folder is always "inbox".
 """
 
 import base64
@@ -18,6 +20,8 @@ MAX_ID_LENGTH: Final = 512
 _ACCOUNT: Final = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _BASE64URL: Final = re.compile(r"^[A-Za-z0-9_-]+$")
 _UINT32_MAX: Final = 2**32 - 1
+GRAPH_FOLDER: Final = "inbox"
+GRAPH_ID: Final = re.compile(r"^[A-Za-z0-9=_-]{1,300}$")  # L5 (spec 080 rev. 4.6 S1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +32,19 @@ class MessageRef:
     uid: int
 
 
+@dataclass(frozen=True, slots=True)
+class GraphMessageRef:
+    account: str
+    graph_id: str
+
+    @property
+    def folder(self) -> str:
+        return GRAPH_FOLDER
+
+
+AnyMessageRef = MessageRef | GraphMessageRef
+
+
 def _encode(parts: list[object]) -> str:
     raw = json.dumps(parts, separators=(",", ":"), ensure_ascii=False).encode()
     value = PREFIX + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
@@ -36,7 +53,9 @@ def _encode(parts: list[object]) -> str:
     return value
 
 
-def encode_message_id(ref: MessageRef) -> str:
+def encode_message_id(ref: AnyMessageRef) -> str:
+    if isinstance(ref, GraphMessageRef):
+        return _encode(["g", ref.account, ref.graph_id])
     return _encode(["m", ref.account, ref.folder, ref.uidvalidity, ref.uid])
 
 
@@ -48,7 +67,7 @@ def _uint32(value: object) -> bool:
     return type(value) is int and 0 < value <= _UINT32_MAX
 
 
-def decode_message_id(value: str) -> MessageRef:
+def decode_message_id(value: str) -> AnyMessageRef:
     if len(value) > MAX_ID_LENGTH or not value.startswith(PREFIX) or not _BASE64URL.fullmatch(value[len(PREFIX) :]):
         _invalid()
     body = value[len(PREFIX) :]
@@ -56,6 +75,16 @@ def decode_message_id(value: str) -> MessageRef:
         data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except ValueError:  # binascii.Error, UnicodeDecodeError and JSONDecodeError are ValueErrors
         _invalid()
+    if isinstance(data, list) and len(data) == 3 and data[0] == "g":
+        _, account, graph_id = data
+        if not (
+            isinstance(account, str)
+            and _ACCOUNT.fullmatch(account)
+            and isinstance(graph_id, str)
+            and GRAPH_ID.fullmatch(graph_id)
+        ):
+            _invalid()
+        return GraphMessageRef(account=account, graph_id=graph_id)
     if not (isinstance(data, list) and len(data) == 5 and data[0] == "m"):
         _invalid()
     _, account, folder, uidvalidity, uid = data
