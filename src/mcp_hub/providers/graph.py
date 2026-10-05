@@ -46,7 +46,7 @@ _HEADER_FIELDS: Final = "id,receivedDateTime,isRead,hasAttachments,from,toRecipi
 MESSAGE_SELECT: Final = _HEADER_FIELDS + ",body,parentFolderId"
 FALLBACK_SELECT: Final = _HEADER_FIELDS + ",bodyPreview,parentFolderId"
 ATTACHMENT_SELECT: Final = "name,contentType,size,isInline"
-_RETRY_AFTER: Final = re.compile(r"^[0-9]{1,9}$")  # review 01 delta N5: long values clamp to 300, not fall back to 30
+_RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anything else is "not a number"
 _log = logging.getLogger("mcp_hub.providers.graph")
 
 
@@ -87,7 +87,12 @@ _INBOX_LOCK: Final = threading.Lock()
 
 def retry_after_seconds(value: str | None) -> int:
     text = (value or "").strip()
-    return min(max(int(text), 1), RETRY_AFTER_MAX) if _RETRY_AFTER.fullmatch(text) else RETRY_AFTER_DEFAULT
+    if not _RETRY_AFTER.fullmatch(text):
+        return RETRY_AFTER_DEFAULT  # missing, negative, HTTP-date or garbage (spec 080 §6.3)
+    digits = text.lstrip("0") or "0"
+    if len(digits) > 9:
+        return RETRY_AFTER_MAX  # far above the ceiling; never int() an absurdly long string
+    return min(max(int(digits), 1), RETRY_AFTER_MAX)
 
 
 def default_client(timeout: float) -> httpx2.Client:

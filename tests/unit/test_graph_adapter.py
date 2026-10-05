@@ -289,7 +289,12 @@ def test_backoff_is_per_account() -> None:
         (" 12 ", 12),
         ("9999999", 300),
         ("999999999", 300),
-        ("9999999999", 30),
+        ("9999999999", 300),  # review round 1 F6: any digit string above the ceiling clamps to 300
+        pytest.param("9" * 5000, 300, id="5000-digits"),
+        ("0000000000012", 12),
+        ("1e9", 30),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 30),
+        ("12 garbage", 30),
     ],
 )
 def test_retry_after_parsing(value: str | None, expected: int) -> None:
