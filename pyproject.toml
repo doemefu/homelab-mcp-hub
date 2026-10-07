@@ -18,18 +18,18 @@ dependencies = [
     "recurring-ical-events==3.8.2",
     # Token store (spec 080 §7.2, #171): AES-256-GCM via cryptography (approved runtime, transitive of pyjwt[crypto]),
     # PostgreSQL driver psycopg[binary] (approved D34).
-    "cryptography==50.0.1",
+    "cryptography==50.0.2",
     "psycopg[binary]==3.3.6",
 ]
 
 [dependency-groups]
 dev = [
-    "ruff==0.16.9",
-    "mypy==2.3.1",
+    "ruff==0.16.10",
+    "mypy==2.4.0",
     "pytest==9.1.1",
     "pytest-httpserver==1.1.5",
     # Imported directly by tests/support/keys.py and scripts/dev_token.py (approved in spec 080 §9.3).
-    "cryptography==50.0.1",
+    "cryptography==50.0.2",
 ]
 
 [tool.uv]
