@@ -31,7 +31,7 @@ spec:
         - name: mcp-hub
           # Image tag is managed by Flux image automation. The initial tag is a placeholder that was never
           # built (data-service bootstrap pattern): Flux replaces it once doemefu/homelab#177 wires cluster/apps/mcp-hub/.
-          image: ghcr.io/doemefu/homelab-mcp-hub:main-20261005T210209 # {"$imagepolicy": "flux-system:mcp-hub"}
+          image: ghcr.io/doemefu/homelab-mcp-hub:main-20261007T135049 # {"$imagepolicy": "flux-system:mcp-hub"}
           ports:
             - name: mcp
               containerPort: 8083
