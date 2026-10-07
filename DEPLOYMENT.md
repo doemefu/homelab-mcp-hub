@@ -61,6 +61,8 @@ Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The f
 
 **Enabling `outlook` (owner).** The order is fixed by the infrastructure runbook "mcp-hub token store and the Outlook account (#171 onboarding)" in `DEPLOYMENT.md` of `doemefu/homelab`: this repository's Graph mail adapter is merged and rolled out by Flux; SOPS gets the token-store variables and the `outlook` registry entry with its client id; playbook 59 creates the database, the role and the Secret keys; `mcp-hub check-registry --expect-sha …` passes; the pod is deleted; `list_accounts` shows `outlook` mail `auth_expired` (no token yet, expected); then the Graph login below; then a `list_unread` and one `get_message` for `outlook`.
 
+**Enabling `gmail` (owner).** Configuration only, no new image: the infrastructure runbook "mcp-hub: Gmail account (#172)" in `DEPLOYMENT.md` of `doemefu/homelab` adds the credentials and the registry entry through SOPS and playbook 59, then `mcp-hub check-registry --expect-sha …` and a pod deletion. `check-registry` validates the configuration only and does not log in; the first `list_unread` for `gmail` is the real login test.
+
 **Graph login (owner).** Once the token-store keys (`db-username`, `db-password`, `token-encryption-key`) are in `mcp-hub-secrets` and a Graph account (`outlook`) is enabled in the registry, the owner signs in once with the device code (spec 080 [§7.3](https://github.com/doemefu/homelab/blob/main/docs/080-mcp-hub.md); a cluster action, so it needs the owner's go):
 
 ```bash

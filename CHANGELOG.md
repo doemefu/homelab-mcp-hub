@@ -31,6 +31,10 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 - `mcp-hub check-registry [--expect-sha <12 hex>]`: validates the mounted `accounts.json` with the server's own model before a pod deletion, proves its freshness by hash, checks credential files, the token key and the key id of each Graph account's stored token.
 - `scripts/memory_probe.py --scenario graph-message [--with-calendar <scenario>]`: memory gate for the Graph caps next to the worst calendar call.
 
+### Changed
+
+- `gmail` account live (homelab#172): mail over the existing IMAP adapter, no code change (registry entry and credentials only, runbook in the `homelab` repository's `DEPLOYMENT.md`).
+
 ### Fixed
 
 - Undecodable header bytes no longer make `list_unread` fail for every account; one message that cannot be processed degrades only its own entry.
