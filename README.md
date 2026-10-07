@@ -8,7 +8,7 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 
 ## Status
 
-Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch.
+Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` mail live since 2026-10-06 (#171), `gmail` mail live since 2026-10-07 (#172, configuration only). Calendars of other accounts are served through iCloud.
 
 | Work package | Scope | Status |
 |--------------|-------|--------|
@@ -16,8 +16,9 @@ Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch.
 | WP5b | IMAP adapter, `list_unread`, `get_message`, sanitiser, output budget, provider CI job | Done |
 | WP5c | CalDAV adapter, `get_events`, background status check | Done |
 | WP5d | `search_mail`, paging, metrics on the internal port | Planned |
-| WP9 | Microsoft Graph for `outlook`: token store and `mcp-hub login` (PR A, done), mail adapter and `mcp-hub check-registry` (PR B, in review) | In progress |
-| WP8, WP10 | Further accounts (IMAP folder handling, calendar feed) | Planned |
+| WP9 | Microsoft Graph for `outlook`: token store, `mcp-hub login`, mail adapter, `mcp-hub check-registry` | Done (live) |
+| WP8 | `gmail` mail over the existing IMAP adapter (registry entry and credentials only) | Done (live) |
+| WP10 | Further accounts (calendar feed) | Planned |
 
 ## Quick reference
 
