@@ -12,7 +12,7 @@ dependencies = [
     "pyjwt[crypto]==2.15.1",
     "httpx2==2.13.1",
     "anyio==4.15.1",
-    "tzdata==2026.4",
+    "tzdata==2026.5",
     "IMAPClient==4.1.0",
     "icalendar==7.3.0",
     "recurring-ical-events==3.8.2",
