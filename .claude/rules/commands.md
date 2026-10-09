@@ -1,6 +1,6 @@
 # Repository Commands
 
-Toolchain: local uv (0.12.17 at bootstrap; CI and image pin 0.12.19), Python 3.13 per `.python-version`. Agents source `.local/env.sh` first (worktree-local venv, uv cache and TMPDIR; no global installs — see CONTRIBUTING.md "Local environment").
+Toolchain: local uv (0.12.17 at bootstrap; CI pins 0.12.19 and the image 0.12.23), Python 3.13 per `.python-version`. Agents source `.local/env.sh` first (worktree-local venv, uv cache and TMPDIR; no global installs — see CONTRIBUTING.md "Local environment").
 
 ## Build, test, run
 ```bash
