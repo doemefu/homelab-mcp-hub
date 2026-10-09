@@ -49,7 +49,7 @@ Implement the plan:
 Reviews against plan, reports issues by severity. Critical issues block progress.
 - **GitHub:** move the corresponding issue to **In review** (see `github-project.md`).
 - Invoke superpowers requesting-code-review Skill.
-- Commit, push and open the PR on a feature branch (standing permission, 2026-08-28), then wait for the bot review(s) and fix or answer every comment before asking for a merge. Merging itself needs an explicit go for the task.
+- Commit, push and open the PR on a feature branch, then wait for the bot review(s) and fix or answer every comment before asking the user to merge.
 - **Copilot quota / fallback:** request a Copilot review first. If Copilot does not review (quota exhausted) and no other bot is installed, substitute the `reviewer` subagent + `/code-review`, and disclose in a PR comment which review path was used before merging.
 
 ## Phase 6 — ship
