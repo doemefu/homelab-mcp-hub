@@ -26,7 +26,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 - Do **not** log tokens, `Authorization` headers, header values, provider URLs, addresses or content; only the fields of spec 080 §9.7.
 - The hub is read-only: no tool writes to a provider.
 - This repository is public: no account identifiers, usernames, addresses or real data in code, tests, fixtures, docs or commit messages.
-- Commit, push and open PRs on feature branches without asking (standing permission, 2026-08-28). Merging, force-pushes, playbook runs, cluster mutations and anything touching SOPS/secrets need an explicit go for that task.
+- Commit, push and open PRs on feature branches without asking. Merging PRs is always the user's. Rolling out changes the user has already merged needs no extra go; force-pushes, playbook runs and other cluster mutations need an explicit go. SOPS files are never read or edited by Claude — the user edits them.
 - Before any merge, wait for the Copilot review and fix or answer every comment (see `.claude/rules/workflow.md` Phase 5).
 - All code, comments and documentation in **English**. Minimize diff size: no drive-by refactors.
 
@@ -37,11 +37,11 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 | Python | 3.13 (`python:3.13-slim@sha256:…` runtime image) |
 | MCP SDK | `mcp` 2.2.0 (`MCPServer`, Streamable HTTP) |
 | HTTP | uvicorn 0.54.0, starlette 1.7.0, httpx2 2.13.1, anyio 4.15.1 |
-| Validation / tokens | pydantic 2.13.5, PyJWT 2.15.0 (`[crypto]`) |
+| Validation / tokens | pydantic 2.13.5, PyJWT 2.15.1 (`[crypto]`) |
 | Mail | IMAPClient 4.1.0 |
 | Calendar | icalendar 7.3.0, recurring-ical-events 3.8.2 (CalDAV requests over httpx2) |
 | Token store | psycopg[binary] 3.3.6 (sync API), cryptography 50.0.1 (AES-256-GCM; direct runtime pin) |
-| Tooling | uv 0.12.19, ruff 0.16.9, mypy 2.3.1 `--strict`, pytest 9.1.1, pytest-httpserver 1.1.5 |
+| Tooling | uv 0.12.19 (CI) / 0.12.23 (image), ruff 0.16.9, mypy 2.3.1 `--strict`, pytest 9.1.1, pytest-httpserver 1.1.5 |
 
 ## Conventions
 
