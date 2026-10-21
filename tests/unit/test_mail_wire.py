@@ -11,9 +11,10 @@ from mcp_hub.config import Settings
 from mcp_hub.ids import MessageRef
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
-from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderError, UnreadPage
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
+from mcp_hub.tools.mail import LIST_MESSAGES_DESCRIPTION
 from tests.support.mcp import body, modern
 from tests.support.tokens import TokenFactory
 
@@ -26,6 +27,9 @@ class Mailbox:
 
     def get_message(self, ref: MessageRef, deadline: CallDeadline) -> MailDetail:
         raise ProviderError("not_found")
+
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
+        return FolderPage([], more=False, truncated=False, complete=True)
 
 
 def fake_mailbox(account: Account, secrets_dir: Path) -> Mailbox:
@@ -42,12 +46,16 @@ def wired(settings: Settings, secrets_dir: Path) -> Iterator[TestClient]:
 
 def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, tokens: TokenFactory) -> None:
     tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
-    assert set(tools) == {"list_accounts", "list_unread", "get_message", "get_events"}
-    for name in ("list_unread", "get_message"):
+    assert set(tools) == {"list_accounts", "list_unread", "get_message", "get_events", "list_messages"}
+    for name in ("list_unread", "get_message", "list_messages"):
         assert tools[name]["annotations"]["readOnlyHint"] is True
         assert tools[name]["annotations"]["destructiveHint"] is False
         assert "outputSchema" in tools[name]
         assert "untrusted" in tools[name]["description"]
+    assert tools["list_messages"]["description"] == LIST_MESSAGES_DESCRIPTION
+    properties = tools["list_messages"]["inputSchema"]["properties"]
+    assert set(properties) == {"account", "folder", "since", "unread_only", "direction", "limit", "cursor"}
+    assert tools["list_messages"]["inputSchema"].get("required", []) == []
 
 
 def test_list_unread_wire_result_has_output_schema(wired: TestClient, tokens: TokenFactory) -> None:
@@ -57,6 +65,22 @@ def test_list_unread_wire_result_has_output_schema(wired: TestClient, tokens: To
     assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
     assert result["structuredContent"]["items"] == []
     assert result["structuredContent"]["next_cursor"] is None
+
+
+def test_list_messages_wire_result_matches_its_text(wired: TestClient, tokens: TokenFactory) -> None:
+    params = {"name": "list_messages", "arguments": {"folder": "all", "unread_only": True}}
+    result = body(modern(wired, tokens.mint(), "tools/call", params, name="list_messages"))["result"]
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    assert result["structuredContent"]["items"] == []
+    assert result["structuredContent"]["next_cursor"] is None
+
+
+def test_list_messages_invalid_folder_is_a_tool_error(wired: TestClient, tokens: TokenFactory) -> None:
+    params = {"name": "list_messages", "arguments": {"folder": "junk"}}
+    result = body(modern(wired, tokens.mint(), "tools/call", params, name="list_messages"))["result"]
+    assert result["isError"] is True
+    assert json.loads(result["content"][0]["text"])["code"] == "invalid_argument"
 
 
 def test_tool_error_body_is_exact_json(wired: TestClient, tokens: TokenFactory) -> None:

@@ -50,8 +50,16 @@ def shrink_or_drop[T: BaseModel](model: T, fits: Callable[[T], bool], drop: Call
     return None
 
 
-def fit_items[T: BaseModel, R: BaseModel](items: list[T], build: Callable[[list[T], bool], R], budget: int) -> R:
-    """Largest prefix of `items` whose result fits; `build(items, cut)` must OR `cut` into its truncated flag."""
+def fit_items[T: BaseModel, R: BaseModel](
+    items: list[T],
+    build: Callable[[list[T], bool], R],
+    budget: int,
+    *,
+    shrink: Callable[[T, Callable[[T], bool]], T | None] = shrink_to_fit,
+) -> R:
+    """Largest prefix of `items` whose result fits; `build(items, cut)` must OR `cut` into its truncated flag.
+
+    When not even the first item fits, `shrink` shortens it (default: the string shortening of §5.4)."""
     limit = min(budget, HARD_MAX_CHARS)
     full = build(items, False)
     if serialized_length(full) <= limit:
@@ -64,7 +72,7 @@ def fit_items[T: BaseModel, R: BaseModel](items: list[T], build: Callable[[list[
         else:
             high = middle - 1
     if low == 0 and items:
-        first = shrink_to_fit(items[0], lambda candidate: serialized_length(build([candidate], True)) <= limit)
+        first = shrink(items[0], lambda candidate: serialized_length(build([candidate], True)) <= limit)
         if first is not None:
             return build([first], True)
     return build(items[:low], True)

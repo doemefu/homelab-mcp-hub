@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from mcp.server.mcpserver import MCPServer
 
 from mcp_hub.config import Settings
+from mcp_hub.cursors import CursorCodec
 from mcp_hub.health import StatusStore
 from mcp_hub.providers import Adapters
 from mcp_hub.registry import Registry
@@ -16,6 +17,7 @@ class HubContext:
     registry: Registry
     status: StatusStore
     adapters: Adapters = field(default_factory=Adapters)
+    cursors: CursorCodec = field(default_factory=CursorCodec)  # random key per process: a restart voids cursors
 
 
 def register_tools(server: MCPServer, ctx: HubContext) -> None:

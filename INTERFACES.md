@@ -121,13 +121,7 @@ Unread messages in each account's configured inbox, newest first, across all mai
 ```json
 {
   "untrusted_content_notice": "…",
-  "items": [
-    {
-      "id": "v1.…", "account": "icloud", "folder": "INBOX",
-      "received_at": "2026-09-29T08:50:00+02:00", "unread": true, "has_attachments": false,
-      "untrusted": { "from_address": "sender@example.org", "from_name": "Sender", "subject": "…", "snippet": "…" }
-    }
-  ],
+  "items": [ { "id": "v1.…", "account": "icloud", "folder": "inbox", "…": "extended MessageSummary, see list_messages" } ],
   "next_cursor": null,
   "truncated": false,
   "account_errors": [ { "account": "gmail", "capability": "mail", "code": "auth_expired", "message": "Credential rejected by provider; re-login required" } ]
@@ -140,6 +134,32 @@ Unread messages in each account's configured inbox, newest first, across all mai
 - `has_attachments` counts every part that is not the chosen body text, including inline images (IMAP); for Graph it is the message's `hasAttachments` flag.
 - **Graph accounts** (`outlook`, spec rev. 4.6 §6.3): one `GET /v1.0/me/mailFolders/inbox/messages` with `$filter=receivedDateTime ge <since, UTC, whole seconds> and isRead eq false`, `$orderby=receivedDateTime desc`, `$select=id,receivedDateTime,isRead,hasAttachments,from,subject,bodyPreview`, `$top=<limit + 1>`. Only the first page is read: `@odata.nextLink` is never followed, and its presence, or more than `limit` entries, sets `truncated`. At most 51 entries of the page are looked at. `folder` is always `inbox`, `received_at` is Graph's `receivedDateTime`, the snippet is Graph's `bodyPreview`. An entry without a usable id (`^[A-Za-z0-9=_-]{1,300}$`) or timestamp is left out (one `item_degraded` line; without `item` when the id itself is unusable); an entry with wrong field types keeps its id with empty third-party fields. A `value` that is not a list is an `upstream_error` for the account.
 - A message the hub cannot decode is listed with empty third-party fields and the fixed note `[the hub could not decode this message]` in `untrusted.snippet` (one `item_degraded` log line). A snippet that cannot be fetched (a protocol error, not a lost connection) is left empty. Header bytes in an unknown charset appear as U+FFFD.
+
+### `list_messages` (§5.2, §5.5; spec rev. 4.9)
+
+Mail of one folder, or of inbox, sent and archive together, received at or after `since` — read or unread, incoming or outgoing — newest first across all mail accounts or one `account`.
+
+- Input: `account?` (registry id), `folder?` (`inbox` default, `sent`, `archive`, `trash`, `all`), `since?` (as for `list_unread`), `unread_only?` (boolean, default `false`), `direction?` (`incoming`, `outgoing`), `limit?` (1–50, default 20), `cursor?`. Any other value answers `invalid_argument` before any provider call; a bad cursor answers `invalid_cursor`.
+- `all` = inbox + sent + archive, deduplicated within the account; trash, junk and drafts are never part of it.
+- Output: the envelope of `list_unread` with extended `MessageSummary` items:
+
+```json
+{
+  "id": "v1.…", "ref": "v1.…", "account": "icloud", "folder": "inbox",
+  "received_at": "2026-10-20T07:12:03+02:00", "direction": "incoming", "unread": true,
+  "flags": { "seen": false, "answered": false, "flagged": false },
+  "has_attachments": false, "thread_key": "v1.…", "thread_key_source": "headers",
+  "untrusted": {
+    "from_address": "sender@example.org", "from_name": "…", "subject": "…", "snippet": "…",
+    "to_addresses": ["recipient@example.org"], "cc_addresses": [],
+    "message_id": "…", "in_reply_to": null, "references": [], "folder_name": "INBOX"
+  }
+}
+```
+
+- `id`: the location id for `get_message`; `null` for a message in a mailbox whose name is longer than 200 characters (§5.3 rule 9). `ref`: the stable key, built from the Message-ID; `null` when the message has none or it fails the §5.5 pattern (`untrusted.message_id` still shows it). `folder`: `inbox`, `sent`, `archive`, `trash` or `other`. `direction`: `outgoing` when the message is in sent or its sender is one of the account's own addresses. `flags.seen` is the inverse of `unread`. `thread_key_source`: `server` (Gmail thread id, Graph conversation), `headers` (root Message-ID) or `subject` (a guess); `null` with `thread_key`.
+- `untrusted` caps in summaries: 10 `to_addresses`, 10 `cc_addresses`, the newest 3 `references`; `message_id`, `in_reply_to` and each reference 300 characters, `folder_name` 100 (`null` for Graph).
+- Every call validates first, then queries the accounts in parallel; one deadline per provider call starts right before the connection-slot wait, so a slow slot counts against the 16 s soft stop and the 20 s hard limit.
 
 ### `get_message` (§5.2)
 
@@ -234,7 +254,10 @@ Calendar event **instances** overlapping the window, recurrences expanded, sorte
 - Strictly read-only: the inbox is opened with `EXAMINE` and every body or header fetch uses `BODY.PEEK`, so the read state never changes. Graph is called with `GET` only.
 - Every third-party string is sanitised (§5.3): zero-width, bidi, control and format characters removed, URLs reduced to `[link: host]` / `[mail link]`, whitespace normalised, field limits applied with the marker ` [truncated]` (addresses 254, names and filenames 200, subject 300, snippet 200, content type 100). `content_type` must match the media-type pattern, else `null`.
 - Deadlines: 20 s per provider call, 60 s per tool call; at most two concurrent connections per account.
-- Output budget: the text content of every result is the compact JSON of its structured content, and `HUB_RESPONSE_BUDGET_CHARS` (default 30,000, hard maximum 100,000) is measured on that text. `list_unread` drops items from the end and sets `truncated`; `get_message` shortens the body first, then drops cc, to and attachment entries from the end; the result never exceeds the budget.
+- Output budget: the text content of every result is the compact JSON of its structured content, and `HUB_RESPONSE_BUDGET_CHARS` (default 30,000, hard maximum 100,000) is measured on that text. `list_unread` and `list_messages` drop items from the end and set `truncated`; a single summary that alone exceeds the budget drops its `references` from the oldest, then `cc_addresses`, then `to_addresses` from the end, and only then has its longest text shortened, so a page holds at least one item when any exists; `get_message` shortens the body first, then drops cc, to and attachment entries from the end; the result never exceeds the budget.
+- **Folder model** (§5.5, D75): every mail item has a normalised `folder`. IMAP: the registry inbox is `inbox`; `sent`, `archive` and `trash` come from the special-use attributes `\Sent`, `\Archive`, `\Trash`, else from the names `Sent Messages`, `Archive`, `Deleted Messages`; any other selectable mailbox is `other`. Gmail (detected by `X-GM-EXT-1`): `inbox` is the registry inbox; `sent` and `archive` are read from All Mail by label; trash is the `\Trash` mailbox. Graph: the well-known folders `inbox`, `sentitems`, `archive`, `deleteditems`. Never read: junk and drafts (by attribute and by the last name component `Junk`, `Spam`, `Drafts`, any case), drafts per message, mailboxes with names that are not printable modified UTF-7, non-selectable mailboxes, Graph `junkemail`, `drafts`, `outbox`. `untrusted.folder_name` is the decoded server mailbox name.
+- **Cursors** (§5.5, D78): `next_cursor` is an opaque `c1.…` value, HMAC-SHA256-signed with a random key per process (a restart voids every cursor), valid for 1 hour. It is bound to the tool and to every argument except `cursor` and `limit` as given — an omitted argument counts as `null`, so an explicit default differs from an omitted one. Repeat the call with identical arguments plus `cursor`; only `limit` may change. A later page keeps the window of the first page (an omitted `since` is not recomputed) and returns the items strictly after the last returned one in the order (`received_at` desc, then a 16-hex key desc). A cursor that is malformed, wrongly signed, older than 1 hour, from another tool or used with other arguments answers `invalid_cursor`.
+- **`next_cursor` and `truncated`:** `next_cursor` is set exactly when more items can be fetched with the same arguments: an account reported more, more than `limit` items were found, or the output budget dropped items — and every account that answered searched every folder of its plan. An account in `account_errors` never blocks the cursor; its items above the next position are not shown on later pages (repeat the call without a cursor to recover them). `truncated: true` means more matches exist than are returned; with `next_cursor: null` the result is incomplete and cannot be paged (a soft stop after 16 s, a candidate cap, an unfinished folder search): narrow `since`, `folder` or `account`. A soft stop returns the items found with no account error.
 
 **Tool errors** (a whole call cannot run): result with `isError: true` and body `{"code": "<ErrorCode>", "message": "<short text>"}`. `ErrorCode`: `invalid_argument`, `invalid_cursor`, `unknown_account`, `capability_unavailable`, `not_found`, `auth_expired`, `unreachable`, `upstream_timeout`, `upstream_error`, `too_large`. The message is a fixed hub text, never provider text.
 

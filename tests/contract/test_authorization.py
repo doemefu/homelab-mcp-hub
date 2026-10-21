@@ -45,6 +45,7 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
         "get_events",
         "get_message",
         "list_accounts",
+        "list_messages",
         "list_unread",
     ]
     called = modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
@@ -72,6 +73,7 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
         "get_events",
         "get_message",
         "list_accounts",
+        "list_messages",
         "list_unread",
     ]
 

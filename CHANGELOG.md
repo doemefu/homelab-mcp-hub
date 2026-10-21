@@ -8,6 +8,8 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Added
 
+- Tool `list_messages` (spec 080 rev. 4.9 §5.2, WP13a): mail of `inbox`, `sent`, `archive`, `trash` or `all` (inbox + sent + archive, deduplicated; never trash, junk or drafts) since a point in time, optionally unread only or by `direction`, newest first across accounts. Pages continue with HMAC-signed keyset cursors (`next_cursor`, valid 1 h, bound to the tool and to the arguments as given, random key per process); `next_cursor` is set exactly when more items can be fetched with the same arguments, and a soft stop or an incomplete folder search returns the items found with `truncated: true` and no cursor.
+- Extended `MessageSummary` for the mail list tools: `ref` (stable key from the Message-ID), `direction`, `flags`, `thread_key` and `thread_key_source`, and inside `untrusted` the first 10 `to_addresses` and `cc_addresses`, `message_id`, `in_reply_to`, the newest 3 `references` and `folder_name`; `id` is `null` for a message in a mailbox whose name cannot be carried in an id. A single item above the output budget drops references (oldest first), then cc, then to entries before its text is shortened, so a page always holds at least one item.
 - Optional `mail.own_addresses_ref` per mail account: a credential file with the owner's own addresses (1–20, one per line), read on every use and never logged or returned; a missing or invalid file falls back to the folder rule with one `registry_value_invalid` WARN per state change. `check-registry` prints `account <id> own_addresses=<n>` or `invalid`.
 - Authorization layer: offline validation of auth-service access tokens (RS256 via a throttled JWKS cache, `typ`, issuer, audience, client, time with 60 s leeway, required claims, subject allowlist re-read every 60 s), both scopes required, Bearer challenges with `resource_metadata` and `scope`, protected-resource metadata, Host/Origin checks.
 - MCP endpoint `/mcp` on port 8083 for protocol versions 2026-07-28 and 2025-11-25; `/healthz` and `/readyz` on port 8084.
@@ -34,6 +36,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Changed
 
+- `list_unread` items carry the extended `MessageSummary`; their `folder` is the normalised `inbox` instead of the registry mailbox name (`INBOX`), for IMAP and Graph accounts alike.
 - `gmail` account live (homelab#172): mail over the existing IMAP adapter, no code change (registry entry and credentials only, runbook in the `homelab` repository's `DEPLOYMENT.md`).
 
 ### Fixed

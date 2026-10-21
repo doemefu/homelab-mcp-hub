@@ -95,3 +95,17 @@ def test_shrink_or_drop_keeps_every_entry_when_shrinking_is_enough() -> None:
 
 def test_shrink_or_drop_gives_up_when_nothing_is_left() -> None:
     assert shrink_or_drop(Listed(names=["a"], untrusted=U(subject="s", body="b")), lambda m: False, drop_name) is None
+
+
+def test_fit_items_custom_shrink() -> None:
+    calls: list[str] = []
+
+    def shrink(model: Item, fits: Callable[[Item], bool]) -> Item | None:
+        calls.append(model.id)
+        candidate = model.model_copy(update={"untrusted": U(subject="custom", body="b")})
+        return candidate if fits(candidate) else None
+
+    result = fit_items([item(0, 50_000), item(1, 50_000)], builder(), 5_000, shrink=shrink)
+    assert calls == ["i0"]  # only the first item is shrunk, by the given function instead of shrink_to_fit
+    assert [(i.id, i.untrusted.subject) for i in result.items] == [("i0", "custom")]
+    assert result.truncated is True
