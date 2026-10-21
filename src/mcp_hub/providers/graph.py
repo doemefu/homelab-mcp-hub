@@ -157,7 +157,9 @@ class GraphMailbox:
 
     # --- plumbing -------------------------------------------------------------------------------------------------
     def _run[T](self, work: Callable[[httpx2.Client, str, float], T], call: CallDeadline) -> T:
-        deadline = call.hard_at  # one deadline for the whole call, incl. a token refresh (L18); owned by the tool layer
+        # One deadline for the whole call, incl. a token refresh (L18), owned by the tool layer. Re-based onto this
+        # adapter's clock, so every comparison of the call (request, chunks, token refresh) uses one clock.
+        deadline = self._clock() + call.remaining()
         try:
             self._backoff.check(self._account, self._clock())  # no refresh, no request during a back-off (L16)
             with self._factory(self._timeout) as client:

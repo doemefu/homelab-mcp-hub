@@ -177,7 +177,7 @@ class ImapMailbox:
         self._timeout = timeout
         self._factory = client_factory
         self._own_addresses, self._folder_maps = own_addresses, folder_maps
-        self._deadline: CallDeadline | None = None
+        self._deadline: CallDeadline | None = None  # stored per call; read by the guard from T12 on
 
     def _run[T](self, work: Callable[[ImapClientLike], T], deadline: CallDeadline) -> T:
         self._deadline = deadline  # the guard (T12) applies it before every command

@@ -18,6 +18,7 @@ from mcp_hub.health import StatusStore, missing_credentials
 from mcp_hub.logging import log_event
 from mcp_hub.providers import SUPPORTED_PROTOCOLS
 from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, TOOL_TIMEOUT_SECONDS, ProviderError, log_provider_failure
+from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.registry import Account, Capability, select_accounts
 
 if TYPE_CHECKING:
@@ -107,6 +108,8 @@ async def gather_accounts[T](
             results[account.id] = await call(account)
         except ProviderError as exc:
             errors[account.id] = exc
+        except SoftStop:  # defensive: adapters map it themselves (R2b)
+            errors[account.id] = ProviderError("upstream_timeout", "SoftStop")
         except Exception as exc:  # third-party text never reaches a result or a log line
             errors[account.id] = ProviderError("upstream_error", type(exc).__name__)
 
