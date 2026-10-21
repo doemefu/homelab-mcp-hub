@@ -12,7 +12,7 @@ from imapclient.exceptions import IMAPClientError
 
 from tests.support.clock import FakeClock
 
-COMMAND_ALLOWLIST = {"CAPABILITY", "LOGIN", "LIST", "EXAMINE", "UID SEARCH", "UID FETCH", "NOOP", "LOGOUT"}
+COMMAND_ALLOWLIST = frozenset({"CAPABILITY", "LOGIN", "LIST", "EXAMINE", "UID SEARCH", "UID FETCH", "NOOP", "LOGOUT"})
 PLAIN = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 64, 2, None, None, None, None)
 MAX_BODY_BYTES = 262_144
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -54,6 +54,15 @@ def abort() -> imaplib.IMAP4.abort:
     return imaplib.IMAP4.abort("connection lost")
 
 
+class _FailMap(dict[str, Exception]):
+    """A typo in a command name must not silently disable the injected failure."""
+
+    def __setitem__(self, key: str, value: Exception) -> None:
+        if key not in COMMAND_ALLOWLIST:
+            raise AssertionError(f"command outside the allowlist: {key}")
+        super().__setitem__(key, value)
+
+
 class _FakeSocket:
     def __init__(self, server: "FakeImapServer") -> None:
         self._server = server
@@ -75,7 +84,7 @@ class FakeImapServer:
         self.capabilities = capabilities
         self.clock, self.step_seconds = clock, step_seconds
         self.commands: list[tuple[str, object]] = []
-        self.fail: dict[str, Exception] = {}
+        self.fail: dict[str, Exception] = _FailMap()
         self.honour_not_draft = True
         self.socket_timeouts: list[float] = []
         self.no, self.bad, self.abort = no, bad, abort

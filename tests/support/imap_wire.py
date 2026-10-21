@@ -21,24 +21,28 @@ class _Handler(socketserver.StreamRequestHandler):
             if not line:
                 return
             line = line.rstrip(b"\r\n")
-            self.server.lines.append(line)
-            literal = _LITERAL.search(line) if line.endswith(b"}") else None
-            if literal is not None:
+            full = line
+            while (literal := _LITERAL.search(line) if line.endswith(b"}") else None) is not None:
                 if not literal.group(2):
                     self.wfile.write(b"+ go ahead\r\n")
-                self.server.literals.append(self.rfile.read(int(literal.group(1))))
-                continue  # the rest of the command follows on the next line
-            tag, _, rest = line.partition(b" ")
-            if not self._answer(tag, rest.split(b" ", 1)[0].upper()):
+                data = self.rfile.read(int(literal.group(1)))
+                self.server.literals.append(data)
+                line = self.rfile.readline().rstrip(b"\r\n")
+                full += data + line
+            self.server.lines.append(full)
+            tag, _, rest = full.partition(b" ")
+            command, _, args = rest.partition(b" ")
+            sub = args.split(b" ", 1)[0].upper()
+            if not self._answer(tag, command.upper(), sub):
                 return
 
-    def _answer(self, tag: bytes, command: bytes) -> bool:
+    def _answer(self, tag: bytes, command: bytes, sub: bytes) -> bool:
         out = self.wfile
         if command == b"CAPABILITY":
             out.write(b"* CAPABILITY " + _CAPABILITY + b"\r\n" + tag + b" OK done\r\n")
         elif command == b"EXAMINE":
             out.write(b"* 0 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n" + tag + b" OK [READ-ONLY] done\r\n")
-        elif command == b"UID":
+        elif command == b"UID" and sub == b"SEARCH":
             out.write(b"* SEARCH\r\n" + tag + b" OK done\r\n")
         elif command == b"LOGOUT":
             out.write(b"* BYE bye\r\n" + tag + b" OK done\r\n")

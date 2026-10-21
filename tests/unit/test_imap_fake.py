@@ -100,3 +100,34 @@ def test_wire_recorder_records_the_uid_search_line() -> None:
     assert (
         len([line for line in rest if re.fullmatch(rb"[A-Za-z]+\d+ UID SEARCH NOT DRAFT SINCE 19-Oct-2026", line)]) == 1
     )
+
+
+def test_wire_recorder_answers_a_search_with_a_literal() -> None:
+    with WireRecorder() as recorder:
+        client = wire_client(recorder)
+        client.login("user", "pw")
+        client.select_folder("INBOX", readonly=True)
+        assert client.search(["TEXT", "hällo"], charset="UTF-8") == []
+        client.logout()
+    assert recorder.literals == ["hällo".encode()]
+    assert [line for line in recorder.lines if b"UID SEARCH" in line and "hällo".encode() in line]
+    assert not [line for line in recorder.lines if line.startswith(b" ")]
+
+
+def test_wire_recorder_rejects_other_uid_subcommands() -> None:
+    with WireRecorder() as recorder:
+        client = wire_client(recorder)
+        client.login("user", "pw")
+        client.select_folder("INBOX", readonly=True)
+        with pytest.raises(IMAPClientError, match="BAD"):
+            client.fetch([1], ["FLAGS"])
+        with pytest.raises(IMAPClientError, match="BAD"):
+            client.add_flags([1], [b"\\Seen"])
+
+
+def test_fake_fail_rejects_keys_outside_the_allowlist() -> None:
+    srv = server()
+    with pytest.raises(AssertionError, match="command outside the allowlist: LISTT"):
+        srv.fail["LISTT"] = srv.no("LIST")
+    with pytest.raises(AssertionError, match="command outside the allowlist: STORE"):
+        srv.run("STORE")
