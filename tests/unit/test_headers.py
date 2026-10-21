@@ -134,12 +134,21 @@ def test_in_reply_to_phrase_form() -> None:
         )
     )
     assert p.in_reply_to == "real@example.org"
+    p = parse_summary_headers(
+        raw(
+            "From: alice@example.org", "In-Reply-To: Alice <alice@example.org>'s message", "Message-ID: <m@example.org>"
+        )
+    )
+    assert p.in_reply_to is None
+    p = parse_summary_headers(raw("In-Reply-To: <only@example.org>", "Message-ID: <m@example.org>"))
+    assert p.in_reply_to == "only@example.org"
 
 
 def test_references_last_ten_and_long_tokens_skipped() -> None:
     ids = [f"<r{i}@example.org>" for i in range(14)]
     long_id = "<" + "a" * 301 + "@example.org>"
-    p = parse_summary_headers(raw("References: " + ids[0] + " " + long_id + " " + " ".join(ids[1:])))
+    # spec 4.9 follow-up: pattern-invalid tokens are skipped
+    p = parse_summary_headers(raw("References: " + ids[0] + " " + " ".join(ids[1:]) + " " + long_id))
     assert p.references == tuple(f"r{i}@example.org" for i in range(4, 14))
     assert p.root == "r0@example.org"
 
@@ -163,6 +172,14 @@ def test_root_falls_back_to_in_reply_to_then_own() -> None:
     assert p.root == "m@example.org"
     p = parse_summary_headers(raw("Subject: x"))
     assert p.root is None
+    long_id = "<" + "a" * 301 + "@example.org>"
+    p = parse_summary_headers(raw(f"In-Reply-To: {long_id}", "Message-ID: <m@example.org>", "Subject: S"))
+    assert p.root == "m@example.org"
+    p = parse_summary_headers(raw(f"In-Reply-To: {long_id}", f"Message-ID: {long_id}", "Subject: S"))
+    assert p.root is None
+    key = imap_thread_key("icloud", p)
+    assert key is not None
+    assert key.source == "subject"
 
 
 def test_references_cut_by_the_64k_cap() -> None:
@@ -206,6 +223,20 @@ def test_normalise_subject(subject: str | None, expected: str) -> None:
     assert normalise_subject(subject) == expected
 
 
+def test_subject_round_cap_keeps_the_rest() -> None:
+    assert normalise_subject("Re: " * 25 + "X") == "re: " * 5 + "x"
+
+
+def test_one_removal_per_round() -> None:
+    assert normalise_subject("[a] " * 25 + "X") == "[a] " * 5 + "x"
+    assert normalise_subject("Re: [a] " * 11 + "X") == "re: [a] x"
+
+
+def test_subject_precut_before_sanitising() -> None:
+    # the 4,000-character pre-cut happens before clean() collapses the blank run
+    assert normalise_subject("Re: " + " " * 5000 + "X") == ""
+
+
 def test_long_subject_digest_ignores_truncation_marker() -> None:
     assert subject_digest("X" * 400) == subject_digest("Re: " + "X" * 400)
     assert len(normalise_subject("X" * 5000)) == 1000
@@ -236,6 +267,9 @@ def test_imap_thread_key_sources() -> None:
         ("Me+News@Example.org", {"me@example.org"}, True),
         ("me@example.org.evil", {"me@example.org"}, False),
         ("m.e@example.org", {"me@example.org"}, False),
+        ("m.e+x@example.org", {"me@example.org"}, False),
+        ("me@example.org", {"Me@Example.org"}, True),
+        ("ME+tag@example.org", {"Me@Example.org"}, True),
         ("me+x@example.org", {"me+x@example.org"}, True),
         ("me+y@example.org", {"me+x@example.org"}, False),
         ("+x@example.org", {"@example.org"}, False),
@@ -258,7 +292,17 @@ def test_is_own(address: str | None, own: set[str], expected: bool) -> None:
     ],
 )
 def test_hostile_header_bytes_do_not_raise(data: bytes) -> None:
-    parse_summary_headers(data)
+    parsed = parse_summary_headers(data)
+    subject_digest(parsed.subject)
+    imap_thread_key("icloud", parsed)
+    is_own(parsed.from_address, frozenset({"me@example.org"}))
+
+
+def test_folded_message_id_fallback_has_no_line_break() -> None:
+    p = parse_summary_headers(raw("Message-ID: abc", " def"))
+    assert p.message_id is not None
+    assert "\n" not in p.message_id
+    assert "\r" not in p.message_id
 
 
 def test_cpu_bounds() -> None:
@@ -268,6 +312,15 @@ def test_cpu_bounds() -> None:
     assert time.perf_counter() - start < 0.5
     start = time.perf_counter()
     normalise_subject("re:" * 2000)
+    assert time.perf_counter() - start < 0.5
+    for payload in (b"\\", b".", b",", b"a\\", b'"', b"<", b"(a"):
+        data = b"From: " + payload * 8192 + b"\r\nTo: " + payload * 8192 + b"\r\nCc: " + payload * 8192 + b"\r\n\r\n"
+        start = time.perf_counter()
+        parse_summary_headers(data)
+        assert time.perf_counter() - start < 0.5, payload
+    data = b"Subject: " + b"=?utf-8?q?" * 6000 + b"\r\n\r\n"
+    start = time.perf_counter()
+    parse_summary_headers(data)
     assert time.perf_counter() - start < 0.5
     data = b"References: " + b"<(" * 30_000 + b"\r\n\r\n"
     start = time.perf_counter()

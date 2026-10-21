@@ -11,6 +11,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from email.header import decode_header, make_header
 from email.parser import BytesHeaderParser
 from email.utils import getaddresses
 from typing import Final, Literal
@@ -31,7 +32,7 @@ _FOLD: Final = re.compile(r"\r?\n(?=[ \t])")
 _SPLIT: Final = re.compile(r"[\s,]+")
 _WHITESPACE: Final = re.compile(r"\s+")
 _PREFIX: Final = re.compile(r"\s*(?:re|aw|antw|antwort|fwd?|wg|wtr|sv)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*:\s*", re.I)
-_TAG: Final = re.compile(r"\[[^\[\]]{1,40}\]\s*", re.I)
+_TAG: Final = re.compile(r"\[[^\[\]]{1,40}\]\s*")
 
 
 def candidate_header_item(fields: Sequence[Literal["MESSAGE-ID", "FROM"]]) -> str:
@@ -150,16 +151,19 @@ def _decoded(name: str, text: str) -> str:
         return text
 
 
-def _addresses(name: str, text: str) -> list[tuple[str, str]]:
-    text = text[:MAX_ADDRESS_HEADER_BYTES]
+def _display_name(name: str) -> str:
     try:
-        parsed = email.policy.default.header_factory(name, text)
-        return [(a.display_name, a.addr_spec) for a in parsed.addresses]
-    except Exception:  # malformed header: lenient stdlib parser on the same bounded text
-        try:
-            return [(n, a) for n, a in getaddresses([text]) if a or n]
-        except Exception:
-            return []
+        return str(make_header(decode_header(name)))
+    except Exception:  # odd charset or malformed encoded word: keep the raw name
+        return name
+
+
+def _addresses(text: str) -> list[tuple[str, str]]:
+    """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic)."""
+    try:
+        return [(_display_name(n), a) for n, a in getaddresses([text[:MAX_ADDRESS_HEADER_BYTES]]) if a or n]
+    except Exception:
+        return []
 
 
 def _first(items: Mapping[str, list[str]], name: str) -> str | None:
@@ -171,7 +175,7 @@ def _in_reply_to(value: str | None, references: Sequence[str], people: set[str])
     if value is None:
         return None
     tokens = msg_id_tokens(value)
-    if len(tokens) <= 1:
+    if not tokens:
         return bare_message_id(value)
     for token in tokens:  # phrase form: a token that also occurs in References is the id
         if token in references:
@@ -188,13 +192,14 @@ def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
     items: dict[str, list[str]] = {}
     for name, value in _PARSER.parsebytes(raw).raw_items():
         items.setdefault(name.lower(), []).append(_FOLD.sub("", str(value)).strip())
-    sender = (_addresses("From", _first(items, "from") or "") or [("", "")])[0]
-    to = tuple(a for _, a in _addresses("To", _first(items, "to") or "") if a)
-    cc = tuple(a for _, a in _addresses("Cc", _first(items, "cc") or "") if a)
+    sender = (_addresses(_first(items, "from") or "") or [("", "")])[0]
+    to = tuple(a for _, a in _addresses(_first(items, "to") or "") if a)
+    cc = tuple(a for _, a in _addresses(_first(items, "cc") or "") if a)
     subject_raw = _first(items, "subject")
     message_id = bare_message_id(_first(items, "message-id"))
     refs_raw = _first(items, "references")
     all_refs = [t for t in msg_id_tokens(refs_raw) if t != message_id] if refs_raw else []
+    # spec 4.9 follow-up: pattern-invalid tokens are skipped
     valid_refs = [t for t in all_refs if valid_message_id(t) is not None]
     people = {a.lower() for a in (sender[1], *to, *cc) if a}
     in_reply_to = _in_reply_to(_first(items, "in-reply-to"), all_refs, people)
@@ -222,11 +227,10 @@ def normalise_subject(subject: str | None) -> str:
     for _ in range(MAX_SUBJECT_ROUNDS):
         if not text:
             break
-        stripped = _PREFIX.sub("", text, count=1) if _PREFIX.match(text) else text
-        stripped = _TAG.sub("", stripped, count=1) if _TAG.match(stripped) else stripped
-        if stripped == text:
+        match = _PREFIX.match(text) or _TAG.match(text)  # one removal per round (S-k)
+        if match is None:
             break
-        text = stripped
+        text = text[match.end() :]
     text = unicodedata.normalize("NFKC", text.casefold())
     return _WHITESPACE.sub(" ", text).strip()
 
@@ -249,6 +253,7 @@ def is_own(address: str | None, own: frozenset[str]) -> bool:
     """Case-insensitive match; a `+tag` is ignored when the configured entry has none; no dot folding (S-j)."""
     if not address:
         return False
+    own = frozenset(entry.lower() for entry in own)
     lowered = address.lower()
     if lowered in own:
         return True
