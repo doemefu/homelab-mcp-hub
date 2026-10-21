@@ -77,6 +77,12 @@ class CursorCodec:
         return _b64encode(hmac.new(self._key, signed.encode("ascii"), hashlib.sha256).digest())
 
     def issue(self, *, tool: str, args_digest: str, window_start: int, position: Position) -> str:
+        if tool not in CURSOR_TOOLS:
+            raise ValueError("unsupported cursor tool")
+        if not (_DIGEST.fullmatch(args_digest) and _K.fullmatch(position.k)):
+            raise ValueError("malformed cursor digest or key")
+        if not (type(window_start) is int and type(position.received_at) is int):
+            raise ValueError("cursor positions must be integers")
         payload = {
             "a": args_digest,
             "i": int(self._clock()),

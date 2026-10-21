@@ -32,8 +32,10 @@ def _issue(codec: CursorCodec, tool: str = "list_messages") -> str:
     return codec.issue(tool=tool, args_digest=DIGEST, window_start=1_699_000_000, position=POS)
 
 
-def _signed(payload: bytes, key: bytes = KEY) -> str:
-    body = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+def _signed(payload: bytes, key: bytes = KEY, *, pad: bool = False) -> str:
+    body = base64.urlsafe_b64encode(payload).decode()
+    if not pad:
+        body = body.rstrip("=")
     signed = "c1." + body
     mac = hmac.new(key, signed.encode(), hashlib.sha256).digest()
     return signed + "." + base64.urlsafe_b64encode(mac).rstrip(b"=").decode()
@@ -149,6 +151,9 @@ def test_omitted_since_differs_from_explicit() -> None:
         "c2.x.y",
         "c1.!!.x",
         "c1.AAAA=.AAAA",
+        "c1.é.x",
+        "c1.\u0661.x",
+        "c1.AAAA.é",
         "c1.AAAA.AAAA.AAAA",
     ],
 )
@@ -228,3 +233,56 @@ def test_digest_ignores_cursor_and_limit() -> None:
     assert argument_digest(base) == argument_digest({**base, "limit": 5, "cursor": "c1.x.y"})
     assert argument_digest(base) == argument_digest({"folder": "inbox", "account": None})
     assert argument_digest(base) != argument_digest({**base, "account": "icloud"})
+
+
+def _padded_to(total_at_least: int) -> bytes:
+    """A valid payload with trailing JSON whitespace, so only the length gate can reject it."""
+    base = json.dumps(_payload())
+    pad = 0
+    while len(_signed((base + " " * pad).encode())) < total_at_least:
+        pad += 1
+    return (base + " " * pad).encode()
+
+
+def test_padded_base64_rejected_even_with_valid_mac() -> None:
+    codec = CursorCodec(KEY, Clock())
+    payload = json.dumps(_payload()).encode() + b" "
+    assert len(payload) % 3 != 0  # base64 of this payload needs padding
+    assert "=" in _signed(payload, pad=True)
+    _assert_invalid(codec, _signed(payload, pad=True))
+    _open(codec, _signed(payload))
+
+
+def test_over_length_rejected_even_with_valid_mac() -> None:
+    codec = CursorCodec(KEY, Clock())
+    value = _signed(_padded_to(MAX_CURSOR_CHARS + 1))
+    assert len(value) > MAX_CURSOR_CHARS
+    _assert_invalid(codec, value)
+
+
+def test_length_boundary_accepted() -> None:
+    codec = CursorCodec(KEY, Clock())
+    # Exactly 2,048 characters cannot be built (unpadded base64 lengths skip it); take the largest below.
+    value = _signed(_padded_to(MAX_CURSOR_CHARS - 3))
+    assert MAX_CURSOR_CHARS - 3 <= len(value) <= MAX_CURSOR_CHARS
+    _open(codec, value)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tool": "get_events"},
+        {"args_digest": "A" * 64},
+        {"args_digest": "a" * 63},
+        {"position": Position(1, "XYZ")},
+        {"position": Position(True, POS.k)},
+        {"window_start": True},
+        {"window_start": 1.5},
+    ],
+)
+def test_issue_validates_inputs(kwargs: dict[str, object]) -> None:
+    codec = CursorCodec(KEY, Clock())
+    args: dict[str, object] = {"tool": "list_messages", "args_digest": DIGEST, "window_start": 1, "position": POS}
+    args.update(kwargs)
+    with pytest.raises(ValueError, match="cursor"):
+        codec.issue(**args)  # type: ignore[arg-type]  # deliberately ill-typed inputs
