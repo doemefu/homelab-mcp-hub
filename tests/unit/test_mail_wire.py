@@ -56,6 +56,8 @@ def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, t
     properties = tools["list_messages"]["inputSchema"]["properties"]
     assert set(properties) == {"account", "folder", "since", "unread_only", "direction", "limit", "cursor"}
     assert tools["list_messages"]["inputSchema"].get("required", []) == []
+    assert properties["folder"]["enum"] == ["inbox", "sent", "archive", "trash", "all", None]
+    assert properties["direction"]["enum"] == ["incoming", "outgoing", None]
 
 
 def test_list_unread_wire_result_has_output_schema(wired: TestClient, tokens: TokenFactory) -> None:

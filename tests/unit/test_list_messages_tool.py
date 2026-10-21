@@ -121,6 +121,10 @@ class Fake:
     errors: dict[str, Exception] = field(default_factory=dict)
     flags: dict[str, dict[str, bool]] = field(default_factory=dict)
     queries: list[tuple[str, ListQuery]] = field(default_factory=list)
+    # Graph-like accounts: each answer scans at most this many candidates and filters `direction` afterwards, so a
+    # page can hold fewer than `limit` items, or none, while more exist; it then reports its scan frontier.
+    scan: dict[str, int] = field(default_factory=dict)
+    second_frontier: set[str] = field(default_factory=set)  # frontier as (second, "f" * 16), as Graph sends it
 
     def factory(self, account: Account, _secrets_dir: Path) -> "FakeMailbox":
         return FakeMailbox(self, account.id)
@@ -142,20 +146,34 @@ class FakeMailbox:
         self.fake.queries.append((self.account, query))
         if self.account in self.fake.errors:
             raise self.fake.errors[self.account]
-        matching = sorted(
+        candidates = sorted(
             (
                 m
                 for m in self.fake.items.get(self.account, [])
                 if m.received_at >= query.since
                 and (query.position is None or query.position.precedes(*order_key(m)))
                 and (not query.unread_only or m.unread)
-                and (query.direction is None or m.meta.direction == query.direction)
             ),
             key=order_key,
             reverse=True,
         )
+        if self.account in self.fake.scan:
+            return self._scanned(candidates, query)
+        matching = [m for m in candidates if query.direction is None or m.meta.direction == query.direction]
         page = FolderPage(matching[: query.limit], len(matching) > query.limit, truncated=False, complete=True)
         return replace(page, **self.fake.flags.get(self.account, {}))  # type: ignore[arg-type]  # page flags per test
+
+    def _scanned(self, candidates: list[MailSummary], query: ListQuery) -> FolderPage:
+        scanned, rest = candidates[: self.fake.scan[self.account]], candidates[self.fake.scan[self.account] :]
+        items = [m for m in scanned if query.direction is None or m.meta.direction == query.direction]
+        frontier: tuple[int, str] | None = None
+        if rest:
+            second, k = order_key(scanned[-1])
+            frontier = (second, "f" * 16) if self.account in self.fake.second_frontier else (second, k)
+        if len(items) > query.limit:
+            items = items[: query.limit]
+            frontier = order_key(items[-1])
+        return FolderPage(items, more=frontier is not None, truncated=False, complete=True, frontier=frontier)
 
 
 def context(secrets_dir: Path, fake: Fake, env: dict[str, str] | None = None, clock: Clock | None = None) -> HubContext:
@@ -569,6 +587,92 @@ async def test_page_holds_at_least_one_item(secrets_dir: Path) -> None:
     assert ids(page2) == [("icloud", 2)]
     assert page2.next_cursor is None
     assert page2.truncated is False  # shortened text is not "more matches"
+
+
+async def _collect(ctx: HubContext, **kwargs: object) -> tuple[list[tuple[str, int]], int]:
+    seen: list[tuple[str, int]] = []
+    cursor = None
+    for pages in range(1, 20):
+        result, _, _ = await run(ctx, cursor=cursor, **kwargs)
+        seen += ids(result)
+        cursor = result.next_cursor
+        if cursor is None:
+            assert result.truncated is False
+            return seen, pages
+    raise AssertionError("paging did not end")
+
+
+def _directed(account: str, uid: int, minutes_ago: float, direction: str) -> MailSummary:
+    return summary(account, uid, minutes_ago, direction=direction)
+
+
+async def test_sparse_more_page_merges_without_gap_or_duplicate(secrets_dir: Path) -> None:
+    """A Graph-like page with fewer than `limit` items and `more` (direction filtered after the scan) merged with
+    a full account: the cursor never passes the sparse account's scan frontier."""
+    sparse = [
+        _directed("gmail", uid, minutes, direction)
+        for uid, minutes, direction in [
+            (1, 1, "outgoing"), (2, 2, "incoming"), (3, 3, "outgoing"), (4, 4, "outgoing"),
+            (5, 5, "incoming"), (6, 6, "incoming"), (7, 7, "outgoing"),
+        ]
+    ]  # fmt: skip
+    full = [_directed("icloud", uid, minutes, "incoming") for uid, minutes in [(8, 8), (9, 9), (10, 10)]]
+    fake = Fake(items={"gmail": sparse, "icloud": full}, scan={"gmail": 3})
+    seen, _ = await _collect(context(secrets_dir, fake), direction="incoming", limit=2)
+    assert seen == [("gmail", 2), ("gmail", 5), ("gmail", 6), ("icloud", 8), ("icloud", 9), ("icloud", 10)]
+
+
+async def test_zero_item_more_page_issues_a_cursor(secrets_dir: Path) -> None:
+    items = [
+        _directed("gmail", uid, minutes, direction)
+        for uid, minutes, direction in [(1, 1, "outgoing"), (2, 2, "outgoing"), (3, 3, "outgoing"),
+                                        (4, 4, "incoming"), (5, 5, "incoming")]
+    ]  # fmt: skip
+    fake = Fake(items={"gmail": items}, scan={"gmail": 3})
+    ctx = context(secrets_dir, fake)
+    page1, _, _ = await run(ctx, account="gmail", direction="incoming", limit=2)
+    assert page1.items == []
+    assert page1.truncated is True
+    assert page1.next_cursor is not None  # more can be fetched with the same arguments
+    page2, _, _ = await run(ctx, account="gmail", direction="incoming", limit=2, cursor=page1.next_cursor)
+    assert ids(page2) == [("gmail", 4), ("gmail", 5)]
+    assert page2.next_cursor is None
+
+
+async def test_graph_second_frontier_rereads_its_second(secrets_dir: Path) -> None:
+    """Frontier (second, "f" * 16): items of that second sort below the cutoff, are held back and come on the
+    next page exactly once."""
+    same_second = 3 - 0.2 / 60  # 0.2 s after the item at 3 minutes: the same whole second
+    sparse = [
+        _directed("gmail", uid, minutes, "incoming")
+        for uid, minutes in [(1, 1), (2, 2), (3, 3), (4, same_second), (5, 5)]
+    ]
+    full = [_directed("icloud", uid, minutes, "incoming") for uid, minutes in [(6, 10), (7, 11)]]
+    fake = Fake(items={"gmail": sparse, "icloud": full}, scan={"gmail": 3}, second_frontier={"gmail"})
+    ctx = context(secrets_dir, fake)
+    page1, _, _ = await run(ctx, direction="incoming", limit=5)
+    assert ids(page1)[:2] == [("gmail", 1), ("gmail", 2)]
+    assert ("gmail", 3) not in ids(page1)  # in the frontier second: held back, read again on page 2
+    assert page1.next_cursor is not None
+    seen, _ = await _collect(ctx, direction="incoming", limit=5)
+    tied = sorted((m for m in sparse if m.ref.uid in (3, 4)), key=order_key, reverse=True)  # type: ignore[union-attr]  # IMAP refs only
+    assert seen == [
+        ("gmail", 1), ("gmail", 2), *[("gmail", m.ref.uid) for m in tied],  # type: ignore[union-attr]  # IMAP refs only
+        ("gmail", 5), ("icloud", 6), ("icloud", 7),
+    ]  # fmt: skip
+
+
+async def test_no_cursor_when_the_frontier_makes_no_progress(secrets_dir: Path) -> None:
+    """More messages in one second than one answer holds (the accepted Graph residual): truncated, no endless
+    cursor loop."""
+    same = [_directed("gmail", uid, 3 - uid * 0.1 / 60, "incoming") for uid in (1, 2, 3)]  # one whole second
+    fake = Fake(items={"gmail": same}, scan={"gmail": 2}, second_frontier={"gmail"})
+    ctx = context(secrets_dir, fake)
+    page1, _, _ = await run(ctx, account="gmail", limit=5)
+    assert (page1.items, page1.truncated) == ([], True)
+    assert page1.next_cursor is not None  # the cutoff lies after "no position": progress
+    page2, _, _ = await run(ctx, account="gmail", limit=5, cursor=page1.next_cursor)
+    assert (page2.items, page2.next_cursor, page2.truncated) == ([], None, True)
 
 
 async def test_truncated_without_cursor_for_overflow(secrets_dir: Path) -> None:

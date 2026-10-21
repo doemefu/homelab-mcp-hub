@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_or_drop, shrink_to_fit
 from mcp_hub.cursors import Position, argument_digest
@@ -64,6 +64,10 @@ SINCE_MAX_AGE: Final = timedelta(days=30)
 CLOCK_SKEW: Final = timedelta(seconds=60)
 LIST_FOLDERS: Final[tuple[ListFolder, ...]] = ("inbox", "sent", "archive", "trash", "all")
 DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
+# The enums appear in the input schema (null included: the schema default), but the value is validated by the hub,
+# so a wrong value answers with the §5.1 invalid_argument body instead of the SDK's validation text.
+FolderArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*LIST_FOLDERS, None]})]
+DirectionArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*DIRECTIONS, None]})]
 ListTool = Literal["list_messages", "list_unread"]
 # The arguments each tool's cursor is bound to (§5.5 "Cursors": every argument except `cursor` and `limit`).
 DIGEST_ARGUMENTS: Final[dict[ListTool, tuple[str, ...]]] = {
@@ -285,7 +289,11 @@ def _choice[T: str](value: str | None, name: str, allowed: tuple[T, ...]) -> T |
 
 def _window_start(since: datetime | None, current: datetime) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
-    the same on every page); default now - 24 h; at most 30 days back, at most 60 s ahead."""
+    the same on every page); default now - 24 h; at most 30 days back, at most 60 s ahead.
+
+    Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
+    but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the
+    hub's whole-second positions agree on that, so no page shows it and no page repeats it."""
     start = current - SINCE_DEFAULT if since is None else since
     if start < current - SINCE_MAX_AGE or start > current + CLOCK_SKEW:
         raise ToolError("invalid_argument", "since must lie within the last 30 days")
@@ -353,10 +361,16 @@ async def run_list_messages(
     if position is not None:  # the keyset invariant holds even if an adapter returns an item at or above it
         found = [m for m in found if position.precedes(*order_key(m))]
     merged = sorted(found, key=order_key, reverse=True)
-    more = any(page.more for page in pages) or len(merged) > count
+    # A `more` page with a frontier scanned nothing below it (it may hold fewer than `limit` items, or none): the
+    # newest such frontier is the cutoff, and items below it wait for the next page, so no account's unscanned
+    # range is skipped. A `more` page without a frontier is full; its last item is its frontier.
+    frontiers = [page.frontier for page in pages if page.more and page.frontier is not None]
+    cutoff = max(frontiers) if frontiers else None
+    eligible = merged if cutoff is None else [m for m in merged if order_key(m) >= cutoff]
+    more = any(page.more for page in pages) or len(eligible) > count
     complete = all(page.complete for page in pages)  # a failed account has no page and never blocks the cursor
     stopped = any(page.truncated for page in pages) or not complete
-    selected = merged[:count]
+    selected = eligible[:count]
     positions = [Position(*order_key(m)) for m in selected]
     zone = ZoneInfo(ctx.settings.default_timezone)
     items = [_summary_or_placeholder(m, zone) for m in selected]
@@ -365,11 +379,14 @@ async def run_list_messages(
         # `chosen` is a prefix of `items`. Only dropped items count as "more" (B8): a single item shortened to fit
         # leaves nothing to fetch, so it sets neither `truncated` nor a cursor.
         remaining = more or len(chosen) < len(items)
+        last: Position | None = None
+        if chosen:
+            last = positions[len(chosen) - 1]
+        elif not items and cutoff is not None and (position is None or position.precedes(*cutoff)):
+            last = Position(*cutoff)  # nothing to show yet, but the scan advanced: continue below the frontier
         next_cursor = None
-        if remaining and complete and chosen:
-            next_cursor = ctx.cursors.issue(
-                tool=tool, args_digest=digest, window_start=window, position=positions[len(chosen) - 1]
-            )
+        if remaining and complete and last is not None:
+            next_cursor = ctx.cursors.issue(tool=tool, args_digest=digest, window_start=window, position=last)
         return ListMessagesResult(
             untrusted_content_notice=UNTRUSTED_CONTENT_NOTICE,
             items=chosen,
@@ -527,10 +544,10 @@ def register(server: MCPServer, ctx: HubContext) -> None:
     @server.tool(name="list_messages", description=LIST_MESSAGES_DESCRIPTION, annotations=read_only("List mail"))
     async def list_messages(
         account: str | None = None,
-        folder: str | None = None,
+        folder: FolderArgument = None,
         since: str | None = None,
         unread_only: bool | None = None,
-        direction: str | None = None,
+        direction: DirectionArgument = None,
         limit: int | None = None,
         cursor: str | None = None,
     ) -> Annotated[CallToolResult, ListMessagesResult]:

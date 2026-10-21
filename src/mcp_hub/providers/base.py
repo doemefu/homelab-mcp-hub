@@ -141,6 +141,11 @@ class FolderPage:
     more: bool  # more matching messages exist than returned
     truncated: bool  # the adapter stopped early (soft stop or candidate cap)
     complete: bool  # every folder of the plan was searched
+    # With `more`: the order_key of the oldest position the adapter scanned. A page can hold fewer than `limit`
+    # items (filters applied after the scan) yet have scanned everything above it; nothing below it was looked at.
+    # Graph gives the frontier second as (second, "f" * 16), so that whole second is read again on the next page.
+    # None with `more`: a full page, whose last item is the frontier.
+    frontier: tuple[int, str] | None = None
 
 
 def read_credential(secrets_dir: Path, ref: str) -> str:
