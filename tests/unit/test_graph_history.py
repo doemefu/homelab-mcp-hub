@@ -2,24 +2,36 @@
 
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta, timezone
+from urllib.parse import parse_qs
 
 import httpx2
 import pytest
 
 from mcp_hub.cursors import Position
-from mcp_hub.ids import GraphMessageRef, ThreadKey, location_k
+from mcp_hub.ids import GraphMessageRef, StableRef, ThreadKey, location_k
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import graph
-from mcp_hub.providers.base import UNDECODABLE_NOTE, FolderPage, ListQuery, ProviderError, order_key
+from mcp_hub.providers.base import (
+    UNDECODABLE_NOTE,
+    FolderPage,
+    ListQuery,
+    MailDetail,
+    MailFlags,
+    MailMeta,
+    ProviderError,
+    order_key,
+)
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import FolderMapCache, GraphFolderIds, ListFolder
 from mcp_hub.providers.graph import (
     ANSWERED_VERBS,
     EXTENDED_EXPAND,
+    FALLBACK_SELECT,
     FOLDER_ID,
     GRAPH_LIST_TOP,
+    MESSAGE_SELECT,
     SUMMARY_SELECT,
     WELL_KNOWN_FOR,
     Backoff,
@@ -839,6 +851,406 @@ def test_logs_carry_no_filter_values_or_folder_ids() -> None:
         "graph.microsoft.com",
         "AT-SENTINEL",
     ):
+        assert secret not in joined
+
+
+# --- get_message: D75 binding, isDraft, lookup by ref (T16) ------------------------------------------------------
+
+REF_PATH = "/v1.0/me/messages"
+TRASH_ID = FOLDER_IDS["deleteditems"]
+JUNK_ID = FOLDER_IDS["junkemail"]
+OTHER_ID = "AQMkOTHERFOLDER"
+MID9 = "m9@example.test"
+
+
+def message_path(graph_id: str) -> str:
+    return f"{REF_PATH}/{graph_id}"
+
+
+def graph_id(n: int) -> str:
+    return f"AAMkMSG{n:04d}="
+
+
+def detail_body(n: int, folder_id: str = INBOX_ID, **extra: object) -> dict[str, object]:
+    return message(n, **({"parentFolderId": folder_id, "body": {"contentType": "text", "content": "Hello"}} | extra))
+
+
+def copy_of(n: int, at: datetime, folder_id: str, **extra: object) -> dict[str, object]:
+    """A lookup hit: a copy of MID9 received at `at` in `folder_id`."""
+    return item(n, at, folder_id, **({"internetMessageId": f"<{MID9}>"} | extra))
+
+
+def message_server(*bodies: dict[str, object], lookup: Handler | None = None) -> Server:
+    server = Server()
+    for body in bodies:
+        server.routes[message_path(str(body["id"]))] = js(body)
+    if lookup is not None:
+        server.routes[REF_PATH] = lookup
+    return server
+
+
+def primed(clock: FakeClock, folder_ids: GraphFolderIds = IDS) -> FolderMapCache:
+    """A folder-id map read by an earlier call."""
+    maps = FolderMapCache(clock=clock)
+    maps.put(folder_ids)
+    return maps
+
+
+def folder_reads(server: Server) -> int:
+    return sum(
+        1
+        for r in server.requests
+        if r.url.path.startswith("/v1.0/me/mailFolders/") and not r.url.path.endswith("/messages")
+    )
+
+
+def opened(server: Server) -> list[str]:
+    return [r.url.path.rsplit("/", 1)[1] for r in server.requests if r.url.path.startswith(REF_PATH + "/")]
+
+
+def by_id(box: GraphMailbox, graph_id_text: str, clock: FakeClock) -> MailDetail:
+    return box.get_message(GraphMessageRef("outlook", graph_id_text), CallDeadline.start(clock))
+
+
+def by_ref(box: GraphMailbox, message_id: str, clock: FakeClock) -> MailDetail:
+    return box.get_message(StableRef("outlook", message_id), CallDeadline.start(clock))
+
+
+def test_message_in_archive_allowed() -> None:
+    clock = FakeClock()
+    server = message_server(detail_body(1, ARCHIVE_ID))
+    detail = by_id(mailbox(server, clock=clock), graph_id(1), clock)
+    assert detail.ref == GraphMessageRef("outlook", graph_id(1))
+    assert detail.meta.folder == "archive"
+    assert detail.body_text == "Hello"
+    assert folder_reads(server) == 7  # read in this call: never read a second time
+
+
+@pytest.mark.parametrize("name", ["junkemail", "drafts", "outbox"])
+def test_parent_junk_drafts_outbox_not_found_after_one_rebuild(name: str) -> None:
+    clock = FakeClock()
+    fresh = message_server(detail_body(1, FOLDER_IDS[name]))
+    with pytest.raises(ProviderError) as info:
+        by_id(mailbox(fresh, clock=clock), graph_id(1), clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "ExcludedFolder")
+    assert folder_reads(fresh) == 7  # the map was read in this call: no re-read before the refusal
+
+    maps = primed(clock)
+    server = message_server(detail_body(1, FOLDER_IDS[name]))
+    box = mailbox(server, clock=clock, maps=maps)
+    with pytest.raises(ProviderError) as info:
+        by_id(box, graph_id(1), clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "ExcludedFolder")
+    assert folder_reads(server) == 7  # a map from an earlier call is read once more before the refusal
+    clock.advance(59)
+    with pytest.raises(ProviderError) as info:
+        by_id(box, graph_id(1), clock)
+    assert info.value.code == "not_found"
+    assert folder_reads(server) == 7  # Sec16: at most one forced re-read per 60 s per account
+    clock.advance(1)
+    with pytest.raises(ProviderError):
+        by_id(box, graph_id(1), clock)
+    assert folder_reads(server) == 14
+
+
+def test_is_draft_not_found() -> None:
+    clock = FakeClock()
+    server = message_server(detail_body(1, isDraft=True))
+    with pytest.raises(ProviderError) as info:
+        by_id(mailbox(server, clock=clock), graph_id(1), clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "Draft")
+    assert folder_reads(server) == 0
+    assert opened(server) == [graph_id(1)]
+
+
+def test_unknown_parent_is_other() -> None:
+    clock = FakeClock()
+    maps = primed(clock)
+    server = message_server(detail_body(1, OTHER_ID))
+    box = mailbox(server, clock=clock, maps=maps)
+    assert by_id(box, graph_id(1), clock).meta.folder == "other"
+    assert folder_reads(server) == 7  # the cached map did not know the parent: one re-read
+    assert by_id(box, graph_id(1), clock).meta.folder == "other"
+    assert folder_reads(server) == 7  # within 60 s the cached map answers (Sec16)
+
+    # A stale map: the re-read shows that the unknown parent is the junk folder now.
+    clock.advance(60)
+    maps.put(GraphFolderIds("outlook", FOLDER_IDS | {"junkemail": "AQMkOLDJUNK"}))  # type: ignore[arg-type]
+    moved = message_server(detail_body(1, JUNK_ID))
+    with pytest.raises(ProviderError) as info:
+        by_id(mailbox(moved, clock=clock, maps=maps), graph_id(1), clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "ExcludedFolder")
+    assert folder_reads(moved) == 7
+
+
+def test_ref_lookup_request_shape() -> None:
+    clock = FakeClock()
+    server = message_server(detail_body(1), lookup=values(item(1, LATER)))
+    detail = by_ref(mailbox(server, clock=clock), "m1@example.test", clock)
+    assert detail.ref == GraphMessageRef("outlook", graph_id(1))
+    assert [r.url.path for r in server.requests] == [
+        REF_PATH,
+        *(f"/v1.0/me/mailFolders/{name}" for name in FOLDER_IDS),
+        message_path(graph_id(1)),
+    ]
+    lookup, message_get = server.requests[0], server.requests[-1]
+    assert lookup.method == "GET"
+    assert dict(lookup.url.params) == {
+        "$filter": "internetMessageId eq '<m1@example.test>'",
+        "$select": SUMMARY_SELECT,
+        "$top": "50",
+    }
+    assert lookup.headers["prefer"] == graph.PREFER
+    assert dict(message_get.url.params) == {"$select": MESSAGE_SELECT, "$expand": EXTENDED_EXPAND}
+    assert graph.REF_LOOKUP_TOP == 50
+
+
+def test_ref_filter_special_characters_byte_identical() -> None:
+    clock = FakeClock()
+    odd = "a+&#%=;/?@x"
+    server = message_server(lookup=values())
+    with pytest.raises(ProviderError):
+        by_ref(mailbox(server, clock=clock), odd, clock)
+    [request] = server.requests
+    assert request.url.path == REF_PATH  # nothing of the value reaches the path
+    decoded = parse_qs(request.url.query.decode("ascii"), keep_blank_values=True, strict_parsing=True)
+    assert decoded["$filter"] == ["internetMessageId eq '<a+&#%=;/?@x>'"]
+    assert request.url.params["$filter"] == "internetMessageId eq '<a+&#%=;/?@x>'"
+
+
+def test_ref_lookup_choice() -> None:
+    clock = FakeClock()
+    hits = [
+        copy_of(1, LATER, INBOX_ID),  # a later copy in the inbox
+        copy_of(2, LATER - timedelta(hours=1), ARCHIVE_ID),  # the earliest acceptable copy
+        copy_of(3, LATER - timedelta(hours=2), JUNK_ID),  # excluded folder
+        copy_of(4, LATER - timedelta(hours=3), FOLDER_IDS["outbox"]),  # excluded folder
+        copy_of(5, LATER - timedelta(hours=4), INBOX_ID, isDraft=True),  # a draft
+        item(6, LATER - timedelta(hours=5), INBOX_ID, internetMessageId="<M9@example.test>"),  # case differs
+        item(7, LATER - timedelta(hours=6), INBOX_ID, internetMessageId="<m9@example.test.x>"),  # another id
+        copy_of(8, LATER - timedelta(hours=7), INBOX_ID, receivedDateTime="garbage"),  # no usable time
+    ]
+    server = message_server(detail_body(2, ARCHIVE_ID), lookup=values(*hits))
+    detail = by_ref(mailbox(server, clock=clock), MID9, clock)
+    assert detail.ref == GraphMessageRef("outlook", graph_id(2))
+    assert detail.meta.folder == "archive"
+    assert opened(server) == [graph_id(2)]
+
+    # Equal received_at: the order inbox, archive, sent, trash, other decides (S-e), whatever order Graph answers in.
+    ranked = [INBOX_ID, ARCHIVE_ID, SENT_ID, TRASH_ID, OTHER_ID]
+    for start in range(len(ranked)):
+        tied = [copy_of(10 + n, LATER, folder_id) for n, folder_id in enumerate(ranked)][start:]
+        server = message_server(
+            *(detail_body(10 + n, folder_id) for n, folder_id in enumerate(ranked)), lookup=values(*reversed(tied))
+        )
+        assert by_ref(mailbox(server, clock=clock), MID9, clock).ref == GraphMessageRef("outlook", graph_id(10 + start))
+
+
+def test_ref_lookup_returned_id_pattern_checked() -> None:
+    clock = FakeClock()
+    forged = copy_of(1, LATER - timedelta(hours=1), INBOX_ID, id="a/b")
+    server = message_server(detail_body(2), lookup=values(forged, copy_of(2, LATER, INBOX_ID)))
+    assert by_ref(mailbox(server, clock=clock), MID9, clock).ref == GraphMessageRef("outlook", graph_id(2))
+    assert opened(server) == [graph_id(2)]
+    for bad in ("a/b", "x" * 301, "", 5, None):
+        alone = message_server(lookup=values(copy_of(1, LATER, INBOX_ID, id=bad)))
+        with pytest.raises(ProviderError) as info:
+            by_ref(mailbox(alone, clock=clock), MID9, clock)
+        assert (info.value.code, info.value.cause) == ("not_found", "RefNotFound")
+        assert [r.url.path for r in alone.requests] == [REF_PATH]
+
+
+def test_ref_not_found() -> None:
+    clock = FakeClock()
+    server = message_server(lookup=values())
+    with pytest.raises(ProviderError) as info:
+        by_ref(mailbox(server, clock=clock), MID9, clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "RefNotFound")
+    assert [r.url.path for r in server.requests] == [REF_PATH]  # no folder ids, no message read
+
+    # Only unacceptable hits on a page that is not full: a complete search, so not_found.
+    only_junk = message_server(lookup=values(copy_of(1, LATER, JUNK_ID), copy_of(2, LATER, INBOX_ID, isDraft=True)))
+    with pytest.raises(ProviderError) as info:
+        by_ref(mailbox(only_junk, clock=clock), MID9, clock)
+    assert (info.value.code, info.value.cause) == ("not_found", "RefNotFound")
+    assert opened(only_junk) == []
+
+
+def _late_401(clock: FakeClock) -> Handler:
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        clock.advance(17.0)  # the soft stop passes while the lookup runs; the retry after the 401 never starts
+        return httpx2.Response(401, content=b"{}")
+
+    return answer
+
+
+def _deadline_mid_body(clock: FakeClock) -> Handler:
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        def body() -> Iterator[bytes]:
+            yield b'{"value": ['
+            clock.advance(25.0)  # the 20 s call deadline passes between two chunks
+            yield b"]}"
+
+        return httpx2.Response(200, content=body())
+
+    return answer
+
+
+def _status(status: int) -> Callable[[FakeClock], Handler]:
+    return lambda clock: js({"error": {"code": "x"}}, status)
+
+
+def _raw(content: bytes) -> Callable[[FakeClock], Handler]:
+    return lambda clock: lambda request: httpx2.Response(200, content=content)
+
+
+def _connect_error(clock: FakeClock) -> Handler:
+    def fail(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("c")
+
+    return fail
+
+
+_FULL_OF_JUNK = values(*(copy_of(n, LATER, JUNK_ID) for n in range(50)))  # the lookup $top
+
+
+@pytest.mark.parametrize(
+    ("make", "code", "cause"),
+    [
+        pytest.param(_late_401, "upstream_timeout", "SoftStop", id="soft-deadline"),
+        pytest.param(_deadline_mid_body, "upstream_timeout", "CallDeadline", id="hard-deadline"),
+        pytest.param(_raw(b"x" * 1_100_000), "upstream_timeout", "IncompleteSearch", id="too-large-after-halving"),
+        pytest.param(_status(400), "upstream_timeout", "IncompleteSearch", id="400"),
+        pytest.param(_status(404), "upstream_timeout", "IncompleteSearch", id="404-collection"),
+        pytest.param(_status(500), "upstream_timeout", "IncompleteSearch", id="500"),
+        pytest.param(_status(502), "upstream_timeout", "IncompleteSearch", id="502"),
+        pytest.param(_status(504), "upstream_timeout", "IncompleteSearch", id="504"),
+        pytest.param(_raw(b"{not json"), "upstream_timeout", "IncompleteSearch", id="malformed-json"),
+        pytest.param(_raw(b'{"value": 5}'), "upstream_timeout", "IncompleteSearch", id="value-not-a-list"),
+        pytest.param(lambda clock: _FULL_OF_JUNK, "upstream_timeout", "IncompleteSearch", id="full-page-no-hit"),
+        pytest.param(
+            lambda clock: values(copy_of(1, LATER, JUNK_ID), **{"@odata.nextLink": f"https://{graph.GRAPH_HOST}/x"}),
+            "upstream_timeout",
+            "IncompleteSearch",
+            id="next-link-no-hit",
+        ),
+        pytest.param(_status(401), "auth_expired", "GraphUnauthorized", id="401-twice"),
+        pytest.param(_connect_error, "unreachable", "ConnectError", id="unreachable"),
+        pytest.param(_status(429), "upstream_error", "Throttled", id="429"),
+        pytest.param(_status(503), "upstream_error", "Throttled", id="503"),
+        pytest.param(_status(403), "upstream_error", "Forbidden", id="403"),
+    ],
+)
+def test_ref_lookup_failure_mapping(make: Callable[[FakeClock], Handler], code: str, cause: str) -> None:
+    clock = FakeClock()
+    server = message_server(lookup=make(clock))
+    with pytest.raises(ProviderError) as info:
+        by_ref(mailbox(server, clock=clock), MID9, clock)
+    assert (info.value.code, info.value.cause) == (code, cause)  # never not_found (B6)
+    assert opened(server) == []
+    assert all(r.url.host == graph.GRAPH_HOST and r.url.path != "/x" for r in server.requests)  # no nextLink GET
+
+
+def test_ref_lookup_over_cap_retried_once_with_top_halved() -> None:
+    clock = FakeClock()
+    tops: list[str] = []
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        tops.append(request.url.params["$top"])
+        if len(tops) == 1:
+            return httpx2.Response(200, content=b"x" * 1_100_000)
+        return values(*(copy_of(n, LATER, JUNK_ID) for n in range(24)), copy_of(30, LATER, INBOX_ID))(request)
+
+    server = message_server(detail_body(30), lookup=answer)
+    assert by_ref(mailbox(server, clock=clock), MID9, clock).ref == GraphMessageRef("outlook", graph_id(30))
+    assert tops == ["50", "25"]
+    # 25 entries after halving fill the effective $top, but an acceptable hit was found: it is used.
+
+
+def test_soft_stop_in_get_message_is_upstream_timeout() -> None:
+    clock = FakeClock()
+
+    def slow(body: Handler) -> Handler:
+        def answer(request: httpx2.Request) -> httpx2.Response:
+            clock.advance(17.0)  # the answer arrives after the 16 s soft stop
+            return body(request)
+
+        return answer
+
+    lookup = message_server(detail_body(1), lookup=slow(values(item(1, LATER))))
+    with pytest.raises(ProviderError) as info:
+        by_ref(mailbox(lookup, clock=clock), "m1@example.test", clock)
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "SoftStop")
+    assert [r.url.path for r in lookup.requests] == [REF_PATH]
+
+    by_id_server = Server()
+    by_id_server.routes[message_path(graph_id(1))] = slow(js(detail_body(1)))
+    with pytest.raises(ProviderError) as info:
+        by_id(mailbox(by_id_server, clock=clock), graph_id(1), clock)
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "SoftStop")
+    assert folder_reads(by_id_server) == 0
+
+
+def test_message_extended_meta() -> None:
+    clock = FakeClock()
+    raw = detail_body(
+        1,
+        SENT_ID,
+        singleValueExtendedProperties=extended("102", "<p@example.test>", "<r@example.test> <p@example.test>"),
+        flag={"flagStatus": "flagged"},
+    )
+    server = message_server(raw)
+    detail = by_id(mailbox(server, clock=clock), graph_id(1), clock)
+    assert detail.meta == MailMeta(
+        folder="sent",
+        folder_name=None,
+        flags=MailFlags(answered=True, flagged=True),
+        direction="outgoing",
+        message_id="m1@example.test",
+        in_reply_to="p@example.test",
+        references=("r@example.test", "p@example.test"),
+        thread=ThreadKey("outlook", "graph", "AAQkCONV0001="),
+    )
+    [message_get] = [r for r in server.requests if r.url.path == message_path(graph_id(1))]
+    assert message_get.url.params["$expand"] == EXTENDED_EXPAND
+    for name in ("isDraft", "internetMessageId", "conversationId", "parentFolderId", "flag"):
+        assert name in MESSAGE_SELECT.split(",")
+        assert name in FALLBACK_SELECT.split(",")
+
+
+def test_foreign_or_malformed_stable_refs_not_found_before_any_request() -> None:
+    clock = FakeClock()
+    server = Server()
+    box = mailbox(server, clock=clock)
+    for target, cause in (
+        (StableRef("uzh", MID9), "ForeignRef"),
+        (StableRef("outlook", "it's@example.test"), "MalformedRef"),
+        (StableRef("outlook", ""), "MalformedRef"),
+    ):
+        with pytest.raises(ProviderError) as info:
+            box.get_message(target, CallDeadline.start(clock))
+        assert (info.value.code, info.value.cause) == ("not_found", cause)
+    assert server.requests == []
+
+
+def test_get_message_logs_carry_no_message_id_or_filter() -> None:
+    configure_logging("DEBUG")
+    capture = Capture()
+    logging.getLogger().addHandler(capture)
+    try:
+        clock = FakeClock()
+        hits = [copy_of(1, LATER, INBOX_ID, id="AAMk/../BAD"), copy_of(2, LATER, INBOX_ID, receivedDateTime="x")]
+        server = message_server(lookup=values(*hits))
+        with pytest.raises(ProviderError):
+            by_ref(mailbox(server, clock=clock, maps=primed(clock)), MID9, clock)
+    finally:
+        logging.getLogger().removeHandler(capture)
+    events = [json.loads(line) for line in capture.lines]
+    assert [e["event"] for e in events].count("item_degraded") == 2
+    for event in events:
+        assert set(event) <= allowed_fields(event["event"])
+    joined = "\n".join(capture.lines + [m for _, _, m in capture.raw])
+    for secret in (MID9, "internetMessageId", "example.test", "BAD", *FOLDER_IDS.values(), "AT-SENTINEL"):
         assert secret not in joined
 
 

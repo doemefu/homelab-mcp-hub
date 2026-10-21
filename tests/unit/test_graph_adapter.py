@@ -9,7 +9,15 @@ import pytest
 from mcp_hub.ids import GraphMessageRef, MessageRef
 from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.graph import EXTENDED_EXPAND, SUMMARY_SELECT, Backoff, GraphMailbox, retry_after_seconds
+from mcp_hub.providers.graph import (
+    EXTENDED_EXPAND,
+    FALLBACK_SELECT,
+    MESSAGE_SELECT,
+    SUMMARY_SELECT,
+    Backoff,
+    GraphMailbox,
+    retry_after_seconds,
+)
 from tests.support.dav_transport import RecordingTransport
 from tests.support.graph_fixtures import FOLDER_IDS, INBOX_ID, FakeTokens, message
 from tests.support.ms_transport import ChunkStream, streamed
@@ -408,20 +416,27 @@ def test_get_message_query_shape() -> None:
     get({FOLDER: js({"id": INBOX_ID}), ("GET", f"{BASE}/me/messages/{MID}"): answer})
     assert dict(seen[0].url.params) == {
         "$select": "id,receivedDateTime,isRead,hasAttachments,from,toRecipients,ccRecipients,subject,"
-        "body,parentFolderId"
+        "body,parentFolderId,isDraft,internetMessageId,conversationId,flag",
+        "$expand": EXTENDED_EXPAND,
     }
+    assert seen[0].url.params["$select"] == MESSAGE_SELECT
+    assert FALLBACK_SELECT == (
+        "id,receivedDateTime,isRead,hasAttachments,from,toRecipients,ccRecipients,subject,"
+        "bodyPreview,parentFolderId,isDraft,internetMessageId,conversationId,flag"
+    )
     assert seen[0].headers["prefer"] == 'IdType="ImmutableId", outlook.body-content-type="text"'
 
 
-def test_message_outside_inbox_is_not_found_after_one_refetch() -> None:
-    t = RecordingTransport(message_routes(full(parentFolderId="AQMkSENTITEMS")))
+def test_message_in_an_excluded_folder_is_not_found_without_a_second_read() -> None:
+    # The folder ids are read in this call, so there is nothing to re-read before the refusal (D75).
+    t = RecordingTransport(folder_routes() | message_routes(full(parentFolderId=FOLDER_IDS["junkemail"])))
     with pytest.raises(ProviderError) as info:
         box(t).get_message(GraphMessageRef("outlook", MID), call_deadline())
-    assert (info.value.code, info.value.cause) == ("not_found", "NotInInbox")
-    assert [p for *_, p, _ in t.seen].count("/v1.0/me/mailFolders/inbox") == 2
+    assert (info.value.code, info.value.cause) == ("not_found", "ExcludedFolder")
+    assert [p for *_, p, _ in t.seen].count("/v1.0/me/mailFolders/junkemail") == 1
 
 
-@pytest.mark.parametrize("parent", [None, 5, ""])
+@pytest.mark.parametrize("parent", [None, 5, "", "a/../b", "x" * 513])
 def test_message_without_a_parent_folder_is_not_found(parent: object) -> None:
     with pytest.raises(ProviderError) as info:
         get(message_routes(full(parentFolderId=parent)))
@@ -443,6 +458,7 @@ def test_message_over_cap_falls_back_to_preview() -> None:
     def answer(request: httpx2.Request) -> httpx2.Response:
         select = request.url.params["$select"]
         calls.append(select)
+        assert request.url.params["$expand"] == EXTENDED_EXPAND
         if "body," in select + ",":
             return httpx2.Response(200, content=b'{"body": {"content": "' + b"x" * 2_200_000 + b'"}}')
         return js(full(bodyPreview="short preview") | {"body": None})(request)
@@ -450,7 +466,8 @@ def test_message_over_cap_falls_back_to_preview() -> None:
     detail = get({FOLDER: js({"id": INBOX_ID}), ("GET", f"{BASE}/me/messages/{MID}"): answer})
     assert detail.body_text == "short preview"
     assert detail.body_cut
-    assert len(calls) == 2
+    assert calls == [MESSAGE_SELECT, FALLBACK_SELECT]
+    assert detail.meta.message_id == "m1@example.test"
 
 
 def test_attachments_listed_without_inline_and_degrade_alone() -> None:
