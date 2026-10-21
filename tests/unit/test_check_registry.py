@@ -238,3 +238,16 @@ def test_invalid_own_addresses_file_does_not_fail(secrets: Path, content: str | 
     assert code == 0
     assert "account icloud own_addresses=invalid" in out.splitlines()
     assert "@" not in out + err
+
+
+def test_invalid_own_addresses_file_with_address_text_leaks_nothing(
+    secrets: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with_own_addresses(secrets, "a@b@example.org\nsecretlocal@example.org\n")
+    code, out, err = run(secrets, [])
+    captured = capsys.readouterr()  # the real handler writes the WARN-free log lines to stdout
+    assert code == 0
+    assert "account icloud own_addresses=invalid" in out.splitlines()
+    for text in (out, err, captured.out, captured.err):
+        assert "@" not in text
+        assert "secretlocal" not in text.lower()

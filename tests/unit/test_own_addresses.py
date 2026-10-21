@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_hub.logging import JsonFormatter
 from mcp_hub.own_addresses import (
     MAX_FILE_BYTES,
     OWN_ADDRESSES,
@@ -159,3 +160,35 @@ def test_count_and_invalid(tmp_path: Path) -> None:
 
 def test_module_reader_exists() -> None:
     assert isinstance(OWN_ADDRESSES, OwnAddressReader)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "a@b@example.org\nsecretlocal@example.org\n",
+        "secretlocal@example.org\nSecretLocal@Example.org\n",
+        "".join(f"secretlocal{i}@example.org\n" for i in range(21)),
+        "secretlocal@" + ".".join(["b" * 60] * 5) + ".org\n",
+    ],
+)
+def test_invalid_file_with_address_text_leaks_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, content: str
+) -> None:
+    (tmp_path / "own").write_text(content)
+    caplog.set_level(logging.INFO)
+    assert OwnAddressReader().read("icloud", tmp_path, "own") == frozenset()
+    records = logged(caplog)
+    assert len(records) == 1
+    formatter = JsonFormatter()  # the real handler's formatter: shows the extra fields caplog.text omits
+    line = formatter.format(records[0])
+    assert json.loads(line) == {
+        "ts": json.loads(line)["ts"],
+        "level": "WARNING",
+        "logger": "mcp_hub.own_addresses",
+        "event": "registry_value_invalid",
+        "account": "icloud",
+        "key": "own",
+    }
+    for text in (line, caplog.text, json.dumps(records[0].fields)):  # type: ignore[attr-defined]
+        assert "@" not in text
+        assert "secretlocal" not in text.lower()
