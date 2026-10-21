@@ -20,6 +20,7 @@ from mcp_hub.ids import (
     location_id,
     location_k,
     mailbox_name_ok,
+    mailbox_name_shape_ok,
 )
 
 
@@ -180,6 +181,9 @@ def test_m_id_mailbox_name_rule() -> None:
         ("&AMR-", False),  # non-canonical trailing bits
         ("&AEoAdQBuAGs-", False),  # "Junk" shifted: printable ASCII only (exclusion bypass)
         ("&AMQ-&AMQ-", False),  # adjacent shifts
+        ("&AOQAYQ-", False),  # a printable character inside a shift
+        ("&AOQAJg-", False),
+        ("&AOQAIA-", False),
         ("&AMQ-x&AMQ-", True),
         ("a&AMQ-", True),
         ("a b", True),
@@ -189,6 +193,14 @@ def test_m_id_mailbox_name_rule() -> None:
 )
 def test_mailbox_name_modified_utf7(name: str, ok: bool) -> None:
     assert mailbox_name_ok(name) is ok
+    assert mailbox_name_shape_ok(name) is ok
+
+
+def test_mailbox_name_shape_has_no_length_rule() -> None:
+    assert mailbox_name_shape_ok("a" * 201) is True
+    assert mailbox_name_ok("a" * 201) is False
+    assert mailbox_name_shape_ok("a&AMQ-" * 100) is True
+    assert mailbox_name_ok("a&AMQ-" * 100) is False
 
 
 def test_location_k() -> None:

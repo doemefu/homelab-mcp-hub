@@ -77,9 +77,9 @@ class ThreadKey:
 def _utf7_ok(name: str) -> bool:
     """True when a printable-ASCII name is strict modified UTF-7 (RFC 3501 5.1.3).
 
-    Each shifted run is canonical base64 of UTF-16BE holding at least one non-printable-ASCII character, and two
-    shifted runs are never adjacent; otherwise a raw name such as "&AEoAdQBuAGs-" ("Junk") could dodge the
-    name-based exclusion of junk and drafts mailboxes.
+    Each shifted run is canonical base64 of UTF-16BE holding no printable-ASCII character (they represent
+    themselves), and two shifted runs are never adjacent: every name has exactly one encoding, so a raw name such
+    as "&AEoAdQBuAGs-" ("Junk") cannot dodge the name-based exclusion of junk and drafts mailboxes.
     """
     if _UTF7_NAME.fullmatch(name) is None:
         return False
@@ -97,18 +97,19 @@ def _utf7_ok(name: str) -> bool:
             text = raw.decode("utf-16-be")
         except ValueError:  # binascii.Error and UnicodeDecodeError are ValueErrors
             return False
-        if base64.b64encode(raw).decode("ascii").rstrip("=") != b64 or all(0x20 <= ord(c) <= 0x7E for c in text):
+        if base64.b64encode(raw).decode("ascii").rstrip("=") != b64 or any(0x20 <= ord(c) <= 0x7E for c in text):
             return False
     return True
 
 
+def mailbox_name_shape_ok(raw_name: str) -> bool:
+    """Printable ASCII (0x20-0x7E) that is strict modified UTF-7; no length rule (the folder map keeps longer names)."""
+    return all(0x20 <= ord(c) <= 0x7E for c in raw_name) and _utf7_ok(raw_name)
+
+
 def mailbox_name_ok(raw_name: str) -> bool:
     """1-200 printable ASCII characters (0x20-0x7E) that decode as modified UTF-7 (spec 080 §5.3 rule 9, D73)."""
-    return (
-        0 < len(raw_name) <= MAX_MAILBOX_NAME_CHARS
-        and all(0x20 <= ord(c) <= 0x7E for c in raw_name)
-        and _utf7_ok(raw_name)
-    )
+    return 0 < len(raw_name) <= MAX_MAILBOX_NAME_CHARS and mailbox_name_shape_ok(raw_name)
 
 
 def _text(parts: list[object]) -> str:

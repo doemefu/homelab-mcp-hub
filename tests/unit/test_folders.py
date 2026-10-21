@@ -435,15 +435,18 @@ def test_repeated_listing_merges_into_one_entry() -> None:
     assert projects.attributes == frozenset({"\\HasNoChildren", "\\Sent"})
 
 
-def test_digit_only_name_not_id_safe() -> None:
-    listing: Listing = [((), b"/", b"INBOX"), ((), b"/", 123)]
+def test_listing_name_types() -> None:
+    # folder_encode = False: names arrive as raw bytes; digit atoms as int (lossless); str is taken as raw
+    listing: Listing = [((), b"/", b"INBOX"), ((), b"/", 123), ((), b"/", "Gesch&AOQ-ftlich"), ((), b"/", b"Work")]
     folder_map = imap_map(listing)
+    assert roles(folder_map) == {"INBOX": "inbox", "123": "other", "Gesch&AOQ-ftlich": "other", "Work": "other"}
     entry = folder_map.lookup("123")
     assert entry is not None
-    assert entry.role == "other"
-    assert entry.from_int is True
-    assert entry.id_safe is False
-    assert folder_map.binding("123") == "refused"
+    assert entry.id_safe is True
+    assert folder_map.binding("123") == "allowed"
+    named = folder_map.lookup("Gesch&AOQ-ftlich")
+    assert named is not None
+    assert named.display_name == "Geschäftlich"
 
 
 def test_other_cap_500_roles_from_full_list() -> None:
@@ -463,6 +466,22 @@ def test_other_cap_500_roles_from_full_list() -> None:
     assert imap_map(listing[:501]).capped is False
 
 
+def test_excluded_cap_500() -> None:
+    listing: Listing = [((), b"/", b"INBOX")]
+    listing += [((b"\\Junk",), b"/", f"Spam {i:03d}".encode()) for i in range(600)]
+    listing += [((b"\\Sent",), b"/", b"Sent Messages"), ((), b"/", b"Work")]
+    folder_map = imap_map(listing)
+    assert folder_map.capped is True
+    excluded = [e.raw_name for e in folder_map.entries if e.role == "excluded"]
+    assert excluded == [f"Spam {i:03d}" for i in range(500)]
+    assert len(folder_map.entries) == 503  # inbox, 500 excluded, sent, one other
+    assert folder_map.binding("Spam 499") == "refused"
+    assert folder_map.binding("Spam 500") == "unknown"  # dropped: rate-limited rebuild, then not_found
+    assert folder_map.binding("Sent Messages") == "allowed"
+    assert folder_map.binding("Work") == "allowed"
+    assert imap_map(listing[:501]).capped is False
+
+
 @pytest.mark.parametrize(
     ("raw", "role"),
     [
@@ -475,6 +494,9 @@ def test_other_cap_500_roles_from_full_list() -> None:
         (b"a&", "excluded"),
         (b"&AEoAdQBuAGs-", "excluded"),  # "Junk" in a non-canonical shift (ASCII-only run)
         (b"&AOQ-&AOQ-", "excluded"),  # adjacent shifts
+        (b"&AOQAYQ-", "excluded"),  # a printable character inside a shift
+        (b"&AOQAJg-", "excluded"),
+        (b"&AOQAIA-", "excluded"),
         (b"&2D0-", "excluded"),  # lone surrogate
         (b"", "excluded"),
         ("café", "excluded"),
@@ -517,15 +539,47 @@ def test_decoded_last_component_excluded() -> None:
     assert entry.role == "excluded"
 
 
-def test_inbox_entry_encodes_to_str() -> None:
-    entry = inbox_entry("Eingänge")
+def test_inbox_entry_takes_the_raw_registry_name() -> None:
+    entry = inbox_entry("Eing&AOQ-nge")
     assert entry.raw_name == "Eing&AOQ-nge"
-    assert type(entry.raw_name) is str
     assert (entry.display_name, entry.role, entry.id_safe) == ("Eingänge", "inbox", True)
-    folder_map = imap_map([((), b"/", b"Eing&AOQ-nge"), ((), b"/", b"INBOX")], inbox="Eingänge")
+    amp = inbox_entry("R&-D")
+    assert (amp.raw_name, amp.display_name) == ("R&-D", "R&D")
+    for bad in ("Eingänge", "&AOQAYQ-", "", "a" * 201):
+        with pytest.raises(ValueError, match="not a valid raw mailbox name"):
+            inbox_entry(bad)
+    folder_map = imap_map([((), b"/", b"Eing&AOQ-nge"), ((), b"/", b"INBOX")], inbox="Eing&AOQ-nge")
     assert roles(folder_map) == {"Eing&AOQ-nge": "inbox", "INBOX": "other"}
     assert folder_map.inbox.raw_name == "Eing&AOQ-nge"
     assert plan_view(folder_map.list_plan("inbox")) == [("Eing&AOQ-nge", None, "inbox")]
+
+
+def test_registry_inbox_listed_as_junk_stays_allowed() -> None:
+    folder_map = imap_map([((b"\\Junk",), b"/", b"INBOX"), ((), b"/", b"Work")])
+    entry = folder_map.lookup("INBOX")
+    assert entry is not None
+    assert entry.role == "inbox"  # lookup answers the registry inbox
+    assert roles(folder_map)["INBOX"] == "excluded"
+    assert folder_map.binding("INBOX") == "allowed"  # the registry inbox passes without LIST (§5.5)
+    assert plan_view(folder_map.list_plan("inbox")) == [("INBOX", None, "inbox")]
+
+
+def test_gmail_excluded_all_still_suppresses_sent() -> None:
+    listing: Listing = [
+        ((), b"/", b"INBOX"),
+        ((b"\\All", b"\\Noselect"), b"/", b"[Gmail]/All Mail"),
+        ((b"\\Sent",), b"/", b"[Gmail]/Sent Mail"),
+        ((b"\\Trash",), b"/", b"[Gmail]/Trash"),
+    ]
+    folder_map = imap_map(listing, gmail=True, account="gmail")
+    assert roles(folder_map) == {
+        "INBOX": "inbox",
+        "[Gmail]/All Mail": "excluded",
+        "[Gmail]/Sent Mail": "excluded",
+        "[Gmail]/Trash": "trash",
+    }
+    assert folder_map.binding("[Gmail]/Sent Mail") == "refused"
+    assert folder_map.list_plan("sent") == []
 
 
 def test_inbox_matches_case_insensitively() -> None:
@@ -605,7 +659,7 @@ def test_folder_map_refreshed_log_line(folder_log: Capture) -> None:
     assert [line["level"] for line in lines] == ["INFO"] * 3
     fields = [{k: v for k, v in line.items() if k not in ("ts", "level", "logger", "event")} for line in lines]
     assert fields == [
-        {"account": "icloud", "capability": "mail", "result_count": 8, "outcome": "ok"},
+        {"account": "icloud", "capability": "mail", "result_count": 6, "outcome": "ok"},
         {"account": "gmail", "capability": "mail", "result_count": 501, "outcome": "partial"},
         {"account": "outlook", "capability": "mail", "result_count": 2, "outcome": "ok"},
     ]

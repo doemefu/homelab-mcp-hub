@@ -3,7 +3,8 @@
 IMAP: one `LIST "" "*"` per build; roles come from the full response (special-use attributes, else the iCloud name
 fallback; on Gmail, detected by `X-GM-EXT-1`, only the registry inbox, `\\All`, `\\Trash` and, without `\\All`,
 `\\Sent`). Junk and drafts are excluded by attribute and by the last hierarchy component (fail closed), and so is
-every name that is not canonical modified UTF-7 in printable ASCII. Graph: the ids of the well-known folders.
+every name that fails `ids.mailbox_name_shape_ok` (strict modified UTF-7 in printable ASCII). Graph: the ids of the
+well-known folders.
 
 The map holds names, attributes and ids only, never message data; it lives in process memory, is never logged
 (folder names and Graph folder ids are third-party data) and is lost on restart.
@@ -13,12 +14,12 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, Literal
 
 from imapclient import imap_utf7
 
-from mcp_hub.ids import mailbox_name_ok
+from mcp_hub.ids import mailbox_name_ok, mailbox_name_shape_ok
 from mcp_hub.logging import log_event
 
 MailFolder = Literal["inbox", "sent", "archive", "trash", "other"]
@@ -28,6 +29,7 @@ FolderRole = Literal["inbox", "sent", "archive", "trash", "all", "other", "exclu
 FOLDER_MAP_TTL_SECONDS: Final = 3600.0
 FORCED_REBUILD_INTERVAL_SECONDS: Final = 60.0  # Sec16: LIST amplification by forged ids
 MAX_OTHER_MAILBOXES: Final = 500
+MAX_EXCLUDED_MAILBOXES: Final = 500  # a dropped excluded name answers "unknown": rebuild, then not_found
 MAX_LOCATE_FOLDERS: Final = 30  # confirmed or lowered by the T1 probe (F2)
 NAME_FALLBACK: Final = {"sent": "Sent Messages", "archive": "Archive", "trash": "Deleted Messages"}
 EXCLUDED_LAST_NAMES: Final = frozenset({"junk", "spam", "drafts"})  # last hierarchy component, casefold (S-b)
@@ -47,7 +49,7 @@ _GMAIL_ROLE_ATTRIBUTE: Final[tuple[tuple[Literal["all", "trash", "sent"], str], 
     ("trash", "\\trash"),
     ("sent", "\\sent"),
 )
-# Roles an id may name. The role rules already leave Gmail only inbox, `all`, trash and (without `\All`) sent (B3).
+# Roles an id may name. The role rules leave Gmail only inbox, `all`, trash and (with no `\All` listed) sent (B3).
 _BOUND_ROLES: Final = frozenset({"inbox", "sent", "archive", "trash", "all", "other"})
 
 
@@ -57,11 +59,10 @@ class FolderEntry:
     display_name: str  # decoded; third-party text for every folder but the registry inbox
     attributes: frozenset[str]
     role: FolderRole
-    from_int: bool = False  # IMAPClient parsed the name as an int: the exact wire text is lost (Sec7)
 
     @property
     def id_safe(self) -> bool:
-        return mailbox_name_ok(self.raw_name) and not self.from_int
+        return mailbox_name_ok(self.raw_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,16 +77,17 @@ class FolderMap:
     account: str
     gmail: bool
     inbox: FolderEntry  # the registry inbox, always present
-    entries: tuple[FolderEntry, ...]  # LIST order, one per raw name: every excluded one, the roles, ≤ 500 `other`
-    capped: bool
+    entries: tuple[FolderEntry, ...]  # LIST order, one per raw name: the roles, ≤ 500 excluded, ≤ 500 `other`
+    capped: bool  # a cap dropped mailboxes
+    _index: dict[str, FolderEntry] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_index", {entry.raw_name: entry for entry in self.entries})
 
     def lookup(self, raw_name: str) -> FolderEntry | None:
         if raw_name == self.inbox.raw_name:
             return self.inbox
-        for entry in self.entries:
-            if entry.raw_name == raw_name:
-                return entry
-        return None
+        return self._index.get(raw_name)
 
     def role(self, role: FolderRole) -> FolderEntry | None:
         if role == "inbox":
@@ -99,12 +101,10 @@ class FolderMap:
         """D75: may an IMAP id name this mailbox? Refused when ANY listing of the name is excluded (Sec7)."""
         if raw_name == self.inbox.raw_name:
             return "allowed"  # the registry inbox passes without LIST (§5.5)
-        matches = [entry for entry in self.entries if entry.raw_name == raw_name]
-        if not matches:
+        entry = self._index.get(raw_name)  # one entry per raw name: listings were merged at build time
+        if entry is None:
             return "unknown"
-        if all(entry.role in _BOUND_ROLES and entry.id_safe for entry in matches):
-            return "allowed"
-        return "refused"
+        return "allowed" if entry.role in _BOUND_ROLES and entry.id_safe else "refused"
 
     def list_plan(self, folder: ListFolder) -> list[FolderPlan]:
         """The mailboxes a list over `folder` examines, in order (§5.2: `all` = inbox, archive, sent; never trash)."""
@@ -150,8 +150,11 @@ class FolderMap:
 
 
 def inbox_entry(registry_inbox: str) -> FolderEntry:
-    raw = imap_utf7.encode(registry_inbox).decode("ascii")
-    return FolderEntry(raw_name=raw, display_name=registry_inbox, attributes=frozenset(), role="inbox")
+    """The registry `inbox` is already a raw modified-UTF-7 name (validated by the registry)."""
+    if not mailbox_name_ok(registry_inbox):
+        raise ValueError("not a valid raw mailbox name")
+    display: str = imap_utf7.decode(registry_inbox.encode("ascii"))
+    return FolderEntry(raw_name=registry_inbox, display_name=display, attributes=frozenset(), role="inbox")
 
 
 def is_gmail(capabilities: Iterable[bytes]) -> bool:
@@ -163,25 +166,28 @@ class _Listed:
     raw_name: str
     display_name: str
     attributes: frozenset[str]
-    from_int: bool
     role: FolderRole | None = None  # None until classified
 
 
-def _decode_name(name: bytes | str | int) -> tuple[str, str | None, bool]:
-    """(raw name, decoded name or None when not canonical modified UTF-7 in printable ASCII, from_int)."""
+def _decode_name(name: bytes | str | int) -> tuple[str, str | None]:
+    """(raw name, decoded name or None when the name is excluded by the name rule).
+
+    With `folder_encode = False` IMAPClient hands over raw bytes, and digit atoms as int (lossless).
+    """
     if isinstance(name, int):
         raw = str(name)
-        return raw, raw, True
-    raw = name.decode("latin-1") if isinstance(name, bytes) else name
-    if not raw or not all(0x20 <= ord(c) <= 0x7E for c in raw):
-        return raw, None, False
-    # IMAPClient's decoder is lenient ("&Jjo", "a&"); only a canonical round trip counts as modified UTF-7 (I7).
-    try:
-        decoded: str = imap_utf7.decode(raw.encode("ascii"))
-        canonical = imap_utf7.encode(decoded) == raw.encode("ascii")
-    except ValueError:  # binascii.Error and the Unicode errors (a lone surrogate) are ValueErrors
-        return raw, None, False
-    return (raw, decoded, False) if canonical else (raw, None, False)
+    elif isinstance(name, bytes):
+        try:
+            raw = name.decode("ascii")
+        except UnicodeDecodeError:
+            return name.decode("latin-1"), None
+    else:
+        raw = name
+    # IMAPClient's decoder is lenient ("&Jjo", "a&"); the strict shape check decides (I7).
+    if not raw or not mailbox_name_shape_ok(raw):
+        return raw, None
+    decoded: str = imap_utf7.decode(raw.encode("ascii"))
+    return raw, decoded
 
 
 def _last_component_excluded(name: str, delimiter: str | None) -> bool:
@@ -215,8 +221,8 @@ def _assign_roles(items: list[_Listed], *, gmail: bool) -> None:
     open_items = [item for item in items if item.role is None]
     if gmail:
         for gmail_role, attribute in _GMAIL_ROLE_ATTRIBUTE:
-            if gmail_role == "sent" and any(item.role == "all" for item in items):
-                continue
+            if gmail_role == "sent" and any("\\all" in _lower(item) for item in items):
+                continue  # any \All counts, even an excluded one (as for the non-Gmail fallback)
             holders = [item for item in open_items if item.role is None and attribute in _lower(item)]
             if holders:
                 _pick(holders, None).role = gmail_role
@@ -249,20 +255,18 @@ def build_imap_folder_map(
     by_name: dict[str, _Listed] = {}
     tainted: set[str] = set()
     for attributes, delimiter_bytes, name in listing:
-        raw, decoded, from_int = _decode_name(name)
+        raw, decoded = _decode_name(name)
         delimiter = delimiter_bytes.decode("latin-1") if delimiter_bytes else None
         item = _Listed(
             raw_name=raw,
             display_name=decoded if decoded is not None else raw,
             attributes=frozenset(attribute.decode("latin-1") for attribute in attributes),
-            from_int=from_int,
         )
         if _base_excluded(item, decoded, delimiter, gmail=gmail):
             tainted.add(raw)
         first = by_name.setdefault(raw, item)
         if first is not item:
             first.attributes |= item.attributes
-            first.from_int = first.from_int or item.from_int
     items = list(by_name.values())
     for item in items:
         if item.raw_name in tainted:
@@ -271,15 +275,18 @@ def build_imap_folder_map(
             item.role = "inbox"
     _assign_roles(items, gmail=gmail)
     entries: list[FolderEntry] = []
-    others = 0
+    counts = {"other": 0, "excluded": 0}
+    caps = {"other": MAX_OTHER_MAILBOXES, "excluded": MAX_EXCLUDED_MAILBOXES}
+    capped = False
     for item in items:
         role: FolderRole = item.role if item.role is not None else "other"
-        if role == "other":
-            others += 1
-            if others > MAX_OTHER_MAILBOXES:
+        if role in counts:
+            counts[role] += 1
+            if counts[role] > caps[role]:
+                capped = True
                 continue
-        entries.append(FolderEntry(item.raw_name, item.display_name, item.attributes, role, item.from_int))
-    return FolderMap(account, gmail, inbox, tuple(entries), capped=others > MAX_OTHER_MAILBOXES)
+        entries.append(FolderEntry(item.raw_name, item.display_name, item.attributes, role))
+    return FolderMap(account, gmail, inbox, tuple(entries), capped=capped)
 
 
 GraphWellKnown = Literal["inbox", "sentitems", "archive", "deleteditems", "drafts", "junkemail", "outbox"]
@@ -342,8 +349,8 @@ class FolderMapCache:
     def put(self, value: FolderMap | GraphFolderIds) -> None:
         with self._lock:
             self._values[value.account] = (self._clock(), value)
-        if isinstance(value, FolderMap):
-            count = len(value.entries)
+        if isinstance(value, FolderMap):  # usable mailboxes: the inbox plus every other non-excluded entry
+            count = 1 + sum(1 for entry in value.entries if entry.role not in ("inbox", "excluded"))
             outcome = "partial" if value.capped else "ok"
         else:
             count = sum(1 for folder_id in value.ids.values() if folder_id is not None)
