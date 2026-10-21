@@ -12,6 +12,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import MessageRef, decode_message_id, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import AttachmentMeta, MailDetail, MailSummary, ProviderError, UnreadPage
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE
@@ -47,15 +48,15 @@ class FakeMailbox:
     ) -> None:
         self.account, self.pages, self.detail = account, pages, detail
 
-    def check(self) -> None: ...
+    def check(self, deadline: CallDeadline) -> None: ...
 
-    def list_unread(self, since: datetime, limit: int) -> UnreadPage:
+    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
         page = self.pages[self.account.id]
         if isinstance(page, Exception):
             raise page
         return page
 
-    def get_message(self, ref: MessageRef) -> MailDetail:
+    def get_message(self, ref: MessageRef, deadline: CallDeadline) -> MailDetail:
         if isinstance(self.detail, Exception):
             raise self.detail
         assert self.detail is not None
@@ -127,10 +128,10 @@ async def test_slow_account_times_out_as_upstream_timeout(secrets_dir: Path, mon
     }
 
     class Slow(FakeMailbox):
-        def list_unread(self, since: datetime, limit: int) -> UnreadPage:
+        def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
             if self.account.id == "icloud":
                 release.wait(5)
-            return super().list_unread(since, limit)
+            return super().list_unread(since, limit, deadline)
 
     base = context(secrets_dir, pages)
     ctx = HubContext(base.settings, base.registry, base.status, Adapters(mailbox=lambda a, d: Slow(a, pages, None)))

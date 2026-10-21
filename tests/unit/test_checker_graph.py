@@ -7,6 +7,7 @@ from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import ProviderError
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 
@@ -25,7 +26,7 @@ async def test_graph_account_is_checked_once_token_store_files_exist(secrets_dir
         def __init__(self, account: Account) -> None:
             self.account = account
 
-        def check(self) -> None:
+        def check(self, deadline: CallDeadline | None = None) -> None:
             checked.append(self.account.id)
             if self.account.id == "outlook":
                 raise ProviderError("auth_expired", "NoToken")

@@ -16,6 +16,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import MAX_TEXT_PART_BYTES, ProviderError
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.mail import run_get_message, run_list_unread
@@ -61,7 +62,7 @@ def test_list_unread_returns_seeded_messages_newest_first() -> None:
     attached.add_attachment(b"%PDF-1.4 test", maintype="application", subtype="pdf", filename="report.pdf")
     for msg in (plain, html, attached):
         greenmail.send("hub-list", msg)
-    items = greenmail.ours(greenmail.mailbox("hub-list").list_unread(since, 20).items)
+    items = greenmail.ours(greenmail.mailbox("hub-list").list_unread(since, 20, CallDeadline.start()).items)
     assert [m.subject for m in items] == [S("Third attached"), S("Second html"), S("First plain")]
     assert [m.has_attachments for m in items] == [True, False, False]
     assert items[2].snippet_text.strip() == "Plain body line"
@@ -75,10 +76,12 @@ def test_since_filter_and_limit() -> None:
     since = seeded_since()
     for n in range(3):
         greenmail.send("hub-list", text_mail(S(f"Recent {n}"), "x"))
-    page = greenmail.mailbox("hub-list").list_unread(since, 2)
+    page = greenmail.mailbox("hub-list").list_unread(since, 2, CallDeadline.start())
     assert len(page.items) == 2
     assert page.more is True
-    recent = greenmail.ours(greenmail.mailbox("hub-list").list_unread(now - timedelta(days=1), 50).items)
+    recent = greenmail.ours(
+        greenmail.mailbox("hub-list").list_unread(now - timedelta(days=1), 50, CallDeadline.start()).items
+    )
     assert S("Old one") not in [m.subject for m in recent]
     assert S("Recent 0") in [m.subject for m in recent]
 
@@ -87,12 +90,12 @@ def test_reading_never_sets_seen() -> None:
     since = seeded_since()
     greenmail.send("hub-get", text_mail(S("Keep unread"), "body"))
     box = greenmail.mailbox("hub-get")
-    [item] = [m for m in box.list_unread(since, 20).items if m.subject == S("Keep unread")]
-    detail = box.get_message(item.ref)
+    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Keep unread")]
+    detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.unread is True
     assert detail.body_text.strip() == "body"
     assert b"\\Seen" not in greenmail.flags("hub-get")[item.ref.uid]
-    assert [m.subject for m in box.list_unread(since, 20).items].count(S("Keep unread")) == 1
+    assert [m.subject for m in box.list_unread(since, 20, CallDeadline.start()).items].count(S("Keep unread")) == 1
 
 
 def test_get_message_html_and_attachment_metadata() -> None:
@@ -106,8 +109,8 @@ def test_get_message_html_and_attachment_metadata() -> None:
     msg.add_attachment(b"x" * 5000, maintype="image", subtype="png", filename="pic.png")
     greenmail.send("hub-get", msg)
     box = greenmail.mailbox("hub-get")
-    [item] = [m for m in box.list_unread(since, 20).items if m.subject == S("Html only")]
-    detail = box.get_message(item.ref)
+    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Html only")]
+    detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.body_source == "text/html-converted"
     assert "Hello" in detail.body_text
     assert "HIDDEN" not in detail.body_text
@@ -129,8 +132,8 @@ def test_oversized_text_part_is_fetched_partially(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(imapclient.IMAPClient, "fetch", spy)
     box = greenmail.mailbox("hub-big")
-    [item] = [m for m in box.list_unread(since, 20).items if m.subject == S("Huge")]
-    detail = box.get_message(item.ref)
+    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Huge")]
+    detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.body_cut is True
     assert len(detail.body_text.encode()) <= MAX_TEXT_PART_BYTES
     assert f"BODY.PEEK[1]<0.{MAX_TEXT_PART_BYTES}>" in requested
@@ -156,7 +159,7 @@ async def test_oversized_message_through_the_tool(secrets_dir: Path) -> None:
 
 def test_wrong_password_is_auth_expired() -> None:
     with pytest.raises(ProviderError) as caught:
-        greenmail.mailbox("hub-get", password="not-the-password").check()
+        greenmail.mailbox("hub-get", password="not-the-password").check(CallDeadline.start())
     assert caught.value.code == "auth_expired"
 
 
@@ -165,7 +168,7 @@ def test_closed_port_is_unreachable() -> None:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     with pytest.raises(ProviderError) as caught:
-        greenmail.mailbox("hub-get", port=port).check()
+        greenmail.mailbox("hub-get", port=port).check(CallDeadline.start())
     assert caught.value.code == "unreachable"
 
 

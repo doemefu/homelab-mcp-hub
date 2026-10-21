@@ -17,6 +17,7 @@ from mcp_hub.health import StatusStore, capability_status
 from mcp_hub.ids import GraphMessageRef, encode_message_id
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from mcp_hub.providers.graph_auth import AccessTokenCache, GraphTokenSource
 from mcp_hub.providers.msidentity import GraphAccount
@@ -50,7 +51,7 @@ def js(
 class _NoProbe:
     """icloud stays offline in these tests."""
 
-    def check(self) -> None: ...
+    def check(self, deadline: CallDeadline) -> None: ...
 
 
 def hub(secrets_dir: Path, store: FakeStore, ms: MsTransport, graph: RecordingTransport) -> HubContext:

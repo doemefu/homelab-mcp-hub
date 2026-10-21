@@ -9,6 +9,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import AnyMessageRef, GraphMessageRef, MessageRef, encode_message_id
 from mcp_hub.providers import SUPPORTED_PROTOCOLS, Adapters
 from mcp_hub.providers.base import MailDetail, MailSummary, ProviderError, UnreadPage
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.mail import run_get_message, run_list_unread
@@ -47,15 +48,15 @@ class Box:
         self.account, self.pages, self.detail = account, pages, detail
         self.asked: list[AnyMessageRef] = []
 
-    def check(self) -> None: ...
+    def check(self, deadline: CallDeadline) -> None: ...
 
-    def list_unread(self, since: datetime, limit: int) -> UnreadPage:
+    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
         page = self.pages[self.account.id]
         if isinstance(page, Exception):
             raise page
         return page
 
-    def get_message(self, ref: AnyMessageRef) -> MailDetail:
+    def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail:
         self.asked.append(ref)
         assert self.detail is not None
         return self.detail

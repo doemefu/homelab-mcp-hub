@@ -22,6 +22,7 @@ from mcp_hub.providers.base import (
     placeholder_summary,
     run_blocking,
 )
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, GraphBlock, ImapMail
 from mcp_hub.sanitize import FIELD_LIMITS, clean, clean_flagged, validate_content_type
 from mcp_hub.tools import HubContext
@@ -165,7 +166,10 @@ async def run_list_unread(
 
     async def call(target: Account) -> UnreadPage:
         opened = partial(ctx.adapters.mailbox, target, ctx.settings.secrets_dir)
-        return await run_blocking(lambda: opened().list_unread(start, count), slot=ctx.adapters.limiters.get(target.id))
+        deadline = CallDeadline.start()  # R2a: started here, so a slot wait counts against the limits
+        return await run_blocking(
+            lambda: opened().list_unread(start, count, deadline), slot=ctx.adapters.limiters.get(target.id)
+        )
 
     gathered = await gather_accounts(accounts, "mail", call, ctx.status)
     merged = sorted((m for _, page in gathered.results for m in page.items), key=lambda m: m.received_at, reverse=True)
@@ -202,7 +206,10 @@ async def run_get_message(ctx: HubContext, *, message_id: str, max_chars: int | 
 
     async def call(account: Account) -> MailDetail:
         opened = partial(ctx.adapters.mailbox, account, ctx.settings.secrets_dir)
-        return await run_blocking(lambda: opened().get_message(ref), slot=ctx.adapters.limiters.get(account.id))
+        deadline = CallDeadline.start()  # R2a
+        return await run_blocking(
+            lambda: opened().get_message(ref, deadline), slot=ctx.adapters.limiters.get(account.id)
+        )
 
     gathered = await gather_accounts([target], "mail", call, ctx.status)
     if gathered.errors:  # single-account call: provider failures are tool errors (spec 080 rev. 4.4 §5.1)

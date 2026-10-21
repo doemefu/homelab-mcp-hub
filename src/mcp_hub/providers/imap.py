@@ -34,7 +34,7 @@ from mcp_hub.providers.base import (
     log_message_skipped,
     placeholder_summary,
 )
-from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
@@ -70,6 +70,8 @@ def _provider_error(exc: Exception) -> ProviderError:
     if isinstance(exc, ProviderError):
         return exc
     cause = type(exc).__name__
+    if isinstance(exc, SoftStop):  # a path without a partial result (R2b)
+        return ProviderError("upstream_timeout", cause)
     if isinstance(exc, LoginError):
         # The server's response code decides; the text itself is never logged or returned.
         text = str(exc).upper()
@@ -175,8 +177,10 @@ class ImapMailbox:
         self._timeout = timeout
         self._factory = client_factory
         self._own_addresses, self._folder_maps = own_addresses, folder_maps
+        self._deadline: CallDeadline | None = None
 
-    def _run[T](self, work: Callable[[ImapClientLike], T]) -> T:
+    def _run[T](self, work: Callable[[ImapClientLike], T], deadline: CallDeadline) -> T:
+        self._deadline = deadline  # the guard (T12) applies it before every command
         client: ImapClientLike | None = None
         try:
             client = self._factory(self._host, self._port, self._context, self._timeout)
@@ -190,20 +194,20 @@ class ImapMailbox:
                 with contextlib.suppress(Exception):
                     client.logout()
 
-    def check(self) -> None:
+    def check(self, deadline: CallDeadline) -> None:
         """Status check (spec 080 §7.4): login + NOOP."""
-        self._run(lambda client: client.noop())
+        self._run(lambda client: client.noop(), deadline)
 
-    def list_unread(self, since: datetime, limit: int) -> UnreadPage:
-        return self._run(lambda client: self._list_unread(client, since, limit))
+    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
+        return self._run(lambda client: self._list_unread(client, since, limit), deadline)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         raise ProviderError("upstream_error", "NotImplemented")  # replaced by the list_messages lane
 
-    def get_message(self, ref: AnyMessageRef) -> MailDetail:
+    def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail:
         if not isinstance(ref, MessageRef):
             raise ProviderError("not_found", "ForeignRef")
-        return self._run(lambda client: self._get_message(client, ref))
+        return self._run(lambda client: self._get_message(client, ref), deadline)
 
     def _list_unread(self, client: ImapClientLike, since: datetime, limit: int) -> UnreadPage:
         validity = _uidvalidity(client.select_folder(self._folder, readonly=True))

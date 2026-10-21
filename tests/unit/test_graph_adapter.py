@@ -8,6 +8,7 @@ import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef
 from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox, retry_after_seconds
 from tests.support.dav_transport import RecordingTransport
 from tests.support.graph_fixtures import INBOX_ID, FakeTokens, message
@@ -44,6 +45,12 @@ def box(
     )
 
 
+def call_deadline(now: list[float] | None = None) -> CallDeadline:
+    """The tool layer's deadline on the same fake clock as the mailbox built by `box`."""
+    clock = now or [100.0]
+    return CallDeadline.start(lambda: clock[0])
+
+
 def list_unread(
     t: RecordingTransport,
     *,
@@ -51,7 +58,7 @@ def list_unread(
     backoff: Backoff | None = None,
     now: list[float] | None = None,
 ) -> UnreadPage:
-    return box(t, tokens, backoff, now).list_unread(SINCE, 20)
+    return box(t, tokens, backoff, now).list_unread(SINCE, 20, call_deadline(now))
 
 
 def test_list_query_shape_and_headers() -> None:
@@ -61,7 +68,7 @@ def test_list_query_shape_and_headers() -> None:
         seen.append(request)
         return js({"value": [message(1)]})(request)
 
-    page = box(RecordingTransport({LIST: answer})).list_unread(SINCE, 20)
+    page = box(RecordingTransport({LIST: answer})).list_unread(SINCE, 20, call_deadline())
     assert dict(seen[0].url.params) == {
         "$filter": "receivedDateTime ge 2026-09-29T06:00:30Z and isRead eq false",
         "$orderby": "receivedDateTime desc",
@@ -77,9 +84,13 @@ def test_list_query_shape_and_headers() -> None:
 
 
 def test_more_when_limit_plus_one_or_next_link() -> None:
-    assert box(RecordingTransport({LIST: js({"value": [message(n) for n in range(1, 4)]})})).list_unread(SINCE, 2).more
+    assert (
+        box(RecordingTransport({LIST: js({"value": [message(n) for n in range(1, 4)]})}))
+        .list_unread(SINCE, 2, call_deadline())
+        .more
+    )
     t = RecordingTransport({LIST: js({"value": [message(1)], "@odata.nextLink": "https://evil.example.test/next"})})
-    assert box(t).list_unread(SINCE, 20).more
+    assert box(t).list_unread(SINCE, 20, call_deadline()).more
     assert [s[0] for s in t.seen] == ["graph.microsoft.com"]
 
 
@@ -94,13 +105,13 @@ def test_next_link_never_requested() -> None:
     t = RecordingTransport(
         {LIST: js({"value": [], "@odata.nextLink": f"{BASE}/me/mailFolders/inbox/messages?$skip=10"})}
     )
-    box(t).list_unread(SINCE, 20)
+    box(t).list_unread(SINCE, 20, call_deadline())
     assert len(t.seen) == 1
 
 
 def test_only_graph_host_gets_bearer() -> None:
     t = RecordingTransport({LIST: js({"value": [message(1)]})})
-    box(t).list_unread(SINCE, 20)
+    box(t).list_unread(SINCE, 20, call_deadline())
     assert all(host == "graph.microsoft.com" and port == 443 for host, port, *_ in t.seen)
 
 
@@ -129,7 +140,7 @@ def test_redirect_not_followed_even_by_a_following_client(status: int) -> None:
         inbox_ids={},
     )
     with pytest.raises(ProviderError) as info:
-        following.list_unread(SINCE, 20)
+        following.list_unread(SINCE, 20, CallDeadline.start())  # this client runs on the real clock
     assert info.value.cause == "Redirect"
     assert [s[0] for s in t.seen] == ["graph.microsoft.com"]
 
@@ -352,7 +363,7 @@ def full(**extra: object) -> dict[str, object]:
 
 
 def get(routes: dict[tuple[str, str], Handler]) -> MailDetail:
-    return box(RecordingTransport(routes)).get_message(GraphMessageRef("outlook", MID))
+    return box(RecordingTransport(routes)).get_message(GraphMessageRef("outlook", MID), call_deadline())
 
 
 def test_get_message_text_body_and_folder_binding() -> None:
@@ -382,7 +393,7 @@ def test_get_message_query_shape() -> None:
 def test_message_outside_inbox_is_not_found_after_one_refetch() -> None:
     t = RecordingTransport(message_routes(full(parentFolderId="AQMkSENTITEMS")))
     with pytest.raises(ProviderError) as info:
-        box(t).get_message(GraphMessageRef("outlook", MID))
+        box(t).get_message(GraphMessageRef("outlook", MID), call_deadline())
     assert (info.value.code, info.value.cause) == ("not_found", "NotInInbox")
     assert [p for *_, p, _ in t.seen].count("/v1.0/me/mailFolders/inbox") == 2
 
@@ -450,7 +461,7 @@ def test_attachments_after_the_deadline_fail_the_whole_call() -> None:
     routes[FOLDER] = folder_using_up_the_deadline
     t = RecordingTransport(routes)
     with pytest.raises(ProviderError) as info:
-        box(t, now=now).get_message(GraphMessageRef("outlook", MID))
+        box(t, now=now).get_message(GraphMessageRef("outlook", MID), call_deadline(now))
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
     assert [r[3] for r in t.seen] == [f"/v1.0/me/messages/{MID}", "/v1.0/me/mailFolders/inbox"]  # no attachments GET
 
@@ -461,7 +472,7 @@ def test_attachments_401_refreshes_the_whole_call_once() -> None:
     tokens = FakeTokens()
     t = RecordingTransport(message_routes(full(hasAttachments=True), attachments=js({}, 401)))
     with pytest.raises(ProviderError) as info:
-        box(t, tokens).get_message(GraphMessageRef("outlook", MID))
+        box(t, tokens).get_message(GraphMessageRef("outlook", MID), call_deadline())
     assert (info.value.code, info.value.cause) == ("auth_expired", "GraphUnauthorized")
     assert tokens.issued == 2
     assert sum(r[3].endswith("/attachments") for r in t.seen) == 2
@@ -471,14 +482,14 @@ def test_foreign_refs_not_found_before_any_request() -> None:
     t = RecordingTransport({})
     for ref in (MessageRef("outlook", "INBOX", 1, 1), GraphMessageRef("uzh", MID)):
         with pytest.raises(ProviderError) as info:
-            box(t).get_message(ref)
+            box(t).get_message(ref, call_deadline())
         assert (info.value.code, info.value.cause) == ("not_found", "ForeignRef")
     assert t.seen == []
 
 
 def test_check_fetches_inbox_id() -> None:
     t = RecordingTransport({FOLDER: js({"id": INBOX_ID})})
-    box(t).check()
+    box(t).check(call_deadline())
     assert len(t.seen) == 1
 
 
@@ -486,7 +497,7 @@ def test_check_fetches_inbox_id() -> None:
 def test_check_without_a_usable_inbox_id_fails(body: dict[str, object]) -> None:
     t = RecordingTransport({FOLDER: js(body)})
     with pytest.raises(ProviderError) as info:
-        box(t).check()
+        box(t).check(call_deadline())
     assert (info.value.code, info.value.cause) == ("upstream_error", "NoInboxId")
 
 

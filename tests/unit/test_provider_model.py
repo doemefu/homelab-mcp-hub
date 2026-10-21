@@ -3,7 +3,7 @@
 import json
 import logging
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -46,7 +46,7 @@ def test_order_key_total_order() -> None:
     assert ordered[0] is newer
     assert [order_key(x) for x in ordered] == sorted([order_key(x) for x in (a, b, newer)], reverse=True)
     # the same instant in another offset gives the same key
-    shifted = summary(a.ref, T0.astimezone(datetime.now().astimezone().tzinfo))
+    shifted = summary(a.ref, T0.astimezone(timezone(timedelta(hours=5))))
     assert order_key(shifted) == order_key(a)
 
 

@@ -11,6 +11,7 @@ from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginEr
 
 from mcp_hub.ids import MessageRef, encode_message_id
 from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ProviderError, item_hash
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap import HEADER_ITEM, ImapMailbox
 from mcp_hub.providers.mime import Part
 from tests.support.logcapture import Capture
@@ -99,7 +100,7 @@ def test_list_unread_filters_on_exact_internaldate_and_sorts_newest_first() -> N
     client = FakeClient(
         {1: message(60 * 30, "old"), 2: message(30, "second"), 3: message(5, "first"), 4: message(1, "read", seen=True)}
     )
-    page = mailbox(client).list_unread(T0 - timedelta(hours=24), 20)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=24), 20, CallDeadline.start())
     assert [m.subject for m in page.items] == ["first", "second"]
     assert page.more is False
     assert page.items[0].ref == MessageRef("icloud", "INBOX", 7, 3)
@@ -121,7 +122,7 @@ def test_one_malformed_message_does_not_fail_the_listing() -> None:
     missing = message(6, "w")
     del missing[b"BODYSTRUCTURE"]
     client = FakeClient({1: message(5, "good"), 2: odd, 3: broken, 4: empty, 5: missing})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     assert len(page.items) == 5
     assert "good" in [m.subject for m in page.items]
     assert all(isinstance(m.snippet_text, str) for m in page.items)
@@ -132,14 +133,14 @@ def test_get_message_of_a_malformed_message_still_answers() -> None:
     odd[b"BODYSTRUCTURE"] = (
         b"text", b"plain", (b"charset", b"rot13"), None, None, b"8bit", 2, 1, None, None, None, None
     )  # fmt: skip
-    detail = mailbox(FakeClient({4: odd})).get_message(MessageRef("icloud", "INBOX", 7, 4))
+    detail = mailbox(FakeClient({4: odd})).get_message(MessageRef("icloud", "INBOX", 7, 4), CallDeadline.start())
     assert isinstance(detail.body_text, str)
     assert detail.body_source == "text/plain"
 
 
 def test_list_unread_limit_sets_more() -> None:
     client = FakeClient({i: message(i, f"m{i}") for i in range(1, 6)})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 2)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 2, CallDeadline.start())
     assert [m.subject for m in page.items] == ["m1", "m2"]
     assert page.more is True
 
@@ -147,9 +148,9 @@ def test_list_unread_limit_sets_more() -> None:
 def test_adapter_only_uses_read_only_commands() -> None:
     client = FakeClient({1: message(5, "a")})
     box = mailbox(client)
-    box.list_unread(T0 - timedelta(hours=1), 20)
-    box.get_message(MessageRef("icloud", "INBOX", 7, 1))
-    box.check()
+    box.list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    box.get_message(MessageRef("icloud", "INBOX", 7, 1), CallDeadline.start())
+    box.check(CallDeadline.start())
     names = {name for name, _ in client.calls}
     assert names <= {"login", "select_folder", "search", "fetch", "noop", "logout"}
     assert all(args == ("INBOX", True) for name, args in client.calls if name == "select_folder")
@@ -178,7 +179,7 @@ def test_get_message_fetches_the_text_part_partially() -> None:
         None,
     )
     client = FakeClient({9: big})
-    detail = mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, 9))
+    detail = mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
     part_fetch = [
         items
         for name, items in client.calls
@@ -195,7 +196,7 @@ def test_get_message_fetches_the_text_part_partially() -> None:
 def test_changed_uidvalidity_or_missing_uid_is_not_found(validity: int, uid: int) -> None:
     client = FakeClient({9: message(5, "x")}, validity=validity)
     with pytest.raises(ProviderError) as caught:
-        mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, uid))
+        mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, uid), CallDeadline.start())
     assert caught.value.code == "not_found"
 
 
@@ -217,7 +218,7 @@ def test_changed_uidvalidity_or_missing_uid_is_not_found(validity: int, uid: int
 def test_failures_map_to_error_codes_without_provider_text(error: Exception, code: str) -> None:
     client = FakeClient({}, login_error=error)
     with pytest.raises(ProviderError) as caught:
-        mailbox(client).check()
+        mailbox(client).check(CallDeadline.start())
     assert caught.value.code == code
     assert caught.value.cause == type(error).__name__
     assert "secret-detail" not in str(caught.value)
@@ -229,7 +230,7 @@ def test_connect_failure_is_unreachable() -> None:
 
     box = ImapMailbox("icloud", host="h", port=1, folder="INBOX", username="u", password="p", client_factory=refuse)
     with pytest.raises(ProviderError) as caught:
-        box.check()
+        box.check(CallDeadline.start())
     assert caught.value.code == "unreachable"
 
 
@@ -252,7 +253,7 @@ def test_undecodable_message_becomes_the_placeholder_with_one_log_line(provider_
     broken = message(3, "broken")
     broken[b"BODYSTRUCTURE"] = 5  # not a structure: walk() raises inside the per-message guards
     client = FakeClient({1: message(5, "good"), 2: broken})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     by_uid = {m.ref.uid: m for m in page.items}
     assert by_uid[1].subject == "good"
     assert by_uid[1].snippet_text == "Hello there"
@@ -278,7 +279,7 @@ def test_item_degraded_logs_the_exception_class_name_only(
 
     monkeypatch.setattr(imap, "_sender_and_subject", exploding)
     page = mailbox(FakeClient({1: message(3, "secret"), 2: message(4, "fine")})).list_unread(
-        T0 - timedelta(hours=1), 20
+        T0 - timedelta(hours=1), 20, CallDeadline.start()
     )
     assert [m.snippet_text for m in page.items] == [UNDECODABLE_NOTE, "Hello there"]
     text = "\n".join(provider_log.lines) + "\n".join(m for _, _, m in provider_log.raw)
@@ -299,7 +300,7 @@ def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytes
 
     monkeypatch.setattr(imap, "decode_part", exploding)
     client = FakeClient({1: message(3, "a", text=b"boom"), 2: message(4, "b")})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
 
 
@@ -316,7 +317,7 @@ class SnippetFailingClient(FakeClient):
 
 def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> None:
     client = SnippetFailingClient({1: message(3, "a"), 2: message(4, "b")}, ProtocolError("SENTINEL odd literal"))
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20)
+    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "")]
     lines = [json.loads(line) for line in provider_log.lines]
     assert [(e["event"], e["exception"]) for e in lines] == [("item_degraded", "ProtocolError")] * 2
@@ -328,7 +329,9 @@ def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> 
 )
 def test_connection_failure_during_the_snippet_fetch_still_fails_the_account(error: Exception, code: str) -> None:
     with pytest.raises(ProviderError) as caught:
-        mailbox(SnippetFailingClient({1: message(3, "a")}, error)).list_unread(T0 - timedelta(hours=1), 20)
+        mailbox(SnippetFailingClient({1: message(3, "a")}, error)).list_unread(
+            T0 - timedelta(hours=1), 20, CallDeadline.start()
+        )
     assert caught.value.code == code
 
 
@@ -344,7 +347,9 @@ class DeepStructureClient(FakeClient):
 def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log: Capture) -> None:
     deep = message(3, "deep")
     deep[b"DEEP"] = True
-    page = mailbox(DeepStructureClient({1: deep, 2: message(4, "fine")})).list_unread(T0 - timedelta(hours=1), 20)
+    page = mailbox(DeepStructureClient({1: deep, 2: message(4, "fine")})).list_unread(
+        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    )
     by_uid = {m.ref.uid: m for m in page.items}
     assert by_uid[1].snippet_text == UNDECODABLE_NOTE
     assert (by_uid[2].subject, by_uid[2].snippet_text) == ("fine", "Hello there")
@@ -354,7 +359,9 @@ def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log
 def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
     deep = message(3, "deep")
     deep[b"DEEP"] = True
-    detail = mailbox(DeepStructureClient({1: deep})).get_message(MessageRef("icloud", "INBOX", 7, 1))
+    detail = mailbox(DeepStructureClient({1: deep})).get_message(
+        MessageRef("icloud", "INBOX", 7, 1), CallDeadline.start()
+    )
     assert (detail.subject, detail.body_source, detail.attachments) == ("deep", "none", [])
 
 
@@ -362,6 +369,6 @@ def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
 def test_body_cut_only_when_the_part_is_longer_than_the_limit(size: int, cut: bool) -> None:
     row = message(5, "edge", text=b"x" * size)
     row[b"BODYSTRUCTURE"] = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", size, 1, None, None, None)
-    detail = mailbox(FakeClient({9: row})).get_message(MessageRef("icloud", "INBOX", 7, 9))
+    detail = mailbox(FakeClient({9: row})).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
     assert len(detail.body_text) == 262_144
     assert detail.body_cut is cut

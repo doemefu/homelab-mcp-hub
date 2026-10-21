@@ -12,18 +12,19 @@ from mcp_hub.ids import MessageRef
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from tests.support.mcp import body, modern
 from tests.support.tokens import TokenFactory
 
 
 class Mailbox:
-    def check(self) -> None: ...
+    def check(self, deadline: CallDeadline) -> None: ...
 
-    def list_unread(self, since: datetime, limit: int) -> UnreadPage:
+    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
         return UnreadPage([], False)
 
-    def get_message(self, ref: MessageRef) -> MailDetail:
+    def get_message(self, ref: MessageRef, deadline: CallDeadline) -> MailDetail:
         raise ProviderError("not_found")
 
 

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from mcp_hub.providers import open_mailbox
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap import default_client
 from mcp_hub.registry import load_registry
 
@@ -52,7 +53,7 @@ def test_open_mailbox_uses_only_the_registry_host_port_and_credentials(
 
     box = open_mailbox(account, secrets_dir)
     assert box._folder == "Custom"  # type: ignore[attr-defined]
-    box.check()
+    box.check(CallDeadline.start())
 
     [client] = recording.instances
     assert client.host == "imap.example.test"
@@ -89,6 +90,26 @@ def test_graph_account_opens_a_graph_mailbox_without_contacting_anything(secrets
     assert outlook is not None
     opener = MailboxOpener(StoreConfig.from_settings(settings))
     assert isinstance(opener(outlook, secrets_dir), GraphMailbox)
+
+
+def test_graph_opener_passes_own_addresses_and_folder_maps(secrets_dir: Path) -> None:
+    from mcp_hub.config import load_settings
+    from mcp_hub.providers import MailboxOpener
+    from mcp_hub.providers.folders import FOLDER_MAPS
+    from mcp_hub.tokenstore.store import StoreConfig
+
+    _graph_ready(secrets_dir)
+    registry = json.loads((secrets_dir / "accounts.json").read_text())
+    [outlook_entry] = [a for a in registry["accounts"] if a["id"] == "outlook"]
+    outlook_entry["mail"]["own_addresses_ref"] = "outlook-own-addresses"
+    (secrets_dir / "accounts.json").write_text(json.dumps(registry))
+    (secrets_dir / "outlook-own-addresses").write_text("me@example.org\n")
+    settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
+    outlook = load_registry(secrets_dir / "accounts.json").get("outlook")
+    assert outlook is not None
+    box = MailboxOpener(StoreConfig.from_settings(settings))(outlook, secrets_dir)
+    assert box._own_addresses == frozenset({"me@example.org"})  # type: ignore[attr-defined]
+    assert box._folder_maps is FOLDER_MAPS  # type: ignore[attr-defined]
 
 
 def test_graph_account_without_a_store_configuration_is_refused(secrets_dir: Path) -> None:
@@ -128,7 +149,8 @@ def test_opener_passes_own_addresses_and_folder_maps(secrets_dir: Path) -> None:
     from mcp_hub.providers.folders import FOLDER_MAPS
 
     (secrets_dir / "gmail-own-addresses").write_text("me@example.org\n")
-    box = open_mailbox(_gmail_with_own_addresses(secrets_dir), secrets_dir)
+    box = open_mailbox(_gmail_with_own_addresses(secrets_dir, inbox="Sent Items"), secrets_dir)
+    assert box._folder == "Sent Items"  # type: ignore[attr-defined]  # the registry's raw inbox
     assert box._own_addresses == frozenset({"me@example.org"})  # type: ignore[attr-defined]
     assert box._folder_maps is FOLDER_MAPS  # type: ignore[attr-defined]
 
