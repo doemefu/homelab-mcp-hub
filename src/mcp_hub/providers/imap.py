@@ -236,6 +236,12 @@ class _Chosen:
     direction: Direction | None  # decided from the candidate headers when `direction` filtered; else in pass 2
 
 
+def _sent_since_pass_one(chosen: _Chosen, row: dict[bytes, object]) -> bool:
+    """A Gmail item chosen as `incoming` (no `\\Sent` label in pass 1) that carries the label in pass 2: listing it
+    would pair `folder: sent` with `direction: incoming`. Empty labels (other servers) never match."""
+    return chosen.direction == "incoming" and _LABEL_SENT in _labels(row)
+
+
 @dataclass(frozen=True, slots=True)
 class FoundCopy:
     """One located copy of a Message-ID: where it is and when it arrived."""
@@ -797,7 +803,10 @@ class ImapMailbox:
         """Pass 2 for one folder: EXAMINE only when another mailbox is open. A chosen item that cannot be read now
         (changed UIDVALIDITY, FETCH NO, expunged) is dropped and the page becomes incomplete: a cursor after the
         items returned would skip it for good. `folder` None (Gmail All Mail): each item's folder follows its
-        X-GM-LABELS."""
+        X-GM-LABELS; on any other server that fails closed. Under a `direction: incoming` filter, a Gmail item whose
+        `\\Sent` label appeared after pass 1 is dropped like a new draft: it no longer matches the filter."""
+        if folder is None and not session.gmail:  # only Gmail All Mail decides the folder per message
+            raise ProviderError("upstream_error", "UnmappedFolder")
         if session.selected != entry.raw_name:
             try:
                 validity = session.examine(entry)
@@ -822,7 +831,7 @@ class ImapMailbox:
             uid = chosen.candidate.uid
             if uid in unparsable:
                 failure, flag_row = unparsable[uid]
-                if _is_draft(flag_row):
+                if _is_draft(flag_row) or _sent_since_pass_one(chosen, flag_row):
                     continue
                 log_message_skipped(chosen.ref, "mail", failure)
                 flags = _flags(flag_row)
@@ -835,7 +844,7 @@ class ImapMailbox:
             if row is None:  # FETCH NO (S-p) or expunged meanwhile
                 progress.complete = False
                 continue
-            if _is_draft(row):  # a draft by now: excluded, like any draft
+            if _is_draft(row) or _sent_since_pass_one(chosen, row):  # excluded now, like any draft or other direction
                 continue
             item_folder = folder or _gmail_folder(_labels(row))
             out[chosen.ref] = self._summary(entry, item_folder, chosen, row, texts.get(uid, ""), gmail=gmail)

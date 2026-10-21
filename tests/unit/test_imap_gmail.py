@@ -10,9 +10,9 @@ import pytest
 
 from mcp_hub.cursors import Position
 from mcp_hub.ids import MessageRef, ThreadKey
-from mcp_hub.providers.base import UNDECODABLE_NOTE, FolderPage, ListQuery
+from mcp_hub.providers.base import UNDECODABLE_NOTE, FolderPage, ListQuery, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.folders import FolderMapCache
+from mcp_hub.providers.folders import FolderMapCache, FolderPlan
 from mcp_hub.providers.headers import SUMMARY_HEADER_ITEM, candidate_header_item
 from mcp_hub.providers.imap import ImapMailbox
 from tests.support.clock import FakeClock
@@ -303,6 +303,59 @@ def test_draft_label_dropped_per_message() -> None:
     assert page.complete is True
 
 
+class DeepStructureClient(FakeImapClient):
+    """UID 1's BODYSTRUCTURE cannot be parsed, so its pass-2 row comes from the FLAGS X-GM-LABELS fallback fetch."""
+
+    def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in items and 1 in messages:  # type: ignore[operator]
+            raise RecursionError("maximum recursion depth exceeded")
+        return super().fetch(messages, items)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("unparsable", [False, True])
+def test_sent_label_added_between_passes_drops_an_incoming_item(
+    unparsable: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under `direction: incoming`, a `\\Sent` label that appears after pass 1 drops the item, so `folder: sent`
+    never pairs with `direction: incoming` (T13 review); without the filter it is listed as sent and outgoing."""
+    later = gmail(all_mail=[gm(1, 5, "becomes sent"), gm(2, 6, "stays incoming")])
+    all_mail = next(f for f in later.folders if f.raw_name == "[Gmail]/All Mail")
+    original = later.run
+    fetched = {"n": 0}
+
+    def run_command(command: str, argument: object = None) -> None:
+        if command == "UID FETCH":
+            fetched["n"] += 1
+            if fetched["n"] == 2:  # the first pass-2 fetch: the summary batch, or the FLAGS X-GM-LABELS fallback
+                all_mail.messages[1].labels = (SENT_L,)
+        original(command, argument)
+
+    later.run = run_command  # type: ignore[method-assign]
+    if unparsable:
+        monkeypatch.setattr(later, "client", lambda: DeepStructureClient(later))
+    page = run(later, query("all", direction="incoming"))
+    assert [item.subject for item in page.items] == ["stays incoming"]
+    assert page.complete is True
+    listed = run(later, query("all"))
+    assert [(item.meta.folder, item.meta.direction) for item in listed.items] == [
+        ("sent", "outgoing"),
+        ("archive", "incoming"),
+    ]
+
+
+def test_per_message_folder_fails_closed_off_gmail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only Gmail All Mail may leave the folder to the labels: a plan without a fixed folder on any other server is
+    `upstream_error`, never a guessed folder (T13 review)."""
+    server = FakeImapServer([folder("INBOX", (), [gm(1, 5, "a", INBOX_L)])], clock=FakeClock())
+    monkeypatch.setattr(
+        ImapMailbox, "_plans", staticmethod(lambda session, value: [FolderPlan(session.inbox, None, None)])
+    )
+    with pytest.raises(ProviderError) as caught:
+        run(server, query())
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", "UnmappedFolder")
+    assert "BODYSTRUCTURE" not in [item for items in fetch_items(server) for item in items]  # before pass 2 reads
+
+
 def test_trash_reads_trash_mailbox() -> None:
     server = gmail(trash=[gm(1, 5, "deleted", SENT_L)], all_mail=all_mail_messages())
     page = run(server, query("trash"))
@@ -492,7 +545,7 @@ def test_gmail_logs_carry_no_labels_or_names(with_all: bool, hub_log: Capture, m
             mailbox.list_messages(query(folder_value, direction=direction), deadline(server))
     events = {json.loads(line)["event"] for line in hub_log.lines}
     assert events == {"folder_map_refreshed", "item_degraded"}  # the degraded paths did run
-    text = "\n".join(hub_log.lines) + "\n".join(message for _, _, message in hub_log.raw)
+    text = "\n".join(hub_log.lines) + "\n" + "\n".join(message for _, _, message in hub_log.raw)
     for secret in (
         "[Gmail]",
         "Gmail]",
