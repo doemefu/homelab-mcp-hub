@@ -215,6 +215,14 @@ def _imap_noop_soft_stop() -> ImapMailbox:
     class Client:
         normalise_times = True
 
+        def socket(self) -> "Client":  # the guard sets a socket timeout before every command
+            return self
+
+        def settimeout(self, value: float) -> None: ...
+
+        def capabilities(self) -> tuple[bytes, ...]:
+            return ()
+
         def login(self, username: str, password: str) -> None: ...
 
         def noop(self) -> None:

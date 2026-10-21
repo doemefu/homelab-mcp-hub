@@ -4,7 +4,7 @@ import socket
 import ssl
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from email.message import EmailMessage, Message
+from email.message import EmailMessage
 
 import pytest
 from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError, ProtocolError
@@ -12,13 +12,15 @@ from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginEr
 from mcp_hub.ids import MessageRef, encode_message_id
 from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ProviderError, item_hash
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.imap import HEADER_ITEM, ImapMailbox
+from mcp_hub.providers.folders import FolderMapCache
+from mcp_hub.providers.headers import ParsedHeaders
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.providers.mime import Part
+from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
 
 T0 = datetime(2026, 9, 29, 7, 0, tzinfo=UTC)
 PLAIN = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 64, 2, None, None, None, None)
-HEADER_KEY = b"BODY[HEADER.FIELDS (FROM TO CC SUBJECT)]<0>"
 
 
 def headers(subject: str, sender: str = "Sender <sender@example.test>") -> bytes:
@@ -27,64 +29,24 @@ def headers(subject: str, sender: str = "Sender <sender@example.test>") -> bytes
     return bytes(msg).split(b"\n\n")[0] + b"\r\n\r\n"
 
 
-class FakeClient:
-    def __init__(
-        self, messages: dict[int, dict[bytes, object]], *, validity: int = 7, login_error: Exception | None = None
-    ) -> None:
-        self.messages, self.validity, self.login_error = messages, validity, login_error
-        self.calls: list[tuple[str, object]] = []
-        self.normalise_times = True
-
-    def login(self, username: str, password: str) -> None:
-        self.calls.append(("login", None))
-        if self.login_error:
-            raise self.login_error
-
-    def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]:
-        self.calls.append(("select_folder", (folder, readonly)))
-        return {b"UIDVALIDITY": self.validity, b"EXISTS": len(self.messages)}
-
-    def search(self, criteria: list[object]) -> list[int]:
-        self.calls.append(("search", criteria))
-        return [uid for uid, m in self.messages.items() if b"\\Seen" not in m[b"FLAGS"]]  # type: ignore[operator]
-
-    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
-        self.calls.append(("fetch", list(data)))
-        out: dict[int, dict[bytes, object]] = {}
-        for uid in messages:
-            if uid not in self.messages:
-                continue
-            row = self.messages[uid]
-            out[uid] = {}
-            for item in data:
-                if item == HEADER_ITEM:
-                    out[uid][HEADER_KEY] = row[HEADER_KEY]
-                elif item.startswith("BODY.PEEK["):
-                    section, rest = item[len("BODY.PEEK[") :].split("]")
-                    length = int(rest.split(".")[1].rstrip(">"))
-                    out[uid][f"BODY[{section}]<0>".encode()] = row[b"TEXT"][:length]  # type: ignore[index]
-                elif item.encode() in row:
-                    out[uid][item.encode()] = row[item.encode()]
-        return out
-
-    def noop(self) -> None:
-        self.calls.append(("noop", None))
-
-    def logout(self) -> None:
-        self.calls.append(("logout", None))
+def message(
+    uid: int, minutes_ago: int, subject: str, *, seen: bool = False, text: bytes = b"Hello there"
+) -> FakeMessage:
+    return FakeMessage(
+        uid,
+        T0 - timedelta(minutes=minutes_ago),
+        flags=(b"\\Seen",) if seen else (),
+        headers=headers(subject),
+        text=text,
+        bodystructure=PLAIN,
+    )
 
 
-def message(minutes_ago: int, subject: str, *, seen: bool = False, text: bytes = b"Hello there") -> dict[bytes, object]:
-    return {
-        b"FLAGS": (b"\\Seen",) if seen else (),
-        b"INTERNALDATE": T0 - timedelta(minutes=minutes_ago),
-        b"BODYSTRUCTURE": PLAIN,
-        HEADER_KEY: headers(subject),
-        b"TEXT": text,
-    }
+def server(*messages: FakeMessage, validity: int = 7) -> FakeImapServer:
+    return FakeImapServer([FakeFolder("INBOX", uidvalidity=validity, messages={m.uid: m for m in messages})])
 
 
-def mailbox(client: FakeClient) -> ImapMailbox:
+def mailbox(srv: FakeImapServer, client: type[FakeImapClient] = FakeImapClient) -> ImapMailbox:
     return ImapMailbox(
         "icloud",
         host="imap.example.test",
@@ -92,98 +54,95 @@ def mailbox(client: FakeClient) -> ImapMailbox:
         folder="INBOX",
         username="u",
         password="p",
-        client_factory=lambda host, port, context, timeout: client,
+        client_factory=lambda host, port, context, timeout: client(srv),
+        folder_maps=FolderMapCache(),
     )
 
 
 def test_list_unread_filters_on_exact_internaldate_and_sorts_newest_first() -> None:
-    client = FakeClient(
-        {1: message(60 * 30, "old"), 2: message(30, "second"), 3: message(5, "first"), 4: message(1, "read", seen=True)}
+    srv = server(
+        message(1, 60 * 30, "old"), message(2, 30, "second"), message(3, 5, "first"), message(4, 1, "read", seen=True)
     )
-    page = mailbox(client).list_unread(T0 - timedelta(hours=24), 20, CallDeadline.start())
+    clients: list[FakeImapClient] = []
+
+    def recording(s: FakeImapServer) -> FakeImapClient:
+        clients.append(FakeImapClient(s))
+        return clients[-1]
+
+    page = mailbox(srv, recording).list_unread(T0 - timedelta(hours=24), 20, CallDeadline.start())  # type: ignore[arg-type]
     assert [m.subject for m in page.items] == ["first", "second"]
     assert page.more is False
     assert page.items[0].ref == MessageRef("icloud", "INBOX", 7, 3)
     assert (page.items[0].from_address, page.items[0].from_name) == ("sender@example.test", "Sender")
     assert page.items[0].snippet_text == "Hello there"
-    assert client.normalise_times is False
+    [client] = clients
+    assert (client.normalise_times, client.folder_encode, client.use_uid) == (False, False, True)
 
 
 def test_one_malformed_message_does_not_fail_the_listing() -> None:
-    odd = message(3, "x")
-    odd[HEADER_KEY] = b"From: =?rot13?q?Fraqre?= <a@xn--.example.test>\r\nSubject: =?idna?q?x?=\r\n\r\n"
-    odd[b"BODYSTRUCTURE"] = (
+    odd = message(2, 3, "x")
+    odd.headers = b"From: =?rot13?q?Fraqre?= <a@xn--.example.test>\r\nSubject: =?idna?q?x?=\r\n\r\n"
+    odd.bodystructure = (
         b"text", b"plain", (b"charset", b"base64"), None, None, b"7bit", 10, 1, None, None, None, None
     )  # fmt: skip
-    broken = message(2, "y")
-    broken[b"BODYSTRUCTURE"] = ("not", "a", "structure")
-    empty = message(4, "z")
-    empty[b"BODYSTRUCTURE"] = ()
-    missing = message(6, "w")
-    del missing[b"BODYSTRUCTURE"]
-    client = FakeClient({1: message(5, "good"), 2: odd, 3: broken, 4: empty, 5: missing})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    broken = message(3, 2, "y")
+    broken.bodystructure = ("not", "a", "structure")
+    empty = message(4, 4, "z")
+    empty.bodystructure = ()
+    missing = message(5, 6, "w")
+    missing.bodystructure = None
+    page = mailbox(server(message(1, 5, "good"), odd, broken, empty, missing)).list_unread(
+        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    )
     assert len(page.items) == 5
     assert "good" in [m.subject for m in page.items]
     assert all(isinstance(m.snippet_text, str) for m in page.items)
 
 
 def test_get_message_of_a_malformed_message_still_answers() -> None:
-    odd = message(3, "x", text=b"\xff\xfe")
-    odd[b"BODYSTRUCTURE"] = (
+    odd = message(4, 3, "x", text=b"\xff\xfe")
+    odd.bodystructure = (
         b"text", b"plain", (b"charset", b"rot13"), None, None, b"8bit", 2, 1, None, None, None, None
     )  # fmt: skip
-    detail = mailbox(FakeClient({4: odd})).get_message(MessageRef("icloud", "INBOX", 7, 4), CallDeadline.start())
+    detail = mailbox(server(odd)).get_message(MessageRef("icloud", "INBOX", 7, 4), CallDeadline.start())
     assert isinstance(detail.body_text, str)
     assert detail.body_source == "text/plain"
 
 
 def test_list_unread_limit_sets_more() -> None:
-    client = FakeClient({i: message(i, f"m{i}") for i in range(1, 6)})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 2, CallDeadline.start())
+    srv = server(*(message(i, i, f"m{i}") for i in range(1, 6)))
+    page = mailbox(srv).list_unread(T0 - timedelta(hours=1), 2, CallDeadline.start())
     assert [m.subject for m in page.items] == ["m1", "m2"]
     assert page.more is True
 
 
 def test_adapter_only_uses_read_only_commands() -> None:
-    client = FakeClient({1: message(5, "a")})
-    box = mailbox(client)
+    srv = server(message(1, 5, "a"))
+    box = mailbox(srv)
     box.list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     box.get_message(MessageRef("icloud", "INBOX", 7, 1), CallDeadline.start())
     box.check(CallDeadline.start())
-    names = {name for name, _ in client.calls}
-    assert names <= {"login", "select_folder", "search", "fetch", "noop", "logout"}
-    assert all(args == ("INBOX", True) for name, args in client.calls if name == "select_folder")
-    for name, items in client.calls:
-        if name == "fetch":
-            for item in items:  # type: ignore[attr-defined]
+    names = [name for name, _ in srv.commands]
+    assert set(names) <= COMMAND_ALLOWLIST
+    assert {argument for name, argument in srv.commands if name == "EXAMINE"} == {"INBOX"}
+    for name, argument in srv.commands:
+        if name == "UID FETCH":
+            for item in argument[1]:  # type: ignore[index]
                 assert item in {"FLAGS", "INTERNALDATE", "BODYSTRUCTURE"} or item.startswith("BODY.PEEK["), item
                 assert "RFC822" not in item
                 assert item != "BODY.PEEK[]"
-    assert [n for n, _ in client.calls].count("logout") == 3
+    assert names.count("LOGOUT") == 3
 
 
 def test_get_message_fetches_the_text_part_partially() -> None:
-    big = message(5, "big", text=b"x" * 300_000)
-    big[b"BODYSTRUCTURE"] = (
-        b"text",
-        b"plain",
-        (b"charset", b"utf-8"),
-        None,
-        None,
-        b"7bit",
-        300_000,
-        1,
-        None,
-        None,
-        None,
-    )
-    client = FakeClient({9: big})
-    detail = mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
+    big = message(9, 5, "big", text=b"x" * 300_000)
+    big.bodystructure = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 300_000, 1, None, None, None)
+    srv = server(big)
+    detail = mailbox(srv).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
     part_fetch = [
-        items
-        for name, items in client.calls
-        if name == "fetch" and any("BODY.PEEK[1]" in i for i in items)  # type: ignore[attr-defined]
+        list(argument[1])  # type: ignore[index]
+        for name, argument in srv.commands
+        if name == "UID FETCH" and any("BODY.PEEK[1]" in i for i in argument[1])  # type: ignore[index]
     ]
     assert part_fetch == [["BODY.PEEK[1]<0.262144>"]]
     assert len(detail.body_text) == 262_144
@@ -194,10 +153,19 @@ def test_get_message_fetches_the_text_part_partially() -> None:
 
 @pytest.mark.parametrize(("validity", "uid"), [(8, 9), (7, 99)])
 def test_changed_uidvalidity_or_missing_uid_is_not_found(validity: int, uid: int) -> None:
-    client = FakeClient({9: message(5, "x")}, validity=validity)
     with pytest.raises(ProviderError) as caught:
-        mailbox(client).get_message(MessageRef("icloud", "INBOX", 7, uid), CallDeadline.start())
+        mailbox(server(message(9, 5, "x"), validity=validity)).get_message(
+            MessageRef("icloud", "INBOX", 7, uid), CallDeadline.start()
+        )
     assert caught.value.code == "not_found"
+
+
+def test_get_message_outside_the_registry_inbox_is_not_found_without_examine() -> None:
+    srv = server(message(9, 5, "x"))
+    with pytest.raises(ProviderError) as caught:
+        mailbox(srv).get_message(MessageRef("icloud", "Archive", 7, 9), CallDeadline.start())
+    assert caught.value.code == "not_found"
+    assert "EXAMINE" not in [name for name, _ in srv.commands]
 
 
 @pytest.mark.parametrize(
@@ -216,16 +184,17 @@ def test_changed_uidvalidity_or_missing_uid_is_not_found(validity: int, uid: int
     ],
 )
 def test_failures_map_to_error_codes_without_provider_text(error: Exception, code: str) -> None:
-    client = FakeClient({}, login_error=error)
+    srv = server()
+    srv.fail["LOGIN"] = error
     with pytest.raises(ProviderError) as caught:
-        mailbox(client).check(CallDeadline.start())
+        mailbox(srv).check(CallDeadline.start())
     assert caught.value.code == code
     assert caught.value.cause == type(error).__name__
     assert "secret-detail" not in str(caught.value)
 
 
 def test_connect_failure_is_unreachable() -> None:
-    def refuse(host: str, port: int, context: ssl.SSLContext, timeout: float) -> FakeClient:
+    def refuse(host: str, port: int, context: ssl.SSLContext, timeout: float) -> FakeImapClient:
         raise ConnectionRefusedError("refused")
 
     box = ImapMailbox("icloud", host="h", port=1, folder="INBOX", username="u", password="p", client_factory=refuse)
@@ -250,10 +219,9 @@ def provider_log() -> Iterator[Capture]:
 
 
 def test_undecodable_message_becomes_the_placeholder_with_one_log_line(provider_log: Capture) -> None:
-    broken = message(3, "broken")
-    broken[b"BODYSTRUCTURE"] = 5  # not a structure: walk() raises inside the per-message guards
-    client = FakeClient({1: message(5, "good"), 2: broken})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    broken = message(2, 3, "broken")
+    broken.bodystructure = 5  # not a structure: walk() raises inside the per-message guards
+    page = mailbox(server(message(1, 5, "good"), broken)).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     by_uid = {m.ref.uid: m for m in page.items}
     assert by_uid[1].subject == "good"
     assert by_uid[1].snippet_text == "Hello there"
@@ -270,15 +238,15 @@ def test_item_degraded_logs_the_exception_class_name_only(
 ) -> None:
     import mcp_hub.providers.imap as imap
 
-    original = imap._sender_and_subject
+    original = imap.parse_summary_headers
 
-    def exploding(headers: Message) -> tuple[tuple[str, str], str | None]:
-        if "secret" in str(headers.get("Subject", "")):
+    def exploding(raw: bytes | None) -> ParsedHeaders:
+        if raw is not None and b"secret" in raw:
             raise ValueError("SENTINEL-provider-text secret@example.test")
-        return original(headers)
+        return original(raw)
 
-    monkeypatch.setattr(imap, "_sender_and_subject", exploding)
-    page = mailbox(FakeClient({1: message(3, "secret"), 2: message(4, "fine")})).list_unread(
+    monkeypatch.setattr(imap, "parse_summary_headers", exploding)
+    page = mailbox(server(message(1, 3, "secret"), message(2, 4, "fine"))).list_unread(
         T0 - timedelta(hours=1), 20, CallDeadline.start()
     )
     assert [m.snippet_text for m in page.items] == [UNDECODABLE_NOTE, "Hello there"]
@@ -299,25 +267,26 @@ def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytes
         return original(data, part)
 
     monkeypatch.setattr(imap, "decode_part", exploding)
-    client = FakeClient({1: message(3, "a", text=b"boom"), 2: message(4, "b")})
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    srv = server(message(1, 3, "a", text=b"boom"), message(2, 4, "b"))
+    page = mailbox(srv).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
 
 
-class SnippetFailingClient(FakeClient):
-    def __init__(self, messages: dict[int, dict[bytes, object]], error: Exception) -> None:
-        super().__init__(messages)
-        self.error = error
+def snippet_failing(error: Exception) -> type[FakeImapClient]:
+    class SnippetFailingClient(FakeImapClient):
+        def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+            if any(item.endswith(f"<0.{SNIPPET_FETCH_BYTES}>") for item in items):  # type: ignore[attr-defined]
+                raise error
+            return super().fetch(messages, items)  # type: ignore[arg-type]
 
-    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
-        if any(item.endswith(f"<0.{SNIPPET_FETCH_BYTES}>") for item in data):
-            raise self.error
-        return super().fetch(messages, data)
+    return SnippetFailingClient
 
 
 def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> None:
-    client = SnippetFailingClient({1: message(3, "a"), 2: message(4, "b")}, ProtocolError("SENTINEL odd literal"))
-    page = mailbox(client).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    srv = server(message(1, 3, "a"), message(2, 4, "b"))
+    page = mailbox(srv, snippet_failing(ProtocolError("SENTINEL odd literal"))).list_unread(
+        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    )
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "")]
     lines = [json.loads(line) for line in provider_log.lines]
     assert [(e["event"], e["exception"]) for e in lines] == [("item_degraded", "ProtocolError")] * 2
@@ -325,29 +294,36 @@ def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> 
 
 
 @pytest.mark.parametrize(
-    ("error", "code"), [(OSError("reset"), "unreachable"), (IMAPClientAbortError("eof"), "upstream_error")]
+    ("error", "code"),
+    [
+        (OSError("reset"), "unreachable"),
+        (IMAPClientAbortError("eof"), "upstream_error"),
+        (IMAPClientError("FETCH command error: BAD [x]"), "upstream_error"),
+    ],
 )
-def test_connection_failure_during_the_snippet_fetch_still_fails_the_account(error: Exception, code: str) -> None:
+def test_connection_failure_or_bad_during_the_snippet_fetch_still_fails_the_account(
+    error: Exception, code: str
+) -> None:
     with pytest.raises(ProviderError) as caught:
-        mailbox(SnippetFailingClient({1: message(3, "a")}, error)).list_unread(
+        mailbox(server(message(1, 3, "a")), snippet_failing(error)).list_unread(
             T0 - timedelta(hours=1), 20, CallDeadline.start()
         )
     assert caught.value.code == code
 
 
-class DeepStructureClient(FakeClient):
+class DeepStructureClient(FakeImapClient):
     """IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE nested ~1000 deep."""
 
-    def fetch(self, messages: list[int], data: list[str]) -> dict[int, dict[bytes, object]]:
-        if "BODYSTRUCTURE" in data and any(self.messages[uid].get(b"DEEP") for uid in messages if uid in self.messages):
+    deep: frozenset[int] = frozenset({1})
+
+    def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in items and any(uid in self.deep for uid in messages):  # type: ignore[operator,attr-defined]
             raise RecursionError("maximum recursion depth exceeded")
-        return super().fetch(messages, data)
+        return super().fetch(messages, items)  # type: ignore[arg-type]
 
 
 def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log: Capture) -> None:
-    deep = message(3, "deep")
-    deep[b"DEEP"] = True
-    page = mailbox(DeepStructureClient({1: deep, 2: message(4, "fine")})).list_unread(
+    page = mailbox(server(message(1, 3, "deep"), message(2, 4, "fine")), DeepStructureClient).list_unread(
         T0 - timedelta(hours=1), 20, CallDeadline.start()
     )
     by_uid = {m.ref.uid: m for m in page.items}
@@ -357,9 +333,7 @@ def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log
 
 
 def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
-    deep = message(3, "deep")
-    deep[b"DEEP"] = True
-    detail = mailbox(DeepStructureClient({1: deep})).get_message(
+    detail = mailbox(server(message(1, 3, "deep")), DeepStructureClient).get_message(
         MessageRef("icloud", "INBOX", 7, 1), CallDeadline.start()
     )
     assert (detail.subject, detail.body_source, detail.attachments) == ("deep", "none", [])
@@ -367,8 +341,8 @@ def test_parser_recursion_in_get_message_still_answers_with_headers() -> None:
 
 @pytest.mark.parametrize(("size", "cut"), [(262_144, False), (262_145, True)])
 def test_body_cut_only_when_the_part_is_longer_than_the_limit(size: int, cut: bool) -> None:
-    row = message(5, "edge", text=b"x" * size)
-    row[b"BODYSTRUCTURE"] = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", size, 1, None, None, None)
-    detail = mailbox(FakeClient({9: row})).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
+    row = message(9, 5, "edge", text=b"x" * size)
+    row.bodystructure = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", size, 1, None, None, None)
+    detail = mailbox(server(row)).get_message(MessageRef("icloud", "INBOX", 7, 9), CallDeadline.start())
     assert len(detail.body_text) == 262_144
     assert detail.body_cut is cut

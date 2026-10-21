@@ -22,6 +22,14 @@ class RecordingClient:
         self.normalise_times = True
         RecordingClient.instances.append(self)
 
+    def socket(self) -> "RecordingClient":  # the guard sets a socket timeout before every command
+        return self
+
+    def settimeout(self, value: float) -> None: ...
+
+    def capabilities(self) -> tuple[bytes, ...]:
+        return ()
+
     def login(self, username: str, password: str) -> None:
         self.calls.append(("login", (username, password)))
 

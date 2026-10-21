@@ -127,9 +127,15 @@ class FakeImapClient:
 
     def list_folders(
         self, directory: str = "", pattern: str = "*"
-    ) -> list[tuple[tuple[bytes, ...], bytes | None, str | int]]:
+    ) -> list[tuple[tuple[bytes, ...], bytes | None, bytes | str | int]]:
+        """Like IMAPClient 4.1.0: with `folder_encode = False` the raw names come back as bytes (int names stay)."""
         self._server.run("LIST", (directory, pattern))
-        return [(f.attributes, f.delimiter, f.raw_name) for f in self._server.folders]
+        return [(f.attributes, f.delimiter, self._listed_name(f.raw_name)) for f in self._server.folders]
+
+    def _listed_name(self, name: str | int) -> bytes | str | int:
+        if isinstance(name, int) or self.folder_encode:
+            return name
+        return name.encode("utf-8")  # the bytes on the wire
 
     def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]:
         if not readonly:
