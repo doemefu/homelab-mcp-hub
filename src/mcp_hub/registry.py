@@ -56,6 +56,7 @@ class ImapMail(_Strict):
     username_ref: SecretRef
     password_ref: SecretRef
     inbox: Annotated[str, StringConstraints(min_length=1, max_length=100)] = "INBOX"
+    own_addresses_ref: SecretRef | None = None
 
 
 class CalDavCalendar(_Strict):
@@ -75,6 +76,7 @@ class IcsCalendar(_Strict):
 
 class GraphBlock(_Strict):
     protocol: Literal["graph"]
+    own_addresses_ref: SecretRef | None = None
 
 
 class GraphSettings(_Strict):
@@ -118,6 +120,8 @@ class Account(_Strict):
                 raise ValueError(f"capability {name} is true but its block is missing")
             if not flag and block is not None:
                 raise ValueError(f"capability {name} is false but a block is present")
+        if self.calendar is not None and getattr(self.calendar, "own_addresses_ref", None) is not None:
+            raise ValueError("own_addresses_ref is allowed on a mail block only")
         uses_graph = any(isinstance(b, GraphBlock) for b in (self.mail, self.calendar))
         if uses_graph and self.graph is None:
             raise ValueError("graph settings are required for protocol graph")
@@ -142,6 +146,11 @@ class Account(_Strict):
         if block is None:
             raise KeyError(capability)
         return block.protocol
+
+    @property
+    def own_addresses_ref(self) -> str | None:
+        """File name of the optional own-addresses credential file; not a credential (spec 080 §8.2)."""
+        return self.mail.own_addresses_ref if self.mail is not None else None
 
     def credential_refs(self, capability: Capability) -> tuple[str, ...]:
         block = self._block(capability)

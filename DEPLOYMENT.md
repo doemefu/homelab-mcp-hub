@@ -41,6 +41,8 @@ kubectl -n apps delete pod -l app=mcp-hub   # only after exit 0
 
 `check-registry` exit codes: 0 every check passed; 1 a check failed (`registry error <path>: <type>`, `… missing <key>`, `key invalid`, `token unreachable`, or "not the expected one yet": the kubelet has not refreshed the volume — wait a minute and run it again); 2 usage or configuration error. A token state `none` (no login yet) is not a failure. Output lines are listed in INTERFACES.md §7.
 
+**Own addresses (owner, optional).** `mail.own_addresses_ref` names a credential file with the owner's own addresses of a mail account (spec 080 §8.2, D70). Order, because an older hub rejects the unknown registry field and does not start (R36): first an image with this field runs in the cluster (`kubectl -n apps get pod -l app=mcp-hub` shows the new image); only then add the files (for example `icloud-own-addresses`) to `mcp_hub_credentials` and `mail.own_addresses_ref` to the registry in SOPS (the owner edits SOPS); then playbook 59, `mcp-hub check-registry --expect-sha …` (it prints `account <id> own_addresses=<n>`; `invalid` means a missing or malformed file, which does not fail the check or disable the account), and the pod deletion (D51, D66). A changed address list later needs only playbook 59: the file is read on every use.
+
 **Kill switch** (spec §4.6 layer L2, two steps; owner go, because both change the cluster or SOPS):
 
 1. Immediately:

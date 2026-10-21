@@ -8,6 +8,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Added
 
+- Optional `mail.own_addresses_ref` per mail account: a credential file with the owner's own addresses (1–20, one per line), read on every use and never logged or returned; a missing or invalid file falls back to the folder rule with one `registry_value_invalid` WARN per state change. `check-registry` prints `account <id> own_addresses=<n>` or `invalid`.
 - Authorization layer: offline validation of auth-service access tokens (RS256 via a throttled JWKS cache, `typ`, issuer, audience, client, time with 60 s leeway, required claims, subject allowlist re-read every 60 s), both scopes required, Bearer challenges with `resource_metadata` and `scope`, protected-resource metadata, Host/Origin checks.
 - MCP endpoint `/mcp` on port 8083 for protocol versions 2026-07-28 and 2025-11-25; `/healthz` and `/readyz` on port 8084.
 - Tool `list_accounts` with per-capability status from the account registry (`accounts.json`) and in-memory state.
