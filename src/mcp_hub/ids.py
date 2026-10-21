@@ -11,17 +11,23 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Final, NoReturn
+from typing import Final, Literal, NoReturn
 
 from mcp_hub.errors import ToolError
 
 PREFIX: Final = "v1."
 MAX_ID_LENGTH: Final = 512
-_ACCOUNT: Final = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
-_BASE64URL: Final = re.compile(r"^[A-Za-z0-9_-]+$")
+_ACCOUNT: Final = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_BASE64URL: Final = re.compile(r"[A-Za-z0-9_-]+")
 _UINT32_MAX: Final = 2**32 - 1
+MESSAGE_ID_PATTERN: Final = re.compile(
+    r"[\x21\x23-\x26\x28-\x3B\x3D\x3F-\x5B\x5D-\x7A\x7C\x7E]{1,300}"
+)  # fullmatch only
+MAX_MAILBOX_NAME_CHARS: Final = 200
+_SUBJECT_KEY: Final = re.compile(r"[0-9a-f]{32}")
+_UTF7_SHIFT: Final = re.compile(r"&(?:-|([A-Za-z0-9+,]+)-)")
 GRAPH_FOLDER: Final = "inbox"
-GRAPH_ID: Final = re.compile(r"^[A-Za-z0-9=_-]{1,300}$")  # L5 (spec 080 rev. 4.6 S1)
+GRAPH_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,300}")  # L5 (spec 080 rev. 4.6 S1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,20 +49,91 @@ class GraphMessageRef:
 
 
 AnyMessageRef = MessageRef | GraphMessageRef
+ThreadSource = Literal["gmail", "graph", "headers", "subject"]
+_THREAD_SOURCES: Final = ("gmail", "graph", "headers", "subject")
+
+
+@dataclass(frozen=True, slots=True)
+class StableRef:
+    """Spec 080 `MessageRef` (field `ref`, kind "r"): account and Message-ID, stable across moves."""
+
+    account: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadKey:
+    """Kind "t"; value is an int for source "gmail", a str otherwise."""
+
+    account: str
+    source: ThreadSource
+    value: int | str
+
+
+def _utf7_ok(name: str) -> bool:
+    """True when a printable-ASCII name is well-formed modified UTF-7 (RFC 3501 5.1.3)."""
+    pos = 0
+    while (amp := name.find("&", pos)) != -1:
+        shift = _UTF7_SHIFT.match(name, amp)
+        if shift is None:
+            return False
+        pos = shift.end()
+        body = shift.group(1)
+        if body is None:
+            continue
+        padded = body.replace(",", "/") + "=" * (-len(body) % 4)
+        try:
+            raw = base64.b64decode(padded, validate=True)
+            raw.decode("utf-16-be")
+        except ValueError:  # binascii.Error and UnicodeDecodeError are ValueErrors
+            return False
+        if len(raw) % 2 or base64.b64encode(raw).decode("ascii").rstrip("=") != body.replace(",", "/"):
+            return False
+    return True
+
+
+def mailbox_name_ok(raw_name: str) -> bool:
+    """1-200 printable ASCII characters (0x20-0x7E) that decode as modified UTF-7 (spec 080 §5.3 rule 9, D73)."""
+    return (
+        0 < len(raw_name) <= MAX_MAILBOX_NAME_CHARS
+        and all(0x20 <= ord(c) <= 0x7E for c in raw_name)
+        and _utf7_ok(raw_name)
+    )
+
+
+def _text(parts: list[object]) -> str:
+    raw = json.dumps(parts, separators=(",", ":"), ensure_ascii=False).encode()
+    return PREFIX + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def _encode(parts: list[object]) -> str:
-    raw = json.dumps(parts, separators=(",", ":"), ensure_ascii=False).encode()
-    value = PREFIX + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    value = _text(parts)
     if len(value) > MAX_ID_LENGTH:
         raise ValueError("id longer than 512 characters")
     return value
 
 
-def encode_message_id(ref: AnyMessageRef) -> str:
+def _location_parts(ref: AnyMessageRef) -> list[object]:
     if isinstance(ref, GraphMessageRef):
-        return _encode(["g", ref.account, ref.graph_id])
-    return _encode(["m", ref.account, ref.folder, ref.uidvalidity, ref.uid])
+        return ["g", ref.account, ref.graph_id]
+    return ["m", ref.account, ref.folder, ref.uidvalidity, ref.uid]
+
+
+def encode_message_id(ref: AnyMessageRef) -> str:
+    return _encode(_location_parts(ref))
+
+
+def location_id(ref: AnyMessageRef) -> str | None:
+    """The MessageId, or None when the mailbox name fails `mailbox_name_ok` or the id would exceed 512 characters."""
+    if isinstance(ref, MessageRef) and not mailbox_name_ok(ref.folder):
+        return None
+    value = _text(_location_parts(ref))
+    return value if len(value) <= MAX_ID_LENGTH else None
+
+
+def location_k(ref: AnyMessageRef) -> str:
+    """Keyset key: first 16 hex chars of SHA-256 over the id text, also for `id: null` (uncapped text)."""
+    return hashlib.sha256(_text(_location_parts(ref)).encode()).hexdigest()[:16]
 
 
 def _invalid() -> NoReturn:
@@ -92,12 +169,89 @@ def decode_message_id(value: str) -> AnyMessageRef:
         isinstance(account, str)
         and _ACCOUNT.fullmatch(account)
         and isinstance(folder, str)
-        and 0 < len(folder) <= 100
+        and mailbox_name_ok(folder)
         and _uint32(uidvalidity)
         and _uint32(uid)
     ):
         _invalid()
     return MessageRef(account=account, folder=folder, uidvalidity=uidvalidity, uid=uid)
+
+
+def _bad_ref() -> NoReturn:
+    raise ToolError("invalid_argument", "Malformed message reference")
+
+
+def _bad_thread_key() -> NoReturn:
+    raise ToolError("invalid_argument", "Malformed thread key")
+
+
+def _decode_list(value: str) -> object:
+    if len(value) > MAX_ID_LENGTH or not value.startswith(PREFIX) or not _BASE64URL.fullmatch(value[len(PREFIX) :]):
+        return None
+    body = value[len(PREFIX) :]
+    try:
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except ValueError:
+        return None
+
+
+def encode_ref(account: str, message_id: str) -> str | None:
+    """The stable `ref`, or None when the Message-ID fails the §5.5 pattern or the id would exceed 512 characters."""
+    if not (_ACCOUNT.fullmatch(account) and MESSAGE_ID_PATTERN.fullmatch(message_id)):
+        return None
+    value = _text(["r", account, message_id])
+    return value if len(value) <= MAX_ID_LENGTH else None
+
+
+def decode_ref(value: str) -> StableRef:
+    data = _decode_list(value)
+    if not (isinstance(data, list) and len(data) == 3 and data[0] == "r"):
+        _bad_ref()
+    _, account, message_id = data
+    if not (
+        isinstance(account, str)
+        and _ACCOUNT.fullmatch(account)
+        and isinstance(message_id, str)
+        and MESSAGE_ID_PATTERN.fullmatch(message_id)
+    ):
+        _bad_ref()
+    return StableRef(account=account, message_id=message_id)
+
+
+def _thread_value_ok(source: object, value: object) -> bool:
+    if source == "gmail":
+        return type(value) is int and 0 <= value < 2**64
+    if not isinstance(value, str):
+        return False
+    if source == "graph":
+        return GRAPH_ID.fullmatch(value) is not None
+    if source == "headers":
+        return MESSAGE_ID_PATTERN.fullmatch(value) is not None
+    if source == "subject":
+        return _SUBJECT_KEY.fullmatch(value) is not None
+    return False
+
+
+def encode_thread_key(key: ThreadKey) -> str | None:
+    if not (_ACCOUNT.fullmatch(key.account) and _thread_value_ok(key.source, key.value)):
+        return None
+    value = _text(["t", key.account, key.source, key.value])
+    return value if len(value) <= MAX_ID_LENGTH else None
+
+
+def decode_thread_key(value: str) -> ThreadKey:
+    data = _decode_list(value)
+    if not (isinstance(data, list) and len(data) == 4 and data[0] == "t"):
+        _bad_thread_key()
+    _, account, source, thread_value = data
+    if not (
+        isinstance(account, str)
+        and _ACCOUNT.fullmatch(account)
+        and source in _THREAD_SOURCES
+        and _thread_value_ok(source, thread_value)
+    ):
+        _bad_thread_key()
+    return ThreadKey(account=account, source=source, value=thread_value)
 
 
 def encode_event_id(account: str, calendar_path: str, uid: str, recurrence_id: str) -> str:
