@@ -20,6 +20,7 @@ from mcp_hub.providers.base import (
     ProviderError,
     item_hash,
     order_key,
+    order_key_of,
 )
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import FolderMapCache
@@ -682,7 +683,8 @@ def test_uidvalidity_change_with_a_limit_loses_no_item() -> None:
     first = run(server, query("all", limit=2))
     assert subjects(first) == ["arch"]
     assert (first.more, first.truncated, first.complete) == (True, True, False)
-    again = [i.subject for page in pages(three_folders, query("all", limit=2)) for i in page.items]
+    assert server.folders[0].uidvalidity == 8  # the server keeps its new UIDVALIDITY
+    again = [i.subject for page in pages(lambda: server, query("all", limit=2)) for i in page.items]
     assert sorted(again) == sorted(["in-1", "in-2", "arch", "sent"])
 
 
@@ -870,6 +872,27 @@ def test_frontier_is_the_order_key_of_the_last_returned_item_when_more() -> None
     assert page.more is True
     assert page.frontier == order_key(page.items[-1])
     assert run(server(), query(limit=3)).frontier is None  # nothing more: no frontier
+
+
+def test_frontier_falls_back_to_the_last_chosen_item_when_none_is_returned() -> None:
+    """Every chosen item became a draft before pass 2: nothing is returned, yet the window above the last chosen
+    item was scanned, so the frontier is that item's order key and the page stays complete (T17 merges on it)."""
+    server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b"), msg(3, 7, "c")])
+    original = server.run
+
+    def run_command(command: str, argument: object = None) -> None:
+        if command == "UID FETCH" and SUMMARY_HEADER_ITEM in argument[1]:  # type: ignore[index]
+            for uid in (1, 2):
+                server.folders[0].messages[uid].flags = (b"\\Draft",)
+        original(command, argument)
+
+    server.run = run_command  # type: ignore[method-assign]
+    page = run(server, query(limit=2))
+    assert page.items == []
+    assert (page.more, page.complete) == (True, True)
+    last_chosen = server.folders[0].messages[2]
+    assert last_chosen.internaldate is not None
+    assert page.frontier == order_key_of(last_chosen.internaldate, MessageRef("icloud", "INBOX", 7, 2))
 
 
 class DeepStructureClient(FakeImapClient):
