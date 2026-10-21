@@ -8,6 +8,11 @@ to disk, and the output carries counts, roles and timings only.
     uv run python scripts/imap_probe.py --host imap.mail.me.com
     uv run python scripts/imap_probe.py --host imap.gmail.com
 
+Definitions: `other` counts selectable mailboxes without a special-use attribute. It includes INBOX, folders skipped
+as junk or drafts by name, and virtual folders such as \\Flagged or \\Important, so it overstates the scan.
+`scan_targets` is the number of folders the probe actually scans (INBOX first, junk and drafts skipped, capped at
+--max-folders); use it to size MAX_LOCATE_FOLDERS.
+
 Paste only the part after the `--- result ---` line. With --show-names the output contains mailbox names, a banner
 says so, and the marker line is left out.
 
@@ -30,6 +35,7 @@ from imapclient import IMAPClient
 
 ALLOWED_HOSTS: Final = frozenset({"imap.mail.me.com", "imap.gmail.com"})
 PORT: Final = 993
+SOCKET_TIMEOUT: Final = 30.0  # seconds; a hung search must not block the owner's terminal
 
 _FETCH_INTERNALDATE: Final = "INTERNALDATE"
 _FETCH_MESSAGE_ID: Final = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>"
@@ -83,6 +89,7 @@ class ReadOnlyProxy:
 
 
 def quoted(value: str) -> str:
+    # Keep in sync with imap_search.quoted in the hub (D74).
     """Hub-style IMAP quoted string: backslash and double quote escaped, control characters refused."""
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
         raise ValueError("control character in search value")
@@ -187,6 +194,8 @@ def probe(
     targets.sort(key=lambda t: t[1] != "inbox")  # INBOX first; the sort is stable
     targets = targets[:max_folders]
 
+    emit(f"scan_targets: {len(targets)}")
+
     since = _imap_date(datetime.now(UTC) - timedelta(days=since_days))
     inbox_ids: list[str] = []
     for index, (name, role) in enumerate(targets):
@@ -196,6 +205,9 @@ def probe(
         elapsed = _ms(started)
         label = f" name={name!r}" if show_names else ""
         emit(f"examine_search_since: folder#{index} role={role} hits={len(uids)} ms={elapsed}{label}")
+        started = time.perf_counter()
+        unseen = client.search(f"NOT DRAFT UNSEEN SINCE {since}".encode("ascii"))
+        emit(f"search_unseen_since: folder#{index} role={role} hits={len(unseen)} ms={_ms(started)}")
         if role == "inbox" and uids and not inbox_ids:
             inbox_ids = _recent_message_ids(client, uids)
 
@@ -250,7 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         username = getpass.getpass("Username: ")
         password = getpass.getpass("Password (app-specific): ")
-        raw = IMAPClient(args.host, port=PORT, ssl=True, ssl_context=ssl.create_default_context())
+        raw = IMAPClient(
+            args.host, port=PORT, ssl=True, ssl_context=ssl.create_default_context(), timeout=SOCKET_TIMEOUT
+        )
         client = ReadOnlyProxy(raw)
         try:
             client.login(username, password)

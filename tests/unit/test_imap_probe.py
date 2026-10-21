@@ -263,3 +263,25 @@ def test_errors_printed_as_class_name_only(monkeypatch: pytest.MonkeyPatch, caps
     assert "BoomError" in captured.err + captured.out
     assert "secret-detail" not in captured.err + captured.out
     assert "user@example.org" not in captured.err + captured.out
+
+
+def test_scan_targets_and_unseen_timing_reported() -> None:
+    out, stub = _run(StubClient(_folders()))
+    assert re.search(r"^scan_targets: 4$", out, re.MULTILINE)
+    assert len(re.findall(r"^search_unseen_since: folder#\d role=\w+ hits=\d+ ms=\d+$", out, re.MULTILINE)) == 4
+    assert any(
+        re.fullmatch(r"NOT DRAFT UNSEEN SINCE \d{2}-[A-Z][a-z]{2}-\d{4}", t) for c, t in stub.commands if c == "SEARCH"
+    )
+
+
+def test_client_gets_a_socket_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def factory(*args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise RuntimeError
+
+    monkeypatch.setattr(probe_mod, "IMAPClient", factory)
+    monkeypatch.setattr(probe_mod.getpass, "getpass", lambda prompt="": "x")
+    assert probe_mod.main(["--host", "imap.gmail.com"]) == 1
+    assert seen["timeout"] == 30.0
