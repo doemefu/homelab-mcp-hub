@@ -75,7 +75,7 @@ def test_library_item_quoting_sends_atoms() -> None:
     assert searches == [b"UID SEARCH NOT DRAFT HEADER Message-ID a(b)@x"]
 
 
-@pytest.mark.parametrize("value", ['a"b@x', "a\\b@x", "a\r\nb@x", "a\x00b@x", "ä@x", ""])
+@pytest.mark.parametrize("value", ['a"b@x', "a\\b@x", "a\r\nb@x", "a\x00b@x", "ä@x", "", "X-GM-RAW@example.org"])
 def test_unsafe_value_never_reaches_the_wire(value: str) -> None:
     with WireRecorder() as recorder:
         guard = GuardedImapClient(wire_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")

@@ -22,6 +22,7 @@ from mcp_hub.providers.imap_guard import (
     GuardedImapClient,
     ImapCommandRefused,
     imap_error_kind,
+    search_criteria_ok,
 )
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapServer, FakeMessage, bad, no
@@ -227,6 +228,7 @@ def test_fetch_sends_sorted_unique_uids() -> None:
     ],
 )
 def test_search_refuses_bad_criteria(criteria: Any) -> None:
+    assert not search_criteria_ok(criteria)
     server, _, guard = logged_in()
     before = list(server.commands)
     with pytest.raises(ImapCommandRefused):
@@ -235,6 +237,8 @@ def test_search_refuses_bad_criteria(criteria: Any) -> None:
 
 
 def test_search_passes_valid_criteria() -> None:
+    assert search_criteria_ok(b'NOT DRAFT HEADER Message-ID "x{5}"')
+    assert search_criteria_ok(b"NOT DRAFT {5} SINCE 19-Oct-2026")  # only a trailing marker announces a literal
     server, _, guard = logged_in()
     assert guard.search(b'NOT DRAFT SINCE 19-Oct-2026 HEADER Message-ID "a@example.org"') == []
     assert guard.search(b"NOT DRAFT SINCE 19-Oct-2026") == [1, 2, 3, 5, 7, 8]

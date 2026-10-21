@@ -12,6 +12,7 @@ from datetime import date
 from typing import Final, Literal
 
 from mcp_hub.providers.folders import GmailLabelFilter
+from mcp_hub.providers.imap_guard import search_criteria_ok
 
 MAX_OR_BYTES: Final = 4000  # bounds one header OR tree, so a UID SEARCH line stays well below server line limits
 HeaderField = Literal["Message-ID", "In-Reply-To", "References"]
@@ -20,8 +21,6 @@ _NOT_DRAFT: Final = b"NOT DRAFT"
 _HEADER_FIELDS: Final = frozenset({"Message-ID", "In-Reply-To", "References"})
 _MONTHS: Final = (b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec")
 _QUOTABLE: Final = re.compile(r"[\x20\x21\x23-\x5b\x5d-\x7e]+")  # printable ASCII without '"' and '\'
-_PRINTABLE: Final = re.compile(rb"[\x20-\x7e]+")
-_LITERAL_MARKER: Final = re.compile(rb".*\{[0-9]+\+?\}")  # a trailing {N} or {N+} would announce a literal
 # Gmail system labels as quoted strings; the backslash of `\Sent` is escaped inside the quotes (I8, SA8).
 _GMAIL_SENT: Final = b'X-GM-LABELS "\\\\Sent"'
 _GMAIL_INBOX: Final = b'X-GM-LABELS "\\\\Inbox"'
@@ -35,10 +34,16 @@ class UnsafeSearchValue(ValueError):  # noqa: N818  # name fixed by the WP13a in
     """A value or criteria the builder refuses. The message is a fixed text; it never carries the refused value."""
 
 
+def search_value_ok(value: str) -> bool:
+    """Whether `value` can go out as a search value: non-empty printable ASCII without `"` and `\\`, and without
+    `X-GM-RAW` in any case, so that a value the criteria check would refuse is refused on its own (D80)."""
+    return type(value) is str and _QUOTABLE.fullmatch(value) is not None and "X-GM-RAW" not in value.upper()
+
+
 def quoted(value: str) -> bytes:
-    """`value` as one IMAP quoted string. Only non-empty printable ASCII without `"` and `\\` is accepted: an empty
-    value would match every message with the header, and nothing is escaped."""
-    if type(value) is not str or _QUOTABLE.fullmatch(value) is None:
+    """`value` as one IMAP quoted string, for values that pass `search_value_ok`: an empty value would match every
+    message with the header, and nothing is escaped."""
+    if not search_value_ok(value):
         raise UnsafeSearchValue("search value refused")
     return b'"' + value.encode("ascii") + b'"'
 
@@ -74,7 +79,7 @@ def _leaves(fields: Sequence[HeaderField], values: Sequence[str]) -> list[bytes]
         raise ValueError("no header fields")
     for field in field_list:
         if type(field) is not str or field not in _HEADER_FIELDS:
-            raise UnsafeSearchValue("search value refused")
+            raise ValueError("unknown header field")
     return [b"HEADER " + field.encode("ascii") + b" " + quoted(value) for value in values for field in field_list]
 
 
@@ -108,9 +113,15 @@ def or_batches(
     values: Sequence[str], fields: Sequence[HeaderField], *, max_values: int, max_bytes: int = MAX_OR_BYTES
 ) -> list[list[str]]:
     """Consecutive batches in input order; each holds at most `max_values` values and its `header_or` at most
-    `max_bytes` bytes. A batch is closed when the next value would break either cap."""
+    `max_bytes` bytes. A batch is closed when the next value would break either cap.
+
+    Raises `UnsafeSearchValue` at the first value that fails `search_value_ok` (or whose own leaves exceed
+    `max_bytes`). Callers with third-party values filter them one by one with `search_value_ok` first, so that one
+    bad value does not cost the whole search."""
     if type(max_values) is not int or max_values < 1:
         raise ValueError("max_values must be positive")
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
     if isinstance(fields, (str, bytes)) or isinstance(values, (str, bytes)):
         raise ValueError("fields and values must be sequences, not one string")
     field_list = list(fields)  # one snapshot: every value's leaves use the same fields
@@ -141,11 +152,6 @@ def criteria(*parts: bytes) -> bytes:
     if not parts or any(type(part) is not bytes or not part for part in parts):
         raise UnsafeSearchValue("search criteria refused")
     joined = b" ".join(parts)
-    if (
-        not (joined == _NOT_DRAFT or joined.startswith(_NOT_DRAFT + b" "))
-        or _PRINTABLE.fullmatch(joined) is None
-        or b"X-GM-RAW" in joined.upper()
-        or _LITERAL_MARKER.fullmatch(joined) is not None
-    ):
+    if not (joined == _NOT_DRAFT or joined.startswith(_NOT_DRAFT + b" ")) or not search_criteria_ok(joined):
         raise UnsafeSearchValue("search criteria refused")
     return joined

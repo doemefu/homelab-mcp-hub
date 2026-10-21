@@ -21,6 +21,7 @@ from mcp_hub.providers.imap_search import (
     imap_date,
     or_batches,
     quoted,
+    search_value_ok,
     window_keys,
 )
 from tests.support.clock import FakeClock
@@ -139,8 +140,9 @@ def test_header_or_refuses_empty_inputs_and_unknown_fields() -> None:
         or_batches("a@x", ("Message-ID",), max_values=20)
     bad_fields: list[Any] = [("Subject",), ("Message-ID FLAGGED",), ("message-id",), ("Message-ID\r\n",)]
     for fields in bad_fields:
-        with pytest.raises(UnsafeSearchValue):
+        with pytest.raises(ValueError, match="unknown header field") as caught:
             header_or(fields, ["a@x"])
+        assert type(caught.value) is ValueError  # a programming error, not a refused third-party value
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 7, 8, 9, 20])
@@ -200,6 +202,15 @@ def test_or_batches_edge_cases() -> None:
     assert or_batches([], ("Message-ID",), max_values=20) == []
     with pytest.raises(ValueError, match="max_values must be positive"):
         or_batches(["a@x"], ("Message-ID",), max_values=0)
+    bad_caps: list[Any] = [0, -1, 1.5, "4000", True, None]
+    for cap in bad_caps:
+        with pytest.raises(ValueError, match="max_bytes must be positive") as caught:
+            or_batches(["a@x"], ("Message-ID",), max_values=20, max_bytes=cap)
+        assert type(caught.value) is ValueError
+    bad_counts: list[Any] = [True, 2.0]
+    for count in bad_counts:
+        with pytest.raises(ValueError, match="max_values must be positive"):
+            or_batches(["a@x"], ("Message-ID",), max_values=count)
     with pytest.raises(UnsafeSearchValue):
         or_batches(["a" * 50 + "@x"], ("Message-ID",), max_values=20, max_bytes=40)  # one leaf alone is too long
     with pytest.raises(UnsafeSearchValue):
@@ -224,12 +235,67 @@ def test_quoted_accepts_every_message_id_character() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ['a"b@x', "a\\b@x", "a\r\nb@x", "a\nb", "a\rb", "a\x00b", "a\tb", "a\x7fb", "a\x1bb", "äb@x", "a\u2028b", ""],
+    [
+        'a"b@x',
+        "a\\b@x",
+        "a\r\nb@x",
+        "a\nb",
+        "a\rb",
+        "a\x00b",
+        "a\tb",
+        "a\x7fb",
+        "a\x1bb",
+        "äb@x",
+        "a\u2028b",
+        "",
+        "X-GM-RAW@example.org",
+        "x-gm-raw@example.org",
+        "a.X-Gm-Raw.b@example.org",
+    ],
 )
 def test_quoted_refuses_quote_backslash_control_non_ascii(value: str) -> None:
     with pytest.raises(UnsafeSearchValue) as caught:
         quoted(value)
     assert str(caught.value) == "search value refused"  # fixed text: never the refused value
+
+
+def test_search_value_ok_matches_quoted() -> None:
+    for value in ["a@x", "a(b)%*]{5}@x", "X-GM-RA", "X-GM-RA@W", "x-gm_raw@example.org"]:
+        assert search_value_ok(value)
+        assert quoted(value) == b'"' + value.encode() + b'"'
+    bad_values: list[Any] = [
+        'a"b',
+        "a\\b",
+        "a\r\nb",
+        "",
+        "äb",
+        "X-GM-RAW@example.org",
+        "X-GM-RAWX",
+        "id.x-gm-raw",
+        b"a@x",
+        None,
+    ]
+    for value in bad_values:
+        assert not search_value_ok(value)
+        with pytest.raises(UnsafeSearchValue):
+            quoted(value)
+
+
+def test_filtered_values_round_trip_through_batches_and_criteria() -> None:
+    # Third-party refs are filtered one by one with search_value_ok; one bad ref must not cost its batch.
+    refs = [f"{index:02d}@example.org" for index in range(25)]
+    refs[3] = "X-GM-RAW@example.org"
+    refs[17] = 'a"b@example.org'
+    refs[21] = "x-gm-raw.21@example.org"
+    usable = [ref for ref in refs if search_value_ok(ref)]
+    assert len(usable) == 22
+    batches = or_batches(usable, ("In-Reply-To", "References"), max_values=20)
+    assert [len(batch) for batch in batches] == [20, 2]
+    for batch in batches:
+        built = criteria(b"NOT DRAFT", header_or(("In-Reply-To", "References"), batch))
+        assert built.startswith(b"NOT DRAFT OR ")
+    with pytest.raises(UnsafeSearchValue):
+        or_batches(refs, ("Message-ID",), max_values=20)  # unfiltered: the first bad value raises
 
 
 @pytest.mark.parametrize("value", [b"a@x", None, 5])
@@ -312,7 +378,7 @@ from mcp_hub.providers.imap_search import UnsafeSearchValue, criteria, header_or
 cases = [
     lambda: quoted('a"b'),
     lambda: quoted("a\\\\b"),
-    lambda: header_or(("Subject",), ["a@x"]),
+    lambda: quoted("X-GM-RAW@example.org"),
     lambda: or_batches(["a" * 80], ("Message-ID",), max_values=5, max_bytes=40),
     lambda: criteria(b"NOT DRAFT", b"a\\r\\nb"),
     lambda: criteria(b'NOT DRAFT X-GM-RAW "x"'),

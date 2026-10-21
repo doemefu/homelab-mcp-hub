@@ -82,6 +82,18 @@ def imap_error_kind(exc: Exception) -> Literal["no", "bad", "other"]:
     return "other"
 
 
+def search_criteria_ok(data: bytes) -> bool:
+    """The one rule for UID SEARCH criteria (the guard and `imap_search.criteria` share it): `bytes` of printable
+    ASCII (no CR, LF, NUL or 8-bit byte), no `X-GM-RAW` in any case (D80), and no trailing `{N}`/`{N+}` literal
+    marker."""
+    return (
+        type(data) is bytes
+        and _PRINTABLE.fullmatch(data) is not None
+        and b"X-GM-RAW" not in data.upper()
+        and _LITERAL_MARKER.fullmatch(data) is None
+    )
+
+
 def _uid_snapshot(uids: Sequence[int]) -> list[int]:
     """One pass over `uids`; the checked copy is what gets sent."""
     if isinstance(uids, (str, bytes, bytearray)):
@@ -161,12 +173,7 @@ class GuardedImapClient:
         return self._client.select_folder(raw_name, readonly=True)
 
     def search(self, criteria: bytes) -> list[int]:
-        if (
-            type(criteria) is not bytes
-            or _PRINTABLE.fullmatch(criteria) is None
-            or b"X-GM-RAW" in criteria.upper()
-            or _LITERAL_MARKER.fullmatch(criteria) is not None
-        ):
+        if not search_criteria_ok(criteria):
             raise ImapCommandRefused("search criteria refused")
         self._before_command()
         return self._client.search(criteria)
