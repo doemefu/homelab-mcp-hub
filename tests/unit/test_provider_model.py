@@ -9,6 +9,7 @@ import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, ThreadKey, location_k
 from mcp_hub.providers.base import (
+    FolderPage,
     MailDetail,
     MailFlags,
     MailMeta,
@@ -16,6 +17,7 @@ from mcp_hub.providers.base import (
     direction_of,
     log_message_skipped,
     order_key,
+    order_key_of,
     placeholder_summary,
 )
 from tests.support.logcapture import Capture
@@ -48,6 +50,17 @@ def test_order_key_total_order() -> None:
     # the same instant in another offset gives the same key
     shifted = summary(a.ref, T0.astimezone(timezone(timedelta(hours=5))))
     assert order_key(shifted) == order_key(a)
+
+
+def test_order_key_of_is_the_order_key_from_its_parts() -> None:
+    ref = MessageRef("icloud", "INBOX", 7, 1)
+    assert order_key_of(T0, ref) == order_key(summary(ref, T0)) == (int(T0.timestamp()), location_k(ref))
+
+
+def test_folder_page_frontier_defaults_to_none() -> None:
+    page = FolderPage(items=[], more=False, truncated=False, complete=True)
+    assert page.frontier is None
+    assert list(FolderPage.__dataclass_fields__)[-1] == "frontier"
 
 
 @pytest.mark.parametrize(

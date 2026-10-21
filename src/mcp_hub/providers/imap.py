@@ -21,7 +21,7 @@ from typing import Final, Literal, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
-from mcp_hub.ids import AnyMessageRef, MessageRef, location_k, mailbox_name_ok
+from mcp_hub.ids import AnyMessageRef, MessageRef
 from mcp_hub.providers.base import (
     MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
@@ -39,6 +39,7 @@ from mcp_hub.providers.base import (
     UnreadPage,
     direction_of,
     log_message_skipped,
+    order_key_of,
     placeholder_summary,
 )
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
@@ -62,7 +63,13 @@ from mcp_hub.providers.headers import (
     parse_summary_headers,
     valid_message_id,
 )
-from mcp_hub.providers.imap_guard import PASS_THROUGH, GuardedImapClient, ImapClientLike, imap_error_kind
+from mcp_hub.providers.imap_guard import (
+    PASS_THROUGH,
+    GuardedImapClient,
+    ImapClientLike,
+    examine_name_ok,
+    imap_error_kind,
+)
 from mcp_hub.providers.imap_search import criteria, gmail_label_keys, window_keys
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
@@ -73,6 +80,7 @@ LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_H
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
 MAX_SEARCH_CANDIDATES: Final = 5000  # newest SEARCH hits per folder and call (§5.4, B5)
 FETCH_CHUNK_UIDS: Final = 500  # UIDs per UID FETCH (the guard's MAX_FETCH_UIDS bounds the command line)
+SOFT_CHECK_EVERY: Final = 100  # candidates parsed between two soft-limit checks in pass 1 (CPU without commands)
 _SEEN: Final = b"\\seen"
 _ANSWERED: Final = b"\\answered"
 _FLAGGED: Final = b"\\flagged"
@@ -288,24 +296,30 @@ class ImapSession:
         self._client.noop()
 
 
+Unparsable = dict[int, tuple[Exception, dict[bytes, object]]]
+
+
 def _fetch_summaries(
     session: ImapSession, uids: list[int], items: Sequence[str]
-) -> tuple[dict[int, dict[bytes, object]], dict[int, Exception]]:
+) -> tuple[dict[int, dict[bytes, object]], Unparsable]:
     """Summary rows of `uids`. IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE
-    nested about 1000 deep; the batch is then fetched per UID, and a UID that fails alone is returned as unparsable
-    so only that message degrades."""
+    nested about 1000 deep; the batch is then fetched per UID, and a UID that fails alone is returned as unparsable,
+    with its FLAGS fetched alone, so only that message degrades (to a placeholder with the right `unread`). A UID
+    whose FLAGS do not come back either is missing from both results."""
     if not uids:
         return {}, {}
     try:
         return session.fetch(uids, items), {}
     except RecursionError:
         rows: dict[int, dict[bytes, object]] = {}
-        unparsable: dict[int, Exception] = {}
+        unparsable: Unparsable = {}
         for uid in uids:
             try:
                 rows.update(session.fetch([uid], items))
             except RecursionError as exc:
-                unparsable[uid] = exc
+                flags = session.fetch([uid], ["FLAGS"]).get(uid)
+                if flags is not None:
+                    unparsable[uid] = (exc, flags)
         return rows, unparsable
 
 
@@ -392,7 +406,7 @@ class ImapMailbox:
         try:
             raw.normalise_times = False  # keep the server's offset on INTERNALDATE
             return GuardedImapClient(raw, deadline, registry_inbox_raw=self._folder)
-        except Exception:
+        except BaseException:  # cleanup and re-raise: nothing is swallowed here (Sec3)
             with contextlib.suppress(Exception):
                 raw.logout()
             raise
@@ -417,6 +431,10 @@ class ImapMailbox:
             if client is not None:
                 with contextlib.suppress(Exception):
                     client.logout()
+
+    def _soft_check(self) -> None:
+        if self._deadline is not None and self._deadline.soft_expired():
+            raise SoftStop
 
     def check(self, deadline: CallDeadline) -> None:
         """Status check (spec 080 §7.4): login + NOOP."""
@@ -444,8 +462,7 @@ class ImapMailbox:
         candidates: list[Candidate] = []
         try:
             plans = self._plans(session, query.folder)
-            if any(plan.fixed_folder is None for plan in plans):  # Gmail All Mail: folder per message by labels
-                raise ProviderError("upstream_error", "NotImplemented")
+            folder_of = {plan.entry.raw_name: _fixed_folder(plan) for plan in plans}  # before any EXAMINE
             merge = query.folder == "all" and len(plans) > 1
             for plan in plans:
                 candidates.extend(self._candidates(session, plan, query, merge, progress))
@@ -455,11 +472,21 @@ class ImapMailbox:
         built: dict[MessageRef, MailSummary] = {}
         try:
             for entry, group in _by_folder(plans, chosen):
-                built.update(self._summaries(session, entry, group, query, progress))
+                built.update(self._summaries(session, entry, folder_of[entry.raw_name], group, progress))
         except SoftStop:  # SA13: pass 2 incomplete, so the page gets no cursor
             progress.truncated, progress.complete = True, False
-        items = [built[c.ref] for c in chosen if c.ref in built]
-        return FolderPage(items=items, more=more, truncated=progress.truncated, complete=progress.complete)
+        returned = [c for c in chosen if c.ref in built]
+        frontier: tuple[int, str] | None = None
+        if more:  # the whole window was scanned: the account's items continue below its last returned item
+            last = returned[-1] if returned else chosen[-1]
+            frontier = last.key
+        return FolderPage(
+            items=[built[c.ref] for c in returned],
+            more=more,
+            truncated=progress.truncated,
+            complete=progress.complete,
+            frontier=frontier,
+        )
 
     @staticmethod
     def _plans(session: ImapSession, folder: ListFolder) -> list[FolderPlan]:
@@ -471,8 +498,8 @@ class ImapMailbox:
         self, session: ImapSession, plan: FolderPlan, query: ListQuery, merge: bool, progress: _Progress
     ) -> list[Candidate]:
         entry = plan.entry
-        if entry.raw_name != session.registry_inbox and not mailbox_name_ok(entry.raw_name):
-            progress.complete = False  # the guard opens no mailbox an id cannot name (over 200 characters)
+        if entry.raw_name != session.registry_inbox and not examine_name_ok(entry.raw_name):
+            progress.complete = False  # over 1,000 characters: the guard would refuse the EXAMINE
             return []
         try:
             validity = session.examine(entry)
@@ -509,7 +536,9 @@ class ImapMailbox:
         items = [*CANDIDATE_ITEMS, candidate_header_item(fields)] if fields else list(CANDIDATE_ITEMS)
         rows = session.fetch(newest, items)
         out: list[Candidate] = []
-        for uid in newest:
+        for count, uid in enumerate(newest):
+            if count and count % SOFT_CHECK_EVERY == 0:
+                self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
             row = rows.get(uid)
             if row is None or _is_draft(row):  # FETCH NO, expunged meanwhile, or a draft (S1)
                 continue
@@ -549,7 +578,7 @@ class ImapMailbox:
         kept: list[_Chosen] = []
         for candidate, in_sent in merged:
             ref = MessageRef(self._account, candidate.plan.entry.raw_name, candidate.uidvalidity, candidate.uid)
-            key = (int(candidate.received_at.timestamp()), location_k(ref))
+            key = order_key_of(candidate.received_at, ref)
             if query.position is not None and not query.position.precedes(*key):
                 continue
             sent = in_sent or candidate.sent_label
@@ -563,9 +592,11 @@ class ImapMailbox:
         return kept[: query.limit], len(kept) > query.limit
 
     def _summaries(
-        self, session: ImapSession, entry: FolderEntry, group: list[_Chosen], query: ListQuery, progress: _Progress
+        self, session: ImapSession, entry: FolderEntry, folder: MailFolder, group: list[_Chosen], progress: _Progress
     ) -> dict[MessageRef, MailSummary]:
-        """Pass 2 for one folder: EXAMINE only when another mailbox is open; a changed UIDVALIDITY drops the items."""
+        """Pass 2 for one folder: EXAMINE only when another mailbox is open. A chosen item that cannot be read now
+        (changed UIDVALIDITY, FETCH NO, expunged) is dropped and the page becomes incomplete: a cursor after the
+        items returned would skip it for good."""
         if session.selected != entry.raw_name:
             try:
                 validity = session.examine(entry)
@@ -577,7 +608,7 @@ class ImapMailbox:
                 progress.complete = False
                 return {}
             if validity != group[0].candidate.uidvalidity:
-                progress.truncated = True
+                progress.truncated, progress.complete = True, False
                 return {}
         uids = [chosen.candidate.uid for chosen in group]
         rows, unparsable = _fetch_summaries(session, uids, LIST_SUMMARY_ITEMS)
@@ -586,35 +617,48 @@ class ImapMailbox:
         for chosen in group:
             uid = chosen.candidate.uid
             if uid in unparsable:
-                log_message_skipped(chosen.ref, "mail", unparsable[uid])
-                meta = self._meta(entry, chosen, frozenset(), None)
-                out[chosen.ref] = placeholder_summary(chosen.ref, chosen.candidate.received_at, query.unread_only, meta)
+                failure, flag_row = unparsable[uid]
+                if _is_draft(flag_row):
+                    continue
+                log_message_skipped(chosen.ref, "mail", failure)
+                flags = _flags(flag_row)
+                meta = self._meta(entry, folder, chosen, flags, None)
+                out[chosen.ref] = placeholder_summary(
+                    chosen.ref, chosen.candidate.received_at, _SEEN not in flags, meta
+                )
                 continue
             row = rows.get(uid)
-            if row is None or _is_draft(row):  # expunged or FETCH NO meanwhile; or a draft by now
+            if row is None:  # FETCH NO (S-p) or expunged meanwhile
+                progress.complete = False
                 continue
-            out[chosen.ref] = self._summary(entry, chosen, row, texts.get(uid, ""))
+            if _is_draft(row):  # a draft by now: excluded, like any draft
+                continue
+            out[chosen.ref] = self._summary(entry, folder, chosen, row, texts.get(uid, ""))
         return out
 
-    def _meta(self, entry: FolderEntry, chosen: _Chosen, flags: frozenset[bytes], from_address: str | None) -> MailMeta:
+    def _meta(
+        self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, flags: frozenset[bytes], from_address: str | None
+    ) -> MailMeta:
         direction = chosen.direction or direction_of(
             in_sent=chosen.in_sent, from_address=from_address, own=self._own_addresses
         )
         return MailMeta(
-            folder=_fixed_folder(chosen.candidate.plan),
+            folder=folder,
             folder_name=entry.display_name,
             flags=MailFlags(answered=_ANSWERED in flags, flagged=_FLAGGED in flags),
             direction=direction,
         )
 
-    def _summary(self, entry: FolderEntry, chosen: _Chosen, row: dict[bytes, object], snippet: str) -> MailSummary:
+    def _summary(
+        self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, row: dict[bytes, object], snippet: str
+    ) -> MailSummary:
         flags = _flags(row)
         received = chosen.candidate.received_at
         try:  # one hostile message degrades to a placeholder, never fails the account
             parts = _structure(row)
             text_part = choose_text_part(parts)
             parsed = parse_summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
-            meta = self._meta(entry, chosen, flags, parsed.from_address)
+            meta = self._meta(entry, folder, chosen, flags, parsed.from_address)
             return MailSummary(
                 ref=chosen.ref,
                 received_at=received,
@@ -638,7 +682,8 @@ class ImapMailbox:
             raise
         except Exception as exc:
             log_message_skipped(chosen.ref, "mail", exc)
-            return placeholder_summary(chosen.ref, received, _SEEN not in flags, self._meta(entry, chosen, flags, None))
+            meta = self._meta(entry, folder, chosen, flags, None)
+            return placeholder_summary(chosen.ref, received, _SEEN not in flags, meta)
 
     # --- get_message -------------------------------------------------------------------------------------------
 

@@ -13,7 +13,7 @@ from typing import Final, Literal, Protocol
 
 from imapclient.exceptions import InvalidCriteriaError, LoginError
 
-from mcp_hub.ids import mailbox_name_ok
+from mcp_hub.ids import mailbox_name_shape_ok
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 
@@ -24,6 +24,9 @@ PLAIN_ITEMS: Final = frozenset({"FLAGS", "INTERNALDATE", "BODYSTRUCTURE", "X-GM-
 MAX_FETCH_UIDS: Final = 500  # bounds the UID FETCH line (at most 500 UIDs of 11 bytes each); the guard owns it
 MAX_UID: Final = 2**32 - 1  # nz-number (RFC 3501)
 MIN_SOCKET_TIMEOUT: Final = 0.5
+# Mailboxes over 200 characters are listed with `id: null` (§5.3 rule 9), so EXAMINE takes longer names; this cap only
+# bounds the command line.
+MAX_EXAMINE_NAME_CHARS: Final = 1000
 
 _PEEK: Final = re.compile(r"BODY\.PEEK\[([^\]]*)\](<[^>]*>)")
 _PRINTABLE: Final = re.compile(rb"[\x20-\x7e]+")
@@ -92,6 +95,12 @@ def search_criteria_ok(data: bytes) -> bool:
         and b"X-GM-RAW" not in data.upper()
         and _LITERAL_MARKER.fullmatch(data) is None
     )
+
+
+def examine_name_ok(raw_name: object) -> bool:
+    """A name EXAMINE may send (other than the registry inbox): 1-1,000 characters of printable ASCII in strict
+    modified UTF-7 (`ids.mailbox_name_shape_ok`)."""
+    return type(raw_name) is str and 0 < len(raw_name) <= MAX_EXAMINE_NAME_CHARS and mailbox_name_shape_ok(raw_name)
 
 
 def _uid_snapshot(uids: Sequence[int]) -> list[int]:
@@ -167,7 +176,7 @@ class GuardedImapClient:
         return self._client.list_folders()
 
     def examine(self, raw_name: str) -> dict[bytes, object]:
-        if type(raw_name) is not str or (raw_name != self._inbox_raw and not mailbox_name_ok(raw_name)):
+        if type(raw_name) is not str or (raw_name != self._inbox_raw and not examine_name_ok(raw_name)):
             raise ImapCommandRefused("mailbox name refused")
         self._before_command()
         return self._client.select_folder(raw_name, readonly=True)

@@ -273,9 +273,13 @@ def item_hash(opaque_id: str) -> str:
     return hashlib.sha256(opaque_id.encode()).hexdigest()[:12]
 
 
-def order_key(item: MailSummary) -> tuple[int, str]:
+def order_key_of(received_at: datetime, ref: AnyMessageRef) -> tuple[int, str]:
     """Total list order (received_at desc, k desc): epoch seconds and the 16-hex location key."""
-    return int(item.received_at.timestamp()), location_k(item.ref)
+    return int(received_at.timestamp()), location_k(ref)
+
+
+def order_key(item: MailSummary) -> tuple[int, str]:
+    return order_key_of(item.received_at, item.ref)
 
 
 def direction_of(*, in_sent: bool, from_address: str | None, own: frozenset[str]) -> Direction:

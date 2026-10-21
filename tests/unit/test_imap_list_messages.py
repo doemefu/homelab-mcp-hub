@@ -19,11 +19,13 @@ from mcp_hub.providers.base import (
     MailSummary,
     ProviderError,
     item_hash,
+    order_key,
 )
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import FolderMapCache
 from mcp_hub.providers.headers import SUMMARY_HEADER_ITEM, candidate_header_item
 from mcp_hub.providers.imap import FETCH_CHUNK_UIDS, MAX_SEARCH_CANDIDATES, ImapMailbox
+from mcp_hub.providers.imap_guard import MAX_EXAMINE_NAME_CHARS
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
@@ -511,7 +513,9 @@ def test_examine_no_with_a_refused_rebuild_is_incomplete_not_an_error() -> None:
     assert (page.items, page.complete) == ([], False)
 
 
-def test_fetch_no_in_pass_two_drops_those_items() -> None:
+def test_fetch_no_in_pass_two_drops_those_items_and_leaves_the_page_incomplete() -> None:
+    """S-p drops the UIDs a FETCH NO did not return. "a" is newer than "b": a cursor after "b" would skip "a" for
+    good, so the page is incomplete and gets no cursor."""
     server = icloud(inbox=[msg(1, 5, "a")], archive=[msg(2, 6, "b")])
     original = server.run
     count = {"fetch": 0}
@@ -526,7 +530,7 @@ def test_fetch_no_in_pass_two_drops_those_items() -> None:
     server.run = run_command  # type: ignore[method-assign]
     page = run(server, query("all"))
     assert subjects(page) == ["b"]
-    assert page.complete is True
+    assert page.complete is False
 
 
 # --- soft stop and hard deadline -------------------------------------------------------------------------------
@@ -588,6 +592,25 @@ def test_soft_stop_in_pass_two_gives_no_cursor() -> None:
     assert (page.items, page.truncated, page.complete) == ([], True, False)
 
 
+def test_candidate_parse_checks_the_soft_limit_every_100_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hostile From blocks cost CPU without any IMAP command: pass 1 checks the soft limit every 100 candidates."""
+    server = icloud(inbox=[msg(uid, 5 + uid / 100, f"m{uid}") for uid in range(1, 501)])
+    clock = clock_of(server)
+    original = imap.parse_summary_headers
+    parsed = {"n": 0}
+
+    def slow_parse(raw: bytes | None) -> object:
+        parsed["n"] += 1
+        clock.advance(0.1)
+        return original(raw)
+
+    monkeypatch.setattr(imap, "parse_summary_headers", slow_parse)
+    page = box(server, own=OWN).list_messages(query(direction="incoming"), CallDeadline(clock(), 15.0, 100.0, clock))
+    assert parsed["n"] == 200  # soft limit passed at 151; stopped at the next check, not after all 500
+    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    assert names(server)[-2:] == ["UID FETCH", "LOGOUT"]  # no pass-2 command
+
+
 def test_abandoned_worker_stops_after_hard_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     server = icloud(inbox=[msg(1, 5, "a")])
     original = server.run
@@ -608,26 +631,28 @@ def test_abandoned_worker_stops_after_hard_deadline(monkeypatch: pytest.MonkeyPa
 
 
 def test_unsafe_mailbox_name_lists_items_with_null_location_id() -> None:
-    name = '"' * 190 + "Sent"  # a valid name whose JSON-escaped id would exceed 512 characters
+    name = "Sent " + "x" * 196  # 201 characters: listed, but no id can carry the name (§5.3 rule 9)
     server = icloud(sent=[msg(5, 30, "report")], sent_name=name)
     page = run(server, query("sent"))
     [item] = page.items
+    assert len(name) == 201
     assert item.ref == MessageRef("icloud", name, 7, 5)
     assert location_id(item.ref) is None
     assert item.meta.folder_name == name
+    assert ("EXAMINE", name) in server.commands
     assert page.complete is True
 
 
-def test_overlong_mailbox_name_is_skipped_as_incomplete() -> None:
-    """The guard opens no mailbox whose name an id cannot carry (> 200 characters): the folder is incomplete."""
-    server = icloud(sent=[msg(5, 30, "report")], sent_name="S" * 201)
+def test_mailbox_name_over_the_guard_cap_is_skipped_as_incomplete() -> None:
+    """The guard bounds EXAMINE at 1,000 characters: such a folder is incomplete, never an account error."""
+    server = icloud(sent=[msg(5, 30, "report")], sent_name="S" * (MAX_EXAMINE_NAME_CHARS + 1))
     page = run(server, query("sent"))
     assert (page.items, page.complete) == ([], False)
     assert "EXAMINE" not in names(server)
 
 
-def test_uidvalidity_change_between_passes_drops_items() -> None:
-    server = three_folders()
+def validity_changes_in_pass_two(server: FakeImapServer) -> None:
+    """The inbox gets a new UIDVALIDITY between its pass-1 EXAMINE and its pass-2 EXAMINE."""
     original = server.run
     examined = {"inbox": 0}
 
@@ -639,9 +664,26 @@ def test_uidvalidity_change_between_passes_drops_items() -> None:
         original(command, argument)
 
     server.run = run_command  # type: ignore[method-assign]
+
+
+def test_uidvalidity_change_between_passes_drops_items() -> None:
+    server = three_folders()
+    validity_changes_in_pass_two(server)
     page = run(server, query("all"))
     assert subjects(page) == ["arch", "sent"]
-    assert (page.truncated, page.complete) == (True, True)
+    assert (page.truncated, page.complete) == (True, False)
+
+
+def test_uidvalidity_change_with_a_limit_loses_no_item() -> None:
+    """With limit 2 the chosen items are in-1 (inbox) and arch. in-1 is dropped in pass 2; a cursor after arch would
+    skip it for good, so the page must be incomplete (no cursor). Repeating the call without a cursor finds it."""
+    server = three_folders()
+    validity_changes_in_pass_two(server)
+    first = run(server, query("all", limit=2))
+    assert subjects(first) == ["arch"]
+    assert (first.more, first.truncated, first.complete) == (True, True, False)
+    again = [i.subject for page in pages(three_folders, query("all", limit=2)) for i in page.items]
+    assert sorted(again) == sorted(["in-1", "in-2", "arch", "sent"])
 
 
 def test_archive_without_role_is_empty_and_complete() -> None:
@@ -815,3 +857,62 @@ def test_fake_lists_raw_bytes_names_like_imapclient() -> None:
     client = server.client()
     client.folder_encode = False
     assert [name for _, _, name in client.list_folders()] == [b"Eing&AOQ-nge", 2026]
+
+
+# --- frontier, unparsable messages, log content ----------------------------------------------------------------
+
+
+def test_frontier_is_the_order_key_of_the_last_returned_item_when_more() -> None:
+    def server() -> FakeImapServer:
+        return icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b"), msg(3, 7, "c")])
+
+    page = run(server(), query(limit=2))
+    assert page.more is True
+    assert page.frontier == order_key(page.items[-1])
+    assert run(server(), query(limit=3)).frontier is None  # nothing more: no frontier
+
+
+class DeepStructureClient(FakeImapClient):
+    """IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE nested about 1000 deep."""
+
+    def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in items and 1 in messages:  # type: ignore[operator]
+            raise RecursionError("maximum recursion depth exceeded")
+        return super().fetch(messages, items)  # type: ignore[arg-type]
+
+
+def test_unparsable_message_keeps_its_read_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=[msg(1, 5, "deep", flags=(b"\\Seen", b"\\Answered")), msg(2, 6, "fine")])
+    monkeypatch.setattr(server, "client", lambda: DeepStructureClient(server))
+    page = run(server, query())
+    deep, fine = page.items
+    assert (deep.snippet_text, deep.unread, deep.meta.flags.answered) == (UNDECODABLE_NOTE, False, True)
+    assert (fine.subject, fine.unread) == ("fine", True)
+    assert ([1], ["FLAGS"]) in fetches(server)  # the FLAGS of the unparsable UID, fetched alone
+    assert page.complete is True
+
+
+def test_merged_all_logs_carry_no_message_id_folder_name_or_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub")
+    logger.addHandler(handler)
+    level = logger.level
+    logger.setLevel(logging.INFO)  # also the INFO folder_map_refreshed line
+    try:
+        server = icloud(
+            inbox=[msg(1, 5, "Quarterly numbers", message_id="<q1@example.test>")],
+            archive=[msg(11, 15, "Quarterly numbers", message_id="<q1@example.test>")],
+            sent=[msg(21, 25, "Reply", message_id="<r1@example.test>", sender="owner@example.org"), msg(22, 26, "x")],
+        )
+        monkeypatch.setattr(NoDateClient, "blank", frozenset({22}))
+        monkeypatch.setattr(server, "client", lambda: NoDateClient(server))
+        page = run(server, query("all", direction="outgoing"), own=OWN)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    assert [i.subject for i in page.items] == ["Reply"]
+    events = [json.loads(line)["event"] for line in handler.lines]
+    assert events == ["folder_map_refreshed", "item_degraded"]
+    text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
+    for secret in ("q1@example.test", "r1@example.test", "Sent Messages", "Archive", "INBOX", "@example", "Quarterly"):
+        assert secret not in text

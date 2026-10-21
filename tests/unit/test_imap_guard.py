@@ -15,6 +15,7 @@ from imapclient.exceptions import IMAPClientError, InvalidCriteriaError, LoginEr
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.imap_guard import (
+    MAX_EXAMINE_NAME_CHARS,
     MAX_FETCH_UIDS,
     MAX_PARTIAL_BYTES,
     PASS_THROUGH,
@@ -39,7 +40,11 @@ def make(
 ) -> tuple[FakeImapServer, FakeClock, GuardedImapClient]:
     clock = FakeClock(1000.0)
     inbox = FakeFolder("INBOX", messages={uid: FakeMessage(uid, D) for uid in (1, 2, 3, 5, 7, 8)})
-    server = FakeImapServer([inbox, FakeFolder("Eing&AOQ-nge"), FakeFolder("a" * 201)], clock=clock, step_seconds=step)
+    server = FakeImapServer(
+        [inbox, FakeFolder("Eing&AOQ-nge"), FakeFolder("a" * 201), FakeFolder("b" * 1000), FakeFolder("a" * 1001)],
+        clock=clock,
+        step_seconds=step,
+    )
     deadline = CallDeadline(clock(), soft, hard, clock)
     return server, clock, GuardedImapClient(server.client(), deadline, registry_inbox_raw=registry_inbox)
 
@@ -70,18 +75,29 @@ def test_examine_is_read_only() -> None:
 def test_examine_refuses_unsafe_names_except_registry_inbox() -> None:
     server, _, guard = make(registry_inbox="Eing&AOQ-nge")
     guard.login("user", "secret")
-    for unsafe in ("a\r\nb", "a" * 201, "", "a&b", "Eingänge"):
+    for unsafe in ("a\r\nb", "a" * (MAX_EXAMINE_NAME_CHARS + 1), "", "a&b", "Eingänge"):
         with pytest.raises(ImapCommandRefused):
             guard.examine(unsafe)
     assert names(server) == ["LOGIN", "CAPABILITY"]
     guard.examine("Eing&AOQ-nge")
     assert server.commands[-1] == ("EXAMINE", "Eing&AOQ-nge")
 
-    # The registry inbox is exempt from the name rule even when it fails it (here: longer than 200 characters).
-    server, _, guard = make(registry_inbox="a" * 201)
+    # The registry inbox is exempt from the name rule even when it fails it (here: longer than 1,000 characters).
+    long_inbox = "a" * (MAX_EXAMINE_NAME_CHARS + 1)
+    server, _, guard = make(registry_inbox=long_inbox)
+    guard.login("user", "secret")
+    guard.examine(long_inbox)
+    assert server.commands[-1] == ("EXAMINE", long_inbox)
+
+
+def test_examine_takes_names_longer_than_ids_carry() -> None:
+    """A mailbox over 200 characters is listed with `id: null` (§5.3 rule 9), so EXAMINE must open it."""
+    server, _, guard = make()
     guard.login("user", "secret")
     guard.examine("a" * 201)
-    assert server.commands[-1] == ("EXAMINE", "a" * 201)
+    guard.examine("b" * MAX_EXAMINE_NAME_CHARS)
+    assert server.commands[-2:] == [("EXAMINE", "a" * 201), ("EXAMINE", "b" * MAX_EXAMINE_NAME_CHARS)]
+    assert MAX_EXAMINE_NAME_CHARS == 1000
 
 
 @pytest.mark.parametrize("value", ["a\r\nb", "INBOX\x00", "", "Eingänge"])
