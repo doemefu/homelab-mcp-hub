@@ -665,7 +665,9 @@ class GraphMailbox:
         query parameter (G8; the caller checked the §5.5 pattern, which excludes `'`). Hits are kept only with a
         Graph id (Sec8), the exact Message-ID (case-sensitive), no draft and a parent outside the excluded folders.
         A failed request, an answer that does not parse, or a full answer (`$top` or a nextLink, never followed)
-        without an acceptable hit is an incomplete search: upstream_timeout, never None (G5, B6)."""
+        without an acceptable hit is an incomplete search: upstream_timeout, never None (G5, B6). Accepted residual
+        (R39): a full answer that holds an acceptable hit uses the best hit on it, so with more than 50 copies of one
+        Message-ID an earlier copy can lie beyond the page."""
         params = {
             "$filter": f"internetMessageId eq '<{message_id}>'",
             "$select": SUMMARY_SELECT,

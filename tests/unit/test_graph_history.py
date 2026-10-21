@@ -388,7 +388,13 @@ def test_drafts_dropped_per_item() -> None:
 
 def test_excluded_parent_dropped_per_item() -> None:
     clock = FakeClock()
-    entries = [item(1, LATER, FOLDER_IDS["junkemail"]), item(2, LATER, parentFolderId=None), item(3, LATER)]
+    entries = [
+        item(1, LATER, FOLDER_IDS["junkemail"]),
+        item(2, LATER, parentFolderId=None),
+        item(3, LATER),
+        item(4, LATER, parentFolderId=""),  # not a folder id: no parent (Sec8, D75 fail closed)
+        item(5, LATER, parentFolderId="a/../b"),
+    ]
     page = listed(mailbox(Server({INBOX_ID: values(*entries)}), clock=clock), query(), clock)
     assert ids(page) == ["AAMkMSG0003="]
 
@@ -1013,6 +1019,8 @@ def test_ref_filter_special_characters_byte_identical() -> None:
         by_ref(mailbox(server, clock=clock), odd, clock)
     [request] = server.requests
     assert request.url.path == REF_PATH  # nothing of the value reaches the path
+    # The recorded wire bytes (D74): every special character percent-encoded inside the one $filter parameter.
+    assert b"%24filter=internetMessageId+eq+%27%3Ca%2B%26%23%25%3D%3B%2F%3F%40x%3E%27&" in request.url.query
     decoded = parse_qs(request.url.query.decode("ascii"), keep_blank_values=True, strict_parsing=True)
     assert decoded["$filter"] == ["internetMessageId eq '<a+&#%=;/?@x>'"]
     assert request.url.params["$filter"] == "internetMessageId eq '<a+&#%=;/?@x>'"
