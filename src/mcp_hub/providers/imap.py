@@ -21,7 +21,7 @@ from typing import Final, Literal, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
-from mcp_hub.ids import AnyMessageRef, MessageRef
+from mcp_hub.ids import AnyMessageRef, MessageRef, ThreadKey
 from mcp_hub.providers.base import (
     MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
@@ -78,13 +78,18 @@ HEADER_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT)]<0.{MAX_HEAD
 SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", HEADER_ITEM)  # get_message
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
+_GMAIL_CANDIDATE_ITEM: Final = "X-GM-LABELS"  # Gmail: label drafts and `sent_label` before `limit` (I8, C4)
+_GMAIL_SUMMARY_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: per-message folder and thread (§5.5)
 MAX_SEARCH_CANDIDATES: Final = 5000  # newest SEARCH hits per folder and call (§5.4, B5)
 FETCH_CHUNK_UIDS: Final = 500  # UIDs per UID FETCH (the guard's MAX_FETCH_UIDS bounds the command line)
 SOFT_CHECK_EVERY: Final = 100  # candidates parsed between two soft-limit checks in pass 1 (CPU without commands)
 _SEEN: Final = b"\\seen"
 _ANSWERED: Final = b"\\answered"
 _FLAGGED: Final = b"\\flagged"
-_DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8)
+_DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8); as a flag and as a Gmail label (S-r)
+_LABEL_INBOX: Final = b"\\inbox"
+_LABEL_SENT: Final = b"\\sent"
+_MAX_THRID: Final = 2**64
 _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 
 ClientFactory = Callable[[str, int, ssl.SSLContext, float], ImapClientLike]
@@ -150,12 +155,43 @@ def _flags(row: dict[bytes, object]) -> frozenset[bytes]:
     return frozenset(flag.lower() for flag in flags if isinstance(flag, bytes))
 
 
+def _labels(row: dict[bytes, object]) -> frozenset[bytes]:
+    """Gmail `X-GM-LABELS`, lowercased; empty on other servers (never fetched there)."""
+    labels = row.get(b"X-GM-LABELS", ())
+    if not isinstance(labels, (tuple, list)):
+        return frozenset()
+    out: set[bytes] = set()
+    for label in labels:
+        if isinstance(label, str):
+            label = label.encode("utf-8", "replace")
+        if isinstance(label, bytes):
+            out.add(label.lower())
+    return frozenset(out)
+
+
 def _unread(row: dict[bytes, object]) -> bool:
     return _SEEN not in _flags(row)
 
 
 def _is_draft(row: dict[bytes, object]) -> bool:
-    return bool(_flags(row) & _DRAFT)
+    """`\\Draft` or `\\Drafts` in any case, as a flag or (Gmail) as a label (S1, S-r)."""
+    return bool((_flags(row) | _labels(row)) & _DRAFT)
+
+
+def _gmail_folder(labels: frozenset[bytes]) -> MailFolder:
+    """All Mail decides per message (§5.5): `\\Inbox` → inbox, `\\Sent` → sent, else archive (drafts are dropped
+    before this)."""
+    if _LABEL_INBOX in labels:
+        return "inbox"
+    return "sent" if _LABEL_SENT in labels else "archive"
+
+
+def _gmail_thread(account: str, row: dict[bytes, object]) -> ThreadKey | None:
+    """The `gmail` thread key from `X-GM-THRID` (an unsigned 64-bit integer); no key without a valid one (D79)."""
+    value = row.get(b"X-GM-THRID")
+    if type(value) is int and 0 <= value < _MAX_THRID:
+        return ThreadKey(account, "gmail", value)
+    return None
 
 
 def _structure(row: dict[bytes, object]) -> list[Part]:
@@ -166,12 +202,6 @@ def _sender_and_subject(headers: Message) -> tuple[tuple[str, str], str | None]:
     """str() on an encoded word with an odd charset can raise, so callers guard this per message."""
     sender = (_addresses(headers, "From") or [("", "")])[0]
     return sender, str(headers.get("Subject", "")) or None
-
-
-def _fixed_folder(plan: FolderPlan) -> MailFolder:
-    if plan.fixed_folder is None:  # Gmail All Mail decides per message by X-GM-LABELS (not implemented yet)
-        raise ProviderError("upstream_error", "NotImplemented")
-    return plan.fixed_folder
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,12 +330,13 @@ Unparsable = dict[int, tuple[Exception, dict[bytes, object]]]
 
 
 def _fetch_summaries(
-    session: ImapSession, uids: list[int], items: Sequence[str]
+    session: ImapSession, uids: list[int], items: Sequence[str], flag_items: Sequence[str]
 ) -> tuple[dict[int, dict[bytes, object]], Unparsable]:
     """Summary rows of `uids`. IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE
     nested about 1000 deep; the batch is then fetched per UID, and a UID that fails alone is returned as unparsable,
-    with its FLAGS fetched alone, so only that message degrades (to a placeholder with the right `unread`). A UID
-    whose FLAGS do not come back either is missing from both results."""
+    with its `flag_items` (FLAGS; on Gmail also X-GM-LABELS) fetched alone, so only that message degrades (to a
+    placeholder with the right `unread` and folder). A UID whose FLAGS do not come back either is missing from both
+    results."""
     if not uids:
         return {}, {}
     try:
@@ -317,7 +348,7 @@ def _fetch_summaries(
             try:
                 rows.update(session.fetch([uid], items))
             except RecursionError as exc:
-                flags = session.fetch([uid], ["FLAGS"]).get(uid)
+                flags = session.fetch([uid], flag_items).get(uid)
                 if flags is not None:
                     unparsable[uid] = (exc, flags)
         return rows, unparsable
@@ -462,7 +493,8 @@ class ImapMailbox:
         candidates: list[Candidate] = []
         try:
             plans = self._plans(session, query.folder)
-            folder_of = {plan.entry.raw_name: _fixed_folder(plan) for plan in plans}  # before any EXAMINE
+            # None: Gmail All Mail, where X-GM-LABELS decide per message
+            folder_of = {plan.entry.raw_name: plan.fixed_folder for plan in plans}
             merge = query.folder == "all" and len(plans) > 1
             for plan in plans:
                 candidates.extend(self._candidates(session, plan, query, merge, progress))
@@ -533,7 +565,8 @@ class ImapMailbox:
             fields = ["MESSAGE-ID", "FROM"]  # the dedup key (S-e)
         elif query.direction is not None and session.own:
             fields = ["FROM"]  # I13
-        items = [*CANDIDATE_ITEMS, candidate_header_item(fields)] if fields else list(CANDIDATE_ITEMS)
+        base = [*CANDIDATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if session.gmail else list(CANDIDATE_ITEMS)
+        items = [*base, candidate_header_item(fields)] if fields else base
         rows = session.fetch(newest, items)
         out: list[Candidate] = []
         for count, uid in enumerate(newest):
@@ -551,7 +584,8 @@ class ImapMailbox:
             if received < query.since:
                 continue
             message_id, sender = _candidate_headers(row) if fields else (None, None)
-            out.append(Candidate(plan, validity, uid, received, message_id, sender, False))
+            sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
+            out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
         return out
 
     def _choose(self, candidates: list[Candidate], query: ListQuery, merge: bool) -> tuple[list[_Chosen], bool]:
@@ -592,11 +626,17 @@ class ImapMailbox:
         return kept[: query.limit], len(kept) > query.limit
 
     def _summaries(
-        self, session: ImapSession, entry: FolderEntry, folder: MailFolder, group: list[_Chosen], progress: _Progress
+        self,
+        session: ImapSession,
+        entry: FolderEntry,
+        folder: MailFolder | None,
+        group: list[_Chosen],
+        progress: _Progress,
     ) -> dict[MessageRef, MailSummary]:
         """Pass 2 for one folder: EXAMINE only when another mailbox is open. A chosen item that cannot be read now
         (changed UIDVALIDITY, FETCH NO, expunged) is dropped and the page becomes incomplete: a cursor after the
-        items returned would skip it for good."""
+        items returned would skip it for good. `folder` None (Gmail All Mail): each item's folder follows its
+        X-GM-LABELS."""
         if session.selected != entry.raw_name:
             try:
                 validity = session.examine(entry)
@@ -611,7 +651,10 @@ class ImapMailbox:
                 progress.truncated, progress.complete = True, False
                 return {}
         uids = [chosen.candidate.uid for chosen in group]
-        rows, unparsable = _fetch_summaries(session, uids, LIST_SUMMARY_ITEMS)
+        gmail = session.gmail
+        items = [*LIST_SUMMARY_ITEMS, *_GMAIL_SUMMARY_ITEMS] if gmail else list(LIST_SUMMARY_ITEMS)
+        flag_items = ["FLAGS", _GMAIL_CANDIDATE_ITEM] if gmail else ["FLAGS"]
+        rows, unparsable = _fetch_summaries(session, uids, items, flag_items)
         texts = _fetch_texts(session, rows, SNIPPET_FETCH_BYTES, {c.candidate.uid: c.ref for c in group})
         out: dict[MessageRef, MailSummary] = {}
         for chosen in group:
@@ -622,7 +665,7 @@ class ImapMailbox:
                     continue
                 log_message_skipped(chosen.ref, "mail", failure)
                 flags = _flags(flag_row)
-                meta = self._meta(entry, folder, chosen, flags, None)
+                meta = self._meta(entry, folder or _gmail_folder(_labels(flag_row)), chosen, flags, None)
                 out[chosen.ref] = placeholder_summary(
                     chosen.ref, chosen.candidate.received_at, _SEEN not in flags, meta
                 )
@@ -633,14 +676,15 @@ class ImapMailbox:
                 continue
             if _is_draft(row):  # a draft by now: excluded, like any draft
                 continue
-            out[chosen.ref] = self._summary(entry, folder, chosen, row, texts.get(uid, ""))
+            item_folder = folder or _gmail_folder(_labels(row))
+            out[chosen.ref] = self._summary(entry, item_folder, chosen, row, texts.get(uid, ""), gmail=gmail)
         return out
 
     def _meta(
         self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, flags: frozenset[bytes], from_address: str | None
     ) -> MailMeta:
         direction = chosen.direction or direction_of(
-            in_sent=chosen.in_sent, from_address=from_address, own=self._own_addresses
+            in_sent=chosen.in_sent or folder == "sent", from_address=from_address, own=self._own_addresses
         )
         return MailMeta(
             folder=folder,
@@ -650,7 +694,14 @@ class ImapMailbox:
         )
 
     def _summary(
-        self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, row: dict[bytes, object], snippet: str
+        self,
+        entry: FolderEntry,
+        folder: MailFolder,
+        chosen: _Chosen,
+        row: dict[bytes, object],
+        snippet: str,
+        *,
+        gmail: bool,
     ) -> MailSummary:
         flags = _flags(row)
         received = chosen.candidate.received_at
@@ -675,7 +726,7 @@ class ImapMailbox:
                     message_id=parsed.message_id,
                     in_reply_to=parsed.in_reply_to,
                     references=parsed.references,
-                    thread=imap_thread_key(self._account, parsed),
+                    thread=_gmail_thread(self._account, row) if gmail else imap_thread_key(self._account, parsed),
                 ),
             )
         except PASS_THROUGH:
