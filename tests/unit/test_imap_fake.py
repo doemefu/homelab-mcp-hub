@@ -131,3 +131,12 @@ def test_fake_fail_rejects_keys_outside_the_allowlist() -> None:
         srv.fail["LISTT"] = srv.no("LIST")
     with pytest.raises(AssertionError, match="command outside the allowlist: STORE"):
         srv.run("STORE")
+
+
+def test_fake_select_honours_folder_encode() -> None:
+    srv = FakeImapServer([FakeFolder("Eing&AOQ-nge"), FakeFolder("Eing&-AOQ-nge")])
+    client = srv.client()
+    client.select_folder("Eing&AOQ-nge", readonly=True)  # folder_encode=True, like IMAPClient: re-encoded
+    client.folder_encode = False
+    client.select_folder("Eing&AOQ-nge", readonly=True)
+    assert srv.commands == [("EXAMINE", "Eing&-AOQ-nge"), ("EXAMINE", "Eing&AOQ-nge")]

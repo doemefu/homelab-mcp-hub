@@ -11,7 +11,7 @@ import socket
 from collections.abc import Sequence
 from typing import Final, Literal, Protocol
 
-from imapclient.exceptions import InvalidCriteriaError
+from imapclient.exceptions import InvalidCriteriaError, LoginError
 
 from mcp_hub.ids import mailbox_name_ok
 from mcp_hub.providers.base import ProviderError
@@ -21,11 +21,13 @@ SECTION: Final = re.compile(r"[0-9.]+|TEXT|HEADER\.FIELDS \([A-Z -]+\)")
 PARTIAL: Final = re.compile(r"<0\.([0-9]{1,6})>")
 MAX_PARTIAL_BYTES: Final = 262_144
 PLAIN_ITEMS: Final = frozenset({"FLAGS", "INTERNALDATE", "BODYSTRUCTURE", "X-GM-LABELS", "X-GM-THRID"})
+MAX_FETCH_UIDS: Final = 500  # bounds the UID FETCH line (at most 500 UIDs of 11 bytes each); the guard owns it
 MAX_UID: Final = 2**32 - 1  # nz-number (RFC 3501)
 MIN_SOCKET_TIMEOUT: Final = 0.5
 
 _PEEK: Final = re.compile(r"BODY\.PEEK\[([^\]]*)\](<[^>]*>)")
 _PRINTABLE: Final = re.compile(rb"[\x20-\x7e]+")
+_LITERAL_MARKER: Final = re.compile(rb".*\{[0-9]+\+?\}")  # a trailing {N} or {N+} would announce a literal
 _PRINTABLE_TEXT: Final = re.compile(r"[\x20-\x7e]+")
 # The library builds the leading words of these texts from the command name; only that prefix and the status token
 # are read. imaplib reports a tagged BAD as "<CMD> command error: BAD …"; IMAPClient 4.1.0 reports a tagged NO as
@@ -63,10 +65,13 @@ PASS_THROUGH: Final = (SoftStop, ImapCommandRefused, ProviderError, imaplib.IMAP
 
 def imap_error_kind(exc: Exception) -> Literal["no", "bad", "other"]:
     """Tagged NO, tagged BAD or anything else. The exception text is matched against fixed patterns only and is
-    never stored, logged or returned (C2)."""
+    never stored, logged or returned (C2).
+
+    A LoginError is always "other": for a NO its text is the server's own, with no library-built prefix. A NOOP BAD
+    is classified "no", because IMAPClient reports NOOP failures of both kinds as "NOOP failed: …"."""
     if isinstance(exc, InvalidCriteriaError):
         return "bad"
-    if isinstance(exc, imaplib.IMAP4.abort) or not isinstance(exc, imaplib.IMAP4.error):
+    if isinstance(exc, (imaplib.IMAP4.abort, LoginError)) or not isinstance(exc, imaplib.IMAP4.error):
         return "other"
     text = str(exc)
     status = _STATUS_ERROR.fullmatch(text)
@@ -77,29 +82,27 @@ def imap_error_kind(exc: Exception) -> Literal["no", "bad", "other"]:
     return "other"
 
 
-def _checked_uids(uids: Sequence[int]) -> list[int]:
-    if isinstance(uids, (str, bytes, bytearray)) or not uids:
+def _uid_snapshot(uids: Sequence[int]) -> list[int]:
+    """One pass over `uids`; the checked copy is what gets sent."""
+    if isinstance(uids, (str, bytes, bytearray)):
         raise ImapCommandRefused("uid set refused")
-    for uid in uids:
+    snapshot = list(uids)
+    if not 0 < len(snapshot) <= MAX_FETCH_UIDS:
+        raise ImapCommandRefused("uid set refused")
+    for uid in snapshot:
         if type(uid) is not int or not 0 < uid <= MAX_UID:
             raise ImapCommandRefused("uid refused")
-    return sorted(set(uids))
+    return sorted(set(snapshot))
 
 
-def uid_set(uids: Sequence[int]) -> str:
-    """Sorted UIDs as an IMAP sequence set with ranges: [1, 2, 3, 5, 7, 8] → "1:3,5,7:8" (I10).
-
-    Not passed to IMAPClient 4.1.0's fetch(), which filters its reply with int(messages) and fails on a range."""
-    ordered = _checked_uids(uids)
-    runs: list[str] = []
-    start = prev = ordered[0]
-    for uid in ordered[1:]:
-        if uid != prev + 1:
-            runs.append(f"{start}:{prev}" if prev > start else str(start))
-            start = uid
-        prev = uid
-    runs.append(f"{start}:{prev}" if prev > start else str(start))
-    return ",".join(runs)
+def _item_snapshot(items: Sequence[str]) -> list[str]:
+    """One pass over `items`; the checked copy is what gets sent."""
+    if isinstance(items, (str, bytes, bytearray)):
+        raise ImapCommandRefused("fetch item refused")
+    snapshot = list(items)
+    if not snapshot or not all(_fetch_item_ok(item) for item in snapshot):
+        raise ImapCommandRefused("fetch item refused")
+    return snapshot
 
 
 def _fetch_item_ok(item: object) -> bool:
@@ -120,6 +123,10 @@ class GuardedImapClient:
     def __init__(self, client: ImapClientLike, deadline: CallDeadline, *, registry_inbox_raw: str) -> None:
         if type(registry_inbox_raw) is not str or _PRINTABLE_TEXT.fullmatch(registry_inbox_raw) is None:
             raise ImapCommandRefused("registry inbox refused")
+        # UID SEARCH/UID FETCH only (plain SEARCH/FETCH are outside the allowlist), and raw names sent as given:
+        # IMAPClient's default folder_encode=True would re-encode a raw modified-UTF-7 name and open another folder.
+        client.use_uid = True
+        client.folder_encode = False
         self._client = client
         self._deadline = deadline
         self._inbox_raw = registry_inbox_raw
@@ -154,17 +161,21 @@ class GuardedImapClient:
         return self._client.select_folder(raw_name, readonly=True)
 
     def search(self, criteria: bytes) -> list[int]:
-        if type(criteria) is not bytes or _PRINTABLE.fullmatch(criteria) is None or b"X-GM-RAW" in criteria.upper():
+        if (
+            type(criteria) is not bytes
+            or _PRINTABLE.fullmatch(criteria) is None
+            or b"X-GM-RAW" in criteria.upper()
+            or _LITERAL_MARKER.fullmatch(criteria) is not None
+        ):
             raise ImapCommandRefused("search criteria refused")
         self._before_command()
         return self._client.search(criteria)
 
     def fetch(self, uids: Sequence[int], items: Sequence[str]) -> dict[int, dict[bytes, object]]:
-        ordered = _checked_uids(uids)
-        if isinstance(items, (str, bytes, bytearray)) or not items or not all(_fetch_item_ok(i) for i in items):
-            raise ImapCommandRefused("fetch item refused")
+        uid_list = _uid_snapshot(uids)
+        item_list = _item_snapshot(items)
         self._before_command()
-        return self._client.fetch(ordered, list(items))
+        return self._client.fetch(uid_list, item_list)
 
     def noop(self) -> None:
         self._before_command()

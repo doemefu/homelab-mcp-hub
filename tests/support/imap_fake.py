@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
+from imapclient import imap_utf7
 from imapclient.exceptions import IMAPClientError
 
 from tests.support.clock import FakeClock
@@ -133,6 +134,8 @@ class FakeImapClient:
     def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]:
         if not readonly:
             raise AssertionError("SELECT refused")
+        if self.folder_encode:  # like IMAPClient: the name is re-encoded as modified UTF-7 before it is sent
+            folder = imap_utf7.encode(folder).decode("ascii")
         self._server.run("EXAMINE", folder)
         found = next((f for f in self._server.folders if f.raw_name == folder or str(f.raw_name) == folder), None)
         if found is None:

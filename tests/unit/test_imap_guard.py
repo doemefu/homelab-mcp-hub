@@ -1,29 +1,27 @@
 import ast
 import imaplib
-import inspect
 import logging
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from imapclient import IMAPClient
-from imapclient import util as imapclient_util
-from imapclient.exceptions import IMAPClientError, InvalidCriteriaError
+from imapclient.exceptions import IMAPClientError, InvalidCriteriaError, LoginError
 
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.imap_guard import (
+    MAX_FETCH_UIDS,
     MAX_PARTIAL_BYTES,
     PASS_THROUGH,
     PLAIN_ITEMS,
     GuardedImapClient,
     ImapCommandRefused,
     imap_error_kind,
-    uid_set,
 )
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapServer, FakeMessage, bad, no
@@ -148,22 +146,62 @@ def test_fetch_refuses_non_int_or_zero_uids(uids: Any) -> None:
     before = list(server.commands)
     with pytest.raises(ImapCommandRefused):
         guard.fetch(uids, ["FLAGS"])
-    with pytest.raises(ImapCommandRefused):
-        uid_set(uids)
     assert server.commands == before
 
 
-def test_fetch_collapses_uid_ranges() -> None:
-    assert uid_set([1, 2, 3, 5, 7, 8]) == "1:3,5,7:8"
-    assert uid_set([8, 7, 5, 3, 2, 1, 2]) == "1:3,5,7:8"
-    assert uid_set([4]) == "4"
-    assert uid_set([2**32 - 1, 1]) == f"1,{2**32 - 1}"
+def test_fetch_refuses_more_than_max_uids() -> None:
+    server, _, guard = logged_in()
+    assert MAX_FETCH_UIDS == 500
+    guard.fetch(range(1, MAX_FETCH_UIDS + 1), ["FLAGS"])  # the guard owns the command-line length bound
+    assert server.commands[-1] == ("UID FETCH", (list(range(1, 501)), ["FLAGS"]))
+    before = list(server.commands)
+    with pytest.raises(ImapCommandRefused):
+        guard.fetch(range(1, MAX_FETCH_UIDS + 2), ["FLAGS"])
+    assert server.commands == before
+
+
+class Flipping(Sequence[Any]):
+    """A hostile sequence: `first` on the first iteration, `then` on every later one."""
+
+    def __init__(self, first: list[Any], then: list[Any]) -> None:
+        self._passes = (first, then)
+        self.iterations = 0
+
+    def _current(self) -> list[Any]:
+        return self._passes[min(self.iterations, 1)]
+
+    def __len__(self) -> int:
+        return len(self._current())
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._current()[index]
+
+    def __iter__(self) -> Iterator[Any]:
+        value = self._current()
+        self.iterations += 1
+        return iter(value)
+
+
+def test_fetch_checks_and_sends_one_snapshot_of_items() -> None:
+    # BODY[TEXT] (no PEEK) would set \Seen: a second pass over the items must never reach the client.
+    server, _, guard = logged_in()
+    items = Flipping(["FLAGS"], ["BODY[TEXT]"])
+    guard.fetch([1], items)
+    assert server.commands[-1] == ("UID FETCH", ([1], ["FLAGS"]))
+    assert items.iterations == 1
+
+
+def test_fetch_checks_and_sends_one_snapshot_of_uids() -> None:
+    server, _, guard = logged_in()
+    uids = Flipping([1], ["1:*"])
+    guard.fetch(uids, ["FLAGS"])
+    assert server.commands[-1] == ("UID FETCH", ([1], ["FLAGS"]))
+    assert uids.iterations == 1
 
 
 def test_fetch_sends_sorted_unique_uids() -> None:
-    # IMAPClient 4.1.0 parses the FETCH reply with int(messages): a range string such as "1:3,5,7:8" reaches the
-    # wire but the reply is lost to a ValueError (see test_real_client_cannot_fetch_a_uid_range_string). The guard
-    # therefore hands the client a sorted, de-duplicated int list.
+    # IMAPClient 4.1.0 filters the FETCH reply with int(messages): a range string such as "1:3,5,7:8" reaches the
+    # wire but the reply is lost to a ValueError. The guard therefore hands the client a sorted, de-duplicated int list.
     server, _, guard = logged_in()
     rows = guard.fetch([8, 7, 5, 3, 2, 1, 2], ["FLAGS"])
     assert sorted(rows) == [1, 2, 3, 5, 7, 8]
@@ -184,6 +222,8 @@ def test_fetch_sends_sorted_unique_uids() -> None:
         b"NOT\tDRAFT",
         b'X-GM-RAW "in:inbox"',
         b'NOT DRAFT x-gm-raw "in:inbox"',
+        b"HEADER Subject {5}",
+        b"NOT DRAFT HEADER Subject {12+}",
     ],
 )
 def test_search_refuses_bad_criteria(criteria: Any) -> None:
@@ -242,13 +282,32 @@ def test_real_client_sends_only_allowlisted_commands_and_no_capability_after_log
     assert lines[login_lines].split(b" ", 1)[1] == b'EXAMINE "INBOX"'
 
 
-def test_real_client_cannot_fetch_a_uid_range_string() -> None:
-    # Documents why the guard passes ints, not uid_set(): IMAPClient 4.1.0's fetch() sends the range but then filters
-    # the reply with to_ints(messages), i.e. int("1:3,5"), so the parsed reply is lost to a ValueError.
-    assert "to_ints(messages)" in inspect.getsource(IMAPClient.fetch)
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        imapclient_util.to_ints("1:3,5")
-    assert imapclient_util.to_ints([1, 2, 3, 5]) == [1, 2, 3, 5]
+def test_guard_sets_uid_mode_and_raw_folder_names_on_the_client() -> None:
+    client = FakeImapServer([]).client()
+    client.use_uid, client.folder_encode = False, True  # IMAPClient's folder_encode default re-encodes raw names
+    GuardedImapClient(client, CallDeadline.start(FakeClock()), registry_inbox_raw="INBOX")
+    assert (client.use_uid, client.folder_encode) == (True, False)
+
+
+def test_examine_sends_a_raw_mutf7_name_unchanged() -> None:
+    server, _, guard = make()
+    guard.login("user", "secret")
+    guard.examine("Eing&AOQ-nge")
+    assert server.commands[-1] == ("EXAMINE", "Eing&AOQ-nge")
+
+
+def test_real_client_examines_a_raw_mutf7_name_unchanged() -> None:
+    # With IMAPClient's default folder_encode=True the raw name would be re-encoded to "Eing&-AOQ-nge".
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(wire_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.examine("Eing&AOQ-nge")
+        guard.search(b"NOT DRAFT")
+        guard.logout()
+        lines = list(recorder.lines)
+    sent = [line.split(b" ", 1)[1] for line in lines]
+    assert b'EXAMINE "Eing&AOQ-nge"' in sent
+    assert b"UID SEARCH NOT DRAFT" in sent
 
 
 def _wire_command(line: bytes) -> str:
@@ -422,6 +481,9 @@ def _wire_bad() -> Exception:
         (lambda: bad("UID FETCH"), "bad"),
         (lambda: imaplib.IMAP4.error("EXAMINE command error: BAD [b'private']"), "bad"),
         (lambda: InvalidCriteriaError("private server text"), "bad"),
+        (lambda: LoginError("LOGIN command error: BAD [b'private']"), "other"),
+        (lambda: LoginError("select failed: private server text"), "other"),
+        (lambda: LoginError("x command error: NO private"), "other"),
         (lambda: imaplib.IMAP4.abort("socket error: EOF"), "other"),
         (lambda: imaplib.IMAP4.abort("FETCH command error: BAD [b'x']"), "other"),
         (lambda: IMAPClientError("command: FETCH => socket error: EOF"), "other"),
