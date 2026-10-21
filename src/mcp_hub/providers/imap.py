@@ -21,9 +21,8 @@ from typing import Final, Literal, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
-from mcp_hub.ids import AnyMessageRef, MessageRef, ThreadKey
+from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
 from mcp_hub.providers.base import (
-    MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
     SNIPPET_FETCH_BYTES,
@@ -45,6 +44,7 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import (
     FOLDER_MAPS,
+    MAX_LOCATE_FOLDERS,
     FolderEntry,
     FolderMap,
     FolderMapCache,
@@ -57,6 +57,7 @@ from mcp_hub.providers.folders import (
 )
 from mcp_hub.providers.headers import (
     SUMMARY_HEADER_ITEM,
+    ParsedHeaders,
     candidate_header_item,
     header_bytes,
     imap_thread_key,
@@ -70,14 +71,21 @@ from mcp_hub.providers.imap_guard import (
     examine_name_ok,
     imap_error_kind,
 )
-from mcp_hub.providers.imap_search import criteria, gmail_label_keys, window_keys
+from mcp_hub.providers.imap_search import (
+    criteria,
+    gmail_label_keys,
+    header_or,
+    or_batches,
+    search_value_ok,
+    window_keys,
+)
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
-HEADER_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT)]<0.{MAX_HEADER_BYTES}>"
-SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", HEADER_ITEM)  # get_message
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
+LOCATE_ITEMS: Final = ("FLAGS", "INTERNALDATE", candidate_header_item(["MESSAGE-ID"]))  # the re-check of a hit
+LOCATE_BATCH_VALUES: Final = 20  # Message-IDs per UID SEARCH in the location step (F6; or_batches bounds the bytes)
 _GMAIL_CANDIDATE_ITEM: Final = "X-GM-LABELS"  # Gmail: label drafts and `sent_label` before `limit` (I8, C4)
 _GMAIL_SUMMARY_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: per-message folder and thread (§5.5)
 MAX_SEARCH_CANDIDATES: Final = 5000  # newest SEARCH hits per folder and call (§5.4, B5)
@@ -228,6 +236,23 @@ class _Chosen:
     direction: Direction | None  # decided from the candidate headers when `direction` filtered; else in pass 2
 
 
+@dataclass(frozen=True, slots=True)
+class FoundCopy:
+    """One located copy of a Message-ID: where it is and when it arrived."""
+
+    entry: FolderEntry
+    uidvalidity: int
+    uid: int
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class LocateResult:
+    # Message-ID → copy with the earliest received_at; ties by folder order (spec §5.5 matching rule, C3)
+    found: dict[str, FoundCopy]
+    complete: bool  # False: soft stop, folder cap or a failed batch while refs were still open
+
+
 @dataclass(slots=True)
 class _Progress:
     truncated: bool = False
@@ -255,6 +280,7 @@ class ImapSession:
         self._maps = folder_maps
         self.gmail: bool = is_gmail(client.capabilities())  # cached at LOGIN: no command
         self._map: FolderMap | None = None
+        self._listed = False
         self._selected: str | None = None
 
     @property
@@ -266,6 +292,11 @@ class ImapSession:
     def selected(self) -> str | None:
         """Raw name of the mailbox the last successful EXAMINE opened."""
         return self._selected
+
+    @property
+    def listed(self) -> bool:
+        """True once this session has sent `LIST`: its map is current, so a forced rebuild would gain nothing."""
+        return self._listed
 
     def folder_map(self, *, refresh: bool = False) -> FolderMap:
         """The account's folder map: the one built in this session, else the cached one, else one `LIST "" "*"`.
@@ -284,6 +315,7 @@ class ImapSession:
         built = build_imap_folder_map(
             self.account, self.registry_inbox, gmail=self.gmail, listing=self._client.list_folders()
         )
+        self._listed = True
         self._maps.put(built)
         self._map = built
         return built
@@ -307,9 +339,12 @@ class ImapSession:
     def search(self, criteria: bytes) -> list[int]:
         return self._client.search(criteria)
 
-    def fetch(self, uids: Sequence[int], items: Sequence[str]) -> dict[int, dict[bytes, object]]:
+    def fetch(
+        self, uids: Sequence[int], items: Sequence[str], *, on_no: Literal["drop", "fail"] = "drop"
+    ) -> dict[int, dict[bytes, object]]:
         """UID FETCH in ascending chunks of at most 500 UIDs. A chunk answered NO is dropped: the UIDs it did not
-        return are missing from the result (S-p). Every other error propagates."""
+        return are missing from the result (S-p). With `on_no="fail"` a NO is `upstream_timeout` instead (a single
+        message read, where a missing row would otherwise read as "not found", B6). Every other error propagates."""
         ordered = sorted(set(uids))
         rows: dict[int, dict[bytes, object]] = {}
         for start in range(0, len(ordered), FETCH_CHUNK_UIDS):
@@ -320,7 +355,111 @@ class ImapSession:
             except imaplib.IMAP4.error as exc:
                 if not _answered_no(exc):
                     raise
+                if on_no == "fail":
+                    raise ProviderError("upstream_timeout", "FetchRefused") from None
         return rows
+
+    def locate(
+        self,
+        message_ids: Sequence[str],
+        *,
+        max_folders: int = MAX_LOCATE_FOLDERS,
+        batch_values: int = LOCATE_BATCH_VALUES,
+    ) -> LocateResult:
+        """The location step of spec §5.5 (matching rule, C3) and §5.2 (`get_message_status` lookups).
+
+        Every core folder of `FolderMap.locate_order` is searched for every ref, so the copies there are compared;
+        the `other` mailboxes follow in LIST order, only for refs still unresolved, until none is left. At most
+        `max_folders` mailboxes in all (core first). Per mailbox: EXAMINE, then per batch of at most `batch_values`
+        Message-IDs (and 4,000 bytes of keys) one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` keys, then
+        `UID FETCH` of FLAGS, INTERNALDATE and the Message-ID header of the hits (Gmail: also X-GM-LABELS); a hit
+        counts only on exact equality and without a draft flag or label. The earliest `received_at` wins; on a tie
+        the first in folder order. A SoftStop ends the search early; other errors propagate.
+
+        A ref is "missed" when a step that covered it did not complete: a refused value (fails the Message-ID
+        pattern or `search_value_ok`), the folder cap, the folder map's mailbox cap, an EXAMINE or SEARCH answered
+        NO, a FETCH that lost hits, a matching copy without INTERNALDATE or the soft stop. `complete` is False when
+        a missed ref stayed unresolved (B6, B7)."""
+        wanted = list(dict.fromkeys(message_ids))
+        searchable = [v for v in wanted if valid_message_id(v) is not None and search_value_ok(v)]
+        missed = set(wanted) - set(searchable)
+        found: dict[str, FoundCopy] = {}
+        if searchable:
+            try:
+                folder_map = self.folder_map()
+                core, other = folder_map.locate_order()
+                ordered = [(entry, True) for entry in core] + [(entry, False) for entry in other]
+                for index, (entry, is_core) in enumerate(ordered):
+                    refs = searchable if is_core else [v for v in searchable if v not in found]
+                    if not refs:
+                        break  # every ref resolved: no further `other` mailbox
+                    if index >= max_folders:
+                        missed.update(refs)
+                        break
+                    self._locate_in(entry, refs, batch_values, found, missed)
+                else:
+                    if folder_map.capped:  # mailboxes the map dropped were never searched
+                        missed.update(searchable)
+            except SoftStop:
+                missed.update(searchable)
+        return LocateResult(found=found, complete=all(v in found for v in missed))
+
+    def _locate_in(
+        self, entry: FolderEntry, refs: list[str], batch_values: int, found: dict[str, FoundCopy], missed: set[str]
+    ) -> None:
+        if entry.raw_name != self.registry_inbox and not examine_name_ok(entry.raw_name):
+            missed.update(refs)  # over 1,000 characters: the guard would refuse the EXAMINE
+            return
+        try:
+            validity = self.examine(entry)
+        except PASS_THROUGH:
+            raise
+        except imaplib.IMAP4.error as exc:
+            if not _answered_no(exc):
+                raise
+            if entry.raw_name != self.registry_inbox and self.may_force_rebuild():
+                self.folder_map(refresh=True)  # one rebuild for the next call; this mailbox stays unsearched (S-p)
+            missed.update(refs)
+            return
+        if validity is None:  # missing UIDVALIDITY on a folder other than the registry inbox (I11)
+            missed.update(refs)
+            return
+        items = [*LOCATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if self.gmail else list(LOCATE_ITEMS)
+        for batch in or_batches(refs, ("Message-ID",), max_values=batch_values):
+            try:
+                hits = self.search(criteria(b"NOT DRAFT", header_or(("Message-ID",), batch)))
+            except PASS_THROUGH:
+                raise
+            except imaplib.IMAP4.error as exc:
+                if not _answered_no(exc):
+                    raise
+                missed.update(batch)  # only the refs of this batch (B7)
+                continue
+            uids = sorted(set(hits))
+            if len(uids) > MAX_SEARCH_CANDIDATES:  # substring hits of short values: the newest are re-checked
+                uids = uids[-MAX_SEARCH_CANDIDATES:]
+                missed.update(batch)
+            rows = self.fetch(uids, items) if uids else {}
+            if len(rows.keys() & set(uids)) < len(uids):  # FETCH NO or expunged meanwhile: a hit is unchecked
+                missed.update(batch)
+            wanted = set(batch)
+            for uid in uids:
+                row = rows.get(uid)
+                if row is None:
+                    continue
+                message_id, _ = _candidate_headers(row)
+                if message_id is None or message_id not in wanted or _is_draft(row):
+                    continue
+                received = _aware(row.get(b"INTERNALDATE"))
+                if received is None:
+                    log_message_skipped(
+                        MessageRef(self.account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
+                    )
+                    missed.add(message_id)
+                    continue
+                current = found.get(message_id)
+                if current is None or received < current.received_at:  # a tie keeps the earlier folder (S-e)
+                    found[message_id] = FoundCopy(entry, validity, uid, received)
 
     def noop(self) -> None:
         self._client.noop()
@@ -405,6 +544,26 @@ def _candidate_headers(row: dict[bytes, object]) -> tuple[str | None, str | None
     return valid_message_id(parsed.message_id), parsed.from_address
 
 
+_ROLE_FOLDER: Final[dict[str, MailFolder]] = {
+    "inbox": "inbox",
+    "sent": "sent",
+    "archive": "archive",
+    "trash": "trash",
+    "other": "other",
+}
+
+
+def _detail_folder(entry: FolderEntry, row: dict[bytes, object], *, gmail: bool) -> MailFolder:
+    """The normalised folder of a message read in `entry`: Gmail All Mail decides per message by its labels (§5.5);
+    any other role no id can name fails closed."""
+    if entry.role == "all" and gmail:
+        return _gmail_folder(_labels(row))
+    folder = _ROLE_FOLDER.get(entry.role)
+    if folder is None:
+        raise ProviderError("upstream_error", "UnmappedFolder")
+    return folder
+
+
 class ImapMailbox:
     def __init__(
         self,
@@ -479,10 +638,12 @@ class ImapMailbox:
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         return self._run(lambda session: self._list_messages(session, query), deadline)
 
-    def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail:
-        if not isinstance(ref, MessageRef):
+    def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
+        """By `id` (D75 binding) or by `ref` (the location step); a Graph id is foreign here."""
+        if not isinstance(target, (MessageRef, StableRef)):
             raise ProviderError("not_found", "ForeignRef")
-        return self._run(lambda session: self._get_message(session, ref), deadline)
+        own_target: MessageRef | StableRef = target
+        return self._run(lambda session: self._get_message(session, own_target), deadline)
 
     # --- list_messages -----------------------------------------------------------------------------------------
 
@@ -738,20 +899,93 @@ class ImapMailbox:
 
     # --- get_message -------------------------------------------------------------------------------------------
 
-    def _get_message(self, session: ImapSession, ref: MessageRef) -> MailDetail:
-        if ref.folder != session.registry_inbox:  # the tool layer binds ids to the registry inbox (D56)
-            raise ProviderError("not_found", "UnboundFolder")
-        if session.examine(session.inbox) != ref.uidvalidity:
+    def _get_message(self, session: ImapSession, target: MessageRef | StableRef) -> MailDetail:
+        if isinstance(target, StableRef):
+            return self._get_by_ref(session, target.message_id)
+        entry = self._bound_entry(session, target.folder)
+        if self._examine_bound(session, entry) != target.uidvalidity:
             raise ProviderError("not_found", "UidValidityChanged")
+        return self._read(session, entry, target, gone=ProviderError("not_found", "UnknownUid"))
+
+    @staticmethod
+    def _bound_entry(session: ImapSession, raw_name: str) -> FolderEntry:
+        """D75, before EXAMINE: the registry inbox passes without LIST; any other name must be `allowed` in the
+        folder map. A cached map that does not know the name is rebuilt once, when Sec16 allows it; a map listed
+        in this call is current already."""
+        if raw_name == session.registry_inbox:
+            return session.inbox
+        folder_map = session.folder_map()
+        binding = folder_map.binding(raw_name)
+        if binding == "unknown" and not session.listed and session.may_force_rebuild():
+            folder_map = session.folder_map(refresh=True)
+            binding = folder_map.binding(raw_name)
+        entry = folder_map.lookup(raw_name)
+        if binding != "allowed" or entry is None:
+            raise ProviderError("not_found", "UnboundFolder")
+        return entry
+
+    @staticmethod
+    def _examine_bound(session: ImapSession, entry: FolderEntry) -> int | None:
+        """EXAMINE for an id. A NO rebuilds the map once (S-p): a mailbox the new map no longer allows is
+        `not_found`; otherwise the read did not complete (`upstream_timeout`, B6)."""
+        try:
+            return session.examine(entry)
+        except PASS_THROUGH:
+            raise
+        except imaplib.IMAP4.error as exc:
+            if not _answered_no(exc):
+                raise
+        if (
+            entry.raw_name != session.registry_inbox
+            and session.may_force_rebuild()
+            and session.folder_map(refresh=True).binding(entry.raw_name) != "allowed"
+        ):
+            raise ProviderError("not_found", "UnboundFolder")
+        raise ProviderError("upstream_timeout", "ExamineRefused")
+
+    def _get_by_ref(self, session: ImapSession, message_id: str) -> MailDetail:
+        """A `ref` opens the copy `locate` finds (spec §5.2, §5.5). Not found after a complete search → `not_found`;
+        a search or read that did not complete → `upstream_timeout`, never `not_found` (B6); a soft stop anywhere
+        → `upstream_timeout` (R2b)."""
+        result = session.locate([message_id])
+        self._soft_check()
+        copy = result.found.get(message_id)
+        if copy is None:
+            if result.complete:
+                raise ProviderError("not_found", "NotFound")
+            raise ProviderError("upstream_timeout", "IncompleteSearch")
+        if session.selected != copy.entry.raw_name:  # the search moved on to other mailboxes
+            try:
+                validity = session.examine(copy.entry)
+            except PASS_THROUGH:
+                raise
+            except imaplib.IMAP4.error as exc:
+                if not _answered_no(exc):
+                    raise
+                validity = None
+            if validity != copy.uidvalidity:
+                raise ProviderError("upstream_timeout", "IncompleteSearch")
+        ref = MessageRef(self._account, copy.entry.raw_name, copy.uidvalidity, copy.uid)
+        return self._read(session, copy.entry, ref, gone=ProviderError("upstream_timeout", "IncompleteSearch"))
+
+    def _read(self, session: ImapSession, entry: FolderEntry, ref: MessageRef, *, gone: ProviderError) -> MailDetail:
+        """One message of the examined `entry`: the summary items (Gmail: also labels and thread id), then only the
+        chosen text part. A draft is `not_found` (S1); a FETCH answered NO is `upstream_timeout`; a message that
+        does not come back raises `gone`."""
+        gmail = session.gmail
+        items = [*LIST_SUMMARY_ITEMS, *_GMAIL_SUMMARY_ITEMS] if gmail else list(LIST_SUMMARY_ITEMS)
         structure_known = True
         try:
-            row = session.fetch([ref.uid], SUMMARY_ITEMS).get(ref.uid)
+            row = session.fetch([ref.uid], items, on_no="fail").get(ref.uid)
         except RecursionError as exc:  # see _fetch_summaries: open the message without its structure
             log_message_skipped(ref, "mail", exc)
             structure_known = False
-            row = session.fetch([ref.uid], [i for i in SUMMARY_ITEMS if i != "BODYSTRUCTURE"]).get(ref.uid)
+            row = session.fetch([ref.uid], [i for i in items if i != "BODYSTRUCTURE"], on_no="fail").get(ref.uid)
         if row is None:
-            raise ProviderError("not_found", "UnknownUid")
+            raise gone
+        if _is_draft(row):
+            raise ProviderError("not_found", "Draft")
+        folder = _detail_folder(entry, row, gmail=gmail)
         received = _aware(row.get(b"INTERNALDATE")) or datetime.now(UTC)
         body = ""
         source: Literal["text/plain", "text/html-converted", "none"] = "none"
@@ -767,7 +1001,7 @@ class ImapMailbox:
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
         if text_part is not None:
-            data = session.fetch([ref.uid], [f"BODY.PEEK[{text_part.section}]<0.{MAX_TEXT_PART_BYTES}>"])
+            data = session.fetch([ref.uid], [f"BODY.PEEK[{text_part.section}]<0.{MAX_TEXT_PART_BYTES}>"], on_no="fail")
             raw = data.get(ref.uid, {}).get(f"BODY[{text_part.section}]<0>".encode())
             raw_bytes = raw if isinstance(raw, bytes) else b""
             # The BODYSTRUCTURE size decides; only without one does a full-length fetch count as cut.
@@ -785,16 +1019,38 @@ class ImapMailbox:
             except Exception as exc:
                 log_message_skipped(ref, "mail", exc)
                 body, source = "", "none"
+        parsed: ParsedHeaders | None = None
         try:
-            headers = _PARSER.parsebytes(header_bytes(row))
+            raw_headers = header_bytes(row)
+            headers = _PARSER.parsebytes(raw_headers)
             sender, subject = _sender_and_subject(headers)
             to = [a for _, a in _addresses(headers, "To") if a]
             cc = [a for _, a in _addresses(headers, "Cc") if a]
+            parsed = parse_summary_headers(raw_headers)  # Message-ID, In-Reply-To, References (§5.5)
         except PASS_THROUGH:
             raise
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
             sender, subject, to, cc = ("", ""), None, [], []
+        flags = _flags(row)
+        if gmail:
+            thread = _gmail_thread(self._account, row)
+        else:
+            thread = imap_thread_key(self._account, parsed) if parsed is not None else None
+        meta = MailMeta(
+            folder=folder,
+            folder_name=entry.display_name,
+            flags=MailFlags(answered=_ANSWERED in flags, flagged=_FLAGGED in flags),
+            direction=direction_of(
+                in_sent=folder == "sent" or (gmail and _LABEL_SENT in _labels(row)),
+                from_address=sender[1] or None,
+                own=self._own_addresses,
+            ),
+            message_id=parsed.message_id if parsed is not None else None,
+            in_reply_to=parsed.in_reply_to if parsed is not None else None,
+            references=parsed.references if parsed is not None else (),
+            thread=thread,
+        )
         return MailDetail(
             ref=ref,
             received_at=received,
@@ -808,6 +1064,7 @@ class ImapMailbox:
             body_text=body,
             body_source=source,
             body_cut=cut,
+            meta=meta,
         )
 
 
