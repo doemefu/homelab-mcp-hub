@@ -12,7 +12,7 @@ from mcp_hub.cursors import Position
 from mcp_hub.ids import GraphMessageRef, ThreadKey, location_k
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import graph
-from mcp_hub.providers.base import FolderPage, ListQuery, ProviderError, order_key
+from mcp_hub.providers.base import UNDECODABLE_NOTE, FolderPage, ListQuery, ProviderError, order_key
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import FolderMapCache, GraphFolderIds, ListFolder
 from mcp_hub.providers.graph import (
@@ -24,9 +24,11 @@ from mcp_hub.providers.graph import (
     WELL_KNOWN_FOR,
     Backoff,
     GraphMailbox,
+    _answered,
     graph_meta,
     list_filter,
 )
+from mcp_hub.providers.headers import MAX_REFERENCES
 from tests.support.clock import FakeClock
 from tests.support.graph_fixtures import (
     ARCHIVE_ID,
@@ -47,6 +49,7 @@ Handler = Callable[[httpx2.Request], httpx2.Response]
 SINCE = datetime(2026, 10, 7, 7, 0, tzinfo=UTC)
 LATER = datetime(2026, 10, 20, 6, 0, tzinfo=UTC)
 OWN = frozenset({"owner@example.test"})
+TOP_K = "f" * 16  # the frontier covers its whole second (ruling, T15 fix round 1)
 
 
 def js(body: object, status: int = 200) -> Handler:
@@ -313,6 +316,9 @@ def test_extended_fields() -> None:
     assert meta.thread == ThreadKey("outlook", "graph", "AAQkCONV0001=")
     answered = graph_meta(message(2, singleValueExtendedProperties=extended(answered="abc")), IDS, OWN, "outlook")
     assert answered.flags.answered is False
+    many = " ".join(f"<r{n}@example.test>" for n in range(MAX_REFERENCES + 5))
+    long = graph_meta(message(3, singleValueExtendedProperties=extended(references=many)), IDS, OWN, "outlook")
+    assert long.references == tuple(f"r{n}@example.test" for n in range(5, MAX_REFERENCES + 5))  # the newest kept
 
 
 def test_extended_fields_through_the_list() -> None:
@@ -385,6 +391,23 @@ def test_conversation_id_outside_pattern_degrades_thread_only(conversation: obje
     assert summary.subject == "Subject 1"
 
 
+@pytest.mark.parametrize(
+    ("folder", "folder_id", "direction"), [("sent", SENT_ID, "outgoing"), ("inbox", INBOX_ID, "incoming")]
+)
+def test_degraded_item_keeps_folder_and_direction(
+    monkeypatch: pytest.MonkeyPatch, folder: ListFolder, folder_id: str, direction: str
+) -> None:
+    def broken(*args: object) -> object:
+        raise ValueError("undecodable")
+
+    monkeypatch.setattr(graph, "graph_meta", broken)
+    clock = FakeClock()
+    page = listed(mailbox(Server({folder_id: values(item(1, LATER, folder_id))}), clock=clock), query(folder), clock)
+    [summary] = page.items
+    assert summary.snippet_text == UNDECODABLE_NOTE
+    assert (summary.meta.folder, summary.meta.direction) == (folder, direction)
+
+
 def test_unread_only_and_since_refiltered_locally() -> None:
     clock = FakeClock()
     entries = [item(1, LATER, isRead=True), item(2, LATER), item(3, SINCE - timedelta(seconds=1))]
@@ -421,8 +444,20 @@ def test_full_page_without_item_below_position_stops_truncated() -> None:
         mailbox(server, clock=clock), query("all", position=Position(int(LATER.timestamp()), "0" * 16)), clock
     )
     assert page.items == []
-    assert (page.more, page.truncated) == (False, True)
+    assert (page.more, page.truncated, page.complete) == (False, True, False)  # no cursor past a stuck folder
     assert [r.url.path for r in server.lists()] == [f"/v1.0/me/mailFolders/{INBOX_ID}/messages"]  # account stops
+
+
+def test_stuck_later_folder_of_all_keeps_earlier_items_without_cursor() -> None:
+    clock = FakeClock()
+    stuck = [item(100 + n, LATER, ARCHIVE_ID) for n in range(GRAPH_LIST_TOP)]  # one second, no position needed
+    server = Server(
+        {INBOX_ID: values(item(1, LATER - timedelta(hours=2))), ARCHIVE_ID: values(*stuck), SENT_ID: values()}
+    )
+    page = listed(mailbox(server, clock=clock), query("all"), clock)
+    assert ids(page) == ["AAMkMSG0001="]
+    assert (page.more, page.truncated, page.complete) == (False, True, False)
+    assert [r.url.path.split("/")[4] for r in server.lists()] == [INBOX_ID, ARCHIVE_ID]  # sent never requested
 
 
 def test_full_page_or_next_link_sets_more_and_is_not_followed() -> None:
@@ -431,11 +466,14 @@ def test_full_page_or_next_link_sets_more_and_is_not_followed() -> None:
     page = listed(mailbox(server, clock=clock), query(limit=20), clock)
     assert len(page.items) == 20
     assert (page.more, page.truncated, page.complete) == (True, False, True)
+    assert page.frontier == (int((LATER - timedelta(minutes=GRAPH_LIST_TOP - 1)).timestamp()), TOP_K)
     link = "https://evil.example.test/v1.0/me/mailFolders/x/messages?$skip=101"
-    server = Server({INBOX_ID: values(item(1, LATER), **{"@odata.nextLink": link})})
+    older = LATER - timedelta(minutes=1)
+    server = Server({INBOX_ID: values(item(1, LATER), item(2, older), **{"@odata.nextLink": link})})
     page = listed(mailbox(server, clock=clock), query(), clock)
-    assert ids(page) == ["AAMkMSG0001="]
+    assert ids(page) == ["AAMkMSG0001="]  # the frontier second is read again on the next page
     assert page.more is True
+    assert page.frontier == (int(older.timestamp()), TOP_K)
     assert len(server.lists()) == 1
     assert {r.url.host for r in server.requests} == {"graph.microsoft.com"}
 
@@ -449,6 +487,11 @@ def test_full_page_is_the_frontier_for_other_folders() -> None:
     server = Server({INBOX_ID: values(*inbox), ARCHIVE_ID: values(), SENT_ID: values(*sent)})
     page = listed(mailbox(server, clock=clock), query("all", limit=50), clock)
     assert len(page.items) == 50
+    assert page.more is True
+    assert page.frontier == (int(frontier.timestamp()), TOP_K)
+    assert all(order_key(i)[0] > int(frontier.timestamp()) for i in page.items)
+    wide = listed(mailbox(server, clock=clock), query("all", direction="outgoing", limit=50), clock)
+    assert ids(wide) == ["AAMkMSG0500="]  # sent 501 lies below the inbox frontier: left for the next page
     page = listed(mailbox(server, clock=clock), query("sent"), clock)
     assert ids(page) == ["AAMkMSG0500=", "AAMkMSG0501="]  # a single folder: no frontier from another folder
     small = listed(
@@ -456,9 +499,50 @@ def test_full_page_is_the_frontier_for_other_folders() -> None:
         query("all", limit=50, position=Position(int((frontier + timedelta(minutes=2)).timestamp()), "0" * 16)),
         clock,
     )
-    assert ids(small)[-1] == f"AAMkMSG{GRAPH_LIST_TOP:04d}="  # the full page's last item ends the account's items
-    assert "AAMkMSG0500=" in ids(small)
-    assert "AAMkMSG0501=" not in ids(small)
+    assert ids(small) == ["AAMkMSG0100=", "AAMkMSG0500="]  # nothing at or below the frontier second
+    assert small.frontier == (int(frontier.timestamp()), TOP_K)
+
+
+def test_zero_item_direction_page_reports_more_and_frontier() -> None:
+    clock = FakeClock()
+    server = Server({INBOX_ID: values(*run_of(1, LATER, GRAPH_LIST_TOP))})
+    page = listed(mailbox(server, clock=clock), query(direction="outgoing"), clock)
+    assert page.items == []
+    assert (page.more, page.truncated, page.complete) == (True, False, True)
+    assert page.frontier == (int((LATER - timedelta(minutes=GRAPH_LIST_TOP - 1)).timestamp()), TOP_K)
+
+
+class GraphStore:
+    """A folder answering like Graph: newest first, `lt` bound honoured, at most `$top` entries."""
+
+    def __init__(self, entries: list[dict[str, object]]) -> None:
+        self.entries = entries  # already in Graph's answer order
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        flt = request.url.params["$filter"]
+        bound = flt.split("receivedDateTime lt ")[1].split(" ")[0] if " lt " in flt else None
+        kept = [e for e in self.entries if bound is None or str(e["receivedDateTime"]) < bound]
+        return values(*kept[: int(request.url.params["$top"])])(request)
+
+
+def test_frontier_second_cut_by_top_returns_both_messages_across_pages() -> None:
+    """$top cuts between two messages of one second: both are returned, over two pages (no same-second gap)."""
+    clock = FakeClock()
+    second = LATER - timedelta(minutes=GRAPH_LIST_TOP - 1)
+    pair = sorted(
+        (f"AAMkMSG{n:04d}=" for n in (300, 301)), key=lambda g: location_k(GraphMessageRef("outlook", g))
+    )  # Graph lists the smaller k first, so $top cuts off the one with the larger k
+    own = {"from": {"emailAddress": {"address": "owner@example.test"}}}
+    entries = run_of(1, LATER, GRAPH_LIST_TOP - 1) + [item(int(g[7:11]), second, **own) for g in pair]
+    store = GraphStore(entries)  # type: ignore[arg-type]
+    box = mailbox(Server({INBOX_ID: store}), clock=clock)
+    first = listed(box, query(direction="outgoing"), clock)
+    assert first.items == []  # the listed copy sits in the frontier second: not returned yet
+    assert first.frontier == (int(second.timestamp()), TOP_K)
+    assert first.more is True
+    later = listed(box, query(direction="outgoing", position=Position(*first.frontier)), clock)
+    assert sorted(ids(later)) == sorted(pair)
+    assert later.more is False
 
 
 def _over_cap(request: httpx2.Request) -> httpx2.Response:
@@ -487,8 +571,9 @@ def test_effective_top_after_halving_drives_more(count: int, more: bool) -> None
     answers = iter([_over_cap, values(*run_of(1, LATER, count))])
     server = Server({INBOX_ID: lambda request: next(answers)(request)})
     page = listed(mailbox(server, clock=clock), query(limit=50), clock)
-    assert len(page.items) == count
+    assert len(page.items) == 49  # a full answer of 50 leaves its last (frontier) second for the next page
     assert page.more is more
+    assert (page.frontier is not None) is more
 
 
 # --- folders, direction, soft stop -------------------------------------------------------------------------------
@@ -706,3 +791,10 @@ def test_fixture_shapes_match_t1b_facts() -> None:
     present = {entry["id"] for entry in entries} if isinstance(entries, list) else set()
     for name in T1B_EXTENDED:
         assert (name in present) is T1B_FACTS[name]
+    assert T1B_FACTS["request10_older_than_e"] is True  # the `lt` upper bound holds (S-f)
+    replied = T1B_FACTS["replied_last_verb"]
+    assert isinstance(replied, str)
+    assert replied in ("102", "103")
+    assert _answered(replied) is True  # the reported value is what `answered` reads
+    assert T1B_FACTS["folder_ids_in_pattern"] is True  # requests 1-7: letters, digits, "=", "_" and "-" only
+    assert all(FOLDER_ID.fullmatch(folder_id) for folder_id in FOLDER_IDS.values())

@@ -80,6 +80,7 @@ _LAST_VERB: Final = "integer 0x1081"  # extended-property ids, compared lower-ca
 _IN_REPLY_TO: Final = "string 0x1042"
 _REFERENCES: Final = "string 0x1039"
 _VERB: Final = re.compile(r"[0-9]{1,10}")  # ASCII digits only; anything else is "not answered"
+_FRONTIER_K: Final = "f" * 16  # above every location key: a frontier covers its whole second
 _HEADER_FIELDS: Final = "id,receivedDateTime,isRead,hasAttachments,from,toRecipients,ccRecipients,subject"
 MESSAGE_SELECT: Final = _HEADER_FIELDS + ",body,parentFolderId"
 FALLBACK_SELECT: Final = _HEADER_FIELDS + ",bodyPreview,parentFolderId"
@@ -257,8 +258,8 @@ def _soft_stopped_page() -> FolderPage:
 @dataclass(frozen=True, slots=True)
 class _FolderAnswer:
     items: list[MailSummary]  # after the draft, window, unread, folder and position filters
-    frontier: tuple[int, str] | None  # order key of the answer's last item when more may exist beyond the answer
-    stuck: bool  # a full answer without any item below the position (S-f)
+    frontier: int | None  # a full answer: the second of its last item; that second and older may be unread
+    stuck: bool  # a full answer with no item read after the position and above its frontier second (S-f)
 
 
 class GraphMailbox:
@@ -425,8 +426,10 @@ class GraphMailbox:
         """One request per well-known folder of the query (spec 080 §5.5 "Cursors", §6.5), merged by order_key.
 
         Filter order as on IMAP (R3): drafts, window and unread per item, then the position, then the direction,
-        then `limit`. A full answer (the effective `$top`, or a nextLink, which is never followed) sets `more` and is
-        the frontier: no item older than its last item is returned, so the cursor continues after it."""
+        then `limit`. A full answer (the effective `$top`, or a nextLink, which is never followed) sets `more` and a
+        frontier at the second of its last item: only items received after that second are returned, and the page
+        reports `(second, "ffff…")` so the tool's merge cuts there too and the next page reads the whole second again
+        through `lt <second + 1 s>` (no gap where `$top` cuts inside one second)."""
         try:
             ids = self._folder_ids(client, token, deadline)
         except SoftStop:
@@ -441,7 +444,7 @@ class GraphMailbox:
         }
         found: list[MailSummary] = []
         seen: set[AnyMessageRef] = set()
-        floor: tuple[int, str] | None = None
+        floor: int | None = None
         more = truncated = False
         complete = True
         for name in WELL_KNOWN_FOR[query.folder]:
@@ -454,7 +457,8 @@ class GraphMailbox:
                 truncated, complete = True, False  # what was read is returned, without a cursor (§5.4)
                 break
             if answer.stuck:
-                truncated = True  # more than 100 messages in one second: the account stops here (S-f residual)
+                # More than 100 messages in one second (S-f residual): the account stops, without a cursor.
+                truncated, complete = True, False
                 break
             if answer.frontier is not None:
                 more = True
@@ -464,13 +468,19 @@ class GraphMailbox:
                     seen.add(summary.ref)
                     found.append(summary)
         if floor is not None:
-            found = [summary for summary in found if order_key(summary) >= floor]
+            found = [summary for summary in found if order_key(summary)[0] > floor]
         if query.direction is not None:
             found = [summary for summary in found if summary.meta.direction == query.direction]
         found.sort(key=order_key, reverse=True)
         if len(found) > query.limit:
             more = True
-        return FolderPage(items=found[: query.limit], more=more, truncated=truncated, complete=complete)
+        return FolderPage(
+            items=found[: query.limit],
+            more=more,
+            truncated=truncated,
+            complete=complete,
+            frontier=None if floor is None else (floor, _FRONTIER_K),
+        )
 
     def _folder_answer(
         self,
@@ -496,18 +506,19 @@ class GraphMailbox:
             raise ProviderError("upstream_error", "MalformedList")
         full = len(values) >= top or "@odata.nextLink" in body  # the effective $top decides (G6)
         items: list[MailSummary] = []
-        lowest: tuple[int, str] | None = None
+        after: list[tuple[int, str]] = []  # keys of the items read strictly after the position
         for raw in values[:top]:  # entries beyond the requested $top are never inspected (L7)
             key, summary = self._list_item(raw, ids, query)
-            if key is None:
-                continue
-            lowest = key if lowest is None else min(lowest, key)
-            if summary is not None and (query.position is None or query.position.precedes(*key)):
-                items.append(summary)  # the local (received_at, k) drop of S-f
+            if key is None or (query.position is not None and not query.position.precedes(*key)):
+                continue  # the local (received_at, k) drop of S-f
+            after.append(key)
+            if summary is not None:
+                items.append(summary)
         if not full:
             return _FolderAnswer(items, None, False)
-        stuck = lowest is None or (query.position is not None and not query.position.precedes(*lowest))
-        return _FolderAnswer(items, lowest, stuck)
+        second = min(key[0] for key in after) if after else None
+        stuck = second is None or not any(key[0] > second for key in after)
+        return _FolderAnswer(items, second, stuck)
 
     def _degraded(self, exc: Exception) -> None:
         # No valid id: item_degraded without the `item` field (spec 080 rev. 4.6 S12).
@@ -561,7 +572,9 @@ class GraphMailbox:
             )
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
-            return key, placeholder_summary(ref, received, unread, MailMeta(folder=_listed_folder(folder)))
+            listed = _listed_folder(folder)
+            meta = MailMeta(folder=listed, direction="outgoing" if listed == "sent" else "incoming")
+            return key, placeholder_summary(ref, received, unread, meta)
 
     # --- message --------------------------------------------------------------------------------------------------
     def _message(self, client: httpx2.Client, token: str, deadline: CallDeadline, ref: GraphMessageRef) -> MailDetail:

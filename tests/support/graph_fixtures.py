@@ -24,10 +24,14 @@ FOLDER_IDS: Final[dict[str, str]] = {
     "outbox": OUTBOX_ID,
 }
 
-# The facts of the owner's Graph Explorer run (T1b, plan §4): property name -> present in request 8, and the three
-# extended-property entries -> seen on at least one message. None until the owner's report is recorded.
-T1B_FACTS: dict[str, bool] | None = None
+# The facts of the owner's Graph Explorer run (T1b, plan §4), None until the owner's report is recorded:
+# - each name of T1B_FIELDS -> present in request 8; each entry of T1B_EXTENDED -> seen on at least one message;
+# - "request10_older_than_e" -> every message of request 10 is older than E (fact 4);
+# - "replied_last_verb" -> the `Integer 0x1081` value of a message the owner replied to, as a string (fact 5);
+# - "folder_ids_in_pattern" -> the ids of requests 1-7 hold only letters, digits, "=", "_" and "-".
+T1B_FACTS: dict[str, bool | str] | None = None
 T1B_FIELDS: Final = (
+    "parentFolderId",
     "isDraft",
     "internetMessageId",
     "conversationId",
