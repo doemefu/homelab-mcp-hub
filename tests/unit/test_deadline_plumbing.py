@@ -27,7 +27,7 @@ from mcp_hub.tools import mail as mail_tools
 from mcp_hub.tools.mail import run_get_message, run_list_unread
 from tests.support.dav_transport import RecordingTransport
 from tests.support.graph_fixtures import FakeTokens
-from tests.unit.test_graph_adapter import LIST
+from tests.unit.test_graph_adapter import LIST, routes
 from tests.unit.test_mail_tools import detail
 
 pytestmark = pytest.mark.anyio
@@ -163,14 +163,14 @@ def _graph_with_own_clock(transport: RecordingTransport, mailbox_clock: list[flo
         client_factory=lambda timeout: httpx2.Client(transport=transport.transport(), trust_env=False),
         clock=lambda: mailbox_clock[0],
         backoff=Backoff(),
-        inbox_ids={},
     )
 
 
 def test_graph_honours_a_deadline_on_another_clock_than_its_own() -> None:
     """The CallDeadline's clock and the mailbox's clock are unrelated; the remaining time is what counts."""
     tool_clock = [5000.0]
-    deadline = CallDeadline.start(lambda: tool_clock[0])
+    # soft = hard: this test is about the hard limit on another clock, not about the 16 s soft stop
+    deadline = CallDeadline(tool_clock[0], 20.0, 20.0, lambda: tool_clock[0])
     tool_clock[0] += 19.5  # 0.5 s of the hard limit remain
     mailbox_clock = [100.0]
 
@@ -182,7 +182,7 @@ def test_graph_honours_a_deadline_on_another_clock_than_its_own() -> None:
 
         return httpx2.Response(200, content=body())
 
-    t = RecordingTransport({LIST: body_advancing_the_mailbox_clock})
+    t = RecordingTransport(routes(body_advancing_the_mailbox_clock))
     with pytest.raises(ProviderError) as info:
         _graph_with_own_clock(t, mailbox_clock).list_unread(SINCE, 20, deadline)
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
@@ -247,7 +247,7 @@ class SoftStopTokens(FakeTokens):
 
 
 def _graph_soft_stop() -> GraphMailbox:
-    return GraphMailbox("outlook", SoftStopTokens(), backoff=Backoff(), inbox_ids={})
+    return GraphMailbox("outlook", SoftStopTokens(), backoff=Backoff())
 
 
 @pytest.mark.parametrize("make", [_imap_noop_soft_stop, _graph_soft_stop], ids=["imap", "graph"])

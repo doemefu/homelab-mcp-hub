@@ -11,7 +11,7 @@ from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from tests.support.dav_transport import RecordingTransport
 from tests.support.graph_fixtures import FakeTokens
-from tests.unit.test_graph_adapter import LIST
+from tests.unit.test_graph_adapter import routes
 
 pytestmark = pytest.mark.anyio
 
@@ -29,13 +29,12 @@ async def test_hanging_graph_call_times_out_within_deadline(monkeypatch: pytest.
         release.wait(5)
         return httpx2.Response(200, content=b'{"value": []}')
 
-    t = RecordingTransport({LIST: hang})
+    t = RecordingTransport(routes(hang))
     mailbox = GraphMailbox(
         "outlook",
         FakeTokens(),
         client_factory=lambda timeout: httpx2.Client(transport=t.transport()),
         backoff=Backoff(),
-        inbox_ids={},
     )
     started = time.monotonic()
     try:

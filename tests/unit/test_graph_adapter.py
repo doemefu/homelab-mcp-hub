@@ -9,13 +9,13 @@ import pytest
 from mcp_hub.ids import GraphMessageRef, MessageRef
 from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.graph import Backoff, GraphMailbox, retry_after_seconds
+from mcp_hub.providers.graph import EXTENDED_EXPAND, SUMMARY_SELECT, Backoff, GraphMailbox, retry_after_seconds
 from tests.support.dav_transport import RecordingTransport
-from tests.support.graph_fixtures import INBOX_ID, FakeTokens, message
-from tests.support.ms_transport import streamed
+from tests.support.graph_fixtures import FOLDER_IDS, INBOX_ID, FakeTokens, message
+from tests.support.ms_transport import ChunkStream, streamed
 
 BASE = "https://graph.microsoft.com:443/v1.0"
-LIST = ("GET", f"{BASE}/me/mailFolders/inbox/messages")
+LIST = ("GET", f"{BASE}/me/mailFolders/{INBOX_ID}/messages")  # lists address the well-known folder by its id
 FOLDER = ("GET", f"{BASE}/me/mailFolders/inbox")
 MID = "AAMkMSG0001="
 SINCE = datetime(2026, 9, 29, 6, 0, 30, 500_000, tzinfo=UTC)
@@ -26,6 +26,20 @@ def js(body: object, status: int = 200, headers: dict[str, str] | None = None) -
     return lambda request: httpx2.Response(
         status, content=json.dumps(body).encode(), headers={"Content-Type": "application/json"} | (headers or {})
     )
+
+
+def folder_routes() -> dict[tuple[str, str], Handler]:
+    """The seven well-known folder GETs of the folder-id map (spec 080 §5.5)."""
+    return {("GET", f"{BASE}/me/mailFolders/{name}"): js({"id": folder_id}) for name, folder_id in FOLDER_IDS.items()}
+
+
+def routes(answer: Handler) -> dict[tuple[str, str], Handler]:
+    """The folder-id map plus `answer` for the inbox list."""
+    return folder_routes() | {LIST: answer}
+
+
+def list_requests(t: RecordingTransport) -> int:
+    return sum(1 for *_, path, _ in t.seen if path.endswith("/messages"))
 
 
 def box(
@@ -41,7 +55,6 @@ def box(
         client_factory=lambda timeout: httpx2.Client(transport=t.transport(), trust_env=False, follow_redirects=False),
         clock=lambda: clock[0],
         backoff=backoff or Backoff(),
-        inbox_ids={},
     )
 
 
@@ -68,12 +81,13 @@ def test_list_query_shape_and_headers() -> None:
         seen.append(request)
         return js({"value": [message(1)]})(request)
 
-    page = box(RecordingTransport({LIST: answer})).list_unread(SINCE, 20, call_deadline())
+    page = box(RecordingTransport(routes(answer))).list_unread(SINCE, 20, call_deadline())
     assert dict(seen[0].url.params) == {
         "$filter": "receivedDateTime ge 2026-09-29T06:00:30Z and isRead eq false",
         "$orderby": "receivedDateTime desc",
-        "$select": "id,receivedDateTime,isRead,hasAttachments,from,subject,bodyPreview",
-        "$top": "21",
+        "$select": SUMMARY_SELECT,
+        "$expand": EXTENDED_EXPAND,
+        "$top": "101",
     }
     h = seen[0].headers
     assert h["prefer"] == 'IdType="ImmutableId", outlook.body-content-type="text"'
@@ -85,32 +99,33 @@ def test_list_query_shape_and_headers() -> None:
 
 def test_more_when_limit_plus_one_or_next_link() -> None:
     assert (
-        box(RecordingTransport({LIST: js({"value": [message(n) for n in range(1, 4)]})}))
+        box(RecordingTransport(routes(js({"value": [message(n) for n in range(1, 4)]}))))
         .list_unread(SINCE, 2, call_deadline())
         .more
     )
-    t = RecordingTransport({LIST: js({"value": [message(1)], "@odata.nextLink": "https://evil.example.test/next"})})
+    t = RecordingTransport(routes(js({"value": [message(1)], "@odata.nextLink": "https://evil.example.test/next"})))
     assert box(t).list_unread(SINCE, 20, call_deadline()).more
-    assert [s[0] for s in t.seen] == ["graph.microsoft.com"]
+    assert {s[0] for s in t.seen} == {"graph.microsoft.com"}
+    assert list_requests(t) == 1
 
 
 def test_duplicate_graph_ids_keep_the_first_entry() -> None:
     first = message(1, subject="first copy")
     entries = [first, message(2), message(1, subject="second copy", receivedDateTime="2026-09-29T06:59:00Z")]
-    page = list_unread(RecordingTransport({LIST: js({"value": entries})}))
+    page = list_unread(RecordingTransport(routes(js({"value": entries}))))
     assert [(i.ref.graph_id, i.subject) for i in page.items] == [("AAMkMSG0002=", "Subject 2"), (MID, "first copy")]
 
 
 def test_next_link_never_requested() -> None:
     t = RecordingTransport(
-        {LIST: js({"value": [], "@odata.nextLink": f"{BASE}/me/mailFolders/inbox/messages?$skip=10"})}
+        routes(js({"value": [], "@odata.nextLink": f"{BASE}/me/mailFolders/{INBOX_ID}/messages?$skip=10"}))
     )
     box(t).list_unread(SINCE, 20, call_deadline())
-    assert len(t.seen) == 1
+    assert list_requests(t) == 1
 
 
 def test_only_graph_host_gets_bearer() -> None:
-    t = RecordingTransport({LIST: js({"value": [message(1)]})})
+    t = RecordingTransport(routes(js({"value": [message(1)]})))
     box(t).list_unread(SINCE, 20, call_deadline())
     assert all(host == "graph.microsoft.com" and port == 443 for host, port, *_ in t.seen)
 
@@ -118,44 +133,51 @@ def test_only_graph_host_gets_bearer() -> None:
 @pytest.mark.parametrize("status", [301, 302, 307, 308])
 def test_redirect_not_followed(status: int) -> None:
     t = RecordingTransport(
-        {LIST: lambda r: httpx2.Response(status, headers={"Location": "https://evil.example.test/"})}
+        routes(lambda r: httpx2.Response(status, headers={"Location": "https://evil.example.test/"}))
     )
     with pytest.raises(ProviderError) as info:
         list_unread(t)
     assert (info.value.code, info.value.cause) == ("upstream_error", "Redirect")
-    assert len(t.seen) == 1
+    assert list_requests(t) == 1
+    assert {s[0] for s in t.seen} == {"graph.microsoft.com"}
 
 
 @pytest.mark.parametrize("status", [301, 307])
 def test_redirect_not_followed_even_by_a_following_client(status: int) -> None:
     """follow_redirects=False is set per request, so a following client cannot send the bearer to Location (F2)."""
     t = RecordingTransport(
-        {LIST: lambda r: httpx2.Response(status, headers={"Location": "https://evil.example.test/"})}
+        routes(lambda r: httpx2.Response(status, headers={"Location": "https://evil.example.test/"}))
     )
     following = GraphMailbox(
         "outlook",
         FakeTokens(),
         client_factory=lambda timeout: httpx2.Client(transport=t.transport(), follow_redirects=True),
         backoff=Backoff(),
-        inbox_ids={},
     )
     with pytest.raises(ProviderError) as info:
         following.list_unread(SINCE, 20, CallDeadline.start())  # this client runs on the real clock
     assert info.value.cause == "Redirect"
-    assert [s[0] for s in t.seen] == ["graph.microsoft.com"]
+    assert {s[0] for s in t.seen} == {"graph.microsoft.com"}
+    assert list_requests(t) == 1
 
 
 def test_response_over_cap_stops_after_first_chunk_beyond() -> None:
-    response, stream = streamed(200, [b'{"value": ['] + [b" " * 65_536] * 40)
-    t = RecordingTransport({LIST: lambda r: response})
+    served: list[ChunkStream] = []
+
+    def over_cap(request: httpx2.Request) -> httpx2.Response:
+        response, stream = streamed(200, [b'{"value": ['] + [b" " * 65_536] * 40)
+        served.append(stream)
+        return response
+
+    t = RecordingTransport(routes(over_cap))
     with pytest.raises(ProviderError) as info:
         list_unread(t)
     assert info.value.code == "too_large"
-    assert stream.served == 17  # 1 + 16 x 64 KiB > 1 MiB
+    assert [s.served for s in served] == [17, 17]  # 1 + 16 x 64 KiB > 1 MiB; once more with $top halved (§5.4)
 
 
 def test_deeply_nested_json_is_upstream_error() -> None:
-    t = RecordingTransport({LIST: lambda r: httpx2.Response(200, content=b'{"value": ' + b"[" * 200_000)})
+    t = RecordingTransport(routes(lambda r: httpx2.Response(200, content=b'{"value": ' + b"[" * 200_000)))
     with pytest.raises(ProviderError) as info:
         list_unread(t)
     assert (info.value.code, info.value.cause) == ("upstream_error", "MalformedJson")
@@ -163,7 +185,7 @@ def test_deeply_nested_json_is_upstream_error() -> None:
 
 def test_gzip_refused_before_reading() -> None:
     response, stream = streamed(200, [gzip.compress(b'{"value": []}')], {"Content-Encoding": "gzip"})
-    t = RecordingTransport({LIST: lambda r: response})
+    t = RecordingTransport(routes(lambda r: response))
     with pytest.raises(ProviderError) as info:
         list_unread(t)
     assert info.value.cause == "ContentEncoding"
@@ -181,7 +203,7 @@ def test_deadline_between_chunks() -> None:
 
         return httpx2.Response(200, content=body())
 
-    t = RecordingTransport({LIST: chunks_advancing_clock})
+    t = RecordingTransport(routes(chunks_advancing_clock))
     with pytest.raises(ProviderError) as info:
         list_unread(t, now=now)
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
@@ -195,7 +217,7 @@ def test_no_request_after_the_deadline() -> None:
             now[0] = deadline + 1.0  # the token refresh used up the whole call deadline
             return super().access_token(deadline)
 
-    t = RecordingTransport({LIST: js({"value": []})})
+    t = RecordingTransport(routes(js({"value": []})))
     with pytest.raises(ProviderError) as info:
         list_unread(t, tokens=SlowTokens(), now=now)
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
@@ -204,13 +226,13 @@ def test_no_request_after_the_deadline() -> None:
 
 def test_401_refreshes_once_then_auth_expired() -> None:
     tokens = FakeTokens()
-    t = RecordingTransport({LIST: js({"error": {"code": "InvalidAuthenticationToken"}}, 401)})
+    t = RecordingTransport(routes(js({"error": {"code": "InvalidAuthenticationToken"}}, 401)))
     with pytest.raises(ProviderError) as info:
         list_unread(t, tokens=tokens)
     assert (info.value.code, info.value.cause) == ("auth_expired", "GraphUnauthorized")
     assert tokens.invalidated == 2  # the refreshed token Graph also rejected is dropped too (review round 1 F7)
     assert tokens.issued == 2
-    assert len(t.seen) == 2
+    assert list_requests(t) == 2
 
 
 def test_after_a_second_401_the_next_call_starts_with_a_refresh() -> None:
@@ -236,7 +258,7 @@ def test_after_a_second_401_the_next_call_starts_with_a_refresh() -> None:
         sent.append(request.headers["authorization"])
         return httpx2.Response(401, content=b"{}")
 
-    tokens, t = CachingTokens(), RecordingTransport({LIST: reject})
+    tokens, t = CachingTokens(), RecordingTransport(routes(reject))
     for _ in range(2):
         with pytest.raises(ProviderError):
             list_unread(t, tokens=tokens)
@@ -251,19 +273,19 @@ def test_401_then_success_uses_the_refreshed_token() -> None:
         seen.append(request.headers["authorization"])
         return next(answers)(request)
 
-    page = list_unread(RecordingTransport({LIST: answer}))
+    page = list_unread(RecordingTransport(routes(answer)))
     assert len(page.items) == 1
     assert seen == ["Bearer AT-SENTINEL-1", "Bearer AT-SENTINEL-2"]
 
 
 def test_403_is_upstream_error_and_drops_the_token() -> None:
     tokens = FakeTokens()
-    t = RecordingTransport({LIST: js({"error": {"code": "ErrorAccessDenied", "message": "secret text"}}, 403)})
+    t = RecordingTransport(routes(js({"error": {"code": "ErrorAccessDenied", "message": "secret text"}}, 403)))
     with pytest.raises(ProviderError) as info:
         list_unread(t, tokens=tokens)
     assert (info.value.code, info.value.cause) == ("upstream_error", "Forbidden")
     assert tokens.invalidated == 1
-    assert len(t.seen) == 1
+    assert list_requests(t) == 1
     assert "secret" not in str(info.value)
 
 
@@ -277,7 +299,7 @@ def test_403_is_upstream_error_and_drops_the_token() -> None:
     ],
 )
 def test_status_mapping(status: int, code: str, cause: str) -> None:
-    t = RecordingTransport({LIST: js({"error": {"code": "x", "message": "secret text"}}, status)})
+    t = RecordingTransport(routes(js({"error": {"code": "x", "message": "secret text"}}, status)))
     with pytest.raises(ProviderError) as info:
         list_unread(t)
     assert (info.value.code, info.value.cause) == (code, cause)
@@ -287,7 +309,7 @@ def test_status_mapping(status: int, code: str, cause: str) -> None:
 @pytest.mark.parametrize("status", [429, 503])
 def test_throttling_backoff_clamped_fails_fast_and_skips_token_refresh(status: int) -> None:
     now, backoff, tokens = [100.0], Backoff(), FakeTokens()
-    t = RecordingTransport({LIST: js({}, status, {"Retry-After": "99999"})})
+    t = RecordingTransport(routes(js({}, status, {"Retry-After": "99999"})))
     with pytest.raises(ProviderError) as first:
         list_unread(t, tokens=tokens, backoff=backoff, now=now)
     assert (first.value.code, first.value.cause) == ("upstream_error", "Throttled")
@@ -295,16 +317,17 @@ def test_throttling_backoff_clamped_fails_fast_and_skips_token_refresh(status: i
     with pytest.raises(ProviderError) as info:
         list_unread(t, tokens=tokens, backoff=backoff, now=now)
     assert info.value.cause == "Throttled"
-    assert len(t.seen) == 1
+    sent = len(t.seen)
+    assert list_requests(t) == 1
     assert tokens.issued == issued
     now[0] += 299
     with pytest.raises(ProviderError):
         list_unread(t, tokens=tokens, backoff=backoff, now=now)
-    assert len(t.seen) == 1  # still inside the clamped 300 s
+    assert len(t.seen) == sent  # still inside the clamped 300 s: no request at all
     now[0] += 2
     with pytest.raises(ProviderError):
         list_unread(t, tokens=tokens, backoff=backoff, now=now)
-    assert len(t.seen) == 2
+    assert list_requests(t) == 2
 
 
 def test_backoff_is_per_account() -> None:
@@ -514,5 +537,5 @@ def test_transport_failures_map_to_class_names(exc: Exception, code: str) -> Non
         raise exc
 
     with pytest.raises(ProviderError) as info:
-        list_unread(RecordingTransport({LIST: fail}))
+        list_unread(RecordingTransport(routes(fail)))
     assert (info.value.code, info.value.cause) == (code, type(exc).__name__)

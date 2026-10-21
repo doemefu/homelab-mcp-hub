@@ -1,51 +1,85 @@
-"""Read-only Microsoft Graph mail adapter (spec 080 §6.3, rev. 4.6 S1 to S5).
+"""Read-only Microsoft Graph mail adapter (spec 080 §6.3, rev. 4.6 S1 to S5; §5.5 and §6.5, rev. 4.9).
 
-Inbox only, GET only, fixed host, no redirects, no nextLink, capped streamed reads against one call deadline.
-Blocking; runs through providers.base.run_blocking. Returns decoded, unsanitised text; the tool layer sanitises every
-string (spec 080 §5.3)."""
+Lists cover the well-known folders by id (inbox, sentitems, archive, deleteditems), with the mail-history fields of
+§5.5 and keyset paging; GET only, fixed host, no redirects, no nextLink, capped streamed reads against one call
+deadline with the 16 s soft stop. Blocking; runs through providers.base.run_blocking. Returns decoded, unsanitised
+text; the tool layer sanitises every string (spec 080 §5.3)."""
 
 import logging
 import re
 import threading
 import time
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Final, Literal, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx2
 
-from mcp_hub.ids import GRAPH_ID, AnyMessageRef, GraphMessageRef
+from mcp_hub.ids import GRAPH_ID, AnyMessageRef, GraphMessageRef, ThreadKey, location_k
 from mcp_hub.logging import log_event
 from mcp_hub.providers.base import (
+    MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
     AttachmentMeta,
     FolderPage,
     ListQuery,
     MailDetail,
+    MailFlags,
+    MailMeta,
     MailSummary,
     ProviderError,
     UnreadPage,
+    direction_of,
     load_json_object,
     log_message_skipped,
+    order_key,
     placeholder_summary,
     read_capped,
 )
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
-from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache
+from mcp_hub.providers.folders import (
+    FOLDER_MAPS,
+    GRAPH_WELL_KNOWN,
+    FolderMapCache,
+    GraphFolderIds,
+    GraphWellKnown,
+    ListFolder,
+    MailFolder,
+)
+from mcp_hub.providers.headers import MAX_REFERENCES, bare_message_id, msg_id_tokens, valid_message_id
 from mcp_hub.sanitize import html_to_text
 
 GRAPH_HOST: Final = "graph.microsoft.com"
 API: Final = f"https://{GRAPH_HOST}/v1.0"
 MAX_LIST_RESPONSE_BYTES: Final = 1_048_576  # L1
 MAX_MESSAGE_RESPONSE_BYTES: Final = 2_097_152  # L2
-MAX_LIST_ITEMS: Final = 51  # L7
 RETRY_AFTER_DEFAULT: Final = 30  # L16
 RETRY_AFTER_MAX: Final = 300
-MAX_FOLDER_ID_CHARS: Final = 512
 PREFER: Final = 'IdType="ImmutableId", outlook.body-content-type="text"'
-LIST_SELECT: Final = "id,receivedDateTime,isRead,hasAttachments,from,subject,bodyPreview"
+SUMMARY_SELECT: Final = (
+    "id,receivedDateTime,isRead,hasAttachments,from,subject,bodyPreview,isDraft,internetMessageId,"
+    "conversationId,parentFolderId,toRecipients,ccRecipients,flag,sentDateTime"
+)
+EXTENDED_EXPAND: Final = (
+    "singleValueExtendedProperties($filter=id eq 'Integer 0x1081' or id eq 'String 0x1042' or id eq 'String 0x1039')"
+)
+GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
+ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
+FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
+WELL_KNOWN_FOR: Final[dict[ListFolder, tuple[GraphWellKnown, ...]]] = {
+    "inbox": ("inbox",),
+    "sent": ("sentitems",),
+    "archive": ("archive",),
+    "trash": ("deleteditems",),
+    "all": ("inbox", "archive", "sentitems"),  # never trash (§5.2); the folder order of S-e
+}
+_LAST_VERB: Final = "integer 0x1081"  # extended-property ids, compared lower-cased (G7)
+_IN_REPLY_TO: Final = "string 0x1042"
+_REFERENCES: Final = "string 0x1039"
+_VERB: Final = re.compile(r"[0-9]{1,10}")  # ASCII digits only; anything else is "not answered"
 _HEADER_FIELDS: Final = "id,receivedDateTime,isRead,hasAttachments,from,toRecipients,ccRecipients,subject"
 MESSAGE_SELECT: Final = _HEADER_FIELDS + ",body,parentFolderId"
 FALLBACK_SELECT: Final = _HEADER_FIELDS + ",bodyPreview,parentFolderId"
@@ -85,8 +119,6 @@ class Backoff:
 
 
 BACKOFF: Final = Backoff()
-INBOX_IDS: Final[dict[str, str]] = {}
-_INBOX_LOCK: Final = threading.Lock()
 
 
 def retry_after_seconds(value: str | None) -> int:
@@ -137,6 +169,98 @@ def _timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _utc_second(value: datetime) -> str:
+    return f"{value.astimezone(UTC).replace(microsecond=0):%Y-%m-%dT%H:%M:%SZ}"
+
+
+def list_filter(since: datetime, bound: datetime | None, unread_only: bool) -> str:
+    """Exactly `receivedDateTime ge A[ and receivedDateTime lt B][ and isRead eq false]` (G2).
+
+    `receivedDateTime` comes first, as Graph requires for `$orderby`; B is the cursor's second plus one second, `lt`
+    rather than `le` because Exchange's sub-second precision is undocumented (S-f). The caller drops items at or above
+    the `(received_at, k)` position locally. Sent only as an httpx query parameter, never concatenated into a URL."""
+    terms = [f"receivedDateTime ge {_utc_second(since)}"]
+    if bound is not None:
+        terms.append(f"receivedDateTime lt {_utc_second(bound + timedelta(seconds=1))}")
+    if unread_only:
+        terms.append("isRead eq false")
+    return " and ".join(terms)
+
+
+def _folder_id(body: Mapping[str, object]) -> str | None:
+    value = body.get("id")
+    return value if isinstance(value, str) and FOLDER_ID.fullmatch(value) else None
+
+
+def _extended(raw: Mapping[str, object]) -> dict[str, str]:
+    """Expanded extended properties by lower-cased id (G7), string values only, each cut to 64 KiB (as the IMAP header
+    cap). A missing or malformed `singleValueExtendedProperties` gives {}: unknown, never an account error (S-n)."""
+    entries = raw.get("singleValueExtendedProperties")
+    found: dict[str, str] = {}
+    if not isinstance(entries, list):
+        return found
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key, value = entry.get("id"), entry.get("value")
+        if isinstance(key, str) and isinstance(value, str):
+            found.setdefault(key.lower(), value[:MAX_HEADER_BYTES])
+    return found
+
+
+def _answered(value: str | None) -> bool:
+    return value is not None and _VERB.fullmatch(value) is not None and int(value) in ANSWERED_VERBS
+
+
+def graph_meta(raw: Mapping[str, object], ids: GraphFolderIds, own: frozenset[str], account: str) -> MailMeta:
+    """Mail-history fields of a Graph message (spec 080 §5.5); third-party strings decoded, not yet sanitised.
+
+    The folder comes from `parentFolderId`; callers drop items in excluded folders first, and an excluded or missing
+    parent here is `not_found` (D75, fail closed). A `conversationId` outside the Graph id pattern only loses the
+    thread key."""
+    folder = ids.role_of(_str(raw.get("parentFolderId")))
+    if folder == "excluded":
+        raise ProviderError("not_found", "ExcludedFolder")
+    props = _extended(raw)
+    message_id = bare_message_id((_str(raw.get("internetMessageId")) or "")[:MAX_HEADER_BYTES] or None)
+    references_raw = props.get(_REFERENCES)
+    references = (
+        [t for t in msg_id_tokens(references_raw) if t != message_id and valid_message_id(t) is not None]
+        if references_raw
+        else []
+    )
+    flag = raw.get("flag")
+    conversation = raw.get("conversationId")
+    return MailMeta(
+        folder=folder,
+        folder_name=None,  # the hub does not read Graph folder display names (§5.5)
+        flags=MailFlags(
+            answered=_answered(props.get(_LAST_VERB)),
+            flagged=isinstance(flag, dict) and flag.get("flagStatus") == "flagged",
+        ),
+        direction=direction_of(in_sent=folder == "sent", from_address=_address(raw.get("from"))[1], own=own),
+        message_id=message_id,
+        in_reply_to=bare_message_id(props.get(_IN_REPLY_TO)),
+        references=tuple(references[-MAX_REFERENCES:]),
+        thread=(
+            ThreadKey(account, "graph", conversation)
+            if isinstance(conversation, str) and GRAPH_ID.fullmatch(conversation)
+            else None
+        ),
+    )
+
+
+def _soft_stopped_page() -> FolderPage:
+    return FolderPage(items=[], more=False, truncated=True, complete=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _FolderAnswer:
+    items: list[MailSummary]  # after the draft, window, unread, folder and position filters
+    frontier: tuple[int, str] | None  # order key of the answer's last item when more may exist beyond the answer
+    stuck: bool  # a full answer without any item below the position (S-f)
+
+
 class GraphMailbox:
     def __init__(
         self,
@@ -147,42 +271,54 @@ class GraphMailbox:
         clock: Callable[[], float] = time.monotonic,
         timeout: float = PROVIDER_TIMEOUT_SECONDS,
         backoff: Backoff = BACKOFF,
-        inbox_ids: dict[str, str] = INBOX_IDS,
         own_addresses: frozenset[str] = frozenset(),
         folder_maps: FolderMapCache = FOLDER_MAPS,
     ) -> None:
         self._account, self._tokens, self._factory = account_id, tokens, client_factory
-        self._clock, self._timeout, self._backoff, self._inbox_ids = clock, timeout, backoff, inbox_ids
+        self._clock, self._timeout, self._backoff = clock, timeout, backoff
         self._own_addresses, self._folder_maps = own_addresses, folder_maps
 
     # --- plumbing -------------------------------------------------------------------------------------------------
-    def _run[T](self, work: Callable[[httpx2.Client, str, float], T], call: CallDeadline) -> T:
+    def _run[T](
+        self,
+        work: Callable[[httpx2.Client, str, CallDeadline], T],
+        call: CallDeadline,
+        *,
+        on_soft_stop: Callable[[], T] | None = None,
+    ) -> T:
         # One deadline for the whole call, incl. a token refresh (L18), owned by the tool layer. Re-based onto this
-        # adapter's clock, so every comparison of the call (request, chunks, token refresh) uses one clock.
-        deadline = self._clock() + call.remaining()
+        # adapter's clock (same elapsed time, same limits), so every comparison of the call (soft stop, request,
+        # chunks, token refresh) uses one clock.
+        now = self._clock()
+        deadline = CallDeadline(now - (call.clock() - call.started), call.soft_seconds, call.hard_seconds, self._clock)
         try:
-            self._backoff.check(self._account, self._clock())  # no refresh, no request during a back-off (L16)
+            self._backoff.check(self._account, now)  # no refresh, no request during a back-off (L16)
             with self._factory(self._timeout) as client:
-                token = self._tokens.access_token(deadline)
+                deadline.before_command()  # no token refresh starts after the soft stop (S-o)
+                token = self._tokens.access_token(deadline.hard_at)  # a running refresh ends by the hard deadline
                 try:
                     return work(client, token, deadline)
                 except _UnauthorizedError:
                     self._tokens.invalidate()  # drop the rejected access token; one refresh and one retry (§6.3)
-                token = self._tokens.access_token(deadline)
+                deadline.before_command()
+                token = self._tokens.access_token(deadline.hard_at)
                 try:
                     return work(client, token, deadline)
                 except _UnauthorizedError:
                     self._tokens.invalidate()  # Graph rejected the refreshed token too: the next call refreshes first
                     raise ProviderError("auth_expired", "GraphUnauthorized") from None
+        except SoftStop:
+            if on_soft_stop is None:
+                raise ProviderError("upstream_timeout", "SoftStop") from None  # no partial result here (R2b)
+            return on_soft_stop()
         except Exception as exc:
             raise _provider_error(exc) from None
 
     def _get(
-        self, client: httpx2.Client, token: str, deadline: float, path: str, params: dict[str, str], cap: int
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, path: str, params: dict[str, str], cap: int
     ) -> dict[str, object]:
+        deadline.before_command()  # hard limit: upstream_timeout; soft stop: SoftStop (§5.4)
         now = self._clock()
-        if now > deadline:
-            raise ProviderError("upstream_timeout", "CallDeadline")
         self._backoff.check(self._account, now)
         url = API + path
         parts = urlsplit(url)
@@ -201,14 +337,16 @@ class GraphMailbox:
             url,
             params=params,
             headers=headers,
-            timeout=min(deadline - now, PROVIDER_TIMEOUT_SECONDS),
+            timeout=min(deadline.remaining(), PROVIDER_TIMEOUT_SECONDS),
             follow_redirects=False,
         ) as response:
             status = response.status_code
             if status == 200:
                 if response.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity"):
                     raise ProviderError("upstream_error", "ContentEncoding")
-                return load_json_object(read_capped(response.iter_bytes(), cap, deadline=deadline, clock=self._clock))
+                return load_json_object(
+                    read_capped(response.iter_bytes(), cap, deadline=deadline.hard_at, clock=self._clock)
+                )
             if 300 <= status < 400:
                 raise ProviderError("upstream_error", "Redirect")
             if status == 401:
@@ -225,58 +363,151 @@ class GraphMailbox:
                 raise ProviderError("upstream_error", "Throttled")
             raise ProviderError("upstream_error", "UnexpectedStatus")
 
-    def _inbox_id(self, client: httpx2.Client, token: str, deadline: float, *, refresh: bool = False) -> str:
-        with _INBOX_LOCK:
-            cached = None if refresh else self._inbox_ids.get(self._account)
-        if cached is not None:
-            return cached
+    def _folder_ids(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, *, refresh: bool = False
+    ) -> GraphFolderIds:
+        """The ids of the seven well-known folders (spec 080 §5.5), cached per account for at most 3,600 s.
+
+        A 404 means the account has no such folder; any other failure, and an id outside `FOLDER_ID` (Sec8), fails
+        the call. Ids are never logged."""
+        if not refresh:
+            cached = self._folder_maps.get(self._account)
+            if isinstance(cached, GraphFolderIds):
+                return cached
+        found: dict[GraphWellKnown, str | None] = {}
+        for name in GRAPH_WELL_KNOWN:
+            try:
+                body = self._get(
+                    client, token, deadline, f"/me/mailFolders/{name}", {"$select": "id"}, MAX_LIST_RESPONSE_BYTES
+                )
+            except ProviderError as exc:
+                if exc.code != "not_found":
+                    raise
+                found[name] = None
+                continue
+            folder_id = _folder_id(body)
+            if folder_id is None:
+                raise ProviderError("upstream_error", "MalformedFolderId")
+            found[name] = folder_id
+        ids = GraphFolderIds(self._account, found)
+        self._folder_maps.put(ids)
+        return ids
+
+    def _check_inbox(self, client: httpx2.Client, token: str, deadline: CallDeadline) -> None:
         body = self._get(client, token, deadline, "/me/mailFolders/inbox", {"$select": "id"}, MAX_LIST_RESPONSE_BYTES)
-        folder = body.get("id")
-        if not isinstance(folder, str) or not 0 < len(folder) <= MAX_FOLDER_ID_CHARS:
+        if _folder_id(body) is None:
             raise ProviderError("upstream_error", "NoInboxId")
-        with _INBOX_LOCK:
-            self._inbox_ids[self._account] = folder
-        return folder
 
     # --- Mailbox protocol -----------------------------------------------------------------------------------------
     def check(self, deadline: CallDeadline) -> None:
-        """Status check (spec 080 §7.4, rev. 4.6 S10): token (refresh only near expiry) + inbox folder id."""
-        self._run(lambda client, token, hard_at: self._inbox_id(client, token, hard_at, refresh=True), deadline)
+        """Status check (spec 080 §7.4, rev. 4.6 S10): token (refresh only near expiry) + one inbox folder-id GET."""
+        self._run(self._check_inbox, deadline)
 
     def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
-        return self._run(lambda client, token, hard_at: self._list(client, token, hard_at, since, limit), deadline)
+        """The unread inbox, through list_messages (kept until the tool layer calls list_messages itself)."""
+        page = self.list_messages(ListQuery("inbox", since, True, None, limit), deadline)
+        return UnreadPage(items=page.items, more=page.more or page.truncated)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
-        raise ProviderError("upstream_error", "NotImplemented")  # replaced by the list_messages lane
+        return self._run(
+            lambda client, token, call: self._list_messages(client, token, call, query),
+            deadline,
+            on_soft_stop=_soft_stopped_page,  # stopped before any folder answered: nothing read, no cursor
+        )
 
     def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail:
         if not isinstance(ref, GraphMessageRef) or ref.account != self._account:
             raise ProviderError("not_found", "ForeignRef")
-        return self._run(lambda client, token, hard_at: self._message(client, token, hard_at, ref), deadline)
+        return self._run(lambda client, token, call: self._message(client, token, call, ref), deadline)
 
     # --- list -----------------------------------------------------------------------------------------------------
-    def _list(self, client: httpx2.Client, token: str, deadline: float, since: datetime, limit: int) -> UnreadPage:
-        floor = since.astimezone(UTC).replace(microsecond=0)
+    def _list_messages(self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery) -> FolderPage:
+        """One request per well-known folder of the query (spec 080 §5.5 "Cursors", §6.5), merged by order_key.
+
+        Filter order as on IMAP (R3): drafts, window and unread per item, then the position, then the direction,
+        then `limit`. A full answer (the effective `$top`, or a nextLink, which is never followed) sets `more` and is
+        the frontier: no item older than its last item is returned, so the cursor continues after it."""
+        try:
+            ids = self._folder_ids(client, token, deadline)
+        except SoftStop:
+            return _soft_stopped_page()
+        bound = None if query.position is None else datetime.fromtimestamp(query.position.received_at, UTC)
         params = {
-            "$filter": f"receivedDateTime ge {floor:%Y-%m-%dT%H:%M:%SZ} and isRead eq false",
+            "$filter": list_filter(query.since, bound, query.unread_only),
             "$orderby": "receivedDateTime desc",
-            "$select": LIST_SELECT,
-            "$top": str(limit + 1),
+            "$top": str(GRAPH_LIST_TOP),
+            "$select": SUMMARY_SELECT,
+            "$expand": EXTENDED_EXPAND,
         }
-        body = self._get(client, token, deadline, "/me/mailFolders/inbox/messages", params, MAX_LIST_RESPONSE_BYTES)
+        found: list[MailSummary] = []
+        seen: set[AnyMessageRef] = set()
+        floor: tuple[int, str] | None = None
+        more = truncated = False
+        complete = True
+        for name in WELL_KNOWN_FOR[query.folder]:
+            folder_id = ids.ids.get(name)
+            if folder_id is None:
+                continue  # the account has no such folder (404 when the ids were read)
+            try:
+                answer = self._folder_answer(client, token, deadline, folder_id, params, query, ids)
+            except SoftStop:
+                truncated, complete = True, False  # what was read is returned, without a cursor (§5.4)
+                break
+            if answer.stuck:
+                truncated = True  # more than 100 messages in one second: the account stops here (S-f residual)
+                break
+            if answer.frontier is not None:
+                more = True
+                floor = answer.frontier if floor is None else max(floor, answer.frontier)
+            for summary in answer.items:
+                if summary.ref not in seen:  # a repeated Graph id keeps its first entry
+                    seen.add(summary.ref)
+                    found.append(summary)
+        if floor is not None:
+            found = [summary for summary in found if order_key(summary) >= floor]
+        if query.direction is not None:
+            found = [summary for summary in found if summary.meta.direction == query.direction]
+        found.sort(key=order_key, reverse=True)
+        if len(found) > query.limit:
+            more = True
+        return FolderPage(items=found[: query.limit], more=more, truncated=truncated, complete=complete)
+
+    def _folder_answer(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        folder_id: str,
+        params: dict[str, str],
+        query: ListQuery,
+        ids: GraphFolderIds,
+    ) -> _FolderAnswer:
+        path = f"/me/mailFolders/{quote(folder_id, safe='')}/messages"
+        top = GRAPH_LIST_TOP
+        try:
+            body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
+        except ProviderError as exc:
+            if exc.code != "too_large":
+                raise
+            top = GRAPH_LIST_TOP // 2  # once more with $top halved; a second too_large fails the account (§5.4)
+            body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
         values = body.get("value")
         if not isinstance(values, list):
             raise ProviderError("upstream_error", "MalformedList")
+        full = len(values) >= top or "@odata.nextLink" in body  # the effective $top decides (G6)
         items: list[MailSummary] = []
-        seen: set[AnyMessageRef] = set()
-        for raw in values[:MAX_LIST_ITEMS]:
-            summary = self._summary(raw, since)
-            if summary is not None and summary.ref not in seen:  # a repeated Graph id keeps its first entry
-                seen.add(summary.ref)
-                items.append(summary)
-        items.sort(key=lambda s: s.received_at, reverse=True)
-        more = len(values) > limit or "@odata.nextLink" in body or len(items) > limit
-        return UnreadPage(items=items[:limit], more=more)
+        lowest: tuple[int, str] | None = None
+        for raw in values[:top]:  # entries beyond the requested $top are never inspected (L7)
+            key, summary = self._list_item(raw, ids, query)
+            if key is None:
+                continue
+            lowest = key if lowest is None else min(lowest, key)
+            if summary is not None and (query.position is None or query.position.precedes(*key)):
+                items.append(summary)  # the local (received_at, k) drop of S-f
+        if not full:
+            return _FolderAnswer(items, None, False)
+        stuck = lowest is None or (query.position is not None and not query.position.precedes(*lowest))
+        return _FolderAnswer(items, lowest, stuck)
 
     def _degraded(self, exc: Exception) -> None:
         # No valid id: item_degraded without the `item` field (spec 080 rev. 4.6 S12).
@@ -289,39 +520,51 @@ class GraphMailbox:
             exception=type(exc).__name__,
         )
 
-    def _summary(self, raw: object, since: datetime) -> MailSummary | None:
+    def _list_item(
+        self, raw: object, ids: GraphFolderIds, query: ListQuery
+    ) -> tuple[tuple[int, str] | None, MailSummary | None]:
+        """(order key, summary): the key when the item has a valid id and timestamp, the summary when it is kept."""
         if not isinstance(raw, dict):
             self._degraded(MalformedItemError())
-            return None
+            return None, None
         graph_id = raw.get("id")
         if not isinstance(graph_id, str) or not GRAPH_ID.fullmatch(graph_id):
             self._degraded(MalformedItemError())
-            return None
+            return None, None
         ref = GraphMessageRef(self._account, graph_id)
         received = _timestamp(raw.get("receivedDateTime"))
         if received is None:
             log_message_skipped(ref, "mail", MalformedItemError())
-            return None
-        if received < since or raw.get("isRead") is True:  # defensive re-filter of the server's answer
-            return None
+            return None, None
+        key = (int(received.timestamp()), location_k(ref))
+        unread = raw.get("isRead") is not True
+        # Drafts per message (S1); the window and unread_only re-checked on the server's answer.
+        if raw.get("isDraft") is True or received < query.since or (query.unread_only and not unread):
+            return key, None
+        folder = ids.role_of(_str(raw.get("parentFolderId")))
+        if folder == "excluded":
+            return key, None  # junk, drafts, outbox or no parent: never listed (D75)
         try:
             name, address = _address(raw.get("from"))
-            return MailSummary(
+            return key, MailSummary(
                 ref=ref,
                 received_at=received,
-                unread=True,
+                unread=unread,
                 has_attachments=raw.get("hasAttachments") is True,
                 from_address=address,
                 from_name=name,
                 subject=_str(raw.get("subject")),
                 snippet_text=_str(raw.get("bodyPreview")) or "",
+                to_addresses=tuple(self._recipients(raw.get("toRecipients"))),
+                cc_addresses=tuple(self._recipients(raw.get("ccRecipients"))),
+                meta=graph_meta(raw, ids, self._own_addresses, self._account),
             )
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
-            return placeholder_summary(ref, received, True)
+            return key, placeholder_summary(ref, received, unread, MailMeta(folder=_listed_folder(folder)))
 
     # --- message --------------------------------------------------------------------------------------------------
-    def _message(self, client: httpx2.Client, token: str, deadline: float, ref: GraphMessageRef) -> MailDetail:
+    def _message(self, client: httpx2.Client, token: str, deadline: CallDeadline, ref: GraphMessageRef) -> MailDetail:
         path = f"/me/messages/{quote(ref.graph_id, safe='')}"
         preview_only = False
         try:
@@ -332,9 +575,10 @@ class GraphMailbox:
             preview_only = True
             body = self._get(client, token, deadline, path, {"$select": FALLBACK_SELECT}, MAX_LIST_RESPONSE_BYTES)
         parent = body.get("parentFolderId")
-        # A12: comparable ids are assumed (checked at the first live call, V3); a mismatch fails closed (SL6).
-        if parent != self._inbox_id(client, token, deadline) and parent != self._inbox_id(
-            client, token, deadline, refresh=True
+        # A12: comparable ids are assumed (checked at the first live call, V3); a mismatch fails closed (SL6) after
+        # one re-read of the folder ids. Inbox only until get_message binds by D75.
+        if not _is_inbox(parent, self._folder_ids(client, token, deadline)) and not _is_inbox(
+            parent, self._folder_ids(client, token, deadline, refresh=True)
         ):
             raise ProviderError("not_found", "NotInInbox")
         text, source, cut = self._body(body, preview_only)
@@ -380,7 +624,7 @@ class GraphMailbox:
         return text, "text/plain", cut
 
     def _attachments(
-        self, client: httpx2.Client, token: str, deadline: float, path: str, ref: GraphMessageRef
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, path: str, ref: GraphMessageRef
     ) -> list[AttachmentMeta]:
         try:
             body = self._get(
@@ -406,3 +650,11 @@ class GraphMailbox:
             size_bytes = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else 0
             found.append(AttachmentMeta(size_bytes, _str(item.get("name")), _str(item.get("contentType"))))
         return found
+
+
+def _is_inbox(parent: object, ids: GraphFolderIds) -> bool:
+    return isinstance(parent, str) and parent == ids.ids.get("inbox")
+
+
+def _listed_folder(folder: MailFolder | Literal["excluded"]) -> MailFolder:
+    return "other" if folder == "excluded" else folder

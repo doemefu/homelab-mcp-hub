@@ -72,7 +72,6 @@ def hub(secrets_dir: Path, store: FakeStore, ms: MsTransport, graph: RecordingTr
             account.id,
             tokens,
             backoff=backoff,
-            inbox_ids={},
             client_factory=lambda t: httpx2.Client(transport=graph.transport(), trust_env=False),
         )
 
@@ -103,7 +102,7 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
         hostile = {"id": "AAMk/../SENTINEL-ID", "subject": "SUBJECT-SENTINEL"}  # degraded without an item hash
         graph = RecordingTransport(
             {
-                ("GET", f"{BASE}/me/mailFolders/inbox/messages"): js({"value": [leaky, hostile]}),
+                ("GET", f"{BASE}/me/mailFolders/{INBOX_ID}/messages"): js({"value": [leaky, hostile]}),
                 ("GET", f"{BASE}/me/mailFolders/inbox"): js({"id": INBOX_ID}),
                 ("GET", f"{BASE}/me/messages/AAMkMSG0001="): js(
                     leaky
@@ -173,7 +172,12 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
 async def test_duplicate_graph_ids_are_listed_once(secrets_dir: Path) -> None:
     received = (NOW - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     entries = [message(n, receivedDateTime=received) for n in (1, 2, 1, 1)]
-    graph = RecordingTransport({("GET", f"{BASE}/me/mailFolders/inbox/messages"): js({"value": entries})})
+    graph = RecordingTransport(
+        {
+            ("GET", f"{BASE}/me/mailFolders/inbox"): js({"id": INBOX_ID}),
+            ("GET", f"{BASE}/me/mailFolders/{INBOX_ID}/messages"): js({"value": entries}),
+        }
+    )
     answer = {"access_token": "AT-SENTINEL", "refresh_token": "RT-SENTINEL", "expires_in": 3600, "scope": "Mail.Read"}
     ms = MsTransport({TOKEN_PATH: [json_answer(200, answer)]})
     result, _, outcome = await run_list_unread(
