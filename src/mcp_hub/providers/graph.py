@@ -21,6 +21,8 @@ from mcp_hub.providers.base import (
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
     AttachmentMeta,
+    FolderPage,
+    ListQuery,
     MailDetail,
     MailSummary,
     ProviderError,
@@ -30,6 +32,8 @@ from mcp_hub.providers.base import (
     placeholder_summary,
     read_capped,
 )
+from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache
 from mcp_hub.sanitize import html_to_text
 
 GRAPH_HOST: Final = "graph.microsoft.com"
@@ -142,9 +146,12 @@ class GraphMailbox:
         timeout: float = PROVIDER_TIMEOUT_SECONDS,
         backoff: Backoff = BACKOFF,
         inbox_ids: dict[str, str] = INBOX_IDS,
+        own_addresses: frozenset[str] = frozenset(),
+        folder_maps: FolderMapCache = FOLDER_MAPS,
     ) -> None:
         self._account, self._tokens, self._factory = account_id, tokens, client_factory
         self._clock, self._timeout, self._backoff, self._inbox_ids = clock, timeout, backoff, inbox_ids
+        self._own_addresses, self._folder_maps = own_addresses, folder_maps
 
     # --- plumbing -------------------------------------------------------------------------------------------------
     def _run[T](self, work: Callable[[httpx2.Client, str, float], T]) -> T:
@@ -234,6 +241,9 @@ class GraphMailbox:
 
     def list_unread(self, since: datetime, limit: int) -> UnreadPage:
         return self._run(lambda client, token, deadline: self._list(client, token, deadline, since, limit))
+
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
+        raise ProviderError("upstream_error", "NotImplemented")  # replaced by the list_messages lane
 
     def get_message(self, ref: AnyMessageRef) -> MailDetail:
         if not isinstance(ref, GraphMessageRef) or ref.account != self._account:

@@ -111,3 +111,34 @@ def test_graph_client_id_is_read_when_the_mailbox_opens(secrets_dir: Path) -> No
     with pytest.raises(ProviderError) as info:
         MailboxOpener(StoreConfig.from_settings(settings))(outlook, secrets_dir)
     assert (info.value.code, info.value.cause) == ("upstream_error", "FileNotFoundError")
+
+
+def _gmail_with_own_addresses(secrets_dir: Path, inbox: str = "INBOX") -> Any:
+    registry = json.loads((secrets_dir / "accounts.json").read_text())
+    registry["accounts"][1]["mail"].update(own_addresses_ref="gmail-own-addresses", inbox=inbox)
+    (secrets_dir / "accounts.json").write_text(json.dumps(registry))
+    for ref in ("gmail-username", "gmail-app-password"):
+        (secrets_dir / ref).write_text("placeholder")
+    account = load_registry(secrets_dir / "accounts.json").get("gmail")
+    assert account is not None
+    return account
+
+
+def test_opener_passes_own_addresses_and_folder_maps(secrets_dir: Path) -> None:
+    from mcp_hub.providers.folders import FOLDER_MAPS
+
+    (secrets_dir / "gmail-own-addresses").write_text("me@example.org\n")
+    box = open_mailbox(_gmail_with_own_addresses(secrets_dir), secrets_dir)
+    assert box._own_addresses == frozenset({"me@example.org"})  # type: ignore[attr-defined]
+    assert box._folder_maps is FOLDER_MAPS  # type: ignore[attr-defined]
+
+
+def test_opener_reads_own_addresses_per_connection(secrets_dir: Path) -> None:
+    account = _gmail_with_own_addresses(secrets_dir)
+    path = secrets_dir / "gmail-own-addresses"
+    path.write_text("me@example.org\n")
+    first = open_mailbox(account, secrets_dir)
+    path.write_text("me@example.org\nalias@example.org\n")
+    second = open_mailbox(account, secrets_dir)
+    assert first._own_addresses == frozenset({"me@example.org"})  # type: ignore[attr-defined]
+    assert second._own_addresses == frozenset({"me@example.org", "alias@example.org"})  # type: ignore[attr-defined]

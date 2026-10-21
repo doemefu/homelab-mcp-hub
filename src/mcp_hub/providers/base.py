@@ -14,9 +14,12 @@ from typing import Final, Literal
 import anyio
 import anyio.to_thread
 
+from mcp_hub.cursors import Position
 from mcp_hub.errors import ErrorCode
-from mcp_hub.ids import AnyMessageRef, encode_message_id
+from mcp_hub.ids import AnyMessageRef, ThreadKey, location_id, location_k
 from mcp_hub.logging import log_event
+from mcp_hub.providers.folders import ListFolder, MailFolder
+from mcp_hub.providers.headers import is_own
 from mcp_hub.registry import Capability
 
 PROVIDER_TIMEOUT_SECONDS: Final = 20.0
@@ -49,6 +52,32 @@ class ProviderError(Exception):
         self.cause = cause
 
 
+Direction = Literal["incoming", "outgoing"]
+
+
+@dataclass(frozen=True, slots=True)
+class MailFlags:
+    answered: bool = False
+    flagged: bool = False  # "seen" is the inverse of `unread` on the summary
+
+
+@dataclass(frozen=True, slots=True)
+class MailMeta:
+    """Mail-history fields of a message (spec 080 §5.1); third-party strings are decoded, not yet sanitised."""
+
+    folder: MailFolder = "inbox"
+    folder_name: str | None = None
+    flags: MailFlags = MailFlags()
+    direction: Direction = "incoming"
+    message_id: str | None = None
+    in_reply_to: str | None = None
+    references: tuple[str, ...] = ()
+    thread: ThreadKey | None = None
+
+
+NO_META: Final = MailMeta()
+
+
 @dataclass(frozen=True, slots=True)
 class MailSummary:
     """Decoded but not yet sanitised; the tool layer sanitises every string (spec 080 §5.3)."""
@@ -61,6 +90,9 @@ class MailSummary:
     from_name: str | None
     subject: str | None
     snippet_text: str
+    to_addresses: tuple[str, ...] = ()
+    cc_addresses: tuple[str, ...] = ()
+    meta: MailMeta = MailMeta()
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +122,25 @@ class MailDetail:
     body_text: str
     body_source: Literal["text/plain", "text/html-converted", "none"]
     body_cut: bool  # the text part exceeded the 256 KiB inbound limit
+    meta: MailMeta = MailMeta()
+
+
+@dataclass(frozen=True, slots=True)
+class ListQuery:
+    folder: ListFolder
+    since: datetime
+    unread_only: bool
+    direction: Direction | None
+    limit: int
+    position: Position | None = None  # last item of the previous page; None on the first page
+
+
+@dataclass(frozen=True, slots=True)
+class FolderPage:
+    items: list[MailSummary]
+    more: bool  # more matching messages exist than returned
+    truncated: bool  # the adapter stopped early (soft stop or candidate cap)
+    complete: bool  # every folder of the plan was searched
 
 
 def read_credential(secrets_dir: Path, ref: str) -> str:
@@ -217,19 +268,35 @@ def item_hash(opaque_id: str) -> str:
     return hashlib.sha256(opaque_id.encode()).hexdigest()[:12]
 
 
+def order_key(item: MailSummary) -> tuple[int, str]:
+    """Total list order (received_at desc, k desc): epoch seconds and the 16-hex location key."""
+    return int(item.received_at.timestamp()), location_k(item.ref)
+
+
+def direction_of(*, in_sent: bool, from_address: str | None, own: frozenset[str]) -> Direction:
+    return "outgoing" if in_sent or is_own(from_address, own) else "incoming"
+
+
 def log_message_skipped(ref: AnyMessageRef, capability: Capability, exc: Exception) -> None:
+    """`item` is logged only when the message has a MessageId (a refused folder name or an overlong id has none)."""
+    fields: dict[str, str] = {}
+    encoded = location_id(ref)
+    if encoded is not None:
+        fields["item"] = item_hash(encoded)
     log_event(
         _log,
         logging.WARNING,
         "item_degraded",
         account=ref.account,
         capability=capability,
-        item=item_hash(encode_message_id(ref)),
         exception=type(exc).__name__,
+        **fields,
     )
 
 
-def placeholder_summary(ref: AnyMessageRef, received_at: datetime, unread: bool) -> MailSummary:
+def placeholder_summary(
+    ref: AnyMessageRef, received_at: datetime, unread: bool, meta: MailMeta = NO_META
+) -> MailSummary:
     """A message the hub could not decode: listed with empty third-party fields and a fixed note (spec 080 §10.2)."""
     return MailSummary(
         ref=ref,
@@ -240,6 +307,7 @@ def placeholder_summary(ref: AnyMessageRef, received_at: datetime, unread: bool)
         from_name=None,
         subject=None,
         snippet_text=UNDECODABLE_NOTE,
+        meta=meta,
     )
 
 

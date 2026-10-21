@@ -25,6 +25,8 @@ from mcp_hub.providers.base import (
     PROVIDER_TIMEOUT_SECONDS,
     SNIPPET_FETCH_BYTES,
     AttachmentMeta,
+    FolderPage,
+    ListQuery,
     MailDetail,
     MailSummary,
     ProviderError,
@@ -32,6 +34,8 @@ from mcp_hub.providers.base import (
     log_message_skipped,
     placeholder_summary,
 )
+from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
@@ -161,6 +165,8 @@ class ImapMailbox:
         ssl_context: ssl.SSLContext | None = None,
         timeout: float = PROVIDER_TIMEOUT_SECONDS,
         client_factory: ClientFactory = default_client,
+        own_addresses: frozenset[str] = frozenset(),
+        folder_maps: FolderMapCache = FOLDER_MAPS,
     ) -> None:
         self._account = account_id
         self._host, self._port, self._folder = host, port, folder
@@ -168,6 +174,7 @@ class ImapMailbox:
         self._context = ssl_context or ssl.create_default_context()
         self._timeout = timeout
         self._factory = client_factory
+        self._own_addresses, self._folder_maps = own_addresses, folder_maps
 
     def _run[T](self, work: Callable[[ImapClientLike], T]) -> T:
         client: ImapClientLike | None = None
@@ -189,6 +196,9 @@ class ImapMailbox:
 
     def list_unread(self, since: datetime, limit: int) -> UnreadPage:
         return self._run(lambda client: self._list_unread(client, since, limit))
+
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
+        raise ProviderError("upstream_error", "NotImplemented")  # replaced by the list_messages lane
 
     def get_message(self, ref: AnyMessageRef) -> MailDetail:
         if not isinstance(ref, MessageRef):
