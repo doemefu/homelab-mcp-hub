@@ -126,13 +126,18 @@ def test_thread_key_rejects_foreign_values(source: str, value: object) -> None:
     _invalid(decode_thread_key, _raw(["t", "gmail", source, value]))
 
 
+def test_oversized_ref_and_thread_key_are_rejected() -> None:
+    _invalid(decode_ref, _raw(["r", "icloud", "a" * 600]))
+    _invalid(decode_thread_key, _raw(["t", "icloud", "headers", "a" * 600]))
+
+
 def test_thread_key_rejects_other_shapes() -> None:
     _invalid(decode_thread_key, _raw(["t", "gmail", "gmail"]))
     _invalid(decode_thread_key, _raw(["r", "gmail", "a@x"]))
     _invalid(decode_thread_key, "garbage")
 
 
-def test_pre_rev49_ids_still_decode() -> None:
+def test_existing_id_shapes_stay_byte_identical() -> None:
     inbox = "v1.WyJtIiwiaWNsb3VkIiwiSU5CT1giLDE3MDAwMDAwMDAsNDJd"
     graph = "v1.WyJnIiwib3V0bG9vayIsIkFBUWtBREF3QVRNPSJd"
     nested = "v1.WyJtIiwiZ21haWwiLCJbR21haWxdLyZBTVEtbHRlciIsNSw3XQ"
@@ -141,6 +146,7 @@ def test_pre_rev49_ids_still_decode() -> None:
     assert encode_message_id(ref) == inbox
     assert decode_message_id(graph) == GraphMessageRef(account="outlook", graph_id="AAQkADAwATM=")
     assert encode_message_id(GraphMessageRef(account="outlook", graph_id="AAQkADAwATM=")) == graph
+    assert encode_message_id(MessageRef("gmail", "[Gmail]/&AMQ-lter", 5, 7)) == nested
     assert decode_message_id(nested) == MessageRef(account="gmail", folder="[Gmail]/&AMQ-lter", uidvalidity=5, uid=7)
 
 
@@ -171,6 +177,11 @@ def test_m_id_mailbox_name_rule() -> None:
         ("a&AM-b", False),
         ("&2D3eAA-", True),
         ("&2D0-", False),
+        ("&AMR-", False),  # non-canonical trailing bits
+        ("&AEoAdQBuAGs-", False),  # "Junk" shifted: printable ASCII only (exclusion bypass)
+        ("&AMQ-&AMQ-", False),  # adjacent shifts
+        ("&AMQ-x&AMQ-", True),
+        ("a&AMQ-", True),
         ("a b", True),
         ("a\x7fb", False),
         ("é", False),

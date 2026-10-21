@@ -227,3 +227,13 @@ def test_own_addresses_ref_not_a_credential_ref(tmp_path: Path) -> None:
     assert outlook is not None
     assert icloud.credential_refs("mail") == ("icloud-username", "icloud-app-password")
     assert "outlook-own-addresses" not in outlook.credential_refs("mail")
+
+
+def test_inbox_must_be_a_valid_raw_mailbox_name(tmp_path: Path) -> None:
+    data = example()
+    imap = next(a["mail"] for a in data["accounts"] if a.get("mail", {}).get("protocol") == "imap")
+    imap["inbox"] = "INBOX"
+    load_registry(write(tmp_path, data))
+    imap["inbox"] = "&AMQ-&AMQ-"
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))

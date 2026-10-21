@@ -1,9 +1,12 @@
-"""Opaque MessageId / EventId (spec 080 §5.1): 'v1.' + unpadded base64url of a compact JSON list, ≤ 512 chars.
+"""Opaque ids (spec 080 §5.1): 'v1.' + unpadded base64url of a compact JSON list, ≤ 512 chars.
 
 An EventId carries a 128-bit SHA-256 digest over calendar URL path, UID and recurrence id, not the values
-(spec 080 rev. 4.4, D56); an IMAP MessageId (kind "m") carries folder, UIDVALIDITY and UID, and its folder is checked
-against the registry inbox by the tool layer. A Graph MessageId (kind "g", rev. 4.6) carries the immutable Graph id
-(charset and length checked here, so it can never change the request path); its folder is always "inbox".
+(spec 080 rev. 4.4, D56). An IMAP MessageId (kind "m") carries folder, UIDVALIDITY and UID; its folder is the raw
+modified-UTF-7 mailbox name, checked by `mailbox_name_ok` (D73), and the tool layer binds it to the current folder
+map or the registry inbox (D75). A stable ref (kind "r") carries account and Message-ID, a thread key (kind "t")
+account, source and value; their third-party text is checked against fixed patterns before it is base64url-encoded.
+A Graph MessageId (kind "g", rev. 4.6) carries the immutable Graph id (charset and length checked here, so it can
+never change the request path); its folder is always "inbox".
 """
 
 import base64
@@ -25,7 +28,8 @@ MESSAGE_ID_PATTERN: Final = re.compile(
 )  # fullmatch only
 MAX_MAILBOX_NAME_CHARS: Final = 200
 _SUBJECT_KEY: Final = re.compile(r"[0-9a-f]{32}")
-_UTF7_SHIFT: Final = re.compile(r"&(?:-|([A-Za-z0-9+,]+)-)")
+_UTF7_NAME: Final = re.compile(r"(?:[\x20-\x25\x27-\x7E]|&-|&[A-Za-z0-9+,]+-)*")
+_UTF7_RUN: Final = re.compile(r"&(?:-|([A-Za-z0-9+,]+)-)")
 GRAPH_FOLDER: Final = "inbox"
 GRAPH_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,300}")  # L5 (spec 080 rev. 4.6 S1)
 
@@ -71,23 +75,29 @@ class ThreadKey:
 
 
 def _utf7_ok(name: str) -> bool:
-    """True when a printable-ASCII name is well-formed modified UTF-7 (RFC 3501 5.1.3)."""
-    pos = 0
-    while (amp := name.find("&", pos)) != -1:
-        shift = _UTF7_SHIFT.match(name, amp)
-        if shift is None:
-            return False
-        pos = shift.end()
-        body = shift.group(1)
-        if body is None:
+    """True when a printable-ASCII name is strict modified UTF-7 (RFC 3501 5.1.3).
+
+    Each shifted run is canonical base64 of UTF-16BE holding at least one non-printable-ASCII character, and two
+    shifted runs are never adjacent; otherwise a raw name such as "&AEoAdQBuAGs-" ("Junk") could dodge the
+    name-based exclusion of junk and drafts mailboxes.
+    """
+    if _UTF7_NAME.fullmatch(name) is None:
+        return False
+    previous_end = -1
+    for run in _UTF7_RUN.finditer(name):
+        body = run.group(1)
+        if body is None:  # "&-" is a literal ampersand
             continue
-        padded = body.replace(",", "/") + "=" * (-len(body) % 4)
+        if run.start() == previous_end:
+            return False
+        previous_end = run.end()
+        b64 = body.replace(",", "/")
         try:
-            raw = base64.b64decode(padded, validate=True)
-            raw.decode("utf-16-be")
+            raw = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=True)
+            text = raw.decode("utf-16-be")
         except ValueError:  # binascii.Error and UnicodeDecodeError are ValueErrors
             return False
-        if len(raw) % 2 or base64.b64encode(raw).decode("ascii").rstrip("=") != body.replace(",", "/"):
+        if base64.b64encode(raw).decode("ascii").rstrip("=") != b64 or all(0x20 <= ord(c) <= 0x7E for c in text):
             return False
     return True
 
@@ -144,13 +154,19 @@ def _uint32(value: object) -> bool:
     return type(value) is int and 0 < value <= _UINT32_MAX
 
 
-def decode_message_id(value: str) -> AnyMessageRef:
+def _decode_list(value: str) -> object:
     if len(value) > MAX_ID_LENGTH or not value.startswith(PREFIX) or not _BASE64URL.fullmatch(value[len(PREFIX) :]):
-        _invalid()
+        return None
     body = value[len(PREFIX) :]
     try:
-        data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    except ValueError:  # binascii.Error, UnicodeDecodeError and JSONDecodeError are ValueErrors
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except ValueError:
+        return None
+
+
+def decode_message_id(value: str) -> AnyMessageRef:
+    data = _decode_list(value)
+    if not isinstance(data, list):
         _invalid()
     if isinstance(data, list) and len(data) == 3 and data[0] == "g":
         _, account, graph_id = data
@@ -183,16 +199,6 @@ def _bad_ref() -> NoReturn:
 
 def _bad_thread_key() -> NoReturn:
     raise ToolError("invalid_argument", "Malformed thread key")
-
-
-def _decode_list(value: str) -> object:
-    if len(value) > MAX_ID_LENGTH or not value.startswith(PREFIX) or not _BASE64URL.fullmatch(value[len(PREFIX) :]):
-        return None
-    body = value[len(PREFIX) :]
-    try:
-        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    except ValueError:
-        return None
 
 
 def encode_ref(account: str, message_id: str) -> str | None:

@@ -6,6 +6,7 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, ValidationError, model_validator
 
 from mcp_hub.errors import ToolError
+from mcp_hub.ids import mailbox_name_ok
 
 Capability = Literal["mail", "calendar"]
 CAPABILITIES: Final[tuple[Capability, ...]] = ("mail", "calendar")
@@ -25,6 +26,12 @@ RESERVED_SECRET_KEYS: Final[frozenset[str]] = frozenset(
 )
 # Secret keys every Graph account needs besides its client id: the token store (spec 080 rev. 4.6 §7.2).
 TOKEN_STORE_REFS: Final[tuple[str, ...]] = ("db-username", "db-password", "token-encryption-key")
+
+
+def _valid_mailbox_name(name: str) -> str:
+    if not mailbox_name_ok(name):
+        raise ValueError("not a valid raw mailbox name")
+    return name
 
 
 def _not_reserved(ref: str) -> str:
@@ -55,7 +62,9 @@ class ImapMail(_Strict):
     port: Annotated[int, Field(ge=1, le=65535)]
     username_ref: SecretRef
     password_ref: SecretRef
-    inbox: Annotated[str, StringConstraints(min_length=1, max_length=100)] = "INBOX"
+    inbox: Annotated[str, StringConstraints(min_length=1, max_length=100), AfterValidator(_valid_mailbox_name)] = (
+        "INBOX"
+    )
     own_addresses_ref: SecretRef | None = None
 
 
