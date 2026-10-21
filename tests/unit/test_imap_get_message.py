@@ -14,9 +14,10 @@ from mcp_hub.providers.base import MailDetail, MailFlags, ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import MAX_LOCATE_FOLDERS, FolderMapCache
 from mcp_hub.providers.headers import candidate_header_item
-from mcp_hub.providers.imap import FoundCopy, ImapMailbox, LocateResult
+from mcp_hub.providers.imap import LOCATE_BATCH_VALUES, FoundCopy, ImapMailbox, ImapSession, LocateResult
+from mcp_hub.providers.imap_guard import GuardedImapClient
 from tests.support.clock import FakeClock
-from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapServer, FakeMessage
+from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
 
 NOW = datetime(2026, 10, 21, 7, 0, tzinfo=UTC)
@@ -481,10 +482,6 @@ def _fetch_no() -> tuple[FakeImapServer, float]:
     return server, 16.0
 
 
-def _copy_without_date() -> tuple[FakeImapServer, float]:
-    return icloud(archive=[msg(4, None, "no date", message_id=f"<{MID}>")]), 16.0
-
-
 INCOMPLETE: dict[str, Callable[[], tuple[FakeImapServer, float]]] = {
     "soft_stop_before_any_hit": _soft_stop_before_any_hit,
     "soft_stop_after_a_hit": _soft_stop_after_a_hit,
@@ -492,7 +489,6 @@ INCOMPLETE: dict[str, Callable[[], tuple[FakeImapServer, float]]] = {
     "search_no": _search_no,
     "examine_no": _examine_no,
     "fetch_no": _fetch_no,
-    "copy_without_date": _copy_without_date,
 }
 
 
@@ -501,8 +497,7 @@ def test_ref_incomplete_is_upstream_timeout(case: str) -> None:
     server, soft = INCOMPLETE[case]()
     error = refused(server, ref(), soft=soft)
     assert error.code == "upstream_timeout"
-    if case.startswith("soft_stop"):
-        assert error.cause == "SoftStop"
+    assert error.cause == ("SoftStop" if case.startswith("soft_stop") else "IncompleteSearch")
     if case == "folder_cap":
         assert MAX_LOCATE_FOLDERS == 30
         assert len(examined(server)) == 30
@@ -608,8 +603,11 @@ def test_locate_refuses_values_it_cannot_search(value: str) -> None:
 
 def test_locate_without_searchable_values_sends_nothing() -> None:
     server = icloud()
-    assert locate(server, []) == LocateResult({}, complete=True)
-    assert locate(server, ["X-GM-RAW@example.test"]) == LocateResult({}, complete=False)
+    assert locate(server, []) == LocateResult({}, complete=True, incomplete=frozenset(), uncertain=frozenset())
+    refused_value = "X-GM-RAW@example.test"  # pattern-valid but never searchable: stays incomplete (accepted)
+    assert locate(server, [refused_value]) == LocateResult(
+        {}, complete=False, incomplete=frozenset({refused_value}), uncertain=frozenset()
+    )
     assert "LIST" not in names(server)
 
 
@@ -627,6 +625,152 @@ def test_locate_failed_batch_marks_only_its_refs() -> None:
     result = locate(server, ids)
     assert list(result.found) == [ids[20]]
     assert result.complete is False
+
+
+def fail_search_in(server: FakeImapServer, plan: dict[str, str]) -> None:
+    """UID SEARCH answers NO in mailbox `plan[value]` for every batch that carries `value`."""
+    original = server.run
+    selected = {"name": ""}
+
+    def run(command: str, argument: object = None) -> None:
+        if command == "EXAMINE":
+            selected["name"] = str(argument)
+        if command == "UID SEARCH":
+            for value, mailbox_name in plan.items():
+                if selected["name"] == mailbox_name and f'"{value}"'.encode() in argument:  # type: ignore[operator]
+                    server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        original(command, argument)
+
+    server.run = run  # type: ignore[method-assign]
+
+
+def test_locate_marks_incomplete_and_uncertain_per_ref() -> None:
+    """A failed batch marks only its refs: unresolved → `incomplete`, found → `uncertain` (an earlier copy may sit
+    in the failed batch, S-e); a ref of another batch that matched nothing is absent and certain (WP13b: `gone`)."""
+    a, b, c, d = (f"{x}@example.test" for x in "abcd")
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>"), msg(2, 5, "d", message_id=f"<{d}>")])
+    fail_search_in(server, {c: "INBOX", d: "Archive"})
+    result = locate(server, [a, b, c, d], batch_values=1)
+    assert sorted(result.found) == [a, d]
+    assert (result.incomplete, result.uncertain, result.complete) == (frozenset({c}), frozenset({d}), False)
+    assert b not in result.found
+
+
+def test_ref_uncertain_copy_is_upstream_timeout() -> None:
+    server = icloud(inbox=[msg(1, 5, "inbox copy", message_id=f"<{MID}>")])
+    fail_search_in(server, {MID: "Archive"})
+    error = refused(server, ref())
+    assert (error.code, error.cause) == ("upstream_timeout", "IncompleteSearch")
+
+
+@pytest.mark.parametrize("path", ["id", "ref"])
+def test_no_second_rebuild_after_a_list_in_the_same_call(path: str) -> None:
+    """Sec16 window: a map listed in this call is not listed again after an EXAMINE NO."""
+    server = icloud(other=[folder("Projects", (), [msg(1, 5, "a")])])
+    original = server.run
+
+    def run(command: str, argument: object = None) -> None:
+        if command == "EXAMINE" and argument in ("Projects", "Archive"):
+            server.fail["EXAMINE"] = server.no("EXAMINE")
+        original(command, argument)
+
+    server.run = run  # type: ignore[method-assign]
+    target: MessageRef | StableRef = MessageRef("icloud", "Projects", 7, 1) if path == "id" else ref()
+    assert refused(server, target).code == "upstream_timeout"
+    assert names(server).count("LIST") == 1
+
+
+class NoHeaderItemClient(FakeImapClient):
+    """The server answers the hit's FETCH without the Message-ID header item."""
+
+    def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        rows = super().fetch(messages, items)  # type: ignore[arg-type]
+        for row in rows.values():
+            for key in [k for k in row if k.startswith(b"BODY[HEADER.FIELDS (MESSAGE-ID)]")]:
+                del row[key]
+        return rows
+
+
+def test_hit_without_the_message_id_item_is_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(archive=[msg(4, 60, "a", message_id=f"<{MID}>")])
+    monkeypatch.setattr(server, "client", lambda: NoHeaderItemClient(server))
+    error = refused(server, ref())
+    assert (error.code, error.cause) == ("upstream_timeout", "IncompleteSearch")
+
+
+def test_copy_without_internaldate_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S-p: an unparsable INTERNALDATE drops that message (one item_degraded), like a non-match."""
+    server = icloud(archive=[msg(4, None, "no date", message_id=f"<{MID}>")])
+    assert (refused(server, ref()).code, refused(server, ref()).cause) == ("not_found", "NotFound")
+    server = icloud(
+        archive=[msg(4, None, "no date", message_id=f"<{MID}>")],
+        sent=[msg(3, 90, "dated", message_id=f"<{MID}>")],
+    )
+    assert get(server, ref()).ref == MessageRef("icloud", "Sent Messages", 7, 3)
+
+
+def test_history_header_failure_keeps_sender_and_subject(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub.providers")
+    logger.addHandler(handler)
+
+    def exploding(raw: bytes | None) -> object:
+        raise ValueError("SENTINEL")
+
+    monkeypatch.setattr(imap, "parse_summary_headers", exploding)
+    try:
+        detail = get(icloud(inbox=[msg(1, 5, "kept", message_id=f"<{MID}>")]), MessageRef("icloud", "INBOX", 7, 1))
+    finally:
+        logger.removeHandler(handler)
+    assert (detail.subject, detail.from_address, detail.to_addresses) == (
+        "kept",
+        "sender@example.test",
+        ["owner@example.org"],
+    )
+    assert (detail.meta.message_id, detail.meta.references, detail.meta.thread) == (None, (), None)
+    assert [json.loads(line)["exception"] for line in handler.lines] == ["ValueError"]
+
+
+@pytest.mark.parametrize("phase", ["core", "other"])
+def test_soft_stop_marks_only_the_refs_still_open(phase: str) -> None:
+    """One second per command. A stop among the core folders leaves a found ref uncertain (its copies were not all
+    compared); a stop among the `other` mailboxes leaves it certain, because they are never searched for it."""
+    a, b = "a@example.test", "b@example.test"
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=[folder("P1"), folder("P2")], step=1.0)
+    soft = 8.5 if phase == "core" else 13.5  # stops before the Sent EXAMINE, or before the P2 EXAMINE
+    box = mailbox(server)
+    result = box._run(lambda session: session.locate([a, b]), deadline(server, soft))
+    assert list(result.found) == [a]
+    assert result.incomplete == frozenset({b})
+    assert result.uncertain == (frozenset({a}) if phase == "core" else frozenset())
+    assert ("P1" in examined(server)) is (phase == "other")
+
+
+def test_map_cap_marks_only_unresolved_refs() -> None:
+    """More than 500 excluded mailboxes cap the map: an unresolved ref is incomplete, a ref found in a core folder
+    stays certain."""
+    a, b = "a@example.test", "b@example.test"
+    junk = [folder(f"J{i:03d}", (b"\\Junk",)) for i in range(501)]
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=junk)
+    result = locate(server, [a, b])
+    assert (list(result.found), result.incomplete, result.uncertain) == ([a], frozenset({b}), frozenset())
+    assert locate(icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=junk), [a]).complete is True
+
+
+@pytest.mark.parametrize(
+    ("max_folders", "batch_values"),
+    [(0, 20), (MAX_LOCATE_FOLDERS + 1, 20), (30, 0), (30, LOCATE_BATCH_VALUES + 1), (True, 20)],
+)
+def test_locate_parameters_are_clamped(max_folders: int, batch_values: int) -> None:
+    server = icloud()
+    client = GuardedImapClient(server.client(), deadline(server), registry_inbox_raw="INBOX")
+    client.login("u", "p")
+    session = ImapSession(
+        client, account="icloud", registry_inbox="INBOX", folder_maps=FolderMapCache(), own=frozenset()
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        session.locate([MID], max_folders=max_folders, batch_values=batch_values)
+    assert "LIST" not in names(server)
 
 
 # --- shared get_message steps -----------------------------------------------------------------------------------

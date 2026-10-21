@@ -256,7 +256,9 @@ class FoundCopy:
 class LocateResult:
     # Message-ID → copy with the earliest received_at; ties by folder order (spec §5.5 matching rule, C3)
     found: dict[str, FoundCopy]
-    complete: bool  # False: soft stop, folder cap or a failed batch while refs were still open
+    complete: bool  # not incomplete and not uncertain
+    incomplete: frozenset[str]  # not found, and a step that covered it did not complete (WP13b: incomplete_search)
+    uncertain: frozenset[str]  # found, but a failed step may hide an earlier copy (S-e): not a reliable answer
 
 
 @dataclass(slots=True)
@@ -382,20 +384,28 @@ class ImapSession:
         counts only on exact equality and without a draft flag or label. The earliest `received_at` wins; on a tie
         the first in folder order. A SoftStop ends the search early; other errors propagate.
 
-        A ref is "missed" when a step that covered it did not complete: a refused value (fails the Message-ID
-        pattern or `search_value_ok`), the folder cap, the folder map's mailbox cap, an EXAMINE or SEARCH answered
-        NO, a FETCH that lost hits, a matching copy without INTERNALDATE or the soft stop. `complete` is False when
-        a missed ref stayed unresolved (B6, B7)."""
+        A ref is "missed" when a step that covered it did not complete: a refused value, the folder cap, the
+        folder map's mailbox cap, an EXAMINE or SEARCH answered NO, a FETCH that lost hits or came back without
+        the Message-ID header, or the soft stop. A missed ref is `incomplete` when it was not found and
+        `uncertain` when it was (B6, B7). A copy without INTERNALDATE is dropped like a non-match (S-p)."""
+        if type(max_folders) is not int or not 1 <= max_folders <= MAX_LOCATE_FOLDERS:
+            raise ValueError("max_folders out of range")
+        if type(batch_values) is not int or not 1 <= batch_values <= LOCATE_BATCH_VALUES:
+            raise ValueError("batch_values out of range")
         wanted = list(dict.fromkeys(message_ids))
+        # A pattern-valid value that search_value_ok refuses (one containing `X-GM-RAW`) can never be searched: it
+        # stays incomplete, so get_message answers upstream_timeout for it every time (accepted, never not_found).
         searchable = [v for v in wanted if valid_message_id(v) is not None and search_value_ok(v)]
         missed = set(wanted) - set(searchable)
         found: dict[str, FoundCopy] = {}
+        in_core = True
         if searchable:
             try:
                 folder_map = self.folder_map()
                 core, other = folder_map.locate_order()
                 ordered = [(entry, True) for entry in core] + [(entry, False) for entry in other]
                 for index, (entry, is_core) in enumerate(ordered):
+                    in_core = is_core
                     refs = searchable if is_core else [v for v in searchable if v not in found]
                     if not refs:
                         break  # every ref resolved: no further `other` mailbox
@@ -404,11 +414,15 @@ class ImapSession:
                         break
                     self._locate_in(entry, refs, batch_values, found, missed)
                 else:
-                    if folder_map.capped:  # mailboxes the map dropped were never searched
-                        missed.update(searchable)
-            except SoftStop:
-                missed.update(searchable)
-        return LocateResult(found=found, complete=all(v in found for v in missed))
+                    if folder_map.capped:  # mailboxes the map dropped were never searched for the open refs
+                        missed.update(v for v in searchable if v not in found)
+            except SoftStop:  # in the core folders every ref was still open; afterwards only the unresolved ones
+                missed.update(searchable if in_core else [v for v in searchable if v not in found])
+        incomplete = frozenset(missed - found.keys())
+        uncertain = frozenset(missed & found.keys())
+        return LocateResult(
+            found=found, complete=not incomplete and not uncertain, incomplete=incomplete, uncertain=uncertain
+        )
 
     def _locate_in(
         self, entry: FolderEntry, refs: list[str], batch_values: int, found: dict[str, FoundCopy], missed: set[str]
@@ -423,7 +437,7 @@ class ImapSession:
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
-            if entry.raw_name != self.registry_inbox and self.may_force_rebuild():
+            if entry.raw_name != self.registry_inbox and not self.listed and self.may_force_rebuild():
                 self.folder_map(refresh=True)  # one rebuild for the next call; this mailbox stays unsearched (S-p)
             missed.update(refs)
             return
@@ -453,15 +467,17 @@ class ImapSession:
                 row = rows.get(uid)
                 if row is None:
                     continue
+                if not header_bytes(row):  # the Message-ID item did not come back: the hit cannot be re-checked
+                    missed.update(batch)
+                    continue
                 message_id, _ = _candidate_headers(row)
                 if message_id is None or message_id not in wanted or _is_draft(row):
                     continue
                 received = _aware(row.get(b"INTERNALDATE"))
-                if received is None:
+                if received is None:  # S-p: dropped like a non-match, never a lasting upstream_timeout
                     log_message_skipped(
                         MessageRef(self.account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
                     )
-                    missed.add(message_id)
                     continue
                 current = found.get(message_id)
                 if current is None or received < current.received_at:  # a tie keeps the earlier folder (S-e)
@@ -936,7 +952,8 @@ class ImapMailbox:
     @staticmethod
     def _examine_bound(session: ImapSession, entry: FolderEntry) -> int | None:
         """EXAMINE for an id. A NO rebuilds the map once (S-p): a mailbox the new map no longer allows is
-        `not_found`; otherwise the read did not complete (`upstream_timeout`, B6)."""
+        `not_found`; otherwise the read did not complete (`upstream_timeout`, B6). A map listed in this call is not
+        listed again (Sec16: the rebuild check consumes the window, so it comes last)."""
         try:
             return session.examine(entry)
         except PASS_THROUGH:
@@ -946,6 +963,7 @@ class ImapMailbox:
                 raise
         if (
             entry.raw_name != session.registry_inbox
+            and not session.listed
             and session.may_force_rebuild()
             and session.folder_map(refresh=True).binding(entry.raw_name) != "allowed"
         ):
@@ -959,8 +977,8 @@ class ImapMailbox:
         result = session.locate([message_id])
         self._soft_check()
         copy = result.found.get(message_id)
-        if copy is None:
-            if result.complete:
+        if copy is None or message_id in result.uncertain:  # uncertain: an earlier copy may be unread (S-e)
+            if copy is None and message_id not in result.incomplete:
                 raise ProviderError("not_found", "NotFound")
             raise ProviderError("upstream_timeout", "IncompleteSearch")
         if session.selected != copy.entry.raw_name:  # the search moved on to other mailboxes
@@ -1028,19 +1046,24 @@ class ImapMailbox:
             except Exception as exc:
                 log_message_skipped(ref, "mail", exc)
                 body, source = "", "none"
-        parsed: ParsedHeaders | None = None
+        raw_headers = header_bytes(row)
         try:
-            raw_headers = header_bytes(row)
             headers = _PARSER.parsebytes(raw_headers)
             sender, subject = _sender_and_subject(headers)
             to = [a for _, a in _addresses(headers, "To") if a]
             cc = [a for _, a in _addresses(headers, "Cc") if a]
-            parsed = parse_summary_headers(raw_headers)  # Message-ID, In-Reply-To, References (§5.5)
         except PASS_THROUGH:
             raise
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
             sender, subject, to, cc = ("", ""), None, [], []
+        parsed: ParsedHeaders | None = None
+        try:  # the history fields degrade on their own: sender, subject, To and Cc stay
+            parsed = parse_summary_headers(raw_headers)  # Message-ID, In-Reply-To, References (§5.5)
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:
+            log_message_skipped(ref, "mail", exc)
         flags = _flags(row)
         if gmail:
             thread = _gmail_thread(self._account, row)
