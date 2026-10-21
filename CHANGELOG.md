@@ -43,3 +43,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 - A failing snippet fetch or a deeply nested MIME structure degrades only the affected messages; a text part of exactly 256 KiB is not reported as truncated.
 - Hidden HTML content is removed by a region rule with constant state that errs towards hiding: a hidden element hides everything up to its balancing end tag (out-of-scope end tags, self-closing hidden elements and script escapes included), and an unterminated comment or declaration hides the rest. Hidden-content removal is best effort; its known limits are listed in INTERFACES.md.
 - `scripts/smoke_image.sh` checks on the image's own interpreter that HTML conversion scales linearly on malformed input and keeps unterminated constructs hidden (`scripts/html_scaling_check.py`).
+
+### Security
+
+- Base image python:3.13-slim moved to a digest with Debian ca-certificates 20250419+deb13u1, which no longer trusts the emSign roots behind the compromised eMudhra intermediates; Python 3.13.15 → 3.13.16 with it (#45, #46; doemefu/homelab#212).
