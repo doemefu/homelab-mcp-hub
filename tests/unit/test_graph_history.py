@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta, timezone
 
 import httpx2
@@ -78,7 +78,7 @@ class Server:
         self,
         lists: dict[str, Handler] | None = None,
         *,
-        folders: dict[str, object] | None = None,
+        folders: Mapping[str, object] | None = None,
         missing: tuple[str, ...] = (),
     ) -> None:
         self.requests: list[httpx2.Request] = []
@@ -132,6 +132,7 @@ def query(
     limit: int = 20,
     position: Position | None = None,
 ) -> ListQuery:
+    # direction is a plain str here so tests can pass it as a keyword; ListQuery types it as the Direction literal
     return ListQuery(folder, SINCE, unread_only, direction, limit, position)  # type: ignore[arg-type]
 
 
@@ -271,7 +272,7 @@ def test_list_filter_shapes() -> None:
 
 # --- item fields -------------------------------------------------------------------------------------------------
 
-IDS = GraphFolderIds("outlook", FOLDER_IDS)  # type: ignore[arg-type]
+IDS = GraphFolderIds("outlook", FOLDER_IDS)  # type: ignore[arg-type]  # fixture keys are str, not GraphWellKnown
 
 
 @pytest.mark.parametrize(
@@ -448,6 +449,17 @@ def test_full_page_without_item_below_position_stops_truncated() -> None:
     assert [r.url.path for r in server.lists()] == [f"/v1.0/me/mailFolders/{INBOX_ID}/messages"]  # account stops
 
 
+def test_full_answer_inside_the_position_second_is_stuck() -> None:
+    """Items after the position, but all in its second: a frontier there cannot move the cursor on (>= $top)."""
+    clock = FakeClock()
+    dense = [item(100 + n, LATER) for n in range(GRAPH_LIST_TOP)]
+    middle = sorted((str(e["id"]) for e in dense), key=lambda g: location_k(GraphMessageRef("outlook", g)))[50]
+    server = Server({INBOX_ID: values(*dense)})
+    page = listed(mailbox(server, clock=clock), query(position=position_of(middle, LATER)), clock)
+    assert page.items == []
+    assert (page.more, page.truncated, page.complete, page.frontier) == (False, True, False, None)
+
+
 def test_stuck_later_folder_of_all_keeps_earlier_items_without_cursor() -> None:
     clock = FakeClock()
     stuck = [item(100 + n, LATER, ARCHIVE_ID) for n in range(GRAPH_LIST_TOP)]  # one second, no position needed
@@ -515,14 +527,65 @@ def test_zero_item_direction_page_reports_more_and_frontier() -> None:
 class GraphStore:
     """A folder answering like Graph: newest first, `lt` bound honoured, at most `$top` entries."""
 
-    def __init__(self, entries: list[dict[str, object]]) -> None:
-        self.entries = entries  # already in Graph's answer order
+    def __init__(self, entries: Sequence[object]) -> None:
+        self.entries = [e for e in entries if isinstance(e, dict)]  # already in Graph's answer order
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         flt = request.url.params["$filter"]
         bound = flt.split("receivedDateTime lt ")[1].split(" ")[0] if " lt " in flt else None
         kept = [e for e in self.entries if bound is None or str(e["receivedDateTime"]) < bound]
         return values(*kept[: int(request.url.params["$top"])])(request)
+
+
+def page_to_the_end(box: GraphMailbox, clock: FakeClock, *, limit: int = 50) -> list[str]:
+    """Pages as the tool layer does for one account: the cursor at the last item, else at the page's frontier."""
+    seen: list[str] = []
+    position: Position | None = None
+    for _ in range(20):
+        page = listed(box, query(limit=limit, position=position), clock)
+        assert page.complete
+        seen += ids(page)
+        if not page.more:
+            return seen
+        if page.items:
+            position = Position(*order_key(page.items[-1]))
+        else:
+            assert page.frontier is not None
+            position = Position(*page.frontier)
+    raise AssertionError("paging did not end")
+
+
+def test_frontier_below_the_position_second_progresses() -> None:
+    """The cursor sits on the smallest-k item of second P; the `lt P+1s` answer re-reads P and the next occupied
+    second F fills the rest of $top. F < P, so the frontier (F, "f"*16) progresses: not stuck."""
+    clock = FakeClock()
+    p_second, f_second = LATER, LATER - timedelta(seconds=5)
+    in_p = [item(1000 + n, p_second) for n in range(60)]
+    in_f = [item(2000 + n, f_second) for n in range(41)]  # fewer than $top: the next page reads it whole
+    smallest = min((str(e["id"]) for e in in_p), key=lambda g: location_k(GraphMessageRef("outlook", g)))
+    box = mailbox(Server({INBOX_ID: GraphStore(in_p + in_f + [item(3000, LATER - timedelta(hours=1))])}), clock=clock)
+    page = listed(box, query(limit=50, position=position_of(smallest, p_second)), clock)
+    assert page.items == []
+    assert (page.more, page.truncated, page.complete) == (True, False, True)
+    assert page.frontier == (int(f_second.timestamp()), TOP_K)
+    following = listed(box, query(limit=50, position=Position(*page.frontier)), clock)
+    assert sorted(ids(following)) == sorted([str(e["id"]) for e in in_f] + ["AAMkMSG3000="])
+    assert following.more is False
+
+
+def test_paging_through_dense_seconds_loses_nothing() -> None:
+    """Regression (fix round 2): 60 messages in S1, 41 in S1 - 5 s and 1 an hour older, limit 50."""
+    clock = FakeClock()
+    s1 = LATER
+    entries = (
+        [item(1000 + n, s1) for n in range(60)]
+        + [item(2000 + n, s1 - timedelta(seconds=5)) for n in range(41)]
+        + [item(3000, s1 - timedelta(hours=1))]
+    )
+    box = mailbox(Server({INBOX_ID: GraphStore(entries)}), clock=clock)
+    seen = page_to_the_end(box, clock)
+    assert len(seen) == len(set(seen)) == 102
+    assert set(seen) == {str(e["id"]) for e in entries}
 
 
 def test_frontier_second_cut_by_top_returns_both_messages_across_pages() -> None:
@@ -533,8 +596,8 @@ def test_frontier_second_cut_by_top_returns_both_messages_across_pages() -> None
         (f"AAMkMSG{n:04d}=" for n in (300, 301)), key=lambda g: location_k(GraphMessageRef("outlook", g))
     )  # Graph lists the smaller k first, so $top cuts off the one with the larger k
     own = {"from": {"emailAddress": {"address": "owner@example.test"}}}
-    entries = run_of(1, LATER, GRAPH_LIST_TOP - 1) + [item(int(g[7:11]), second, **own) for g in pair]
-    store = GraphStore(entries)  # type: ignore[arg-type]
+    entries = run_of(1, LATER, GRAPH_LIST_TOP - 1) + [item(int(g[7:11]), second, INBOX_ID, **own) for g in pair]
+    store = GraphStore(entries)
     box = mailbox(Server({INBOX_ID: store}), clock=clock)
     first = listed(box, query(direction="outgoing"), clock)
     assert first.items == []  # the listed copy sits in the frontier second: not returned yet
@@ -617,7 +680,8 @@ def test_direction_filter_per_page() -> None:
     clock = FakeClock()
     entries: list[object] = run_of(1, LATER, GRAPH_LIST_TOP)
     for n in (5, 40):
-        entries[n] = dict(entries[n]) | {"from": {"emailAddress": {"address": "owner@example.test"}}}  # type: ignore[arg-type]
+        # run_of returns list[object]; every entry is a dict built by item()
+        entries[n] = dict(entries[n]) | {"from": {"emailAddress": {"address": "owner@example.test"}}}  # type: ignore[call-overload]
     page = listed(mailbox(Server({INBOX_ID: values(*entries)}), clock=clock), query(direction="outgoing"), clock)
     assert ids(page) == ["AAMkMSG0006=", "AAMkMSG0041="]
     assert page.more is True  # fewer than `limit` items while more exist

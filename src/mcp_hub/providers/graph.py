@@ -258,8 +258,8 @@ def _soft_stopped_page() -> FolderPage:
 @dataclass(frozen=True, slots=True)
 class _FolderAnswer:
     items: list[MailSummary]  # after the draft, window, unread, folder and position filters
-    frontier: int | None  # a full answer: the second of its last item; that second and older may be unread
-    stuck: bool  # a full answer with no item read after the position and above its frontier second (S-f)
+    frontier: int | None  # a full answer: the second of its last item; that second and older not yet scanned
+    stuck: bool  # a full answer whose frontier cannot move the cursor on (S-f residual)
 
 
 class GraphMailbox:
@@ -516,8 +516,16 @@ class GraphMailbox:
                 items.append(summary)
         if not full:
             return _FolderAnswer(items, None, False)
-        second = min(key[0] for key in after) if after else None
-        stuck = second is None or not any(key[0] > second for key in after)
+        if not after:
+            return _FolderAnswer(items, None, True)
+        second = min(key[0] for key in after)
+        # Stuck only when the frontier cannot move the cursor on: on a later page a frontier second below the
+        # position's second always progresses (the next page reads `lt <second + 1 s>`); on the first page there
+        # must be an item above the frontier second. Otherwise one second holds at least $top messages.
+        if query.position is not None:
+            stuck = second >= query.position.received_at
+        else:
+            stuck = not any(key[0] > second for key in after)
         return _FolderAnswer(items, second, stuck)
 
     def _degraded(self, exc: Exception) -> None:
