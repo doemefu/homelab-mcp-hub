@@ -1267,7 +1267,6 @@ def test_get_message_logs_carry_no_message_id_or_filter() -> None:
 # --- T1b facts (owner's Graph Explorer run) ----------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="T1b facts pending")
 def test_fixture_shapes_match_t1b_facts() -> None:
     assert T1B_FACTS is not None, "record the owner's Graph Explorer facts in tests/support/graph_fixtures.py"
     full = message(1, singleValueExtendedProperties=extended("102", "<p@example.test>", "<r@example.test>"))
@@ -1282,5 +1281,11 @@ def test_fixture_shapes_match_t1b_facts() -> None:
     assert isinstance(replied, str)
     assert replied in ("102", "103")
     assert _answered(replied) is True  # the reported value is what `answered` reads
+    forwarded = T1B_FACTS["forwarded_last_verb"]
+    assert isinstance(forwarded, str)
+    assert _answered(forwarded) is False  # reply = 102, forward = 104 (not answered)
+    assert T1B_FACTS["absent_extended_key_without_properties"] is True
+    assert "singleValueExtendedProperties" not in message(2)  # the real shape: the key is absent, not []
+    assert all(isinstance(entry["value"], str) for entry in extended("102", "<p@example.test>", "<r@example.test>"))
     assert T1B_FACTS["folder_ids_in_pattern"] is True  # requests 1-7: letters, digits, "=", "_" and "-" only
     assert all(FOLDER_ID.fullmatch(folder_id) for folder_id in FOLDER_IDS.values())
