@@ -119,8 +119,10 @@ def quoted(value: str) -> str:
 
 def msg_id_token(value: str) -> str:
     """The hub's imap_search.msg_id_token (O35): the bare id as the bracketed token `"<id>"` in one quoted string; the
-    bare id must pass `quoted`."""
+    bare id must pass `quoted` and hold no `<` or `>`."""
     quoted(value)
+    if "<" in value or ">" in value:
+        raise ValueError("search value refused")
     return f'"<{value}>"'
 
 

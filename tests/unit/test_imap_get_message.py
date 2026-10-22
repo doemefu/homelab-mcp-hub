@@ -421,19 +421,33 @@ def test_other_copy_never_beats_core_copy() -> None:
     assert "Projects" not in examined(server)
 
 
-def test_ref_substring_hit_rechecked() -> None:
+class OverMatchingClient(FakeImapClient):
+    """A server whose UID SEARCH also answers every other message of the folder: false hits for the re-check."""
+
+    def search(self, criteria: bytes) -> list[int]:
+        super().search(criteria)
+        return sorted(self._selected("UID SEARCH").messages)
+
+
+def test_ref_substring_hit_rechecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every decoy is older than the exact copy, so accepting any of them would make it the earliest copy and win.
     server = icloud(
         inbox=[
-            msg(1, 5, "longer", message_id=f"<x{MID}>"),
-            msg(2, 5, "suffix", message_id=f"<{MID}.org>"),
-            msg(3, 5, "case", message_id=f"<{MID.upper()}>"),
+            msg(1, 200, "prefix", message_id=f"<x{MID}>"),
+            msg(2, 180, "suffix", message_id=f"<{MID}.org>"),
+            msg(3, 120, "case", message_id=f"<{MID.upper()}>"),
         ],
         archive=[msg(4, 60, "exact", message_id=f"<{MID}>")],
     )
-    detail = get(server, ref())
+    detail = get(server, ref())  # the fake's own search: only the case-insensitive hit (3) comes back
     assert (detail.ref, detail.subject) == (MessageRef("icloud", "Archive", 7, 4), "exact")
-    # The bracketed token `"<id>"` no longer matches longer ids (1, 2); a case-insensitive hit (3) is re-checked.
     assert [3] in [list(argument[0]) for name, argument in server.commands if name == "UID FETCH"]  # type: ignore[index]
+    server.commands.clear()
+    monkeypatch.setattr(server, "client", lambda: OverMatchingClient(server))
+    detail = get(server, ref())  # prefix and suffix variants come back as hits too and are re-checked
+    assert (detail.ref, detail.subject) == (MessageRef("icloud", "Archive", 7, 4), "exact")
+    assert detail.ref != MessageRef("icloud", "INBOX", 7, 3)
+    assert [1, 2, 3] in [list(argument[0]) for name, argument in server.commands if name == "UID FETCH"]  # type: ignore[index]
 
 
 def test_ref_not_found_after_complete_search() -> None:

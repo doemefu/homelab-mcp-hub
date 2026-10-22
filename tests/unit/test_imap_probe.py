@@ -253,9 +253,11 @@ def test_quoted_is_the_hub_rule() -> None:
     for value in ("a(b)@x", "x{5}@y", "%*@x", "a+&#%=;/?@x"):
         assert probe_mod.quoted(value).encode() == imap_search.quoted(value)
         assert probe_mod.msg_id_token(value).encode() == imap_search.msg_id_token(value)
-    for value in ('a"b', "", "x-gm-raw@x"):
+    for value in ('a"b', "a\\b", "", "x-gm-raw@x", "a<b@x", "a>b@x", "<a@x>"):
         with pytest.raises(ValueError, match="search value refused"):
             probe_mod.msg_id_token(value)
+        with pytest.raises(imap_search.UnsafeSearchValue):
+            imap_search.msg_id_token(value)
 
 
 def test_host_outside_allowlist_refused(monkeypatch: pytest.MonkeyPatch) -> None:

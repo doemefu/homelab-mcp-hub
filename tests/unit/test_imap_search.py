@@ -129,7 +129,7 @@ def test_msg_id_token_brackets_the_bare_value() -> None:
     # O35: iCloud matches HEADER msg-id searches against whole `<id>` tokens; the bare value is checked, not escaped.
     assert msg_id_token("a@x") == b'"<a@x>"'
     assert msg_id_token("a(b)%*]{5}@x") == b'"<a(b)%*]{5}@x>"'
-    for value in ['a"b@x', "a\\b@x", "", "X-GM-RAW@x", "ä@x", "a\r\nb@x"]:
+    for value in ['a"b@x', "a\\b@x", "", "X-GM-RAW@x", "ä@x", "a\r\nb@x", "a<b@x", "a>b@x", "<a@x>"]:
         with pytest.raises(UnsafeSearchValue):
             msg_id_token(value)
 

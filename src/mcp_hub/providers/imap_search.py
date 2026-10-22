@@ -53,8 +53,9 @@ def quoted(value: str) -> bytes:
 
 def msg_id_token(value: str) -> bytes:
     """The bare msg-id `value` as the quoted bracketed token `"<value>"`, for HEADER searches on the msg-id fields.
-    `search_value_ok` applies to the bare value; the brackets add two bytes and need no escaping."""
-    if not search_value_ok(value):
+    The bare value must pass `search_value_ok` and hold no `<` or `>`, so none of `<`, `>`, `"`, `\\` reaches the wire
+    from the value; the brackets add two bytes and need no escaping."""
+    if not search_value_ok(value) or "<" in value or ">" in value:
         raise UnsafeSearchValue("search value refused")
     return b'"<' + value.encode("ascii") + b'>"'
 
