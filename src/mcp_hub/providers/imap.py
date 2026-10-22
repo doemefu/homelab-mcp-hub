@@ -739,7 +739,7 @@ class ImapMailbox:
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
-            if entry.raw_name != session.registry_inbox and session.may_force_rebuild():
+            if entry.raw_name != session.registry_inbox and not session.listed and session.may_force_rebuild():
                 session.folder_map(refresh=True)  # one rebuild for the next call; this folder stays incomplete
             progress.complete = False
             return []

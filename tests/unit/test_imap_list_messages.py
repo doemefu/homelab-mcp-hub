@@ -504,7 +504,7 @@ def test_error_classes(case: str) -> None:
     elif case == "examine_no":
         server.fail["EXAMINE"] = server.no("EXAMINE")
         page = run(server, query("sent"))
-        assert names(server) == ["LOGIN", "CAPABILITY", "LIST", "EXAMINE", "LIST", "LOGOUT"]
+        assert names(server) == ["LOGIN", "CAPABILITY", "LIST", "EXAMINE", "LOGOUT"]  # listed in this call already
         assert (page.items, page.complete) == ([], False)
     elif case == "search_no":
         server.fail["UID SEARCH"] = server.no("UID SEARCH")
@@ -523,17 +523,22 @@ def test_error_classes(case: str) -> None:
 
 
 def test_examine_no_with_a_refused_rebuild_is_incomplete_not_an_error() -> None:
+    """A map listed in this call is not listed again; a cached map is rebuilt once per 60 s (Sec16)."""
     clock = FakeClock()
     maps = FolderMapCache(clock=clock)
-    first = icloud(sent=[msg(2, 5, "b")])
-    first.fail["EXAMINE"] = first.no("EXAMINE")
-    run(first, query("sent"), maps=maps)
-    clock.advance(10.0)  # inside the 60 s window of the forced rebuild (Sec16)
-    second = icloud(sent=[msg(2, 5, "b")])
-    second.fail["EXAMINE"] = second.no("EXAMINE")
-    page = run(second, query("sent"), maps=maps)
-    assert names(second) == ["LOGIN", "CAPABILITY", "EXAMINE", "LOGOUT"]
-    assert (page.items, page.complete) == ([], False)
+    calls: list[list[str]] = []
+    for _ in range(3):
+        server = icloud(sent=[msg(2, 5, "b")])
+        server.fail["EXAMINE"] = server.no("EXAMINE")
+        page = run(server, query("sent"), maps=maps)
+        assert (page.items, page.complete) == ([], False)
+        calls.append(names(server))
+        clock.advance(10.0)  # inside the 60 s window of the forced rebuild
+    assert calls == [
+        ["LOGIN", "CAPABILITY", "LIST", "EXAMINE", "LOGOUT"],  # cold: listed in this call, no rebuild
+        ["LOGIN", "CAPABILITY", "EXAMINE", "LIST", "LOGOUT"],  # cached map: one rebuild, which opens the window
+        ["LOGIN", "CAPABILITY", "EXAMINE", "LOGOUT"],  # inside the window: refused
+    ]
 
 
 def test_fetch_no_in_pass_two_drops_those_items_and_leaves_the_page_incomplete() -> None:
