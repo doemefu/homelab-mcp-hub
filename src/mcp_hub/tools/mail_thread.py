@@ -77,6 +77,7 @@ _EXACTLY_ONE: Final = "Pass exactly one of ref, id and thread_key"
 _ACCOUNT_MISMATCH: Final = "account does not match the message"
 _KEY_MISMATCH: Final = "thread_key does not fit this account"
 _TOO_LARGE: Final = "Result exceeds the output budget"
+KEEP_BODIES: Final = 3  # T12-1: the budget keeps the newest three bodies first (request, reply, hand-over)
 GET_THREAD_DESCRIPTION: Final = (
     "One mail conversation, oldest first, including the owner's replies; each body without the quoted history (at "
     "most `max_chars_per_message`, default 2000). Pass exactly one of `ref` (stable key, preferred), `id` or "
@@ -278,10 +279,12 @@ def _shrink_message(message: ThreadMessage, fits: Callable[[ThreadMessage], bool
 
 
 def fit_thread(result: GetThreadResult, budget: int) -> GetThreadResult:
-    """The output budget order of E-td2 (Option 9a): bodies omitted from the oldest message on, never the newest's;
-    then the oldest messages dropped (`truncated`), at least the newest kept; then omitted bodies restored from the
-    newest down, stopping at the first that does not fit (TDc-3); the newest alone too large is shrunk (F7, then the
-    strings; TDc-4). `summary` is never shrunk. A budget-only omission leaves `truncated` as it was (TDc-2).
+    """The output budget order of E-td2 (Option 9a) with the newest three bodies kept first (T12-1): bodies omitted
+    from the oldest message on, never those of the newest `KEEP_BODIES`; then the oldest messages dropped
+    (`truncated`), at least those `KEEP_BODIES` kept. When they do not fit with their bodies, the same order runs again
+    from the start with only the newest body kept. Either way, omitted bodies are then restored from the newest down,
+    stopping at the first that does not fit (TDc-3), and the newest alone too large is shrunk (F7, then the strings;
+    TDc-4). `summary` is never shrunk. A budget-only omission leaves `truncated` as it was (TDc-2).
 
     Lengths are added up from the parts (compact JSON: the envelope with no messages, plus each message, plus the
     commas), so the number of serialisations stays linear; the final length check guards that sum (SC4)."""
@@ -291,9 +294,8 @@ def fit_thread(result: GetThreadResult, budget: int) -> GetThreadResult:
     if not result.messages:  # unreachable with the accepted budget range
         raise ToolError("too_large", _TOO_LARGE)
     full = list(result.messages)
-    shown = list(full)
     full_sizes = [serialized_length(message) for message in full]
-    sizes = list(full_sizes)
+    omitted: dict[int, tuple[ThreadMessage, int]] = {}  # serialised once, reused by the second pass
     bases: dict[bool, int] = {}
 
     def base(truncated: bool) -> int:
@@ -301,32 +303,41 @@ def fit_thread(result: GetThreadResult, budget: int) -> GetThreadResult:
             bases[truncated] = serialized_length(result.model_copy(update={"messages": [], "truncated": truncated}))
         return bases[truncated]
 
-    def fits(start: int, truncated: bool) -> bool:
-        kept = sizes[start:]
-        return base(truncated) + sum(kept) + len(kept) - 1 <= limit
+    def fits(sizes: list[int], truncated: bool) -> bool:
+        return base(truncated) + sum(sizes) + len(sizes) - 1 <= limit
 
-    newest = len(full) - 1
-    truncated = result.truncated
-    for index in range(newest):  # 1. bodies from the oldest on, never the newest's
-        if fits(0, truncated):
-            break
-        if not shown[index].body_omitted:
-            shown[index] = _omitted(full[index])
-            sizes[index] = serialized_length(shown[index])
-    start = 0
-    while start < newest and not fits(start, truncated):  # 2. the oldest messages
-        start, truncated = start + 1, True
-    if start:  # 3. restore from the newest down; the first body that does not fit stops it
-        for index in range(newest - 1, start - 1, -1):
-            if shown[index] is full[index]:
-                continue
-            omitted_size, sizes[index] = sizes[index], full_sizes[index]
-            if not fits(start, truncated):
-                sizes[index] = omitted_size
+    def omit(index: int) -> tuple[ThreadMessage, int]:
+        if index not in omitted:
+            message = _omitted(full[index])
+            omitted[index] = message, serialized_length(message)
+        return omitted[index]
+
+    def order(keep: int) -> tuple[list[ThreadMessage], list[int], bool]:
+        shown, sizes, truncated = list(full), list(full_sizes), result.truncated
+        last = max(len(full) - keep, 0)  # the first message whose body is kept
+        for index in range(last):  # 1. bodies from the oldest on
+            if fits(sizes, truncated):
                 break
-            shown[index] = full[index]
-    kept = shown[start:]
-    if not fits(start, truncated):  # 4. only the newest is left
+            if not full[index].body_omitted:
+                shown[index], sizes[index] = omit(index)
+        start = 0
+        while start < last and not fits(sizes[start:], truncated):  # 2. the oldest messages
+            start, truncated = start + 1, True
+        if start:  # 3. restore from the newest down; the first body that does not fit stops it
+            for index in range(len(full) - 2, start - 1, -1):
+                if shown[index] is full[index]:
+                    continue
+                omitted_size, sizes[index] = sizes[index], full_sizes[index]
+                if not fits(sizes[start:], truncated):
+                    sizes[index] = omitted_size
+                    break
+                shown[index] = full[index]
+        return shown[start:], sizes[start:], truncated
+
+    kept, sizes, truncated = order(KEEP_BODIES)
+    if not fits(sizes, truncated):  # the newest three do not fit with their bodies: only the newest body is kept
+        kept, sizes, truncated = order(1)
+    if not fits(sizes, truncated):  # 4. only the newest is left
         room = limit - base(truncated)
         shrunk = _shrink_message(kept[-1], lambda candidate: serialized_length(candidate) <= room)
         if shrunk is None:
