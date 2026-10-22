@@ -516,3 +516,43 @@ def test_parse_descendant_cpu_bound(field: str, unit: Callable[[int], str]) -> N
     large_best = _best_of(lambda: parse_descendant(large, wanted))
     assert large_best <= 16 * small_best, (large_best, small_best)
     assert large_best < 0.020, large_best
+
+
+def _cut_block(head: str, tail: str, keep: int) -> bytes:
+    """`head`, space padding and `tail`, cut after `keep` bytes of `tail` at exactly DESCENDANT_HEADER_BYTES."""
+    pad = DESCENDANT_HEADER_BYTES - len(head) - keep
+    data = (head + " " * pad + tail).encode()
+    assert data[:DESCENDANT_HEADER_BYTES].endswith(tail[:keep].encode())
+    return data[:DESCENDANT_HEADER_BYTES]
+
+
+def test_parse_descendant_trims_cut_tail() -> None:
+    wanted = frozenset({"a@x", "r1@example.org"})
+    data = _cut_block("References:", "r1@example.org a@x.y", len("r1@example.org a@x"))
+    assert len(data) == DESCENDANT_HEADER_BYTES
+    d = parse_descendant(data, wanted)
+    assert d.referenced == frozenset({"r1@example.org"})  # the shortened `a@x` is not a token
+    assert d.cut is True
+
+
+def test_parse_descendant_no_token_end_reports_cut() -> None:
+    data = b"References: <" + b"z" * (DESCENDANT_HEADER_BYTES - len("References: <"))
+    assert len(data) == DESCENDANT_HEADER_BYTES
+    d = parse_descendant(data, X)
+    assert d.referenced == frozenset()
+    assert d.cut is True
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["<a@x> <b@x>", "<a@x>, <b@x>", "a@x b@x", "<a@x>\r\n <b@x>"],
+)
+@pytest.mark.parametrize("keep", [3, 6, 7, 8])
+def test_parse_descendant_trim_matches_old_call_sites(tail: str, keep: int) -> None:
+    wanted = frozenset({"a@x", "b@x"})
+    data = _cut_block("References:", tail, min(keep, len(tail)))
+    ends = (b" ", b"\t", b"\r", b"\n", b",", b">")
+    old = parse_descendant(data[: max(data.rfind(end) for end in ends) + 1], wanted)  # short: the old call-site path
+    new = parse_descendant(data, wanted)
+    assert new.referenced == old.referenced
+    assert new.cut is True

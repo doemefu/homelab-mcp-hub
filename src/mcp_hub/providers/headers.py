@@ -26,6 +26,7 @@ MAX_ADDRESS_HEADER_BYTES: Final = 8192
 MAX_REFERENCES: Final = 10
 MAX_IN_REPLY_TO_TOKENS: Final = 100  # the phrase-form scan looks at no more (security M1: no quadratic scan)
 DESCENDANT_HEADER_BYTES: Final = 65536
+_TOKEN_ENDS: Final = (b" ", b"\t", b"\r", b"\n", b",", b">")  # where a msg-id token can end
 DESCENDANT_HEADER_ITEM: Final = (
     f"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES FROM)]<0.{DESCENDANT_HEADER_BYTES}>"
 )
@@ -242,9 +243,13 @@ def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
     """Which `wanted` Message-IDs a reply/thread hit names: whole msg-id tokens of its `In-Reply-To` (the first 100)
     and `References`, compared exactly, so `<a@x.y>` never counts for `a@x` and ids in comments or quoted strings are
     skipped. `msg_id_tokens` is one linear pass and the comparison a set lookup: no quadratic scan (security M1).
-    The first value of each field counts, as in `parse_summary_headers`."""
+    The first value of each field counts, as in `parse_summary_headers`. A block at the byte cap is cut: its last,
+    possibly shortened token is dropped before parsing and `cut` is set."""
     if not raw:
         return Descendant(None, None, frozenset(), False)
+    cut = len(raw) >= DESCENDANT_HEADER_BYTES
+    if cut:
+        raw = raw[: max(raw.rfind(end) for end in _TOKEN_ENDS) + 1]
     items = _header_items(raw)
     in_reply_to = _first(items, "in-reply-to")
     references = _first(items, "references")
@@ -257,7 +262,7 @@ def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
                 *(msg_id_tokens(references) if references else ()),
             ]
         ),
-        cut=len(raw) >= DESCENDANT_HEADER_BYTES,
+        cut=cut,
     )
 
 

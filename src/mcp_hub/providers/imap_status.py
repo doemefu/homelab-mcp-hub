@@ -88,7 +88,6 @@ _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "archive", "trash")
 _GMAIL_REPLY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", DESCENDANT_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", DESCENDANT_HEADER_ITEM)
 _GMAIL_NO_ALL_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "trash", "sent")  # Gmail without `\All` (E-im3a)
-_TOKEN_ENDS: Final = (b" ", b"\t", b"\r", b"\n", b",", b">")  # where a msg-id token can end
 _SEEN: Final = b"\\seen"
 _ANSWERED: Final = b"\\answered"
 _FLAGGED: Final = b"\\flagged"
@@ -622,10 +621,9 @@ def _recheck(
     if not block:
         miss(wanted)
         return None
+    parsed = parse_descendant(block, wanted)
     if len(block) < DESCENDANT_HEADER_BYTES:
-        parsed = parse_descendant(block, wanted)
         return _Hit(parsed.message_id, parsed.from_address, received, parsed.referenced)
-    parsed = parse_descendant(block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1], wanted)
     miss(wanted - parsed.referenced)
     if not parsed.referenced:
         return None
@@ -864,10 +862,9 @@ def _gmail_member(
         return None
     sent = _gmail_sent(entry, row)
     ids = wanted[thread_id]
+    parsed = parse_descendant(block, ids)
     if len(block) < DESCENDANT_HEADER_BYTES:
-        parsed = parse_descendant(block, ids)
         return _Member(thread_id, sent, parsed.message_id, parsed.from_address, received, parsed.referenced)
-    parsed = parse_descendant(block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1], ids)
     sender = parsed.from_address if _field_complete(block, b"from") else None
     complete_id = parsed.message_id is not None and _field_complete(block, b"message-id")
     if not complete_id or (not sent and sender is None):
