@@ -1,6 +1,6 @@
 """IMAP `get_thread` (spec 080 §5.2 `get_thread`, §5.5, §6.5; WP13c): the seed, the members, the merge and the body
 pass, inside one `ImapSession` (one connection, one deadline, D76). Gmail finds the members by `X-GM-THRID` (Option
-4a); other servers by the header rounds (T8) and the subject fallback (T9).
+4a); other servers by the header rounds (Option 3a) and the subject fallback (T9).
 
 Read-only through the guard: EXAMINE, UID SEARCH and UID FETCH of FLAGS, INTERNALDATE, the summary header item,
 X-GM-LABELS and X-GM-THRID (Gmail), BODYSTRUCTURE in chunks of at most 10 UIDs (A-sec1) and the chosen text part as
@@ -32,14 +32,28 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import FolderEntry, FolderRole
 from mcp_hub.providers.headers import (
+    _TOKEN_ENDS,
     SUMMARY_HEADER_ITEM,
     ParsedHeaders,
     header_bytes,
     imap_thread_key,
+    parse_descendant,
     parse_summary_headers,
+    valid_message_id,
 )
 from mcp_hub.providers.imap_guard import PASS_THROUGH
-from mcp_hub.providers.imap_search import criteria, thrid_or
+from mcp_hub.providers.imap_search import (
+    THREAD_ROUND_KEYS,
+    THREAD_SEED_IDS,
+    MixedKey,
+    criteria,
+    header_or,
+    mixed_batches,
+    mixed_or,
+    or_batches,
+    search_value_ok,
+    thrid_or,
+)
 from mcp_hub.providers.imap_session import (
     _LABEL_SENT,
     ImapSession,
@@ -71,6 +85,9 @@ BODY_RESERVE_SECONDS: Final = 12.0  # no new member search after this: the body 
 THREAD_BODY_BYTES: Final = 65_536  # partial fetch of a member's text part (§5.2 "Bodies")
 STRUCTURE_CHUNK_UIDS: Final = 10  # BODYSTRUCTURE lines per UID FETCH (A-sec1)
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per call (sec-G8)
+MAX_ROUND_ITERATIONS: Final = 3  # round (2) iterations after round (1) (§6.5, S-m)
+_THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "sent", "archive", "trash")  # trash with include_trash
+_ROUND_ONE_FIELDS: Final = ("Message-ID", "References")
 _MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUMMARY_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", SUMMARY_HEADER_ITEM)
 _SEEN: Final = b"\\seen"
@@ -98,6 +115,15 @@ class _Seed:
 
 
 @dataclass(slots=True)
+class _Rounds:
+    """The ids the header rounds searched (Option 3a): as `Message-ID` keys (round (1) and upward keys) and as
+    `In-Reply-To` keys (downward keys). A member's id is never searched again."""
+
+    up: set[str] = field(default_factory=set)
+    down: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class _Members:
     """The copies found, where they lie, and what the member passes left incomplete (P11)."""
 
@@ -106,6 +132,8 @@ class _Members:
     entries: dict[str, FolderEntry] = field(default_factory=dict)  # raw name → entry, for the body pass
     exact: bool = True  # every search of every pass completed (`message_count_exact`)
     truncated: bool = False  # members may be missing: SEARCH or EXAMINE NO, the reserve, the soft stop
+    seed_headers: ParsedHeaders | None = None  # the seed's headers, trimmed when cut: round (1) ids (IR2, T7-3)
+    seed_cut: bool = False  # the seed's block reached its cap: References beyond the cut were not seen
 
     def partial(self) -> None:
         self.exact, self.truncated = False, True
@@ -180,10 +208,13 @@ def _key_members(
     """The members from the key alone. Nothing found is `not_found` after a complete search and `upstream_timeout`
     otherwise; members found by an incomplete search are a partial answer (B6, Q6 as refined by IR3)."""
     value = key.value
-    if key.source != "gmail" or not isinstance(value, int):
-        raise ProviderError("upstream_error", "NotImplemented")  # `headers` and `subject` keys: WP13c T8, T9
     try:
-        _gmail_members(session, value, query, state, None, soft_check, reserve_spent)
+        if key.source == "gmail" and isinstance(value, int):
+            _gmail_members(session, value, query, state, None, soft_check, reserve_spent)
+        elif key.source == "headers" and isinstance(value, str):
+            _header_members(session, [value], query, state, None, soft_check, reserve_spent)  # round (1): the root
+        else:
+            raise ProviderError("upstream_error", "NotImplemented")  # `subject` keys: WP13c T9
     except SoftStop:
         state.partial()
     if not state.copies:
@@ -201,7 +232,9 @@ def _seed_members(
 ) -> ThreadKey | None:
     """The seed, then its thread's members; returns the thread key. On Gmail the seed's row comes from the
     X-GM-THRID fetch of its mailbox (Q-b); only a seed that no member search returned is read alone. A seed without
-    a thread id is returned alone, not exact, with no key (SG4)."""
+    a thread id is returned alone, not exact, with no key (SG4). Other servers read the seed first, then run the
+    header rounds from its ids; a cut seed block still gives the ids before the cut, and the count is not exact
+    (IR2, P12)."""
     seed = _seed(session, query.seed, soft_check)
     if seed.row is not None:
         _add(session, seed.entry, seed.uidvalidity, seed.uid, seed.row, state, linked_by=_linked_by(session), seed=seed)
@@ -217,9 +250,19 @@ def _seed_members(
         return ThreadKey(session.account, "gmail", seed.thread_id)
     if not state.has_seed():
         _read_seed(session, seed, state)
-    state.inexact()  # Gmail: the seed alone (SG4); other servers: the header rounds follow (T8)
     if session.gmail:
+        state.inexact()  # the seed alone (SG4)
         return None
+    ids = seed_round_ids(state.seed_headers) if state.seed_headers is not None else []
+    if state.seed_cut:
+        state.inexact()  # the References beyond the cut were not seen (IR2)
+    if not ids:
+        state.inexact()  # no id to search by; the subject fallback follows (T9)
+    else:
+        try:
+            _header_members(session, ids, query, state, seed, soft_check, reserve_spent)
+        except SoftStop:
+            state.partial()
     return next(copy for copy in state.copies if copy.seed).summary.meta.thread
 
 
@@ -360,6 +403,8 @@ def _copy(
     flags, labels = _flags(row), _labels(row)
     folder = _detail_folder(entry, row, gmail=session.gmail)
     parsed = _headers(session, ref, row, state, known_id=known_id)
+    if seed:
+        state.seed_headers, state.seed_cut = parsed, len(header_bytes(row)) >= MAX_HEADER_BYTES
     in_sent = folder == "sent" or _LABEL_SENT in labels
     direction = direction_of(in_sent=in_sent, from_address=parsed.from_address, own=session.own)
     if session.gmail:
@@ -396,12 +441,13 @@ def _copy(
 def _headers(
     session: ImapSession, ref: MessageRef, row: dict[bytes, object], state: _Members, *, known_id: str | None
 ) -> ParsedHeaders:
-    """The summary headers of a copy. A block cut at 64 KiB (IR2, MF-P2, A-sec3): a Message-ID that did not end
-    before the cut is dropped (a `ref` seed keeps the ref's) and the count is not exact, since the copy cannot merge;
-    a cut From gives the direction by folder. A block that does not parse degrades only this copy (SC1)."""
+    """The summary headers of a copy. A block cut at 64 KiB (IR2, MF-P2, A-sec3) is parsed without its last, possibly
+    shortened token (T7-3); a Message-ID that did not end before the cut is dropped (a `ref` seed keeps the ref's)
+    and the count is not exact, since the copy cannot merge; a cut From gives the direction by folder. A block that
+    does not parse degrades only this copy (SC1)."""
     block = header_bytes(row)
     try:
-        parsed = parse_summary_headers(block)
+        parsed = parse_summary_headers(_trimmed(block) if len(block) >= MAX_HEADER_BYTES else block)
     except PASS_THROUGH:
         raise
     except Exception as exc:
@@ -417,6 +463,224 @@ def _headers(
             state.inexact()
         parsed = replace(parsed, message_id=known_id, root=known_id if own_root else parsed.root)
     return parsed
+
+
+def _trimmed(block: bytes) -> bytes:
+    """A block cut at its cap up to its last token end, as `parse_descendant` trims it (T0), so that an unbracketed
+    References tail cut inside an id never yields a shortened id."""
+    return block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1]
+
+
+# --- header rounds (other servers) -----------------------------------------------------------------------------
+
+
+def seed_round_ids(parsed: ParsedHeaders) -> list[str]:
+    """Round-(1) ids (A-mf1, ruling G1): the root (the first valid `References` entry), then `In-Reply-To`, then the
+    newest valid `References` entries, until THREAD_SEED_IDS, without duplicates. Without either header the root is
+    the message's own Message-ID, so that id alone is searched."""
+    candidates = (parsed.root, parsed.in_reply_to, *reversed(parsed.references))
+    ids = [valid for value in candidates if (valid := valid_message_id(value)) is not None]
+    return list(dict.fromkeys(ids))[:THREAD_SEED_IDS]
+
+
+def _header_members(
+    session: ImapSession,
+    ids: Sequence[str],
+    query: ThreadQuery,
+    state: _Members,
+    seed: _Seed | None,
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> None:
+    """Option 3a: round (1) from `ids` (the seed's, or a `headers` key's root), then round (2) with the upward
+    closure. No round starts once the reserve is spent (G2); keys left then make the list partial. A SoftStop
+    propagates with the copies read so far kept in `state`."""
+    rounds = _Rounds()
+    _round_one(session, ids, query, state, rounds, seed, soft_check, reserve_spent)
+    _round_two(session, query, state, rounds, seed, soft_check, reserve_spent)
+
+
+def _round_one(
+    session: ImapSession,
+    ids: Sequence[str],
+    query: ThreadQuery,
+    state: _Members,
+    rounds: _Rounds,
+    seed: _Seed | None,
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> None:
+    """Round (1): per folder one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` and `HEADER References` keys
+    for the ids (two commands only when the 4,000-byte cap splits them). A hit is a member when its Message-ID is one
+    of the ids or its In-Reply-To or References name one."""
+    rounds.up.update(ids)
+    values = _searchable(ids, state)
+    if not values:
+        return
+    if reserve_spent():
+        state.partial()
+        return
+    searches = [
+        criteria(b"NOT DRAFT", header_or(_ROUND_ONE_FIELDS, batch))
+        for batch in or_batches(values, _ROUND_ONE_FIELDS, max_values=THREAD_SEED_IDS)
+    ]
+    wanted = frozenset(ids)
+    _round_pass(session, searches, query, state, seed, soft_check, ancestors=wanted, linked_to=wanted)
+
+
+def _round_two(
+    session: ImapSession,
+    query: ThreadQuery,
+    state: _Members,
+    rounds: _Rounds,
+    seed: _Seed | None,
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> None:
+    """Round (2), at most MAX_ROUND_ITERATIONS iterations: downward `HEADER In-Reply-To` keys for the Message-IDs of
+    the members new in the last pass (iteration 1: every member so far, the seed included; A-mf2), then upward
+    `HEADER Message-ID` keys for each new member's In-Reply-To and References root not yet a member or searched
+    (E-mf4, A-mf4), batched by `mixed_batches` (downward first; overflow goes to further SEARCHes, A-mf4a). A hit is
+    a member when its Message-ID is an upward key or its In-Reply-To or References name a downward key. Ends when an
+    iteration adds no member; keys left after the last iteration are never searched (not exact), keys left at the
+    reserve make the list partial (G2, P11)."""
+    new = list(state.copies)
+    for iteration in range(MAX_ROUND_ITERATIONS + 1):
+        down, up = _round_keys(new, state, rounds)
+        if not down and not up:
+            return
+        if iteration == MAX_ROUND_ITERATIONS:
+            state.inexact()
+            return
+        if reserve_spent():
+            state.partial()
+            return
+        rounds.down.update(down)
+        rounds.up.update(up)
+        keys: list[MixedKey] = [("In-Reply-To", value) for value in _searchable(down, state)]
+        keys += [("Message-ID", value) for value in _searchable(up, state)]
+        if not keys:
+            return
+        searches = [
+            criteria(b"NOT DRAFT", mixed_or(batch)) for batch in mixed_batches(keys, max_keys=THREAD_ROUND_KEYS)
+        ]
+        before = len(state.copies)
+        _round_pass(
+            session, searches, query, state, seed, soft_check, ancestors=frozenset(up), linked_to=frozenset(down)
+        )
+        new = state.copies[before:]
+        if not new:
+            return
+
+
+def _round_keys(new: Sequence[ThreadCopy], state: _Members, rounds: _Rounds) -> tuple[list[str], list[str]]:
+    """(downward, upward) ids of an iteration: the new members' Message-IDs not searched as In-Reply-To yet, and per
+    new member at most two upward ids, its In-Reply-To and its References root, that are neither a member's id nor
+    searched as a Message-ID yet."""
+    members = {mid for copy in state.copies if (mid := valid_message_id(copy.summary.meta.message_id)) is not None}
+    down: dict[str, None] = {}
+    up: dict[str, None] = {}
+    for copy in new:
+        meta = copy.summary.meta
+        own = valid_message_id(meta.message_id)
+        if own is not None and own not in rounds.down:
+            down[own] = None
+        root = meta.thread.value if meta.thread is not None and meta.thread.source == "headers" else None
+        for value in (meta.in_reply_to, root):
+            parent = valid_message_id(value) if isinstance(value, str) else None
+            if parent is not None and parent not in members and parent not in rounds.up:
+                up[parent] = None
+    return list(down), list(up)
+
+
+def _searchable(ids: Sequence[str], state: _Members) -> list[str]:
+    """The ids a search may carry (D74, T4-1), filtered before batching so that one refused id does not cost the
+    others; a refused id is never searched, so the count is not exact."""
+    values = [value for value in ids if search_value_ok(value) and "<" not in value and ">" not in value]
+    if len(values) < len(ids):
+        state.inexact()
+    return values
+
+
+def _round_folders(session: ImapSession, query: ThreadQuery) -> list[FolderEntry]:
+    """Inbox, sent, archive and, with `include_trash`, trash; never `other`, junk or drafts. The selected mailbox
+    goes first (one EXAMINE fewer per pass, im-M7). The folder map is never rebuilt here (K7, F6)."""
+    folder_map = session.folder_map()
+    roles = _THREAD_ROLES if query.include_trash else _THREAD_ROLES[:-1]
+    entries = [entry for role in roles if (entry := folder_map.role(role)) is not None]
+    return sorted(entries, key=lambda entry: entry.raw_name != session.selected)  # stable
+
+
+def _round_pass(
+    session: ImapSession,
+    searches: Sequence[bytes],
+    query: ThreadQuery,
+    state: _Members,
+    seed: _Seed | None,
+    soft_check: Callable[[], None],
+    *,
+    ancestors: frozenset[str],
+    linked_to: frozenset[str],
+) -> None:
+    """The searches in every round folder. A folder that cannot be opened (EXAMINE NO, no UIDVALIDITY) or a SEARCH
+    answered NO leaves the list partial (G4, P1); the hit cap leaves it inexact (P11). Locations read already are not
+    fetched again (P7); each other hit is re-checked (`_linked`) and drafts are dropped (S1)."""
+    for entry in _round_folders(session, query):
+        if not _open(session, entry) or session.selected_uidvalidity is None:
+            state.partial()
+            continue
+        validity = session.selected_uidvalidity
+        for search in searches:
+            read = {uid for name, value, uid in state.seen if name == entry.raw_name and value == validity}
+            rows = _uid_rows(
+                session,
+                search,
+                _MEMBER_ITEMS,
+                newest=True,
+                miss=state.partial,
+                soft_check=soft_check,
+                capped=state.inexact,
+                skip=read,
+            )
+            for uid, row in rows:
+                if _is_draft(row):
+                    continue
+                ref = MessageRef(session.account, entry.raw_name, validity, uid)
+                if _linked(session, ref, row, state, ancestors=ancestors, linked_to=linked_to):
+                    _add(session, entry, validity, uid, row, state, linked_by="headers", seed=seed)
+
+
+def _linked(
+    session: ImapSession,
+    ref: MessageRef,
+    row: dict[bytes, object],
+    state: _Members,
+    *,
+    ancestors: frozenset[str],
+    linked_to: frozenset[str],
+) -> bool:
+    """Whether a round hit is a member: its Message-ID is one of `ancestors`, or its In-Reply-To or References name
+    one of `linked_to`, as whole msg-id tokens compared exactly (`parse_descendant`, which trims a cut block), so
+    substring, case, comment and quoted-string hits are not members. A cut block whose Message-ID did not end before
+    the cut is never a member, and a cut block that shows no wanted id may hide one: both make the count inexact
+    (A-sec3). A block that does not parse degrades only this hit (SC1)."""
+    block = header_bytes(row)
+    try:
+        hit = parse_descendant(block, linked_to)
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        session.log_skipped(ref, exc)
+        state.inexact()
+        return False
+    if hit.cut and (hit.message_id is None or not _field_complete(block, b"message-id")):
+        state.inexact()
+        return False
+    if hit.referenced or (hit.message_id is not None and hit.message_id in ancestors):
+        return True
+    if hit.cut:
+        state.inexact()
+    return False
 
 
 # --- body pass -------------------------------------------------------------------------------------------------

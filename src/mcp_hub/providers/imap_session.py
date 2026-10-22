@@ -2,7 +2,7 @@
 FETCH and the location step of Message-IDs. Moved out of `imap.py` so that the status lookups can share it (WP13b)."""
 
 import imaplib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -600,8 +600,12 @@ def _uid_rows(
     newest: bool,
     miss: Callable[[], None],
     soft_check: Callable[[], None],
+    capped: Callable[[], None] | None = None,
+    skip: Collection[int] = (),
 ) -> Iterator[tuple[int, dict[bytes, object]]]:
-    """`_rows` with each row's UID (a fetched row does not carry it), for callers that build ids (WP13c)."""
+    """`_rows` with each row's UID (a fetched row does not carry it), for callers that build ids (WP13c). `capped`
+    marks the hit cap instead of `miss` when given (P11); hits in `skip` were read already: they are neither fetched
+    nor counted against the cap (P7)."""
     try:
         found = session.search(search)
     except PASS_THROUGH:
@@ -611,10 +615,10 @@ def _uid_rows(
             raise
         miss()
         return
-    uids = sorted(set(found))
+    uids = sorted(set(found).difference(skip))
     if len(uids) > MAX_LOOKUP_HITS:
         uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
-        miss()
+        (miss if capped is None else capped)()
     chunks = session.fetch_chunks(uids, items, chunk=LOOKUP_FETCH_UIDS)
     for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
         part = uids[start : start + LOOKUP_FETCH_UIDS]

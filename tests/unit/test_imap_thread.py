@@ -132,7 +132,7 @@ def test_id_seed_read_in_place() -> None:
     assert page.members[0].linked_by == "headers"
     assert page.thread == ThreadKey("icloud", "headers", "s@example.test")
     assert page.members[0].body.text == "Hello"
-    assert "LIST" not in names(server)  # the registry inbox needs no LIST
+    assert names(server)[:4] == ["LOGIN", "CAPABILITY", "EXAMINE", "UID FETCH"]  # the registry inbox needs no LIST
 
     for target, cause in (
         (mid_ref(server, "INBOX", 1, 8), "UidValidityChanged"),
@@ -201,7 +201,9 @@ def test_ref_seed_compares_uidvalidity_after_real_and_skipped_examine() -> None:
     in_sent = icloud(sent=[msg(1, 30, "sent seed", sender=OWNER, message_id="<s@example.test>")])
     page = thread(in_sent, seed=ref("s@example.test", in_sent))
     assert subjects(page) == ["sent seed"]
-    assert examined(in_sent) == ["INBOX", "Archive", "Deleted Messages", "Sent Messages"]  # no EXAMINE after it
+    seed_read = index_of(in_sent, "UID FETCH", lambda argument: SUMMARY_HEADER_ITEM in argument[1])
+    assert examined(in_sent)[:4] == ["INBOX", "Archive", "Deleted Messages", "Sent Messages"]
+    assert names(in_sent)[:seed_read].count("EXAMINE") == 4  # no EXAMINE between the location and the seed read
 
 
 # --- body pass -------------------------------------------------------------------------------------------------
