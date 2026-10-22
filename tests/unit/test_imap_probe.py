@@ -164,7 +164,7 @@ def test_probe_uses_only_read_only_commands() -> None:
     _, stub = _run(StubClient(_folders(), capabilities=(b"X-GM-EXT-1",)))
     searches = [text for cmd, text in stub.commands if cmd == "SEARCH"]
     assert searches
-    assert all(text.startswith("NOT DRAFT") or text.startswith("X-GM-LABELS") for text in searches)
+    assert all(text.startswith(("NOT DRAFT", "HEADER Message-ID", "X-GM-LABELS")) for text in searches)
     assert not any("X-GM-RAW" in text.upper() for text in searches)
     fetches = [text for cmd, text in stub.commands if cmd == "FETCH"]
     allowed = {"INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>", "INTERNALDATE FLAGS X-GM-LABELS"}
@@ -219,7 +219,7 @@ def test_probe_caps_folders() -> None:
     names = [f"Box{i}" for i in range(40)]
     out, stub = _run(StubClient([((), b"/", "INBOX")] + [((), b"/", n) for n in names[:39]]), max_folders=30)
     examines = [text for cmd, text in stub.commands if cmd == "EXAMINE"]
-    assert len(examines) == 30 * 5
+    assert len(examines) == 30 * 5 + 4  # plus the four INBOX Message-ID variants
     assert "header_message_id: folders=30" in out
 
 
@@ -465,3 +465,61 @@ def _searches_by_folder(stub: StubClient) -> list[tuple[str, str]]:
         elif cmd == "SEARCH":
             out.append((selected, text))
     return out
+
+
+class LongIdClient(StubClient):
+    def fetch(self, messages: Any, data: Any) -> dict[int, dict[bytes, bytes]]:
+        self.commands.append(("FETCH", ""))
+        return {
+            int(uid): {
+                b"BODY[HEADER.FIELDS (MESSAGE-ID)]<0>": f"Message-ID: <longlocal{uid}@example.test>\r\n".encode()
+            }
+            for uid in messages
+        }
+
+
+def test_msgid_variants_send_the_exact_criteria() -> None:
+    out, stub = _run(LongIdClient(_folders()))
+    sent = [text for kind, text in stub.commands if kind == "SEARCH"]
+    needle = "longlocal25@example.test"
+    expected = [
+        f'NOT DRAFT HEADER Message-ID "{needle}"',
+        f'NOT DRAFT HEADER Message-ID "<{needle}>"',
+        f'HEADER Message-ID "<{needle}>"',
+        f'NOT DRAFT HEADER message-id "<{needle}>"',
+        'NOT DRAFT HEADER Message-ID "longlocal25"',
+    ]
+    positions = [sent.index(c) for c in expected]
+    assert positions == sorted(positions)
+    names = re.findall(r"^msgid_variant: name=(\w+) hits=\d+ ms=\d+$", out, re.MULTILINE)
+    assert names == [
+        "msgid_bare",
+        "msgid_bracketed",
+        "msgid_no_not_draft",
+        "msgid_lowercase_field",
+        "msgid_localpart",
+    ]
+    assert out.index("msgid_variant") < out.index("header_message_id:")
+    assert needle not in out
+    assert "longlocal25" not in out
+
+
+def test_msgid_localpart_needs_eight_characters() -> None:
+    out, _ = _run(StubClient(_folders()))
+    assert "msgid_bracketed" in out
+    assert "msgid_localpart" not in out
+
+
+class FailingVariant(StubClient):
+    def search(self, criteria: Any = "ALL", charset: Any = None) -> list[int]:
+        if isinstance(criteria, bytes) and criteria.startswith(b'NOT DRAFT HEADER Message-ID "<'):
+            raise TimeoutError
+        return super().search(criteria, charset)
+
+
+def test_a_failing_msgid_variant_does_not_stop_the_others() -> None:
+    out, _ = _run(FailingVariant(_folders()))
+    assert "msgid_variant: name=msgid_bracketed: error=TimeoutError" in out
+    assert re.search(r"^msgid_variant: name=msgid_bare hits=\d+ ", out, re.MULTILINE)
+    assert re.search(r"^msgid_variant: name=msgid_no_not_draft hits=\d+ ", out, re.MULTILINE)
+    assert re.search(r"^text: folders=", out, re.MULTILINE)

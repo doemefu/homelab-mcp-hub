@@ -75,6 +75,7 @@ _BRACKETED: Final = re.compile(r"<([^<>]*)>")
 _OR_VALUES: Final = 20  # the hub's LOCATE_BATCH_VALUES
 _OR_MAX_BYTES: Final = 4000  # the hub's imap_search.MAX_OR_BYTES
 _GMAIL_FETCH_UIDS: Final = 500  # the hub's FETCH_CHUNK_UIDS
+_LOCALPART_MIN: Final = 8
 _HEADER_ROUNDS: Final = ("header_message_id", "header_references", "or20")
 _GMAIL_SENT: Final = 'X-GM-LABELS "\\\\Sent"'
 _GMAIL_INBOX: Final = 'X-GM-LABELS "\\\\Inbox"'
@@ -213,6 +214,32 @@ def _search_round(
         if hits and found_in == "none":
             found_in = role
     emit(f"{round_name}: folders={len(targets)} total_ms={_ms(round_started)} max_ms={slowest} found_in={found_in}")
+
+
+def _msgid_variants(client: ReadOnlyProxy, inbox: str, needle: str, emit: Callable[[str], None]) -> None:
+    """Which form of the Message-ID search does the server match? INBOX only, where the message is known to be.
+    Prints counts and timings, never the needle."""
+    local, _, _ = needle.rpartition("@")
+    variants = {
+        "msgid_bare": f"NOT DRAFT HEADER Message-ID {quoted(needle)}",
+        "msgid_bracketed": f"NOT DRAFT HEADER Message-ID {quoted(f'<{needle}>')}",
+        "msgid_no_not_draft": f"HEADER Message-ID {quoted(f'<{needle}>')}",
+        "msgid_lowercase_field": f"NOT DRAFT HEADER message-id {quoted(f'<{needle}>')}",
+    }
+    if len(local) >= _LOCALPART_MIN:
+        variants["msgid_localpart"] = f"NOT DRAFT HEADER Message-ID {quoted(local)}"
+
+    def run(name: str, criteria: str) -> Callable[[], None]:
+        def measure() -> None:
+            started = time.perf_counter()
+            client.select_folder(inbox)
+            hits = client.search(criteria.encode("ascii"))
+            emit(f"msgid_variant: name={name} hits={len(hits)} ms={_ms(started)}")
+
+        return measure
+
+    for name, criteria in variants.items():
+        _guarded(f"msgid_variant: name={name}", emit, run(name, criteria))
 
 
 def _gmail_rounds(
@@ -355,6 +382,9 @@ def probe(
         emit("header rounds skipped: no readable Message-ID in the newest inbox messages")
     else:
         first = inbox_ids[0]
+        inbox_name = next((n for n, r in targets if r == "inbox"), None)
+        if inbox_name is not None:
+            _msgid_variants(client, inbox_name, first, emit)
         criteria = {
             "header_message_id": f"NOT DRAFT HEADER Message-ID {quoted(first)}",
             "header_references": f"NOT DRAFT HEADER References {quoted(first)}",
