@@ -284,7 +284,7 @@ def test_filter_order() -> None:
                 msg(2, 24 * 60 + 60, "m2", message_id="<m2@example.test>"),
                 # the dedup winner above the position suppresses its archive copy below it
                 msg(3, 10, "m3", message_id="<m3@example.test>"),
-                # merged with its sent copy: outgoing, listed from the inbox
+                # merged with its sent copy: listed from sent, at the sent copy's date (M3, security L1)
                 msg(4, 300, "m4", message_id="<m4@example.test>"),
             ],
             archive=[
@@ -305,22 +305,43 @@ def test_filter_order() -> None:
     assert [(i.subject, i.meta.folder) for i in first.items] == [
         ("s5", "sent"),
         ("m3", "inbox"),
+        ("m4", "sent"),
         ("m1", "archive"),
         ("m2", "archive"),
         ("s6", "sent"),
-        ("m4", "inbox"),
     ]
-    m4 = first.items[-1]
-    assert (m4.meta.direction, m4.ref.folder) == ("outgoing", "INBOX")
+    m4 = first.items[2]
+    assert (m4.meta.direction, m4.ref.folder) == ("outgoing", "Sent Messages")
 
     after_m3 = position_after(first.items[1])
     later = run(server(), query("all", position=after_m3))
     assert ("m3", "archive") not in [(i.subject, i.meta.folder) for i in later.items]
-    assert subjects(later) == ["m1", "m2", "s6", "m4"]
+    assert subjects(later) == ["m4", "m1", "m2", "s6"]
 
     outgoing = run(server(), query("all", direction="outgoing", position=after_m3, limit=1))
-    assert [(i.subject, i.meta.folder) for i in outgoing.items] == [("s6", "sent")]
-    assert outgoing.more is True  # m4 (merged with sent) is outgoing too, below s6
+    assert [(i.subject, i.meta.folder) for i in outgoing.items] == [("m4", "sent")]
+    assert outgoing.more is True  # s6 is outgoing too, below m4
+
+
+@pytest.mark.parametrize("planted_minutes", [3, 30])  # newer and older than the sent copy
+def test_planted_inbox_copy_never_hides_the_sent_copy(planted_minutes: int) -> None:
+    """Security L1: an inbox message with the owner's From and the Message-ID of a sent message merges with it, and
+    the item shown is the sent copy (its folder, its id, outgoing), never the planted one."""
+    mid = "<s@example.test>"
+
+    def server() -> FakeImapServer:
+        return icloud(
+            inbox=[msg(1, planted_minutes, "planted", sender="owner@example.org", message_id=mid)],
+            archive=[msg(11, 40, "archived", sender="owner@example.org", message_id=mid)],
+            sent=[msg(21, 10, "sent", sender="owner@example.org", message_id=mid)],
+        )
+
+    for own in (OWN, frozenset()):
+        page = run(server(), query("all"), own=own)
+        assert [(i.subject, i.meta.folder, i.meta.direction) for i in page.items] == [("sent", "sent", "outgoing")]
+        assert page.items[0].ref == MessageRef("icloud", "Sent Messages", 7, 21)
+    outgoing = run(server(), query("all", direction="outgoing"), own=OWN)
+    assert [i.ref for i in outgoing.items] == [MessageRef("icloud", "Sent Messages", 7, 21)]
 
 
 def test_draft_flag_dropped_per_message() -> None:
@@ -355,12 +376,13 @@ def test_all_dedups_by_message_id_and_from() -> None:
     page = run(server, query("all"))
     found = [(i.subject, i.meta.folder, i.meta.direction) for i in page.items]
     assert found == [
-        ("x", "inbox", "outgoing"),  # one item: the inbox copy, outgoing because one copy is in sent (M3)
         ("y", "inbox", "incoming"),
         ("z", "inbox", "incoming"),
         ("y", "archive", "incoming"),  # same Message-ID, other From: not merged (S-e)
         ("z", "archive", "incoming"),  # no Message-ID: never merged
+        ("x", "sent", "outgoing"),  # one item: one copy is in sent, so the sent copy is shown (M3, security L1)
     ]
+    assert page.items[-1].ref == MessageRef("icloud", "Sent Messages", 7, 21)
     assert all(items == [*CANDIDATE, candidate_header_item(["MESSAGE-ID", "FROM"])] for _, items in fetches(server)[:3])
 
 

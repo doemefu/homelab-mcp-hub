@@ -796,7 +796,10 @@ class ImapMailbox:
         """R3 after the per-candidate drops of pass 1: dedup (`all`), position, direction, then `limit` by
         `order_key`. Returns the chosen items in list order and whether more matched."""
         merged: list[tuple[Candidate, bool]] = []
-        if merge:  # over every candidate of the window, first copy in the order inbox, archive, sent (B4, S-e)
+        # Over every candidate of the window (B4, S-e): the first copy in the order inbox, archive, sent is kept,
+        # unless a copy is in sent: then the first sent copy is shown (its folder, its id; outgoing, M3), so a
+        # planted copy with the owner's From and the same Message-ID can neither hide nor replace it (security L1).
+        if merge:
             index: dict[tuple[str, str | None], int] = {}
             for candidate in candidates:
                 in_sent = candidate.plan.fixed_folder == "sent"
@@ -809,8 +812,8 @@ class ImapMailbox:
                 if first is None:
                     index[merge_key] = len(merged)
                     merged.append((candidate, in_sent))
-                elif in_sent:
-                    merged[first] = (merged[first][0], True)  # M3: outgoing if any copy is in sent
+                elif in_sent and not merged[first][1]:
+                    merged[first] = (candidate, True)
         else:
             merged = [(c, c.plan.fixed_folder == "sent") for c in candidates]
         kept: list[_Chosen] = []
