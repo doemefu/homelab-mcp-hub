@@ -18,15 +18,21 @@ from mcp_hub.providers.folders import GmailLabelFilter
 from mcp_hub.providers.imap_guard import search_criteria_ok
 
 MAX_OR_BYTES: Final = 4000  # bounds one header OR tree, so a UID SEARCH line stays well below server line limits
+# Batch caps of spec 080 §5.4, named so that a wider batch design is a change of constants (ruling E-im5).
+LOCATE_BATCH_VALUES: Final = 20  # Message-IDs per location UID SEARCH
+LOOKUP_BATCH_VALUES: Final = 10  # Message-IDs per reply/thread UID SEARCH: 20 keys (In-Reply-To + References)
+MAX_THRID_VALUES: Final = 20  # X-GM-THRID keys per UID SEARCH
 HeaderField = Literal["Message-ID", "In-Reply-To", "References"]
 
 _NOT_DRAFT: Final = b"NOT DRAFT"
 _HEADER_FIELDS: Final = frozenset({"Message-ID", "In-Reply-To", "References"})
 _MONTHS: Final = (b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec")
+_THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
 _QUOTABLE: Final = re.compile(r"[\x20\x21\x23-\x5b\x5d-\x7e]+")  # printable ASCII without '"' and '\'
 # Gmail system labels as quoted strings; the backslash of `\Sent` is escaped inside the quotes (I8, SA8).
 _GMAIL_SENT: Final = b'X-GM-LABELS "\\\\Sent"'
 _GMAIL_INBOX: Final = b'X-GM-LABELS "\\\\Inbox"'
+GMAIL_SENT_LABEL_KEY: Final = _GMAIL_SENT  # the reply step's key: `\Sent` with or without `\Inbox` (P10)
 _GMAIL_LABEL_KEYS: Final[dict[str, bytes]] = {
     "sent": _GMAIL_SENT + b" NOT " + _GMAIL_INBOX,
     "archive": b"NOT " + _GMAIL_INBOX + b" NOT " + _GMAIL_SENT,
@@ -155,6 +161,56 @@ def or_batches(
         batch.append(value)
         batch_bytes += value_bytes
         batch_leaves += len(leaves)
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _thrid_values(values: Sequence[int]) -> list[int]:
+    """`values` in order without duplicates. Only Gmail thread ids as the server returns them go out: `int` (not
+    `bool`) in 0..2^64-1; anything else is a `ValueError` with a fixed text."""
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError("thread ids must be a sequence, not one string")
+    snapshot = list(values)  # one pass: the checked copy is what gets sent
+    for value in snapshot:
+        if type(value) is not int or not 0 <= value < _THRID_LIMIT:
+            raise ValueError("thread id refused")
+    return list(dict.fromkeys(snapshot))
+
+
+def _thrid_leaf(value: int) -> bytes:
+    return b"X-GM-THRID %d" % value
+
+
+def thrid_or(values: Sequence[int]) -> bytes:
+    """Balanced OR tree (I10) of `X-GM-THRID <n>` keys, duplicates removed in order."""
+    leaves = [_thrid_leaf(value) for value in _thrid_values(values)]
+    if not leaves:
+        raise ValueError("no thread ids")
+    return _or_tree(leaves)
+
+
+def thrid_batches(
+    values: Sequence[int], *, max_values: int = MAX_THRID_VALUES, max_bytes: int = MAX_OR_BYTES
+) -> list[list[int]]:
+    """Consecutive batches of the distinct thread ids in input order; each holds at most `max_values` ids and its
+    `thrid_or` at most `max_bytes` bytes. A batch is closed when the next id would break either cap."""
+    if type(max_values) is not int or max_values < 1:
+        raise ValueError("max_values must be positive")
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    batch_bytes = 0
+    for value in _thrid_values(values):
+        value_bytes = len(_thrid_leaf(value))
+        if value_bytes > max_bytes:
+            raise ValueError("max_bytes below one thread id key")
+        if batch and (len(batch) >= max_values or _or_tree_size(batch_bytes + value_bytes, len(batch) + 1) > max_bytes):
+            batches.append(batch)
+            batch, batch_bytes = [], 0
+        batch.append(value)
+        batch_bytes += value_bytes
     if batch:
         batches.append(batch)
     return batches

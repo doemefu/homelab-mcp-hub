@@ -13,7 +13,11 @@ from mcp_hub.ids import MESSAGE_ID_PATTERN
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap_guard import GuardedImapClient
 from mcp_hub.providers.imap_search import (
+    GMAIL_SENT_LABEL_KEY,
+    LOCATE_BATCH_VALUES,
+    LOOKUP_BATCH_VALUES,
     MAX_OR_BYTES,
+    MAX_THRID_VALUES,
     UnsafeSearchValue,
     criteria,
     gmail_label_keys,
@@ -23,6 +27,8 @@ from mcp_hub.providers.imap_search import (
     or_batches,
     quoted,
     search_value_ok,
+    thrid_batches,
+    thrid_or,
     window_keys,
 )
 from tests.support.clock import FakeClock
@@ -248,6 +254,93 @@ def test_or_batches_edge_cases() -> None:
     assert or_batches(iter(["a@x", "b@x"]), iter(("In-Reply-To", "References")), max_values=1) == [["a@x"], ["b@x"]]
 
 
+def test_batch_cap_constants() -> None:
+    # Spec 080 §5.4; named constants so that Design B is a change of constants (ruling E-im5).
+    assert (LOCATE_BATCH_VALUES, LOOKUP_BATCH_VALUES, MAX_THRID_VALUES, MAX_OR_BYTES) == (20, 10, 20, 4000)
+
+
+def test_lookup_batches_ten_ids_twenty_keys() -> None:
+    both = ("In-Reply-To", "References")
+    values = ids(25, 2)
+    batches = or_batches(values, both, max_values=LOOKUP_BATCH_VALUES)
+    assert [len(batch) for batch in batches] == [10, 10, 5]
+    assert [value for batch in batches for value in batch] == values
+    for batch in batches:
+        built = header_or(both, batch)
+        assert built.count(b"HEADER ") == 2 * len(batch)
+        assert len(built) <= MAX_OR_BYTES
+    long_values = [f"{index:02d}{'v' * 286}@example.org" for index in range(25)]
+    assert {len(value) for value in long_values} == {300}
+    assert all(MESSAGE_ID_PATTERN.fullmatch(value) for value in long_values)
+    long_batches = or_batches(long_values, both, max_values=LOOKUP_BATCH_VALUES)
+    assert [value for batch in long_batches for value in batch] == long_values
+    assert max(len(batch) for batch in long_batches) < LOOKUP_BATCH_VALUES  # the byte cap comes first
+    for index, batch in enumerate(long_batches):
+        assert len(header_or(both, batch)) <= MAX_OR_BYTES
+        if index + 1 < len(long_batches):
+            assert len(header_or(both, [*batch, long_batches[index + 1][0]])) > MAX_OR_BYTES
+
+
+# --- Gmail thread ids ---------------------------------------------------------------------------------------------
+
+
+def test_thrid_or_balanced_shapes() -> None:
+    assert thrid_or([7]) == b"X-GM-THRID 7"
+    assert thrid_or([1, 2**64 - 1]) == b"OR X-GM-THRID 1 X-GM-THRID 18446744073709551615"
+    assert thrid_or([1, 2, 3]) == b"OR (OR X-GM-THRID 1 X-GM-THRID 2) X-GM-THRID 3"
+    assert thrid_or([0, 5, 0, 5, 6]) == b"OR (OR X-GM-THRID 0 X-GM-THRID 5) X-GM-THRID 6"  # duplicates removed in order
+    assert paren_depth(thrid_or(range(1, 21))) <= 6
+    assert criteria(b"NOT DRAFT", thrid_or([1, 2])) == b"NOT DRAFT OR X-GM-THRID 1 X-GM-THRID 2"
+
+
+def test_thrid_values_refused() -> None:
+    bad_values: list[Any] = [-1, 2**64, True, False, "5", 5.0, None, b"5"]
+    for value in bad_values:
+        with pytest.raises(ValueError, match="thread id refused") as caught:
+            thrid_or([1, value])
+        assert str(caught.value) == "thread id refused"  # fixed text: never the refused value
+        with pytest.raises(ValueError, match="thread id refused"):
+            thrid_batches([1, value])
+    bad_sequences: list[Any] = ["5", b"5"]
+    for sequence in bad_sequences:
+        with pytest.raises(ValueError, match="not one string"):
+            thrid_or(sequence)
+        with pytest.raises(ValueError, match="not one string"):
+            thrid_batches(sequence)
+    with pytest.raises(ValueError, match="no thread ids"):
+        thrid_or([])
+    assert thrid_batches([]) == []
+
+
+def test_thrid_batches_caps() -> None:
+    values = list(range(1000, 1045))
+    batches = thrid_batches(values)
+    assert [len(batch) for batch in batches] == [20, 20, 5]
+    assert [value for batch in batches for value in batch] == values
+    assert thrid_batches([3, 1, 3, 2, 1], max_values=2) == [[3, 1], [2]]  # duplicates removed in order
+    largest = [2**64 - 1 - index for index in range(MAX_THRID_VALUES)]
+    assert len(thrid_or(largest)) <= MAX_OR_BYTES  # 20 keys of the largest id fit one batch
+    assert thrid_batches(largest) == [largest]
+    small = list(range(1, 10))  # `X-GM-THRID n` is 12 bytes; two keys under one OR are 28
+    assert thrid_batches(small, max_bytes=28) == [[1, 2], [3, 4], [5, 6], [7, 8], [9]]
+    assert thrid_batches(small, max_bytes=27) == [[value] for value in small]
+    for cap in range(31, 400, 5):
+        capped = thrid_batches(largest, max_bytes=cap)
+        assert [value for batch in capped for value in batch] == largest
+        for index, batch in enumerate(capped):
+            assert len(thrid_or(batch)) <= cap
+            if index + 1 < len(capped):
+                assert len(thrid_or([*batch, capped[index + 1][0]])) > cap
+    bad_caps: list[Any] = [0, -1, True, 1.5, None]
+    for cap in bad_caps:
+        with pytest.raises(ValueError, match="max_values must be positive"):
+            thrid_batches(small, max_values=cap)
+        with pytest.raises(ValueError, match="max_bytes must be positive"):
+            thrid_batches(small, max_bytes=cap)
+    with pytest.raises(ValueError, match="max_bytes below one thread id key"):
+        thrid_batches([2**64 - 1], max_bytes=30)  # one key alone is longer than the cap
+
+
 # --- quoting and the final criteria -------------------------------------------------------------------------------
 
 
@@ -378,6 +471,12 @@ def test_gmail_label_keys_exact_bytes() -> None:
     assert gmail_label_keys("archive") == b'NOT X-GM-LABELS "\\\\Inbox" NOT X-GM-LABELS "\\\\Sent"'
     with pytest.raises(ValueError, match="unknown Gmail label filter"):
         gmail_label_keys("trash")  # type: ignore[arg-type]  # outside GmailLabelFilter on purpose
+
+
+def test_gmail_sent_label_key_is_the_one_sent_literal() -> None:
+    # P10: the reply step's key is `\Sent` with or without `\Inbox`, the same literal as the `sent` list filter's.
+    assert GMAIL_SENT_LABEL_KEY == b'X-GM-LABELS "\\\\Sent"'
+    assert gmail_label_keys("sent").startswith(GMAIL_SENT_LABEL_KEY + b" ")
 
 
 def test_gmail_label_keys_select_by_label_in_the_fake() -> None:
