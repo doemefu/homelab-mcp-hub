@@ -119,6 +119,7 @@ _FOLDER_RANK: Final[dict[MailFolder, int]] = {"inbox": 0, "archive": 1, "sent": 
 _KEPT_CAUSES: Final = frozenset({"Throttled", "Forbidden"})
 _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anything else is "not a number"
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status provider call (SR6)
+MAX_FAILURE_LOGS: Final = 20  # provider_call_failed lines per get_message_status call, one per class (SR6, S-F2)
 MAX_THREAD_SPLITS: Final = 10  # one-conversation re-requests of full conversationId answers per call (C14)
 _log = logging.getLogger("mcp_hub.providers.graph")
 
@@ -316,7 +317,14 @@ class _StatusRun:
     """State of one `message_status` work run. It is built inside `work`, so the restart after a 401 starts clean
     (Graph G9)."""
 
-    def __init__(self, client: httpx2.Client, token: str, deadline: CallDeadline, fresh: GraphFolderIds | None) -> None:
+    def __init__(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        fresh: GraphFolderIds | None,
+        logged: set[tuple[str, str | None]],
+    ) -> None:
         self.client, self.token, self.deadline = client, token, deadline
         self.fresh = fresh  # the folder ids when this call read them; None when they came from an earlier call
         self.located: dict[str, MessageStatus] = {}  # by bare Message-ID
@@ -325,7 +333,7 @@ class _StatusRun:
         self.entries: dict[str, dict[str, ThreadEntry]] = {}  # by conversationId, then Graph id (united by id, C14)
         self.checked: set[str] = set()  # conversations whose answer was complete (not failed, not full, all usable)
         self.no_sent = False  # the account has no sentitems folder: no reply can be found (C5)
-        self.throttle_logged = False  # later back-off fast-fails send no request and are not logged again (T12-1)
+        self.logged = logged  # the (outcome, exception) classes of the call's provider_call_failed lines (S-F2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,8 +535,9 @@ class GraphMailbox:
     def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]:
         """One status per target, in order (spec 080 §5.2 `get_message_status`). Account failures raise; a soft stop
         before the token or the folder ids makes every entry incomplete_search."""
+        logged: set[tuple[str, str | None]] = set()  # outlives a 401 restart: the log cap holds per call (S-F2)
         return self._run(
-            lambda client, token, call: self._message_status(client, token, call, targets),
+            lambda client, token, call: self._message_status(client, token, call, targets, logged),
             deadline,
             on_soft_stop=lambda: [status_unknown("incomplete_search") for _ in targets],
         )
@@ -912,7 +921,12 @@ class GraphMailbox:
 
     # --- get_message_status ---------------------------------------------------------------------------------------
     def _message_status(
-        self, client: httpx2.Client, token: str, deadline: CallDeadline, targets: Sequence[StatusTarget]
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        targets: Sequence[StatusTarget],
+        logged: set[tuple[str, str | None]],
     ) -> list[MessageStatus]:
         """Folder ids, then the `ref` location batches, then the `g` reads, then the conversations (A-sec2).
 
@@ -920,7 +934,7 @@ class GraphMailbox:
         every found entry whose conversation was not checked by then has `thread_checked: false`."""
         fresh = not isinstance(self._folder_maps.get(self._account), GraphFolderIds)
         ids = self._folder_ids(client, token, deadline)  # a soft stop here: on_soft_stop; a failure fails the account
-        run = _StatusRun(client, token, deadline, ids if fresh else None)
+        run = _StatusRun(client, token, deadline, ids if fresh else None, logged)
         message_ids = [
             t.message_id
             for t in targets
@@ -962,15 +976,16 @@ class GraphMailbox:
             self._degraded(MalformedItemError())
 
     def _batch_failed(self, run: _StatusRun, exc: ProviderError | MalformedItemError) -> None:
-        """One WARNING per failed batch with the cause class only; the status store and account_errors stay (GR4).
+        """A WARNING with the cause class only; the status store and account_errors stay (GR4).
 
-        Only the first `Throttled` of a run is logged: the back-off it starts makes every later batch fail without a
-        request (T12-1)."""
+        Only the first failed batch of each (outcome, exception) class is logged per call, at most MAX_FAILURE_LOGS
+        lines (S-F2): 50 failing `g` reads write one line, and after a `Throttled` answer the back-off makes every
+        later batch fail without a request (T12-1)."""
         error = exc if isinstance(exc, ProviderError) else ProviderError("upstream_error", type(exc).__name__)
-        if error.cause == "Throttled":
-            if run.throttle_logged:
-                return
-            run.throttle_logged = True
+        key = (error.code, error.cause)
+        if key in run.logged or len(run.logged) >= MAX_FAILURE_LOGS:
+            return
+        run.logged.add(key)
         log_provider_failure(self._account, "mail", error)
 
     def _lookup_answer(self, run: _StatusRun, params: dict[str, str], top: int) -> tuple[list[object], bool]:

@@ -519,6 +519,46 @@ def test_item_degraded_logged_at_most_twenty_times() -> None:
     assert len(logs.named("item_degraded")) == 20  # SR6
 
 
+def failing_reads_server() -> tuple[Server, list[StatusTarget]]:
+    """A location batch and 48 `g` reads answered 500, one `g` read too large: 50 failed batches of two classes."""
+    reads = {gid(n): js({}, 500) for n in range(48)} | {gid(48): raw(TOO_LARGE)}
+    return Server(js({"error": {"code": "x"}}, 500), reads), [ref(1), *(gref(n) for n in range(49))]
+
+
+def failure_classes(logs: "Logs") -> list[tuple[str, str]]:
+    return [(e["outcome"], e["exception"]) for e in logs.named("provider_call_failed")]
+
+
+def test_batch_failure_logged_once_per_class_per_call() -> None:
+    clock = FakeClock()
+    server, targets = failing_reads_server()
+    with Logs() as logs:
+        result = status(mailbox(server, clock, maps=primed(clock)), targets, clock)
+    assert states(result) == ["incomplete_search"] * 50
+    assert len(server.reads()) == 49  # every batch is still sent; only the log lines are capped (S-F2)
+    assert failure_classes(logs) == [("upstream_error", "UnexpectedStatus"), ("too_large", "ResponseTooLarge")]
+
+
+def test_batch_failure_lines_capped_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(graph, "MAX_FAILURE_LOGS", 1)
+    clock = FakeClock()
+    server, targets = failing_reads_server()
+    with Logs() as logs:
+        status(mailbox(server, clock, maps=primed(clock)), targets, clock)
+    assert failure_classes(logs) == [("upstream_error", "UnexpectedStatus")]
+
+
+def test_batch_failure_class_logged_once_across_the_401_restart() -> None:
+    clock = FakeClock()
+    tokens = FakeTokens()
+    server = Server(sequence(js({}, 500), js({}, 401), js({}, 500)))
+    with Logs() as logs:
+        result = status(mailbox(server, clock, tokens=tokens, maps=primed(clock)), [ref(n) for n in range(11)], clock)
+    assert states(result) == ["incomplete_search"] * 11
+    assert (tokens.issued, tokens.invalidated, len(server.located())) == (2, 1, 4)
+    assert failure_classes(logs) == [("upstream_error", "UnexpectedStatus")]  # the cap holds per call, not per run
+
+
 def test_any_copy_in_sentitems_makes_direction_outgoing() -> None:
     clock = FakeClock()
     items = (copy(1, 1, LATER - timedelta(hours=1)), copy(2, 1, LATER, SENT_ID), copy(3, 2))
@@ -862,7 +902,7 @@ def test_status_logs_carry_no_filter_values_or_ids() -> None:
         status(mailbox(server, clock), targets, clock)
     assert len(server.conversations()) == 1
     failed = logs.named("provider_call_failed")
-    assert [(e["level"], e["exception"]) for e in failed] == [("WARNING", "UnexpectedStatus")] * 3
+    assert [(e["level"], e["exception"]) for e in failed] == [("WARNING", "UnexpectedStatus")]  # 3 batches, 1 class
     assert len(logs.named("item_degraded")) == 1
     for event in logs.events():
         assert set(event) <= allowed_fields(str(event["event"]))
