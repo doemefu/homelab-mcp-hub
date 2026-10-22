@@ -316,6 +316,7 @@ async def test_read_only_snapshot_unchanged(secrets_dir: Path, monkeypatch: pyte
         any(state[0] == "found" for state in states) and any(state != ("found", None, True) for state in states)
         for states in partial
     )  # stopped in the middle: what was read is kept
+    assert any(("found", None, False) in states for states in partial)  # stopped inside the reply and thread lookups
     assert greenmail.snapshot(login, FOLDERS) == before
 
 
@@ -415,7 +416,7 @@ def assert_hand_over(items: list[StatusItem], t0: datetime, refs: tuple[str, str
     assert all((item.state, item.reason, item.thread_checked) == ("found", None, True) for item in items)
     assert (request.folder, request.direction, instant(request.received_at)) == ("inbox", "incoming", t0)
     assert request.flags is not None
-    assert request.flags.answered is False
+    assert (request.flags.seen, request.flags.answered) == (False, False)
     assert (request.replied, instant(request.replied_at), request.reply_ref) == (
         True,
         t0 + timedelta(minutes=1),
@@ -430,6 +431,8 @@ def assert_hand_over(items: list[StatusItem], t0: datetime, refs: tuple[str, str
     assert (reply.replied, reply.replied_at, reply.reply_ref) == (False, None, None)
     assert (reply.newer_incoming_in_thread, instant(reply.newer_incoming_at)) == (True, t0 + timedelta(minutes=2))
     assert (follow_up.folder, follow_up.direction) == ("inbox", "incoming")
+    assert follow_up.flags is not None
+    assert follow_up.flags.seen is False
     assert (follow_up.replied, follow_up.newer_incoming_in_thread, follow_up.newer_incoming_at) == (False, False, None)
 
 
@@ -439,7 +442,9 @@ async def test_status_hand_over(secrets_dir: Path) -> None:
     login = "hub-get"
     greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
     t0, refs = seed_hand_over(login, "ho", lambda request, reply: (request, reply))
+    before = greenmail.snapshot(login, FOLDERS)  # read-only also on the reply and thread hits (64 KiB header item)
     assert_hand_over(await statuses(hub(secrets_dir, login), *refs), t0, refs)
+    assert greenmail.snapshot(login, FOLDERS) == before
 
 
 async def test_status_hand_over_outlook_style(secrets_dir: Path) -> None:
@@ -448,7 +453,9 @@ async def test_status_hand_over_outlook_style(secrets_dir: Path) -> None:
     login = "hub-get"
     greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
     t0, refs = seed_hand_over(login, "hoo", lambda _request, reply: (reply,))
+    before = greenmail.snapshot(login, FOLDERS)
     assert_hand_over(await statuses(hub(secrets_dir, login), *refs), t0, refs)
+    assert greenmail.snapshot(login, FOLDERS) == before
 
 
 async def test_status_archived(secrets_dir: Path) -> None:
