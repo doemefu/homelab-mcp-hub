@@ -34,9 +34,7 @@ from mcp_hub.providers.base import (
     status_unknown,
 )
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.graph import GraphMailbox
 from mcp_hub.providers.imap import ImapMailbox
-from tests.support.graph_fixtures import FakeTokens
 from tests.support.logcapture import Capture
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -319,8 +317,6 @@ def test_get_thread_stubs_are_not_implemented_yet() -> None:
         password="p",
         client_factory=refuse,  # type: ignore[arg-type]
     )
-    graph = GraphMailbox("outlook", FakeTokens(), client_factory=refuse)  # type: ignore[arg-type]
-    for mailbox in (imap, graph):
-        with pytest.raises(ProviderError) as info:
-            mailbox.get_thread(query, CallDeadline.start())
-        assert (info.value.code, info.value.cause) == ("upstream_error", "NotImplemented")
+    with pytest.raises(ProviderError) as info:  # GraphMailbox.get_thread: tests/unit/test_graph_thread.py (T11)
+        imap.get_thread(query, CallDeadline.start())
+    assert (info.value.code, info.value.cause) == ("upstream_error", "NotImplemented")
