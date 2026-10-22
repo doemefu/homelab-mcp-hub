@@ -1,5 +1,6 @@
 """get_message_status (spec 080 §5.2, §5.4 A-td6): entry validation, per-position mapping, pre-checks without a
-provider call, the null rules (E-td1), the tool's own output budget and the wrapper (WP13b T14)."""
+provider call, the null rules (E-td1), the tool's own output budget and the wrapper (WP13b T14), and the real Graph
+adapter behind the tool (M3)."""
 
 import base64
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx2
 import pytest
 from pydantic import ValidationError
 from starlette.testclient import TestClient
@@ -49,7 +51,8 @@ from mcp_hub.providers.base import (
     status_unknown,
 )
 from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.folders import FOLDER_MAPS, MailFolder, build_imap_folder_map
+from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache, MailFolder, build_imap_folder_map
+from mcp_hub.providers.graph import Backoff, GraphMailbox
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext, common, mail_status
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE, structured_result
@@ -65,6 +68,7 @@ from mcp_hub.tools.mail_status import (
     run_get_message_status,
     unknown_item,
 )
+from tests.support.graph_fixtures import FOLDER_IDS, FakeTokens, message
 from tests.support.logfields import allowed_fields
 from tests.support.mcp import body, modern
 from tests.support.tokens import TokenFactory
@@ -976,4 +980,139 @@ def test_tool_call_log_line(wired: tuple[TestClient, Fake], tokens: TokenFactory
     text = "\n".join(captured.lines)
     item_ids = [i["id"] for i in ok["structuredContent"]["items"] if i["id"]]
     for forbidden in [*entries, *item_ids, MID, "Private Folder", "INBOX"]:
+        assert forbidden not in text, forbidden
+
+
+# --- the real Graph adapter behind the tool (M3) ------------------------------------------------------------------
+
+GONE_MID = "gone@example.test"
+
+
+def graph_copy(n: int, message_id: str) -> dict[str, object]:
+    """Graph item `n` in the inbox, a copy of `message_id` received at NOW; no extended properties (not answered)."""
+    return message(n, internetMessageId=f"<{message_id}>", receivedDateTime=NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def graph_json(body: object, status: int = 200) -> httpx2.Response:
+    return httpx2.Response(status, content=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+
+
+@dataclass
+class GraphStub:
+    """Graph v1.0 by path: the well-known folder GETs, the location and conversation lookups over `items`, and the
+    `g` reads, which answer 500 for item 3 and 404 otherwise. `location` is the status of every location lookup."""
+
+    items: list[dict[str, object]]
+    location: int = 200
+
+    def handle(self, request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path
+        if path.startswith("/v1.0/me/mailFolders/"):
+            return graph_json({"id": FOLDER_IDS[path.rsplit("/", 1)[1]]})
+        if path != "/v1.0/me/messages":
+            return graph_json({"error": {"code": "x"}}, 500 if path.endswith("MSG0003=") else 404)
+        text = request.url.params["$filter"]
+        key = "conversationId" if text.startswith("conversationId eq ") else "internetMessageId"
+        if key == "internetMessageId" and self.location != 200:
+            return graph_json({"error": {"code": "x"}}, self.location)
+        return graph_json({"value": [i for i in self.items if f"{key} eq '{i[key]}'" in text]})
+
+
+def test_graph_adapter_behind_the_tool(
+    settings: Settings, secrets_dir: Path, tokens: TokenFactory, captured: Capture
+) -> None:
+    """run_get_message_status over the wire with the real GraphMailbox on a MockTransport: found, gone (location and
+    404 read), a failed `g` read, an id mismatch, then an account failure; items in input order with the null rules,
+    provider_call_failed next to tool_call, and no value in any log line."""
+    for name in ("outlook-ms-client-id", "db-username", "db-password", "token-encryption-key"):
+        (secrets_dir / name).write_text("placeholder")
+    stub = GraphStub([graph_copy(1, MID)])
+    maps = FolderMapCache()
+
+    def factory(account: Account, _secrets_dir: Path) -> GraphMailbox:
+        assert account.id == "outlook"
+        return GraphMailbox(
+            "outlook",
+            FakeTokens(),
+            client_factory=lambda timeout: httpx2.Client(transport=httpx2.MockTransport(stub.handle), trust_env=False),
+            backoff=Backoff(),
+            folder_maps=maps,
+        )
+
+    found_id = encode_message_id(GraphMessageRef("outlook", "AAMkMSG0001="))
+    failed_id = encode_message_id(GraphMessageRef("outlook", "AAMkMSG0003="))
+    gone_id = encode_message_id(GraphMessageRef("outlook", "AAMkMSG0004="))
+    mismatch = encode_message_id(MessageRef("outlook", "INBOX", 7, 1))
+    entries = [ref("outlook"), ref("outlook", GONE_MID), failed_id, gone_id, mismatch]
+    configure_logging(settings.log_level)
+    logging.getLogger().addHandler(captured)  # configure_logging replaced the root handlers
+    hub = create_app(settings, load_registry(secrets_dir / "accounts.json"), adapters=Adapters(mailbox=factory))
+    with TestClient(hub.public, base_url="https://mcp.furchert.ch") as client:
+        answered = call(client, tokens, {"refs": entries})
+        stub.location = 403  # Forbidden fails the account (GR1)
+        failing = call(client, tokens, {"refs": entries[:2]})
+
+    assert answered["isError"] is False
+    content = answered["structuredContent"]
+    assert content["items"] == [
+        {
+            "ref": ref("outlook"),
+            "account": "outlook",
+            "state": "found",
+            "reason": None,
+            "id": found_id,
+            "folder": "inbox",
+            "received_at": "2026-10-20T07:12:03" + ZONE_OFFSET,
+            "direction": "incoming",
+            "flags": {"seen": False, "answered": False, "flagged": False},
+            "replied": False,
+            "replied_at": None,
+            "reply_ref": None,
+            "newer_incoming_in_thread": False,
+            "newer_incoming_at": None,
+            "thread_checked": True,
+        },
+        {"ref": ref("outlook", GONE_MID), "account": "outlook", "state": "gone", "reason": None} | NULL_FIELDS,
+        {"input": failed_id, "ref": None, "account": "outlook", "state": "unknown", "reason": "incomplete_search"}
+        | NULL_FIELDS,
+        {"input": gone_id, "ref": None, "account": "outlook", "state": "gone", "reason": None} | NULL_FIELDS,
+        {"input": mismatch, "ref": None, "account": "outlook", "state": "unknown", "reason": "id_mismatch"}
+        | NULL_FIELDS,
+    ]
+    assert (content["account_errors"], content["truncated"], content["next_cursor"]) == ([], False, None)
+
+    assert failing["isError"] is False
+    assert [(i["state"], i["reason"]) for i in failing["structuredContent"]["items"]] == [
+        ("unknown", "account_error")
+    ] * 2
+    assert failing["structuredContent"]["account_errors"] == [
+        {"account": "outlook", "capability": "mail", "code": "upstream_error", "message": "Provider returned an error"}
+    ]
+
+    events = [json.loads(line) for line in captured.lines]
+    logged = [e for e in events if e["event"] in {"provider_call_failed", "tool_call"}]
+    assert [(e["event"], e.get("outcome"), e.get("exception")) for e in logged] == [
+        ("provider_call_failed", "upstream_error", "UnexpectedStatus"),  # the failed `g` read, while the call goes on
+        ("tool_call", "ok", None),
+        ("provider_call_failed", "upstream_error", "Forbidden"),  # the failed account
+        ("tool_call", "error", None),
+    ]
+    assert [(e["accounts"], e["result_count"]) for e in logged if e["event"] == "tool_call"] == [
+        (["outlook"], 5),
+        (["outlook"], 2),
+    ]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    text = "\n".join(captured.lines)
+    for forbidden in [
+        *entries,
+        found_id,
+        MID,
+        GONE_MID,
+        "example.test",
+        "AAMkMSG",
+        "AAQkCONV",
+        *FOLDER_IDS.values(),
+        "AT-SENTINEL",
+        "graph.microsoft.com",
+    ]:
         assert forbidden not in text, forbidden
