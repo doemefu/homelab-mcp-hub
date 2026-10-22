@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items
 from mcp_hub.errors import ToolError
@@ -76,6 +76,8 @@ GET_MESSAGE_STATUS_DESCRIPTION: Final = (
 class StatusItem(BaseModel):
     """Field order follows the spec bullets; `input` is left out of the output unless it differs from `ref`."""
 
+    model_config = ConfigDict(extra="forbid")
+
     input: str | None = Field(default=None, exclude_if=lambda value: value is None)
     ref: str | None
     account: str
@@ -122,6 +124,8 @@ class StatusItem(BaseModel):
 
 
 class MessageStatusResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     untrusted_content_notice: str
     items: list[StatusItem]
     next_cursor: None

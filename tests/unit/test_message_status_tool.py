@@ -662,6 +662,23 @@ def test_builders_enforce_invariants() -> None:
             StatusItem.model_validate(case)
 
 
+def test_output_models_refuse_unknown_fields() -> None:
+    """PR #51 review CR8 (code style: tool outputs are `extra="forbid"`): a misspelled field is an error."""
+    item = payload(gone_item("e", "e", "icloud"))
+    with pytest.raises(ValidationError):
+        StatusItem.model_validate(item | {"replyed": False})
+    result = {
+        "untrusted_content_notice": UNTRUSTED_CONTENT_NOTICE,
+        "items": [item],
+        "next_cursor": None,
+        "truncated": False,
+        "account_errors": [],
+    }
+    assert MessageStatusResult.model_validate(result).items[0].state == "gone"
+    with pytest.raises(ValidationError):
+        MessageStatusResult.model_validate(result | {"more": True})
+
+
 async def test_input_echo_only_when_differs_from_ref(secrets_dir: Path) -> None:
     inbox, graph = MessageRef("icloud", "INBOX", 7, 3), GraphMessageRef("outlook", "AAMkMSG0001=")
     no_mid = MessageRef("icloud", "INBOX", 7, 4)
