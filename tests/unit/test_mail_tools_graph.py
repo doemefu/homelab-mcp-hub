@@ -6,9 +6,9 @@ import pytest
 from mcp_hub.config import load_settings
 from mcp_hub.errors import ToolError
 from mcp_hub.health import StatusStore
-from mcp_hub.ids import AnyMessageRef, GraphMessageRef, MessageRef, encode_message_id
+from mcp_hub.ids import AnyMessageRef, GraphMessageRef, MessageRef, StableRef, encode_message_id, encode_ref
 from mcp_hub.providers import SUPPORTED_PROTOCOLS, Adapters
-from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, MailSummary, ProviderError
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, MailMeta, MailSummary, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
@@ -50,7 +50,7 @@ def unread_page(items: list[MailSummary], more: bool) -> FolderPage:
 class Box:
     def __init__(self, account: Account, pages: dict[str, FolderPage | Exception], detail: MailDetail | None) -> None:
         self.account, self.pages, self.detail = account, pages, detail
-        self.asked: list[AnyMessageRef] = []
+        self.asked: list[AnyMessageRef | StableRef] = []
 
     def check(self, deadline: CallDeadline) -> None: ...
 
@@ -60,7 +60,7 @@ class Box:
             raise page
         return page
 
-    def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail:
+    def get_message(self, ref: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         self.asked.append(ref)
         assert self.detail is not None
         return self.detail
@@ -163,3 +163,30 @@ async def test_get_message_graph_result_folder_inbox(secrets_dir: Path) -> None:
     dumped = result.model_dump_json()
     assert "\ud800" not in dumped
     assert "\\ud800" not in dumped
+
+
+@pytest.mark.parametrize("by", ["id", "ref"])
+async def test_get_message_graph_folder_from_the_message_not_the_id(secrets_dir: Path, by: str) -> None:
+    """The output `folder` is the folder the adapter found (D75: any readable folder), never the id's kind."""
+    ref = GraphMessageRef("outlook", "AAMkMSG0002=")
+    detail = MailDetail(
+        ref=ref,
+        received_at=NOW,
+        unread=False,
+        attachments=[],
+        from_address="owner@example.test",
+        from_name="Owner",
+        to_addresses=[],
+        cc_addresses=[],
+        subject="S",
+        body_text="B",
+        body_source="text/plain",
+        body_cut=False,
+        meta=MailMeta(folder="archive", direction="outgoing", message_id="m2@example.test"),
+    )
+    opened: list[str] = []
+    given = {"message_id": encode_message_id(ref)} if by == "id" else {"ref": encode_ref("outlook", "m2@example.test")}
+    result, _ = await run_get_message(ctx(secrets_dir, {}, detail, opened=opened), max_chars=None, **given)
+    assert (result.folder, result.direction, result.id) == ("archive", "outgoing", encode_message_id(ref))
+    assert result.untrusted.folder_name is None  # Graph has no server folder name
+    assert opened == ["outlook"]

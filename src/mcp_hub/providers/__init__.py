@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Final, Protocol
 from zoneinfo import ZoneInfo
 
-from mcp_hub.ids import AnyMessageRef
+from mcp_hub.ids import AnyMessageRef, StableRef
 from mcp_hub.own_addresses import OWN_ADDRESSES
 from mcp_hub.providers.base import (
     AccountLimiters,
@@ -36,7 +36,7 @@ SUPPORTED_PROTOCOLS: Final[dict[Capability, frozenset[WireProtocol]]] = {
 
 class Mailbox(Protocol):
     def check(self, deadline: CallDeadline) -> None: ...
-    def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail: ...
+    def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail: ...
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage: ...
 
 

@@ -48,6 +48,9 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
         "list_messages",
         "list_unread",
     ]
+    get_message = next(t for t in body(listed)["result"]["tools"] if t["name"] == "get_message")
+    assert {"id", "ref", "max_chars"} <= set(get_message["inputSchema"]["properties"])  # rev. 4.9: id or ref
+    assert "id" not in get_message["inputSchema"].get("required", [])
     called = modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
     assert called.status_code == 200
     assert body(called)["result"]["isError"] is False

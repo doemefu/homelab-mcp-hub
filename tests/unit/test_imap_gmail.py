@@ -179,6 +179,7 @@ def test_inbox_keeps_examine_inbox() -> None:
     assert [item.subject for item in listed.items] == ["a"]
     assert examined(unread) == ["INBOX"]
     assert searches(unread) == [b"NOT DRAFT UNSEEN SINCE 19-Oct-2026"]
+    assert "LIST" not in names(unread)
 
 
 def test_inbox_message_with_inbox_and_sent_labels_is_outgoing() -> None:

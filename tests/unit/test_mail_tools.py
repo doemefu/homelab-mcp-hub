@@ -9,14 +9,17 @@ import pytest
 from mcp_hub.config import load_settings
 from mcp_hub.errors import ToolError
 from mcp_hub.health import StatusStore
-from mcp_hub.ids import MessageRef, decode_message_id, encode_message_id
+from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, decode_message_id, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import AttachmentMeta, FolderPage, ListQuery, MailDetail, MailSummary, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import FOLDER_MAPS, build_imap_folder_map
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE
 from mcp_hub.tools.mail import LIST_UNREAD_DESCRIPTION, run_get_message, run_list_messages, run_list_unread
+from tests.support.imap_fake import FakeFolder, FakeImapServer
 
 pytestmark = pytest.mark.anyio
 NOW = datetime(2026, 9, 29, 7, 0, tzinfo=UTC)
@@ -46,25 +49,27 @@ def unread_page(items: list[MailSummary], more: bool) -> FolderPage:
     return FolderPage(items, more, truncated=False, complete=True)
 
 
-QUERIES: list[ListQuery] = []
-
-
 class FakeMailbox:
     def __init__(
-        self, account: Account, pages: dict[str, FolderPage | Exception], detail: MailDetail | Exception | None
+        self,
+        account: Account,
+        pages: dict[str, FolderPage | Exception],
+        detail: MailDetail | Exception | None,
+        queries: list[ListQuery] | None = None,
     ) -> None:
         self.account, self.pages, self.detail = account, pages, detail
+        self.queries = queries if queries is not None else []
 
     def check(self, deadline: CallDeadline) -> None: ...
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
-        QUERIES.append(query)
+        self.queries.append(query)
         page = self.pages[self.account.id]
         if isinstance(page, Exception):
             raise page
         return page
 
-    def get_message(self, ref: MessageRef, deadline: CallDeadline) -> MailDetail:
+    def get_message(self, ref: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         if isinstance(self.detail, Exception):
             raise self.detail
         assert self.detail is not None
@@ -76,11 +81,19 @@ def context(
     pages: dict[str, FolderPage | Exception],
     detail: MailDetail | Exception | None = None,
     env: dict[str, str] | None = None,
+    queries: list[ListQuery] | None = None,
+    opened: list[str] | None = None,
 ) -> HubContext:
     for ref in ("gmail-username", "gmail-app-password"):
         (secrets_dir / ref).write_text("placeholder")
     settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)} | (env or {}))
-    adapters = Adapters(mailbox=lambda account, _dir: FakeMailbox(account, pages, detail))
+
+    def mailbox(account: Account, _dir: Path) -> FakeMailbox:
+        if opened is not None:
+            opened.append(account.id)
+        return FakeMailbox(account, pages, detail, queries)
+
+    adapters = Adapters(mailbox=mailbox)
     return HubContext(settings, load_registry(secrets_dir / "accounts.json"), StatusStore(), adapters)
 
 
@@ -251,12 +264,72 @@ async def test_get_message_provider_failure_is_a_tool_error(secrets_dir: Path, e
     assert caught.value.code == code
 
 
-async def test_forged_id_for_another_folder_is_not_found_without_provider_call(secrets_dir: Path) -> None:
-    ctx = context(secrets_dir, {}, AssertionError("provider must not be called"))
-    forged = encode_message_id(MessageRef("icloud", "Sent Messages", 7, 3))
+ICLOUD_LISTING: list[tuple[tuple[bytes, ...], bytes, bytes]] = [
+    ((), b"/", b"INBOX"),
+    ((b"\\Sent",), b"/", b"Sent Messages"),
+    ((b"\\Junk",), b"/", b"Junk"),
+    ((b"\\Drafts",), b"/", b"Drafts"),
+]
+
+
+def icloud_server() -> FakeImapServer:
+    folders = [
+        FakeFolder("INBOX"),
+        FakeFolder("Sent Messages", (b"\\Sent",)),
+        FakeFolder("Junk", (b"\\Junk",)),
+        FakeFolder("Drafts", (b"\\Drafts",)),
+    ]
+    return FakeImapServer(folders)
+
+
+async def test_forged_id_d75_cached_map_refuses_junk_without_provider_call(secrets_dir: Path) -> None:
+    """R10 (D75 replaces the inbox-only rule): with the folder map cached, a Junk id is refused by the tool."""
+    FOLDER_MAPS.put(build_imap_folder_map("icloud", "INBOX", gmail=False, listing=ICLOUD_LISTING))
+    opened: list[str] = []
+    ctx = context(secrets_dir, {}, AssertionError("provider must not be called"), opened=opened)
+    forged = encode_message_id(MessageRef("icloud", "Junk", 7, 3))
     with pytest.raises(ToolError) as caught:
         await run_get_message(ctx, message_id=forged, max_chars=None)
     assert caught.value.code == "not_found"
+    assert opened == []
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cached-map", "no-map"])
+async def test_forged_id_d75_sent_messages_reaches_the_adapter(secrets_dir: Path, cached: bool) -> None:
+    """R10: an id naming `Sent Messages` is valid under D75; the tool passes it on."""
+    if cached:
+        FOLDER_MAPS.put(build_imap_folder_map("icloud", "INBOX", gmail=False, listing=ICLOUD_LISTING))
+    opened: list[str] = []
+    sent = MessageRef("icloud", "Sent Messages", 7, 3)
+    ctx = context(secrets_dir, {}, detail(ref=sent), opened=opened)
+    result, _ = await run_get_message(ctx, message_id=encode_message_id(sent), max_chars=None)
+    assert opened == ["icloud"]
+    assert result.id == encode_message_id(sent)
+
+
+async def test_forged_id_d75_without_map_junk_refused_after_list_before_examine(secrets_dir: Path) -> None:
+    """R10: with no cached map the adapter decides: LIST, then not_found without EXAMINE (T14)."""
+    server = icloud_server()
+    base = context(secrets_dir, {})
+
+    def mailbox(account: Account, _dir: Path) -> ImapMailbox:
+        return ImapMailbox(
+            account.id,
+            host="imap.example.test",
+            port=993,
+            folder="INBOX",
+            username="u",
+            password="p",
+            client_factory=lambda host, port, context, timeout: server.client(),
+        )
+
+    ctx = HubContext(base.settings, base.registry, base.status, Adapters(mailbox=mailbox))
+    with pytest.raises(ToolError) as caught:
+        await run_get_message(ctx, message_id=encode_message_id(MessageRef("icloud", "Junk", 7, 3)), max_chars=None)
+    assert caught.value.code == "not_found"
+    commands = [name for name, _ in server.commands]
+    assert "LIST" in commands
+    assert "EXAMINE" not in commands
 
 
 @pytest.mark.parametrize(
@@ -333,11 +406,12 @@ async def test_get_message_for_a_disabled_account_is_capability_unavailable(
 
 
 async def test_list_unread_is_inbox_unread_list(secrets_dir: Path) -> None:
-    QUERIES.clear()
+    queries: list[ListQuery] = []
     pages: dict[str, FolderPage | Exception] = {"icloud": unread_page([], False), "gmail": unread_page([], False)}
-    await run_list_unread(context(secrets_dir, pages), account=None, since=None, limit=7, cursor=None, now=NOW)
-    assert len(QUERIES) == 2
-    for query in QUERIES:
+    ctx = context(secrets_dir, pages, queries=queries)
+    await run_list_unread(ctx, account=None, since=None, limit=7, cursor=None, now=NOW)
+    assert len(queries) == 2
+    for query in queries:
         assert (query.folder, query.unread_only, query.direction, query.limit) == ("inbox", True, None, 7)
         assert query.since == NOW - timedelta(hours=24)
         assert query.position is None
@@ -350,10 +424,20 @@ async def test_list_unread_cursor_bound_to_tool(secrets_dir: Path) -> None:
     first, _, _ = await run_list_unread(ctx, account=None, since=None, limit=2, cursor=None, now=NOW)
     assert first.next_cursor is not None
     assert first.truncated is True
-    second, _, _ = await run_list_unread(ctx, account=None, since=None, limit=2, cursor=first.next_cursor, now=NOW)
-    assert [decode_message_id(i.id).uid for i in second.items] == [3, 4]  # type: ignore[union-attr,arg-type]
+    # only `limit` may change between pages
+    second, _, _ = await run_list_unread(ctx, account=None, since=None, limit=3, cursor=first.next_cursor, now=NOW)
+    assert [decode_message_id(i.id).uid for i in second.items] == [3, 4, 5]  # type: ignore[union-attr,arg-type]
     with pytest.raises(ToolError) as caught:  # a cursor of another argument set is refused
         await run_list_unread(ctx, account="icloud", since=None, limit=2, cursor=first.next_cursor, now=NOW)
+    assert caught.value.code == "invalid_cursor"
+    since, other_since = "2026-09-29T00:00:00Z", "2026-09-29T00:00:01Z"
+    explicit, _, _ = await run_list_unread(ctx, account=None, since=since, limit=2, cursor=None, now=NOW)
+    assert explicit.next_cursor is not None
+    with pytest.raises(ToolError) as caught:  # another explicit `since` is another argument set
+        await run_list_unread(ctx, account=None, since=other_since, limit=2, cursor=explicit.next_cursor, now=NOW)
+    assert caught.value.code == "invalid_cursor"
+    with pytest.raises(ToolError) as caught:  # an omitted `since` differs from an explicit one
+        await run_list_unread(ctx, account=None, since=None, limit=2, cursor=explicit.next_cursor, now=NOW)
     assert caught.value.code == "invalid_cursor"
     listed, _, _ = await run_list_messages(
         ctx, tool="list_messages", account=None, folder="inbox", since=None, unread_only=True, direction=None,
