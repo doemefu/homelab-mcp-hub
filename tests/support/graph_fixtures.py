@@ -80,8 +80,9 @@ T1B_EXTENDED: Final = ("Integer 0x1081", "String 0x1042", "String 0x1039")
 # `test_fixture_shapes_match_t1c_facts` then turns into a failure, and the marker must go before lane G merges.
 # - "status_14", "status_14b", "status_15", "status_16" -> the HTTP status of each request;
 # - "count_14", "count_14b", "count_15", "count_16" -> the item count of each answer;
-# - "next_link_seen" -> any of the four answers carried `@odata.nextLink`;
+# - "next_link_14", "next_link_14b", "next_link_15", "next_link_16" -> that answer carried `@odata.nextLink` (GR3);
 # - "batch_10_at_cap_ok" -> request 14b (10 values, about 1,800 encoded characters of `$filter`) answered 200 (GR3);
+# - "filter_chars_14b" -> the encoded length of request 14b's `$filter`, as the URL builder printed it;
 # - "request14_both_found", "request14_replied_last_verb" -> request 14 returned both messages, and `Integer 0x1081`
 #   on the replied one (the `$expand` works on the batch; otherwise the C6 fallback);
 # - "request15_only_c1_c2", "request15_sent_reply_after_receipt" -> request 15 returned only items of C1/C2, among

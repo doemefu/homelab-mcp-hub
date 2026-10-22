@@ -1324,6 +1324,30 @@ def test_soft_stop_during_splits_keeps_checked_conversations() -> None:
 
 # --- T17 facts (owner's Graph Explorer run, requests 14, 14b, 15, 16) ----------------------------------------------
 
+T17_TOPS = {"14": STATUS_LOOKUP_TOP, "14b": STATUS_LOOKUP_TOP, "15": THREAD_LOOKUP_TOP, "16": THREAD_LOOKUP_TOP}
+
+
+def short_pages_with_next_link(facts: dict[str, bool | int | None]) -> list[str]:
+    """The T17 requests whose answer carried a nextLink although it held fewer items than its `$top` (GR3).
+
+    A nextLink on a full page is normal: the hub treats that answer as full and never follows the link (C14). One on
+    a short page would make lookups incomplete that are not full."""
+    short = []
+    for request, top in T17_TOPS.items():
+        count = facts[f"count_{request}"]
+        assert isinstance(count, int)
+        if facts[f"next_link_{request}"] and count < top:
+            short.append(request)
+    return short
+
+
+def test_t17_gate_refuses_next_link_only_on_a_short_page() -> None:
+    full: dict[str, bool | int | None] = {f"count_{r}": top for r, top in T17_TOPS.items()}
+    facts = full | {f"next_link_{r}": True for r in T17_TOPS}
+    assert short_pages_with_next_link(facts) == []  # e.g. request 16 filled by a subject-grouped conversation
+    assert short_pages_with_next_link(facts | {"count_16": THREAD_LOOKUP_TOP - 1}) == ["16"]
+    assert short_pages_with_next_link(facts | {"count_14": 2, "next_link_14": False}) == []
+
 
 @pytest.mark.xfail(strict=True, reason="T17: the owner's Graph Explorer facts are not recorded yet (merge gate)")
 def test_fixture_shapes_match_t1c_facts() -> None:
@@ -1331,7 +1355,10 @@ def test_fixture_shapes_match_t1c_facts() -> None:
     for request in ("14", "14b", "15", "16"):
         assert T1C_FACTS[f"status_{request}"] == 200
     assert T1C_FACTS["batch_10_at_cap_ok"] is True  # otherwise lower MAX_FILTER_CHARS first (GR3)
-    assert T1C_FACTS["next_link_seen"] is False  # a routine nextLink would make most lookups incomplete
+    filter_chars = T1C_FACTS["filter_chars_14b"]
+    assert isinstance(filter_chars, int)
+    assert filter_chars >= 1_700  # 14b really came near the cap; a shorter filter proves nothing (G-2)
+    assert short_pages_with_next_link(T1C_FACTS) == []  # a nextLink on a short page would make lookups incomplete
     assert T1C_FACTS["count_14b"] == T1C_FACTS["count_14"]  # the padding values match nothing
     assert T1C_FACTS["request14_both_found"] is True
     assert T1C_FACTS["request14_replied_last_verb"] is True  # the $expand works on the batch; else the C6 fallback
