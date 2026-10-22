@@ -42,15 +42,17 @@ src/mcp_hub/
   sanitize.py      untrusted-content rules and field limits (spec §5.3, §5.4)
   budget.py        output budget (spec §5.4)
   ids.py           opaque message and event ids (spec §5.1)
-  providers/       base.py (deadlines, connection limits, inbound limits), mime.py, imap.py (read-only IMAP adapter), caldav.py (read-only CalDAV adapter and recurrence expansion)
-  tools/           list_accounts, mail (list_unread, get_message); common.py: account selection and aggregation
+  cursors.py       signed paging cursors (spec §5.5)
+  own_addresses.py own-address lookup for the registry
+  providers/       base.py (deadlines, connection limits, inbound limits), deadline.py, folders.py (folder model), headers.py, imap_guard.py, imap_search.py, mime.py, imap.py (read-only IMAP adapter), caldav.py (read-only CalDAV adapter and recurrence expansion)
+  tools/           list_accounts, mail (list_unread, list_messages, get_message); common.py: account selection and aggregation
 tests/
   unit/            per-module tests
   contract/        gate G6: the authorization rules of spec §10.3 over HTTP
   integration/     the real process on two ports; test_imap.py against GreenMail (marker `provider`)
   support/         keys, tokens, clock, MCP wire helpers, GreenMail helpers, log capture
   fixtures/        example registry (neutral ids, no real data)
-scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh (development only, not in the image)
+scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh, imap_probe.py (local owner probe) (development only, not in the image)
   integration/     the real process on two ports; test_imap.py against GreenMail, test_caldav.py against Radicale (marker `provider`)
   support/         keys, tokens, clock, MCP wire helpers, GreenMail and Radicale helpers, ICS fixture loader, canned DAV answers, log capture
   fixtures/        example registry (neutral ids, no real data), ics/ calendar fixtures, radicale/ test server config
