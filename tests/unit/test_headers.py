@@ -556,3 +556,8 @@ def test_parse_descendant_trim_matches_old_call_sites(tail: str, keep: int) -> N
     new = parse_descendant(data, wanted)
     assert new.referenced == old.referenced
     assert new.cut is True
+
+
+def test_parse_descendant_block_without_any_delimiter_trims_to_nothing() -> None:
+    d = parse_descendant(b"x" * DESCENDANT_HEADER_BYTES, X)
+    assert d == Descendant(None, None, frozenset(), True)
