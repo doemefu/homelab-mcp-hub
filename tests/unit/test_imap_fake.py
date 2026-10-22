@@ -205,3 +205,47 @@ def test_fake_thrid_in_or_tree() -> None:
     client.select_folder("INBOX", readonly=True)
     assert client.search(b"NOT DRAFT OR X-GM-THRID 11 X-GM-THRID 22") == [1, 3]
     assert client.search(b"OR X-GM-THRID 11 OR X-GM-THRID 22 X-GM-THRID 33") == [1, 3]
+
+
+@pytest.mark.parametrize(
+    "criteria", [b"X-GM-THRID", b"X-GM-THRID abc", b"X-GM-THRID -1", b"X-GM-THRID 18446744073709551616"]
+)
+def test_fake_malformed_thrid_value_answers_bad(criteria: bytes) -> None:
+    client = thrid_server().client()
+    client.select_folder("INBOX", readonly=True)
+    with pytest.raises(IMAPClientError, match="BAD"):
+        client.search(criteria)
+
+
+@pytest.mark.parametrize("section", ["HEADER.FIELDS.NOT (FROM)", "HEADER.LINES (FROM)", "HEADER.FIELDS FROM"])
+def test_fake_unsupported_header_section_answers_bad(section: str) -> None:
+    client = server().client()
+    client.select_folder("INBOX", readonly=True)
+    with pytest.raises(IMAPClientError, match="BAD"):
+        client.fetch("1", [f"BODY.PEEK[{section}]<0.100>"])
+
+
+def test_fake_header_fields_mixed_case_names_and_duplicate_fields() -> None:
+    srv = server()
+    srv.folders[0].messages[
+        1
+    ].headers = b"message-ID: <one@example.org>\r\nSubject: Hi\r\nMESSAGE-id: <two@example.org>\r\n\r\n"
+    client = srv.client()
+    client.select_folder("INBOX", readonly=True)
+    rows = client.fetch("1", ["BODY.PEEK[HEADER.FIELDS (Message-Id)]<0.200>"])
+    assert rows[1][b"BODY[HEADER.FIELDS (Message-Id)]<0>"] == (
+        b"message-ID: <one@example.org>\r\nMESSAGE-id: <two@example.org>\r\n\r\n"
+    )
+
+
+def test_fake_long_from_pushes_message_id_past_the_cap() -> None:
+    srv = server()
+    long_from = b"From: " + b"x" * 100 + b" <a@example.org>\r\n"
+    srv.folders[0].messages[1].headers = long_from + b"Message-ID: <m@example.org>\r\n\r\n"
+    client = srv.client()
+    client.select_folder("INBOX", readonly=True)
+    section = "HEADER.FIELDS (FROM MESSAGE-ID)"
+    rows = client.fetch("1", [f"BODY.PEEK[{section}]<0.50>"])
+    cut = rows[1][f"BODY[{section}]<0>".encode()]
+    assert cut == long_from[:50]
+    assert b"Message-ID" not in cut

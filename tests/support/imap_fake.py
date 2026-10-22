@@ -237,9 +237,13 @@ def _fill(row: dict[bytes, object], item: str, msg: FakeMessage) -> None:
 
 def _header_subset(headers: bytes | None, section: str) -> bytes | None:
     """HEADER.FIELDS (…): only the requested fields with their folded lines, in message order, plus the closing CRLF."""
-    fields = _HEADER_FIELDS.fullmatch(section)
-    if headers is None or fields is None:
+    if section.upper() == "HEADER":
         return headers
+    fields = _HEADER_FIELDS.fullmatch(section)
+    if fields is None:  # HEADER.FIELDS.NOT and anything else: fail closed
+        raise bad("UID FETCH")
+    if headers is None:
+        return None
     wanted = {name.casefold() for name in fields.group(1).split()}
     kept: list[bytes] = []
     keep = False
@@ -312,6 +316,8 @@ def _parse_key(
         label = _unquote(tokens[pos]).encode().lower()
         return pos + 1, lambda msg, honour: label in {x.lower() for x in msg.labels}
     if word == "X-GM-THRID" and gmail:
+        if pos >= len(tokens) or not re.fullmatch(r"\d{1,20}", tokens[pos]) or int(tokens[pos]) >= 2**64:
+            raise bad("UID SEARCH")
         wanted = int(tokens[pos])
         return pos + 1, lambda msg, honour: msg.thrid is not None and msg.thrid == wanted
     raise bad("UID SEARCH")
