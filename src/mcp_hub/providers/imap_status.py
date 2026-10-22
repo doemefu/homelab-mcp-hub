@@ -283,16 +283,22 @@ def _locate(
     try:
         core, _ = session.folder_map().locate_order()
     except SoftStop:
-        return _unsearched(wanted, dict(copies))
+        return _unsearched(wanted, _seeds(copies, {}))  # no map: no folder rank, the received time decides
     rank = {entry.raw_name: position for position, entry in enumerate(core)}
-    seeds: dict[str, FoundCopy] = {}
-    for message_id, copy in copies:  # two ids of one Message-ID: the earlier copy seeds (§5.5 matching rule)
-        if _replaces(copy, seeds.get(message_id), rank):
-            seeds[message_id] = copy
+    seeds = _seeds(copies, rank)
     budget = MAX_LOCATE_FOLDERS - len(set(state.opened) - rank.keys())
     if budget < 1:
         return _unsearched(wanted, seeds)
     return session.locate(wanted, seeds=seeds, soft_check=soft_check, max_folders=budget)
+
+
+def _seeds(copies: Sequence[tuple[str, FoundCopy]], rank: Mapping[str, int]) -> dict[str, FoundCopy]:
+    """Two ids of one Message-ID: the earlier copy seeds (§5.5 matching rule)."""
+    seeds: dict[str, FoundCopy] = {}
+    for message_id, copy in copies:
+        if _replaces(copy, seeds.get(message_id), rank):
+            seeds[message_id] = copy
+    return seeds
 
 
 def _unsearched(wanted: Sequence[str], seeds: Mapping[str, FoundCopy]) -> LocateResult:

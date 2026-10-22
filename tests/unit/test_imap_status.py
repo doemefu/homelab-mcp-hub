@@ -289,6 +289,17 @@ def test_soft_stop_at_login_all_incomplete_not_account_error() -> None:
     assert states(imap_status.soft_stopped([r(), m("INBOX", 1)])) == [INCOMPLETE] * 2
 
 
+def test_soft_stop_at_the_folder_map_seeds_the_earlier_copy() -> None:
+    """PR #51 review CR3: two ids of one Message-ID read in place, then a soft stop at the LIST: both report the
+    earlier copy (§5.5 matching rule), not the one named last."""
+    copies = [msg(1, 60, "earlier", message_id=f"<{MID}>"), msg(2, 5, "later", message_id=f"<{MID}>")]
+    server = server_with(inbox=copies, step=1.0)
+    statuses = run(server, [m("INBOX", 1), m("INBOX", 2)], soft=3.5)  # EXAMINE, FETCH; stopped at the LIST
+    assert names(server) == ["LOGIN", "CAPABILITY", "EXAMINE", "UID FETCH", "LOGOUT"]
+    assert states(statuses) == [FOUND, FOUND]
+    assert [located(status) for status in statuses] == [("INBOX", 1), ("INBOX", 1)]
+
+
 # --- ids: the in-place check ---------------------------------------------------------------------------------
 
 
