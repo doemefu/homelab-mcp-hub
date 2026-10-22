@@ -9,7 +9,7 @@ X-GM-LABELS and X-GM-THRID (Gmail), BODYSTRUCTURE in chunks of at most 10 UIDs (
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final, cast
 
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
@@ -225,8 +225,8 @@ def _seed_members(
 
 def _seed(session: ImapSession, target: AnyMessageRef | StableRef | None, soft_check: Callable[[], None]) -> _Seed:
     """A `ref` is located as in `get_message` (not found after a complete search → `not_found`; incomplete or
-    uncertain → `upstream_timeout`, B6). An `id` is read in place (D75 binding): another UIDVALIDITY, a missing row,
-    a draft or a row without INTERNALDATE → `not_found`, as in `get_message`."""
+    uncertain → `upstream_timeout`, B6). An `id` is read in place (D75 binding): another UIDVALIDITY, a missing row
+    or a draft → `not_found`, as in `get_message`."""
     if isinstance(target, StableRef):
         message_id = target.message_id
         result = session.locate([message_id], soft_check=soft_check)
@@ -247,8 +247,6 @@ def _seed(session: ImapSession, target: AnyMessageRef | StableRef | None, soft_c
         raise ProviderError("not_found", "UnknownUid")
     if _is_draft(row):
         raise ProviderError("not_found", "Draft")
-    if _aware(row.get(b"INTERNALDATE")) is None:  # a copy without INTERNALDATE is dropped (S-p)
-        raise ProviderError("not_found", "MissingInternalDate")
     return _Seed(entry, target.uidvalidity, target.uid, None, None, _thread_id(row), row)
 
 
@@ -318,7 +316,9 @@ def _add(
     seed: _Seed | None,
 ) -> None:
     """One copy, unless its location was read already (P7). A row without INTERNALDATE is dropped with one
-    `item_degraded` line and the count is not exact (Q9); the located seed keeps the time `locate` read."""
+    `item_degraded` line and the count is not exact (Q9). The seed is never dropped: a located seed keeps the time
+    `locate` read; an `id` seed is kept at the call's time, as `get_message` opens it, with one `item_degraded` line,
+    and the count is not exact, since its place in the order is a guess (T7-1)."""
     location: Location = (entry.raw_name, uidvalidity, uid)
     if location in state.seen:
         return
@@ -328,6 +328,10 @@ def _add(
     received = _aware(row.get(b"INTERNALDATE"))
     if received is None and is_seed and seed is not None:
         received = seed.received_at
+        if received is None:
+            session.log_skipped(ref, MissingInternalDate())
+            state.inexact()
+            received = datetime.now(UTC)
     if received is None:
         session.log_skipped(ref, MissingInternalDate())
         state.inexact()

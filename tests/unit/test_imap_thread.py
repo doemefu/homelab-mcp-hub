@@ -545,3 +545,23 @@ def test_member_row_without_internaldate_dropped_not_exact(provider_log: Capture
     assert page.overview.message_count_exact is False
     assert page.truncated is False
     assert [json.loads(line)["exception"] for line in provider_log.lines] == ["MissingInternalDate"]
+
+
+def test_id_seed_without_internaldate_kept_not_exact(provider_log: Capture) -> None:
+    """T7-1: an `id` seed whose row has no INTERNALDATE is kept, as `get_message` opens it (at the call's time), with
+    one item_degraded line; the count is not exact, since its place in the order is a guess."""
+    server = gmail(
+        all_mail=[
+            msg(1, 30, "dated", INBOX_L, thrid=THREAD, message_id="<a@example.test>"),
+            msg(2, None, "undated seed", INBOX_L, thrid=THREAD, message_id="<b@example.test>"),
+        ]
+    )
+    page = thread(server, seed=mid_ref(server, GMAIL_ALL, 2, 11), include_trash=False)
+    assert page.outcome == "ok"
+    assert subjects(page) == ["dated", "undated seed"]  # the call's time: the newest
+    assert page.members[1].summary.ref == MessageRef("gmail", GMAIL_ALL, 11, 2)
+    assert page.members[1].body.text == "Hello"
+    assert page.overview is not None
+    assert page.overview.message_count_exact is False
+    assert page.truncated is False
+    assert [json.loads(line)["exception"] for line in provider_log.lines] == ["MissingInternalDate"]
