@@ -18,11 +18,15 @@ from mcp_hub.providers.imap_search import (
     LOOKUP_BATCH_VALUES,
     MAX_OR_BYTES,
     MAX_THRID_VALUES,
+    THREAD_ROUND_KEYS,
+    THREAD_SEED_IDS,
     UnsafeSearchValue,
     criteria,
     gmail_label_keys,
     header_or,
     imap_date,
+    mixed_batches,
+    mixed_or,
     msg_id_token,
     or_batches,
     quoted,
@@ -528,3 +532,62 @@ print(__debug__, refused, len(cases))
         env={"PYTHONPATH": str(ROOT / "src"), "PATH": ""},
     )
     assert result.stdout.split() == ["False", "7", "7"]
+
+
+def test_mixed_batches_caps() -> None:
+    keys: list[Any] = [("Message-ID" if n % 2 else "In-Reply-To", f"m{n}@x") for n in range(45)]
+    assert [len(batch) for batch in mixed_batches(keys)] == [20, 20, 5]
+    assert [key for batch in mixed_batches(keys) for key in batch] == keys
+    long_keys: list[Any] = [("References", f"{n:03d}" + "a" * 297) for n in range(40)]
+    batches = mixed_batches(long_keys)
+    assert len(batches) > 2
+    assert all(len(mixed_or(batch)) <= MAX_OR_BYTES for batch in batches)
+    assert [key for batch in batches for key in batch] == long_keys
+    assert mixed_batches([keys[0], keys[1], keys[0], keys[1]]) == [[keys[0], keys[1]]]
+    assert mixed_batches([("References", "a@x"), ("Message-ID", "a@x")]) == [
+        [("References", "a@x"), ("Message-ID", "a@x")]
+    ]
+    assert mixed_batches([]) == []
+    with pytest.raises(UnsafeSearchValue):
+        mixed_batches([("Message-ID", "a" * 5000)])
+
+
+@pytest.mark.parametrize("value", ['a"b', "a<b", "a>b", "X-GM-RAW", "x-gm-raw@x", "", "a\\b", "a\r\nb", "\u00e4@x"])
+def test_mixed_values_refused(value: str) -> None:
+    with pytest.raises(UnsafeSearchValue):
+        mixed_or([("Message-ID", value)])
+    with pytest.raises(UnsafeSearchValue):
+        mixed_batches([("Message-ID", "ok@x"), ("References", value)])
+
+
+def test_mixed_shape_refused() -> None:
+    with pytest.raises(ValueError, match="not one string"):
+        mixed_or("ab")  # type: ignore[arg-type]  # a bare string instead of a sequence
+    with pytest.raises(ValueError, match="not one string"):
+        mixed_batches("ab")  # type: ignore[arg-type]  # same
+    with pytest.raises(ValueError, match="no search keys"):
+        mixed_or([])
+    with pytest.raises(ValueError, match="unknown header field"):
+        mixed_or([("Subject", "a@x")])  # type: ignore[list-item]  # unknown field
+    with pytest.raises(ValueError, match="unknown header field"):
+        mixed_batches([("Subject", "a@x")])  # type: ignore[list-item]  # unknown field
+    with pytest.raises(ValueError, match="max_keys must be positive"):
+        mixed_batches([("Message-ID", "a@x")], max_keys=0)
+
+
+def test_round_one_or_batches_eleven_ids() -> None:
+    ids = [f"{n:02d}" + "a" * 43 for n in range(45)]
+    assert THREAD_SEED_IDS == 11
+    assert THREAD_ROUND_KEYS == 20
+    batches = or_batches(ids[:11], ("Message-ID", "References"), max_values=THREAD_SEED_IDS)
+    assert len(batches) == 1
+    assert len(batches[0]) == 11
+    assert len(header_or(("Message-ID", "References"), batches[0])) <= MAX_OR_BYTES
+    assert [len(b) for b in or_batches(ids, ("Message-ID", "References"), max_values=THREAD_SEED_IDS)] == [11] * 4 + [1]
+
+
+def test_mixed_or_shape() -> None:
+    assert mixed_or([("In-Reply-To", "a@x")]) == b'HEADER In-Reply-To "<a@x>"'
+    assert mixed_or([("In-Reply-To", "a@x"), ("Message-ID", "b@x"), ("References", "c@x")]) == (
+        b'OR (OR HEADER In-Reply-To "<a@x>" HEADER Message-ID "<b@x>") HEADER References "<c@x>"'
+    )
