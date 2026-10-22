@@ -39,6 +39,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import GraphMessageRef, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.caldav import MAX_REPORT_BYTES_PER_CALL, CalDavCalendarSource, SlowObjectCache
+from mcp_hub.providers.folders import GRAPH_WELL_KNOWN, FolderMapCache
 from mcp_hub.providers.graph import MAX_LIST_RESPONSE_BYTES, MAX_MESSAGE_RESPONSE_BYTES, Backoff, GraphMailbox
 from mcp_hub.providers.graph_auth import AccessTokenCache, GraphTokenSource
 from mcp_hub.providers.msidentity import GraphAccount
@@ -224,8 +225,13 @@ def graph_attachments_body() -> bytes:
 
 
 def graph_mailbox(account: Account) -> GraphMailbox:
-    """Real GraphMailbox + GraphTokenSource; the refresh token lives in the in-memory fake store (no PostgreSQL)."""
-    answers = {
+    """Real GraphMailbox + GraphTokenSource; the refresh token lives in the in-memory fake store (no PostgreSQL).
+    The seven well-known folder GETs of the D75 binding are answered: inbox with its id, the others 404 (no such
+    folder); the folder ids are cached per mailbox as in the hub."""
+    answers: dict[tuple[str, str], Callable[[httpx2.Request], httpx2.Response]] = {
+        ("GET", f"{GRAPH}/me/mailFolders/{name}"): lambda r: httpx2.Response(404) for name in GRAPH_WELL_KNOWN
+    }
+    answers |= {
         ("GET", f"{GRAPH}/me/mailFolders/inbox"): lambda r: httpx2.Response(200, json={"id": INBOX_ID}),
         # Built per request, so nothing is held between calls.
         ("GET", f"{GRAPH}/me/messages/{GRAPH_ID}"): lambda r: httpx2.Response(200, content=graph_message_body()),
@@ -247,7 +253,7 @@ def graph_mailbox(account: Account) -> GraphMailbox:
         tokens,
         client_factory=lambda timeout: httpx2.Client(transport=graph, trust_env=False),
         backoff=Backoff(),
-        inbox_ids={},
+        folder_maps=FolderMapCache(),
     )
 
 
