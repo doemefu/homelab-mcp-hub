@@ -318,8 +318,8 @@ class ImapSession:
         Message-IDs (and 4,000 bytes of keys) one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` keys, then
         `UID FETCH` of `locate_items` for the hits in chunks of 500, each reduced before the next; a hit counts only
         on exact equality and without a draft flag or label. `soft_check` (raises SoftStop) runs every
-        `SOFT_CHECK_EVERY` rows parsed and after every chunk, since parsing sends no command the guard could stop
-        (SR2). Copies compare by `(received_at, folder rank)`, the
+        `SOFT_CHECK_EVERY` rows parsed and before every further chunk, since parsing sends no command the guard could
+        stop (SR2); a search whose last chunk is parsed is kept. Copies compare by `(received_at, folder rank)`, the
         rank being the core list's tie order, so the search order never decides a tie. A SoftStop ends the search
         early; other errors propagate.
 
@@ -466,7 +466,8 @@ class ImapSession:
                         in_sent.add(message_id)
                     if _replaces(copy, found.get(message_id), rank):
                         found[message_id] = copy
-                soft_check()
+                if start + FETCH_CHUNK_UIDS < len(uids):
+                    soft_check()  # per chunk; after the last one the guard checks before the next command
 
     def noop(self) -> None:
         self._client.noop()

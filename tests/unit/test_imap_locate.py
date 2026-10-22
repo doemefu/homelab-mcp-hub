@@ -375,8 +375,9 @@ def test_locate_fetch_processed_per_chunk(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_soft_check_per_chunk_and_every_rows() -> None:
-    """T7-2 (SR2): the soft check runs every SOFT_CHECK_EVERY rows while parsing and after every fetched chunk; a
-    stop sends no further FETCH and leaves the open refs uncertain or incomplete."""
+    """T7-2 (SR2): the soft check runs every SOFT_CHECK_EVERY rows while parsing and before every further chunk (the
+    guard checks before every other command); a stop sends no further FETCH and leaves the open refs uncertain or
+    incomplete."""
     copies = [msg(uid, 60, "copy", message_id=f"<{MID}>") for uid in range(1, FETCH_CHUNK_UIDS + 2)]
     copies[SOFT_CHECK_EVERY + 49] = msg(SOFT_CHECK_EVERY + 50, 600, "earliest in chunk 1", message_id=f"<{MID}>")
     calls = {"n": 0}
@@ -385,7 +386,7 @@ def test_soft_check_per_chunk_and_every_rows() -> None:
         calls["n"] += 1
 
     run_locate(icloud(archive=copies), [MID], soft_check=counting)
-    assert calls["n"] == (FETCH_CHUNK_UIDS - 1) // SOFT_CHECK_EVERY + 1 + 1  # rows of chunk 1, then each chunk
+    assert calls["n"] == (FETCH_CHUNK_UIDS - 1) // SOFT_CHECK_EVERY + 1  # rows of chunk 1, then before chunk 2
 
     def stop() -> None:
         raise SoftStop
@@ -396,14 +397,33 @@ def test_soft_check_per_chunk_and_every_rows() -> None:
     assert (where(result), result.uncertain) == (("Archive", 1), frozenset({MID}))  # stopped before row 101
     assert examined(server) == ["INBOX", "Archive"]
 
-    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{MID}>")])
-    result = run_locate(server, [MID, "b@example.test"], soft_check=stop)  # one row: the per-chunk check stops
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{MID}>")], step=1.0)
+    result = run_locate(server, [MID, "b@example.test"], soft=5.5)  # one row: the guard stops the next EXAMINE
     assert (where(result), result.uncertain, result.incomplete) == (
         ("INBOX", 1),
         frozenset({MID}),
         frozenset({"b@example.test"}),
     )
     assert examined(server) == ["INBOX"]
+
+
+def test_soft_limit_after_the_last_chunk_keeps_a_finished_search() -> None:
+    """PR #51 review CR2: the soft limit passing while the last chunk of the last mailbox is parsed does not discard
+    the finished search; a ref found stays certain and an absent ref is not incomplete."""
+    copies = [msg(uid, 60, "copy", message_id=f"<{MID}>") for uid in range(1, FETCH_CHUNK_UIDS + 2)]
+    server = icloud(sent=copies)  # the reply mailbox is searched last; no `other` mailbox follows
+
+    def stop_after_last_fetch() -> None:
+        if len([name for name, _ in server.commands if name == "UID FETCH"]) == 2:
+            raise SoftStop
+
+    result = run_locate(server, [MID, "b@example.test"], soft_check=stop_after_last_fetch)
+    assert (where(result), result.complete, result.uncertain, result.incomplete) == (
+        ("Sent Messages", 1),
+        True,
+        frozenset(),
+        frozenset(),
+    )
 
 
 def test_soft_stop_inside_an_other_mailbox_leaves_its_copy_uncertain() -> None:
