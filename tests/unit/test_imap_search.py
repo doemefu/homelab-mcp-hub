@@ -543,6 +543,11 @@ def test_mixed_batches_caps() -> None:
     assert len(batches) > 2
     assert all(len(mixed_or(batch)) <= MAX_OR_BYTES for batch in batches)
     assert [key for batch in batches for key in batch] == long_keys
+    for index, batch in enumerate(batches[:-1]):  # every batch but the last is maximal
+        assert len(batch) == THREAD_ROUND_KEYS or len(mixed_or([*batch, batches[index + 1][0]])) > MAX_OR_BYTES
+    maximal = mixed_batches(keys)
+    for index, batch in enumerate(maximal[:-1]):
+        assert len(batch) == THREAD_ROUND_KEYS or len(mixed_or([*batch, maximal[index + 1][0]])) > MAX_OR_BYTES
     assert mixed_batches([keys[0], keys[1], keys[0], keys[1]]) == [[keys[0], keys[1]]]
     assert mixed_batches([("References", "a@x"), ("Message-ID", "a@x")]) == [
         [("References", "a@x"), ("Message-ID", "a@x")]
