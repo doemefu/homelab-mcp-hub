@@ -690,8 +690,9 @@ def _gmail_lookups(
     `\\Trash`, where `thread_checked` stays true although archived mail is not seen (E-im3a). A reply is
     `\\Answered`, or a `\\Sent` member of the thread whose re-checked In-Reply-To/References name the copy's
     Message-ID; the All Mail header search runs only while GMAIL_REPLY_HEADER_SEARCH is on (T0 P1: off), and E-mf1
-    reply keys are not used. Residual (R35): a reply whose subject the owner changed lands in a new Gmail thread and
-    is seen only through `\\Answered`.
+    reply keys are not used. Residuals (R35): a reply or follow-up whose subject was changed lands in a new Gmail
+    thread (the owner's reply is then seen only through `\\Answered`, a follow-up not at all); Gmail may group
+    unrelated same-subject mail without References into one thread, which can then count as newer incoming.
 
     A copy without a valid Message-ID keeps the thread lookup (E-mf3); one without a valid X-GM-THRID gets none.
     Both stay unchecked. A NO marks the refs of its batch (or, for an EXAMINE, of the mailbox) unchecked; the folder

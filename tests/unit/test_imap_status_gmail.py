@@ -332,9 +332,13 @@ def test_gmail_one_examine_of_all_mail_for_reply_and_thread(monkeypatch: pytest.
 
 def test_gmail_reply_needs_sent_label_and_reference() -> None:
     """MF T11: a reply needs the `\\Sent` label and X among its whole In-Reply-To/References tokens; a copy of X
-    is never a reply (C8); a `\\Sent` member that does not name X is no reply and never newer incoming."""
+    is never a reply (C8); a `\\Sent` member that does not name X is no reply and never newer incoming. A forward
+    that names X (Gmail web keeps it in the thread with `References: <X>`) counts as a reply: the accepted residual
+    (A-gr1, MF G5)."""
+    forward = msg(5, 60, "Fwd: x", SENT_L, thrid=THR, sender=OWNER, message_id=f"<{A_MID}>", references=f"<{MID}>")
     cases = [
         ([reply(5, 60)], (ago(60), A_MID, None, True)),
+        ([forward], (ago(60), A_MID, None, True)),
         ([reply(5, 60, to=None)], (None, None, None, True)),  # threaded by subject, names nothing
         ([reply(5, 60, to="m1@example.testing")], (None, None, None, True)),  # a longer id, never a substring
         ([member(5, 60, message_id=A_MID)], (None, None, ago(60), True)),  # names X, but no `\\Sent`: incoming
@@ -409,6 +413,31 @@ def test_gmail_inbox_and_sent_member_is_not_incoming() -> None:
     server = gmail(trash=[x_mail(3, 180)], all_mail=[member(5, 60, INBOX_L, message_id=MID)])
     [status] = run(server, [g()])
     assert (status.found is not None and status.found.meta.folder, facts(status)) == ("trash", (None, None, None, True))
+
+
+def test_gmail_hand_over_both_sides() -> None:
+    """The hand-over on Gmail: X arrives, the owner replies A (Cc a colleague), the colleague answers B with
+    `In-Reply-To: <A>` and `References: <X> <A>`. X is replied and continued; A, as a ref of its own, is outgoing,
+    not replied (A is no reply to itself) and continued through B; X is older than A, so not newer for A."""
+    b = FakeMessage(
+        2,
+        ago(30),
+        headers=_block(
+            "From: Colleague <colleague@example.test>",
+            "Cc: Owner <owner@example.org>",
+            f"Message-ID: <{F_MID}>",
+            f"In-Reply-To: <{A_MID}>",
+            f"References: <{MID}> <{A_MID}>",
+        ),
+        labels=(INBOX_L,),
+        thrid=THR,
+    )
+    server = gmail(all_mail=[x_mail(), b, reply(5, 60)])
+    x_status, a_status = run(server, [g(), g(A_MID)])
+    assert facts(x_status) == (ago(60), A_MID, ago(30), True)
+    assert facts(a_status) == (None, None, ago(30), True)
+    assert (a_status.found is not None and a_status.found.meta.folder, direction(a_status)) == ("sent", "outgoing")
+    assert thread_searches(server) == [b"NOT DRAFT X-GM-THRID 7001"]
 
 
 def test_gmail_shared_thread_one_key() -> None:
