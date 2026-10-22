@@ -25,7 +25,6 @@ from mcp_hub.ids import (
     GraphMessageRef,
     StableRef,
     ThreadKey,
-    location_k,
 )
 from mcp_hub.logging import log_event
 from mcp_hub.providers.base import (
@@ -44,6 +43,7 @@ from mcp_hub.providers.base import (
     load_json_object,
     log_message_skipped,
     order_key,
+    order_key_of,
     placeholder_summary,
     read_capped,
 )
@@ -613,7 +613,7 @@ class GraphMailbox:
         if received is None:
             log_message_skipped(ref, "mail", MalformedItemError())
             return None, None
-        key = (int(received.timestamp()), location_k(ref))
+        key = order_key_of(received, ref)
         unread = raw.get("isRead") is not True
         # Drafts per message (S1); the window and unread_only re-checked on the server's answer.
         if raw.get("isDraft") is True or received < query.since or (query.unread_only and not unread):

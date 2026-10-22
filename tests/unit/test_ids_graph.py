@@ -17,11 +17,10 @@ def raw(parts: list[object]) -> str:
     return "v1." + base64.urlsafe_b64encode(json.dumps(parts).encode()).rstrip(b"=").decode()
 
 
-def test_graph_ref_round_trip_and_folder() -> None:
+def test_graph_ref_round_trip() -> None:
     ref = GraphMessageRef("outlook", GRAPH_ID)
     value = encode_message_id(ref)
     assert decode_message_id(value) == ref
-    assert ref.folder == "inbox"
     assert len(value) <= 512
 
 

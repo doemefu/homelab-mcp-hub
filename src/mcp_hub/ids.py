@@ -5,8 +5,8 @@ An EventId carries a 128-bit SHA-256 digest over calendar URL path, UID and recu
 modified-UTF-7 mailbox name, checked by `mailbox_name_ok` (D73), and the tool layer binds it to the current folder
 map or the registry inbox (D75). A stable ref (kind "r") carries account and Message-ID, a thread key (kind "t")
 account, source and value; their third-party text is checked against fixed patterns before it is base64url-encoded.
-A Graph MessageId (kind "g", rev. 4.6) carries the immutable Graph id (charset and length checked here, so it can
-never change the request path); its folder is always "inbox".
+A Graph MessageId (kind "g", rev. 4.6) carries the immutable Graph id only (charset and length checked here, so it can
+never change the request path); the Graph adapter binds it by the message's `parentFolderId` (D75).
 """
 
 import base64
@@ -30,7 +30,6 @@ MAX_MAILBOX_NAME_CHARS: Final = 200
 _SUBJECT_KEY: Final = re.compile(r"[0-9a-f]{32}")
 _UTF7_NAME: Final = re.compile(r"(?:[\x20-\x25\x27-\x7E]|&-|&[A-Za-z0-9+,]+-)*")
 _UTF7_RUN: Final = re.compile(r"&(?:-|([A-Za-z0-9+,]+)-)")
-GRAPH_FOLDER: Final = "inbox"
 GRAPH_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,300}")  # L5 (spec 080 rev. 4.6 S1)
 
 
@@ -46,10 +45,6 @@ class MessageRef:
 class GraphMessageRef:
     account: str
     graph_id: str
-
-    @property
-    def folder(self) -> str:
-        return GRAPH_FOLDER
 
 
 AnyMessageRef = MessageRef | GraphMessageRef
