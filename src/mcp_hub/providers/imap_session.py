@@ -2,7 +2,7 @@
 FETCH and the location step of Message-IDs. Moved out of `imap.py` so that the status lookups can share it (WP13b)."""
 
 import imaplib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -43,6 +43,7 @@ _DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8); as a flag
 _LABEL_INBOX: Final = b"\\inbox"
 _LABEL_SENT: Final = b"\\sent"
 _THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
+_FOLDED: Final = (b" ", b"\t")  # a line starting with either continues the field above it
 
 
 class MissingInternalDate(Exception):  # noqa: N818
@@ -90,6 +91,22 @@ def _thread_id(row: dict[bytes, object]) -> int | None:
     """Gmail `X-GM-THRID` as the server returned it: an `int` (not `bool`) in 0..2^64-1, else None."""
     value = row.get(b"X-GM-THRID")
     return value if type(value) is int and 0 <= value < _THRID_LIMIT else None
+
+
+def _field_complete(block: bytes, name: bytes) -> bool:
+    """Whether the first `name` field of a header block cut at its cap ended before the cut: its last line (folded
+    lines included) is CRLF-terminated and followed by the start of another line that is not a continuation. A
+    block that ends right after a CRLF may hide a folded line, so its last field is not complete. A field the block
+    does not hold counts as complete. `name` is lowercase, without the colon."""
+    lines = block.split(b"\r\n")  # the last element is the text after the last CRLF (the cut)
+    for index, line in enumerate(lines):
+        if line[:1] in _FOLDED or line.partition(b":")[0].strip().lower() != name:
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end][:1] in _FOLDED:
+            end += 1
+        return end < len(lines) - 1 or (end == len(lines) - 1 and lines[end] != b"")
+    return True
 
 
 def locate_items(*, gmail: bool, with_from: bool) -> list[str]:
@@ -275,6 +292,7 @@ class ImapSession:
         message_ids: Sequence[str],
         *,
         seeds: Mapping[str, FoundCopy] = _NO_SEEDS,
+        soft_check: Callable[[], None],
         max_folders: int = MAX_LOCATE_FOLDERS,
         batch_values: int = LOCATE_BATCH_VALUES,
     ) -> LocateResult:
@@ -286,7 +304,9 @@ class ImapSession:
         `max_folders` mailboxes in all (core first). Per mailbox: EXAMINE, then per batch of at most `batch_values`
         Message-IDs (and 4,000 bytes of keys) one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` keys, then
         `UID FETCH` of `locate_items` for the hits in chunks of 500, each reduced before the next; a hit counts only
-        on exact equality and without a draft flag or label. Copies compare by `(received_at, folder rank)`, the
+        on exact equality and without a draft flag or label. `soft_check` (raises SoftStop) runs every
+        `SOFT_CHECK_EVERY` rows parsed and after every chunk, since parsing sends no command the guard could stop
+        (SR2). Copies compare by `(received_at, folder rank)`, the
         rank being the core list's tie order, so the search order never decides a tie. A SoftStop ends the search
         early; other errors propagate.
 
@@ -296,9 +316,9 @@ class ImapSession:
 
         A ref is "missed" when a step that covered it did not complete: a refused value, the folder cap, the
         folder map's mailbox cap, an EXAMINE or SEARCH answered NO, a FETCH that lost hits, came back without
-        the Message-ID header or with a header block at its cap without a parsed Message-ID (A-sec3), or the soft
-        stop. A missed ref is `incomplete` when it was not found and `uncertain` when it was (B6, B7); a seed thus
-        stands. A copy without INTERNALDATE is dropped like a non-match (S-p)."""
+        the Message-ID header or with a header block at its cap whose Message-ID did not end before the cut
+        (A-sec3), or the soft stop. A missed ref is `incomplete` when it was not found and `uncertain` when it was
+        (B6, B7); a seed thus stands. A copy without INTERNALDATE is dropped like a non-match (S-p)."""
         if type(max_folders) is not int or not 1 <= max_folders <= MAX_LOCATE_FOLDERS:
             raise ValueError("max_folders out of range")
         if type(batch_values) is not int or not 1 <= batch_values <= LOCATE_BATCH_VALUES:
@@ -312,7 +332,7 @@ class ImapSession:
         missed = set(wanted) - set(searchable)
         found: dict[str, FoundCopy] = dict(seeds)
         in_sent = {message_id for message_id, copy in seeds.items() if _in_sent(copy)}
-        in_core = True
+        refs = searchable  # the refs of the mailbox being searched: a soft stop leaves them open
         if searchable:
             try:
                 folder_map = self.folder_map()
@@ -322,19 +342,19 @@ class ImapSession:
                 search = sorted(core, key=lambda entry: entry.role == reply)  # stable: the reply mailbox last
                 ordered = [(entry, True) for entry in search] + [(entry, False) for entry in other]
                 for index, (entry, is_core) in enumerate(ordered):
-                    in_core = is_core
                     refs = searchable if is_core else [v for v in searchable if v not in found]
                     if not refs:
                         break  # every ref resolved: no further `other` mailbox
                     if index >= max_folders:
                         missed.update(refs)
                         break
-                    self._locate_in(entry, refs, batch_values, found, missed, in_sent, rank)
+                    self._locate_in(entry, refs, batch_values, found, missed, in_sent, rank, soft_check)
                 else:
                     if folder_map.capped:  # mailboxes the map dropped were never searched for the open refs
                         missed.update(v for v in searchable if v not in found)
-            except SoftStop:  # in the core folders every ref was still open; afterwards only the unresolved ones
-                missed.update(searchable if in_core else [v for v in searchable if v not in found])
+            except SoftStop:  # core: every ref was open; `other`: the refs unresolved before this mailbox, as a copy
+                missed.update(refs)  # found in a chunk of it may have an earlier one in a chunk not read
+
         incomplete = frozenset(missed - found.keys())
         uncertain = frozenset(missed & found.keys())
         return LocateResult(
@@ -354,6 +374,7 @@ class ImapSession:
         missed: set[str],
         in_sent: set[str],
         rank: Mapping[str, int],
+        soft_check: Callable[[], None],
     ) -> None:
         if entry.raw_name != self.registry_inbox and not examine_name_ok(entry.raw_name):
             missed.update(refs)  # over 1,000 characters: the guard would refuse the EXAMINE
@@ -394,7 +415,9 @@ class ImapSession:
                 part = uids[start : start + FETCH_CHUNK_UIDS]
                 if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
                     missed.update(batch)
-                for uid in part:
+                for count, uid in enumerate(part):
+                    if count and count % SOFT_CHECK_EVERY == 0:
+                        soft_check()  # header parsing costs CPU but sends no command the guard could stop (SR2)
                     row = rows.get(uid)
                     if row is None:
                         continue
@@ -403,9 +426,12 @@ class ImapSession:
                         missed.update(batch)
                         continue
                     message_id, sender = _candidate_headers(row)
-                    if message_id is None and len(block) >= cap:  # cut before its Message-ID: unchecked (A-sec3)
-                        missed.update(batch)
+                    cut = len(block) >= cap
+                    if cut and (message_id is None or not _field_complete(block, b"message-id")):
+                        missed.update(batch)  # the Message-ID did not end before the cut: unchecked (A-sec3)
                         continue
+                    if cut and not _field_complete(block, b"from"):
+                        sender = None  # a cut From may be a prefix of the real address: the folder rule decides
                     if message_id is None or message_id not in wanted or _is_draft(row):
                         continue
                     received = _aware(row.get(b"INTERNALDATE"))
@@ -429,6 +455,7 @@ class ImapSession:
                         in_sent.add(message_id)
                     if _replaces(copy, found.get(message_id), rank):
                         found[message_id] = copy
+                soft_check()
 
     def noop(self) -> None:
         self._client.noop()

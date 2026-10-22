@@ -647,7 +647,7 @@ class ImapMailbox:
         """A `ref` opens the copy `locate` finds (spec §5.2, §5.5). Not found after a complete search → `not_found`;
         a search or read that did not complete → `upstream_timeout`, never `not_found` (B6); a soft stop anywhere
         → `upstream_timeout` (R2b)."""
-        result = session.locate([message_id])
+        result = session.locate([message_id], soft_check=self._soft_check)
         self._soft_check()
         copy = result.found.get(message_id)
         if copy is None or message_id in result.uncertain:  # uncertain: an earlier copy may be unread (S-e)

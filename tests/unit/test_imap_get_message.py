@@ -158,7 +158,7 @@ def refused(
 
 def locate(server: FakeImapServer, ids: Sequence[str], **kwargs: object) -> LocateResult:
     box = mailbox(server, account="gmail" if b"X-GM-EXT-1" in server.capabilities else "icloud")
-    return box._run(lambda session: session.locate(ids, **kwargs), deadline(server))  # type: ignore[arg-type]
+    return box._run(lambda session: session.locate(ids, soft_check=box._soft_check, **kwargs), deadline(server))  # type: ignore[arg-type]
 
 
 def prime(box: ImapMailbox, server: FakeImapServer) -> None:
@@ -810,7 +810,7 @@ def test_soft_stop_marks_only_the_refs_still_open(phase: str) -> None:
     server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=[folder("P1"), folder("P2")], step=1.0)
     soft = 8.5 if phase == "core" else 13.5  # stops before the Trash SEARCH (Sent unsearched), or before the P2 EXAMINE
     box = mailbox(server)
-    result = box._run(lambda session: session.locate([a, b]), deadline(server, soft))
+    result = box._run(lambda session: session.locate([a, b], soft_check=box._soft_check), deadline(server, soft))
     assert list(result.found) == [a]
     assert result.incomplete == frozenset({b})
     assert result.uncertain == (frozenset({a}) if phase == "core" else frozenset())
@@ -855,7 +855,7 @@ def test_locate_parameters_are_clamped(max_folders: int, batch_values: int) -> N
         client, account="icloud", registry_inbox="INBOX", folder_maps=FolderMapCache(), own=frozenset()
     )
     with pytest.raises(ValueError, match="out of range"):
-        session.locate([MID], max_folders=max_folders, batch_values=batch_values)
+        session.locate([MID], soft_check=lambda: None, max_folders=max_folders, batch_values=batch_values)
     assert "LIST" not in names(server)
 
 

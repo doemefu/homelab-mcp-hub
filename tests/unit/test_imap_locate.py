@@ -1,18 +1,21 @@
 """The IMAP location step as `get_message_status` uses it (spec 080 §5.2 "Location, IMAP", §5.4; WP13b T7): the data
 of the copies found, seeds, the rank tie rule, the reply mailbox searched last, and the chunked re-check fetch."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 
 import pytest
 
+from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import FolderEntry, FolderMapCache, inbox_entry
 from mcp_hub.providers.imap_guard import GuardedImapClient
 from mcp_hub.providers.imap_session import (
     FETCH_CHUNK_UIDS,
+    SOFT_CHECK_EVERY,
     FoundCopy,
     ImapSession,
     LocateResult,
+    _field_complete,
     locate_items,
 )
 from tests.support.imap_fake import FakeImapServer, FakeMessage
@@ -26,6 +29,7 @@ from tests.unit.test_imap_get_message import (
     OWN,
     SENT_L,
     THREAD,
+    OverMatchingClient,
     deadline,
     examined,
     fail_search_in,
@@ -49,11 +53,13 @@ def run_locate(
     own: frozenset[str] = frozenset(),
     seeds: Mapping[str, FoundCopy] | None = None,
     soft: float = 16.0,
+    soft_check: Callable[[], None] | None = None,
 ) -> LocateResult:
     box = mailbox(server, account="gmail" if b"X-GM-EXT-1" in server.capabilities else "icloud", own=own)
+    check = box._soft_check if soft_check is None else soft_check
     if seeds is None:
-        return box._run(lambda session: session.locate(ids), deadline(server, soft))
-    return box._run(lambda session: session.locate(ids, seeds=seeds), deadline(server, soft))
+        return box._run(lambda session: session.locate(ids, soft_check=check), deadline(server, soft))
+    return box._run(lambda session: session.locate(ids, seeds=seeds, soft_check=check), deadline(server, soft))
 
 
 def raw(uid: int, minutes_ago: float, header: str) -> FakeMessage:
@@ -156,6 +162,67 @@ def test_cut_header_block_marks_missed_not_gone(own: frozenset[str], header: str
     assert [list(argument[0]) for name, argument in server.commands if name == "UID FETCH"] == [[4]]  # type: ignore[index]
 
 
+def _cut_inside(field_value: str, before: str, cap: int = 8192) -> str:
+    """A `From` line padded so that a block of `cap` bytes ends inside `before + field_value`, right after `before`."""
+    pad = cap - len(before) - len("From: () <sender@example.test>\r\n")
+    return f"From: ({'x' * pad}) <sender@example.test>\r\n{before}{field_value}"
+
+
+def test_unbracketed_message_id_cut_mid_value_is_missed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T7-1: `Message-ID: abc@example.test` as the last field, cut to `abc@example.te`, still parses as a valid,
+    different id; a field not CRLF-terminated before the cut is a failed re-check, never a non-match."""
+    wanted = "abc@example.test"
+    header = _cut_inside("st", f"Message-ID: {wanted[:-2]}")
+    monkeypatch.setattr(FakeImapServer, "client", lambda self: OverMatchingClient(self))
+    server = icloud(archive=[raw(4, 60, header)])
+    result = run_locate(server, [wanted], own=OWN)
+    assert (result.found, result.incomplete, result.complete) == ({}, frozenset({wanted}), False)
+
+    server = icloud(inbox=[msg(1, 5, "later", message_id=wanted)], archive=[raw(4, 60, header)])
+    result = run_locate(server, [wanted], own=OWN)
+    assert (where(result, wanted), result.uncertain, result.incomplete) == (
+        ("INBOX", 1),
+        frozenset({wanted}),
+        frozenset(),
+    )
+
+    # the whole value before the cut, the next field cut instead: the copy counts
+    complete = f"Message-ID: <{MID}>\r\n" + _cut_inside("x", "Subject: ", cap=8192 - len(f"Message-ID: <{MID}>\r\n"))
+    server = icloud(archive=[raw(4, 60, complete)])
+    result = run_locate(server, [MID], own=OWN)
+    assert (where(result), result.complete) == (("Archive", 4), True)
+
+
+def test_cut_from_line_gives_no_from_address() -> None:
+    """T7-3: a `From` cut at the cap may be a prefix of the real address (here one of the own addresses)."""
+    pad = 8192 - len(f"Message-ID: <{MID}>\r\n") - len("From: () owner@example.org")
+    header = f"Message-ID: <{MID}>\r\nFrom: ({'x' * pad}) owner@example.org.evil.example"
+    server = icloud(inbox=[raw(1, 60, header)])
+    copy = run_locate(server, [MID], own=OWN).found[MID]
+    assert (copy.entry.raw_name, copy.from_address) == ("INBOX", None)
+
+    server = icloud(inbox=[raw(1, 60, f"Message-ID: <{MID}>\r\nFrom: Owner <owner@example.org>")])
+    assert run_locate(server, [MID], own=OWN).found[MID].from_address == "owner@example.org"
+
+
+@pytest.mark.parametrize(
+    ("block", "complete"),
+    [
+        (b"From: a@example.test\r\nMessage-ID: <m@x>\r\n\r\n", True),
+        (b"Message-ID: <m@x>\r\nFrom: a@exa", True),  # the next field started: Message-ID ended
+        (b"From: a@example.test\r\nMessage-ID: m@x.exa", False),  # cut mid-value
+        (b"From: a@example.test\r\nMessage-ID: <m@x>\r\n", False),  # a folded line may follow the cut
+        (b"Message-ID:\r\n <m@x>\r\n\tcomment", False),  # cut inside a continuation line
+        (b"Message-ID:\r\n <m@x>\r\nFrom: a", True),
+        (b"message-id : <m@x>\r\nFrom: a", True),  # field names in any case
+        (b"From: a@example.test\r\nSubject: s", True),  # no Message-ID field: nothing of it was cut
+        (b"Message-ID: <m@x>\r\nX: y\r\nMessage-ID: <n@x", True),  # only the first field counts
+    ],
+)
+def test_field_complete_before_the_cut(block: bytes, complete: bool) -> None:
+    assert _field_complete(block, b"message-id") is complete
+
+
 def test_in_sent_records_any_sent_copy() -> None:
     other = "o@example.test"
     server = icloud(
@@ -211,7 +278,7 @@ def test_seed_must_name_a_located_id() -> None:
         client, account="icloud", registry_inbox="INBOX", folder_maps=FolderMapCache(), own=frozenset()
     )
     with pytest.raises(ValueError, match="seed"):
-        session.locate([MID], seeds={"x@example.test": seed(inbox_entry("INBOX"), 1, 60)})
+        session.locate([MID], seeds={"x@example.test": seed(inbox_entry("INBOX"), 1, 60)}, soft_check=lambda: None)
 
 
 def test_seed_stands_when_location_is_incomplete() -> None:
@@ -305,6 +372,53 @@ def test_locate_fetch_processed_per_chunk(monkeypatch: pytest.MonkeyPatch) -> No
     server.run = run  # type: ignore[method-assign]
     result = run_locate(server, [MID])
     assert (where(result), result.uncertain) == (("Archive", 1), frozenset({MID}))  # the lost chunk may be earlier
+
+
+def test_soft_check_per_chunk_and_every_rows() -> None:
+    """T7-2 (SR2): the soft check runs every SOFT_CHECK_EVERY rows while parsing and after every fetched chunk; a
+    stop sends no further FETCH and leaves the open refs uncertain or incomplete."""
+    copies = [msg(uid, 60, "copy", message_id=f"<{MID}>") for uid in range(1, FETCH_CHUNK_UIDS + 2)]
+    copies[SOFT_CHECK_EVERY + 49] = msg(SOFT_CHECK_EVERY + 50, 600, "earliest in chunk 1", message_id=f"<{MID}>")
+    calls = {"n": 0}
+
+    def counting() -> None:
+        calls["n"] += 1
+
+    run_locate(icloud(archive=copies), [MID], soft_check=counting)
+    assert calls["n"] == (FETCH_CHUNK_UIDS - 1) // SOFT_CHECK_EVERY + 1 + 1  # rows of chunk 1, then each chunk
+
+    def stop() -> None:
+        raise SoftStop
+
+    server = icloud(archive=copies, other=[folder("Projects")])
+    result = run_locate(server, [MID], soft_check=stop)
+    assert len([name for name, _ in server.commands if name == "UID FETCH"]) == 1  # no further FETCH
+    assert (where(result), result.uncertain) == (("Archive", 1), frozenset({MID}))  # stopped before row 101
+    assert examined(server) == ["INBOX", "Archive"]
+
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{MID}>")])
+    result = run_locate(server, [MID, "b@example.test"], soft_check=stop)  # one row: the per-chunk check stops
+    assert (where(result), result.uncertain, result.incomplete) == (
+        ("INBOX", 1),
+        frozenset({MID}),
+        frozenset({"b@example.test"}),
+    )
+    assert examined(server) == ["INBOX"]
+
+
+def test_soft_stop_inside_an_other_mailbox_leaves_its_copy_uncertain() -> None:
+    """A ref first found in an `other` mailbox may have an earlier copy in a chunk of that mailbox not yet read."""
+    copies = [msg(uid, 60, "copy", message_id=f"<{MID}>") for uid in range(1, FETCH_CHUNK_UIDS + 2)]
+    calls = {"n": 0}
+
+    def stop_after_chunk_one() -> None:
+        calls["n"] += 1
+        if calls["n"] > (FETCH_CHUNK_UIDS - 1) // SOFT_CHECK_EVERY:  # the per-chunk check after chunk 1
+            raise SoftStop
+
+    server = icloud(other=[folder("Projects", (), copies)])
+    result = run_locate(server, [MID], soft_check=stop_after_chunk_one)
+    assert (where(result), result.uncertain) == (("Projects", 1), frozenset({MID}))
 
 
 def _session(server: FakeImapServer) -> ImapSession:
