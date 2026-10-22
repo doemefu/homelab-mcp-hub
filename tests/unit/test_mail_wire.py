@@ -45,8 +45,9 @@ def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, t
     tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
     assert set(tools) == {
         "list_accounts", "list_unread", "get_message", "get_events", "list_messages", "get_message_status",
+        "get_thread",
     }  # fmt: skip
-    for name in ("list_unread", "get_message", "list_messages"):
+    for name in ("list_unread", "get_message", "list_messages", "get_thread"):
         assert tools[name]["annotations"]["readOnlyHint"] is True
         assert tools[name]["annotations"]["destructiveHint"] is False
         assert "outputSchema" in tools[name]
