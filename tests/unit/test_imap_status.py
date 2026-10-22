@@ -1,26 +1,36 @@
-"""IMAP `get_message_status` (spec 080 §5.2 "Location, IMAP", §5.4, §6.5; WP13b T8): the in-place check of `m` ids,
-the location step and the mapping to `MessageStatus`. The reply and thread lookups are T9/T10."""
+"""IMAP `get_message_status` (spec 080 §5.2 "Location, IMAP", §5.4, §6.5; WP13b T8, T9): the in-place check of `m`
+ids, the location step, the mapping to `MessageStatus` and the reply and thread lookups on servers other than Gmail
+(the Gmail lookups are T10)."""
 
 import json
 import logging
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, StableRef
 from mcp_hub.providers import imap_status
 from mcp_hub.providers.base import MessageStatus, ProviderError
-from mcp_hub.providers.deadline import SoftStop
+from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import MAX_LOCATE_FOLDERS, FolderMapCache, build_imap_folder_map
+from mcp_hub.providers.headers import CANDIDATE_HEADER_BYTES, DESCENDANT_HEADER_BYTES, DESCENDANT_HEADER_ITEM
 from mcp_hub.providers.imap_session import FETCH_CHUNK_UIDS
-from mcp_hub.providers.imap_status import MAX_DEGRADED_LOGS, SOFT_CHECK_ROWS
+from mcp_hub.providers.imap_status import (
+    LOOKUP_FETCH_UIDS,
+    MAX_DEGRADED_LOGS,
+    MAX_LOOKUP_HITS,
+    MAX_REPLY_KEYS_PER_REF,
+    SOFT_CHECK_ROWS,
+)
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
 from tests.unit.test_imap_get_message import (
     GMAIL_ALL,
+    ICLOUD_CORE,
     INBOX_L,
     MID,
     NOW,
@@ -153,7 +163,7 @@ FOUND = ("found", None)
 def test_ref_found_in_inbox_archive_sent_trash_other(where: str, raw_name: str, expected: str) -> None:
     server = server_with(**{where: [msg(4, 60, "a", message_id=f"<{MID}>")]})  # type: ignore[arg-type]
     [status] = run(server, [r()])
-    assert (status.state, status.reason, status.thread_checked) == ("found", None, False)
+    assert (status.state, status.reason, status.thread_checked) == ("found", None, True)  # lookups complete, no hit
     assert status.found is not None
     assert status.found.location == MessageRef(ICLOUD, raw_name, 7, 4)
     assert (status.found.message_id, status.found.received_at) == (MID, NOW - timedelta(minutes=60))
@@ -290,7 +300,7 @@ def test_id_in_place_seeds_found_and_earlier_copy_wins() -> None:
     assert (states([status]), located(status), found_folder(status)) == ([FOUND], ("Projects", 3), "other")
     assert status.found is not None
     assert status.found.message_id == MID
-    assert examined(server) == ["Projects", "INBOX", "Archive", "Deleted Messages", "Sent Messages"]
+    assert examined(server)[:5] == ["Projects", "INBOX", "Archive", "Deleted Messages", "Sent Messages"]
 
     server = server_with(projects=projects, archive=[msg(4, 90, "earlier", message_id=f"<{MID}>")])
     [status] = run(server, [m("Projects", 3)])
@@ -521,7 +531,7 @@ def test_duplicate_targets_searched_once() -> None:
     statuses = run(server, [r(), m("INBOX", 1)])
     assert states(statuses) == [FOUND, FOUND]
     assert located(statuses[0]) == located(statuses[1]) == ("INBOX", 1)
-    keys = searches(server)
+    keys = [key for key in searches(server) if b"Message-ID" in key]  # type: ignore[operator]
     assert len(keys) == 4  # one SEARCH per core folder; the seeded ref is resolved for `other`
     assert all(key.count(f'"<{MID}>"'.encode()) == 1 for key in keys)  # type: ignore[attr-defined]
 
@@ -614,6 +624,7 @@ def test_only_allowlisted_commands_and_items() -> None:
         "X-GM-THRID",
         "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>",
         "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM)]<0.8192>",
+        "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES FROM)]<0.65536>",  # the lookups' re-check (C9)
     }
     for each in (server, gm):
         assert {name for name, _ in each.commands} <= COMMAND_ALLOWLIST
@@ -688,3 +699,616 @@ def test_item_degraded_capped_per_call(hub_log: Capture) -> None:
     assert states(statuses) == [STALE] * 15 + [GONE]
     degraded = [line for line in hub_log.lines if json.loads(line)["event"] == "item_degraded"]
     assert len(degraded) == MAX_DEGRADED_LOGS == 20
+
+
+# --- reply and thread lookups (T9, servers other than Gmail) ----------------------------------------------------
+
+A_MID = "a1@example.test"  # the owner's reply to X
+F_MID = "f1@example.test"  # an incoming follow-up
+OWNER = "Owner <owner@example.org>"
+
+
+def ago(minutes: float) -> datetime:
+    return NOW - timedelta(minutes=minutes)
+
+
+def x_inbox(**kwargs: object) -> FakeMessage:
+    """X itself, received three hours ago."""
+    return msg(1, 180, "x", message_id=f"<{MID}>", **kwargs)  # type: ignore[arg-type]
+
+
+def follow(
+    uid: int,
+    minutes: float,
+    message_id: str | None = F_MID,
+    *,
+    to: str = MID,
+    sender: str = "Sender <sender@example.test>",
+    flags: tuple[bytes, ...] = (),
+) -> FakeMessage:
+    """A message that answers `to` (`In-Reply-To` and `References`)."""
+    fields = {"in_reply_to": f"<{to}>", "references": f"<{to}>", "sender": sender}
+    if message_id is not None:
+        fields["message_id"] = f"<{message_id}>"
+    return msg(uid, minutes, "re", flags=flags, **fields)
+
+
+def facts(status: MessageStatus) -> tuple[datetime | None, str | None, datetime | None, bool | None]:
+    """(reply_at, reply_message_id, newer_incoming_at, thread_checked)."""
+    return status.reply_at, status.reply_message_id, status.newer_incoming_at, status.thread_checked
+
+
+def token(value: str) -> bytes:
+    return f'"<{value}>"'.encode()
+
+
+def lookup_searches(server: FakeImapServer) -> list[bytes]:
+    return [key for key in searches(server) if b"In-Reply-To" in key]  # type: ignore[operator]
+
+
+def lookup_commands(server: FakeImapServer) -> list[tuple[int, str, str, object]]:
+    """(index, command, mailbox selected, argument) of every reply/thread SEARCH and re-check FETCH."""
+    out: list[tuple[int, str, str, object]] = []
+    current = ""
+    for index, (name, argument) in enumerate(server.commands):
+        if name == "EXAMINE":
+            current = str(argument)
+        elif (name == "UID SEARCH" and b"In-Reply-To" in argument) or (  # type: ignore[operator]
+            name == "UID FETCH" and DESCENDANT_HEADER_ITEM in argument[1]  # type: ignore[index]
+        ):
+            out.append((index, name, current, argument))
+    return out
+
+
+def lookup_fetches(server: FakeImapServer) -> list[tuple[str, list[int]]]:
+    return [(box, list(arg[0])) for _, name, box, arg in lookup_commands(server) if name == "UID FETCH"]  # type: ignore[index]
+
+
+def lookup_search_index(server: FakeImapServer, mailbox_name: str, value: str) -> int:
+    return next(
+        index
+        for index, name, box, arg in lookup_commands(server)
+        if name == "UID SEARCH" and box == mailbox_name and token(value) in arg  # type: ignore[operator]
+    )
+
+
+def test_reply_in_sent_by_in_reply_to_only_and_by_references_only() -> None:
+    """MF T2: either field names X; on a substring server and on an iCloud-like whole-token server (O35)."""
+    for field in ("in_reply_to", "references"):
+        for whole_tokens in (False, True):
+            answer = msg(5, 60, "re", sender=OWNER, message_id=f"<{A_MID}>", **{field: f"<{MID}>"})
+            server = server_with(inbox=[x_inbox()], sent=[answer])
+            server.whole_msgid_tokens = whole_tokens
+            assert facts(run(server, [r()])[0]) == (ago(60), A_MID, None, True), (field, whole_tokens)
+
+
+def test_reply_to_follow_up_counts_for_x() -> None:
+    """A-mf3 (a): a reply to the follow-up Y (In-Reply-To Y, References X Y) answers X too."""
+    y = "y1@example.test"
+    answer = msg(5, 60, "re", sender=OWNER, message_id=f"<{A_MID}>", in_reply_to=f"<{y}>", references=f"<{MID}> <{y}>")
+    server = server_with(inbox=[x_inbox(), follow(2, 120, y)], sent=[answer])
+    x_status, y_status = run(server, [r(), r(y)])
+    assert facts(x_status) == (ago(60), A_MID, ago(120), True)  # Y is an incoming descendant of X
+    assert facts(y_status) == (ago(60), A_MID, None, True)
+
+
+def test_earliest_reply_gives_reply_at_and_message_id() -> None:
+    later = msg(5, 30, "re", message_id="<a2@example.test>", in_reply_to=f"<{MID}>")
+    earlier = msg(6, 90, "re", message_id=f"<{A_MID}>", references=f"<{MID}>")
+    server = server_with(inbox=[x_inbox()], sent=[later, earlier])
+    assert facts(run(server, [r()])[0]) == (ago(90), A_MID, None, True)  # by INTERNALDATE, not by UID
+
+
+def test_reply_without_valid_message_id_keeps_reply_at() -> None:
+    later = msg(7, 30, "re", message_id=f"<{A_MID}>", in_reply_to=f"<{MID}>")
+    no_id = msg(5, 90, "re", in_reply_to=f"<{MID}>")
+    bad_id = msg(6, 80, "re", message_id="<has space@example.test>", in_reply_to=f"<{MID}>")
+    for earliest, expected in ((no_id, ago(90)), (bad_id, ago(80))):
+        server = server_with(inbox=[x_inbox()], sent=[earliest, later])
+        assert facts(run(server, [r()])[0]) == (expected, None, None, True)
+
+
+def test_substring_hit_is_not_a_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MF T3: SEARCH HEADER is a substring match; only whole, case-sensitive tokens count."""
+    case = msg(5, 60, "re", message_id=f"<{A_MID}>", in_reply_to=f"<{MID.upper()}>")
+    server = server_with(inbox=[x_inbox()], sent=[case])  # the fake matches case-insensitively, as RFC 3501 allows
+    assert facts(run(server, [r()])[0]) == (None, None, None, True)
+    assert ("Sent Messages", [5]) in lookup_fetches(server)  # the hit came back and was re-checked
+
+    variants = [
+        msg(5, 60, "re", message_id=f"<{A_MID}>", in_reply_to=f"<x{MID}>"),
+        msg(6, 50, "re", message_id="<a2@example.test>", references=f"<{MID}.org> <{MID}x>"),
+        msg(7, 40, "re", message_id="<a3@example.test>", references=f'(<{MID}>) "<{MID}>"'),
+    ]
+    server = server_with(inbox=[x_inbox()], sent=variants, archive=[follow(4, 30, to=f"{MID}.org")])
+    monkeypatch.setattr(server, "client", lambda: OverMatchingClient(server))
+    assert facts(run(server, [r()])[0]) == (None, None, None, True)
+    assert ("Sent Messages", [5, 6, 7]) in lookup_fetches(server)
+
+
+def test_copy_of_x_is_never_reply_or_newer() -> None:
+    """MF T5, C8, MF3: a self-sent X whose headers name itself, in Sent and in INBOX."""
+    self_sent = {"message_id": f"<{MID}>", "in_reply_to": f"<{MID}>", "references": f"<{MID}>"}
+    server = server_with(inbox=[msg(1, 60, "x", **self_sent)], sent=[msg(5, 60, "x", **self_sent)])
+    [status] = run(server, [r()])
+    assert facts(status) == (None, None, None, True)
+    assert direction(status) == "outgoing"
+    assert ("Sent Messages", [5]) in lookup_fetches(server)
+    assert ("INBOX", [1]) in lookup_fetches(server)
+
+    # copies outside Sent only (a self-referencing X in the inbox and the archive): never newer
+    server = server_with(inbox=[msg(1, 60, "x", **self_sent)], archive=[msg(4, 30, "x", **self_sent)])
+    assert facts(run(server, [r()])[0]) == (None, None, None, True)
+    assert ("Archive", [4]) in lookup_fetches(server)
+
+
+def test_own_reply_delivered_to_inbox_is_not_newer_incoming() -> None:
+    """MF T6: the owner's reply from an alias the own-addresses file does not list, delivered to the inbox too (MF4),
+    and an own `+tag` address on a message that is not in Sent (MF-R1)."""
+    alias = "Alias <alias@example.net>"
+    tagged = follow(3, 30, "t1@example.test", sender="Owner <owner+lists@example.org>")
+    server = server_with(
+        inbox=[x_inbox(), follow(2, 59, A_MID, sender=alias), tagged], sent=[follow(5, 60, A_MID, sender=alias)]
+    )
+    assert facts(run(server, [r()], own=OWN)[0]) == (ago(60), A_MID, None, True)
+
+
+def test_outlook_style_follow_up_found_through_own_reply() -> None:
+    """E-mf1: B answers the owner's reply A only (In-Reply-To <A>, References <A>), yet continues X's thread."""
+    server = server_with(inbox=[x_inbox(), follow(2, 30, F_MID, to=A_MID)], sent=[follow(5, 60, A_MID, sender=OWNER)])
+    assert facts(run(server, [r()])[0]) == (ago(60), A_MID, ago(30), True)
+    thread = lookup_searches(server)[1:]
+    assert len(thread) == 3
+    assert all(token(MID) in key and token(A_MID) in key for key in thread)
+
+
+@pytest.mark.parametrize("count", [MAX_REPLY_KEYS_PER_REF, MAX_REPLY_KEYS_PER_REF + 1])
+def test_more_than_five_reply_ids_unchecked(count: int) -> None:
+    """E-mf1: at most 5 reply Message-IDs per ref, earliest first, become thread keys; a sixth → unchecked."""
+    answers = [follow(10 + i, 100 - i, f"a{i}@example.test", sender=OWNER) for i in range(count)]
+    last = f"a{count - 1}@example.test"
+    server = server_with(inbox=[x_inbox(), follow(2, 20, to=last)], sent=answers)
+    [status] = run(server, [r()])
+    thread = lookup_searches(server)[1:]
+    assert all(token(f"a{i}@example.test") in key for key in thread for i in range(MAX_REPLY_KEYS_PER_REF))
+    if count == MAX_REPLY_KEYS_PER_REF:
+        assert facts(status) == (ago(100), "a0@example.test", ago(20), True)
+    else:
+        assert facts(status) == (ago(100), "a0@example.test", None, False)  # the latest reply is no key
+        assert all(token(last) not in key for key in thread)
+
+
+def test_moved_x_with_later_internaldate_still_newer() -> None:
+    """E-mf2: a move resets INTERNALDATE, so X (moved 5 minutes ago) is not compared with its follow-up."""
+    server = server_with(archive=[msg(4, 5, "x", message_id=f"<{MID}>")], inbox=[follow(2, 60)])
+    [status] = run(server, [r()])
+    assert (found_folder(status), facts(status)) == ("archive", (None, None, ago(60), True))
+
+
+def test_newer_incoming_at_uses_earliest_copy_of_newest_id() -> None:
+    """MF T8, MF6: per Message-ID its earliest copy; the newest of those. A hit without one counts on its own date."""
+    f2 = "f2@example.test"
+    server = server_with(
+        inbox=[x_inbox(), follow(2, 120), follow(3, 90, f2), follow(6, 100, None)],
+        trash=[follow(7, 30, f2)],  # F2 moved to the trash later: a new INTERNALDATE
+    )
+    assert facts(run(server, [r()])[0]) == (None, None, ago(90), True)
+
+    server = server_with(inbox=[x_inbox(), follow(2, 120), follow(6, 80, None), follow(7, 110, None)])
+    assert run(server, [r()])[0].newer_incoming_at == ago(80)
+
+
+@pytest.mark.parametrize("where", ["inbox", "archive", "trash"])
+def test_newer_incoming_in_inbox_archive_trash(where: str) -> None:
+    mail: dict[str, list[FakeMessage]] = {"inbox": [x_inbox()], "projects": [follow(3, 30, "f3@example.test")]}
+    mail.setdefault(where, []).append(follow(2, 60))
+    server = server_with(**mail)  # type: ignore[arg-type]
+    assert facts(run(server, [r()])[0]) == (None, None, ago(60), True)  # `other` mailboxes are not searched (R35)
+
+
+def test_draft_reply_ignored() -> None:
+    """MF T9, S1: a server that ignores NOT DRAFT; the re-check drops drafts in sent and in the thread folders."""
+    draft = (b"\\Draft",)
+    server = server_with(
+        inbox=[x_inbox(), follow(2, 30, flags=draft)], sent=[follow(5, 60, A_MID, sender=OWNER, flags=(b"\\draft",))]
+    )
+    server.honour_not_draft = False
+    assert facts(run(server, [r()])[0]) == (None, None, None, True)
+    assert ("Sent Messages", [5]) in lookup_fetches(server)
+    assert ("INBOX", [2]) in lookup_fetches(server)
+    assert all(key.startswith(b"NOT DRAFT ") for key in lookup_searches(server))
+
+
+def _block(*lines: str) -> bytes:
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+PADDING = " ".join(f"<p{index}@example.test>" for index in range(5000))  # about 100 KiB of References
+
+
+def test_cut_references_marks_unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A-sec3, C9, MF-R4, T4-3: a 64 KiB block cut before a wanted id, or with its From after the cut, is never a
+    positive and leaves the ref unchecked."""
+    late = FakeMessage(5, ago(60), headers=_block(f"Message-ID: <{A_MID}>", f"References: {PADDING} <{MID}>"))
+    server = server_with(inbox=[x_inbox()], sent=[late])
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)
+
+    sender = "From: Sender <sender@example.test>"
+    fields = (f"Message-ID: <{F_MID}>", f"References: <{MID}> {PADDING}")
+    server = server_with(inbox=[x_inbox(), FakeMessage(2, ago(30), headers=_block(*fields, sender))])
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)  # X shown, From cut off: not counted (MF-R4)
+    server = server_with(inbox=[x_inbox(), FakeMessage(2, ago(30), headers=_block(sender, *fields))])
+    assert facts(run(server, [r()])[0]) == (None, None, ago(30), True)  # From before the cut: counted
+
+    # a Message-ID after the cut, or cut inside it: the hit may be a copy of the owner's reply (A-sec3)
+    mail = FakeMessage(2, ago(30), headers=_block(sender, f"References: <{MID}> {PADDING}", f"Message-ID: <{A_MID}>"))
+    server = server_with(inbox=[x_inbox(), mail])
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)
+    head = f"{sender}\r\nReferences: <{MID}>\r\nMessage-ID: "  # the id itself reaches past the cut
+    raw = (head + "z" * (DESCENDANT_HEADER_BYTES - len(head) - 4) + "@example.test\r\n\r\n").encode()
+    server = server_with(inbox=[x_inbox(), FakeMessage(2, ago(30), headers=raw)])
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)
+
+    # T4-3: an unbracketed References cut inside a longer id that begins with X ("<X>ing")
+    head = f"Message-ID: <{A_MID}>\r\nReferences: "
+    filler = "q" * (DESCENDANT_HEADER_BYTES - len(head) - 1 - len(MID) - len("@example.test")) + "@example.test"
+    raw = (head + filler + " " + MID + "ing\r\nFrom: " + OWNER + "\r\n\r\n").encode()
+    assert raw[:DESCENDANT_HEADER_BYTES].endswith(MID.encode())
+    server = server_with(inbox=[x_inbox()], sent=[FakeMessage(5, ago(60), headers=raw)])
+    monkeypatch.setattr(server, "client", lambda: OverMatchingClient(server))
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)
+
+
+def test_own_reply_in_archive_with_and_without_own_addresses() -> None:
+    """MF-R3: an own message outside Sent counts as newer incoming without the own-addresses file, not with it."""
+    own_sent = follow(4, 30, "o1@example.test", sender=OWNER)  # sent from a client that did not save it to Sent
+    server = server_with(inbox=[x_inbox()], archive=[own_sent])
+    assert facts(run(server, [r()])[0]) == (None, None, ago(30), True)
+    server = server_with(inbox=[x_inbox()], archive=[own_sent])
+    assert facts(run(server, [r()], own=OWN)[0]) == (None, None, None, True)
+
+
+def test_thread_step_runs_with_x_only_when_in_reply_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P13: without the reply step the thread step still runs, with X as the only key."""
+    monkeypatch.setattr(imap_status, "OTHER_REPLY_IN_REPLY_TO", False)
+    server = server_with(
+        inbox=[x_inbox(), follow(2, 30, F_MID, to=A_MID), follow(3, 50, "f2@example.test")],
+        sent=[follow(5, 60, A_MID, sender=OWNER)],
+    )
+    assert facts(run(server, [r()])[0]) == (None, None, ago(50), False)
+    thread = lookup_searches(server)
+    assert len(thread) == 3  # inbox, archive, trash
+    assert all(token(A_MID) not in key for key in thread)
+
+
+def test_in_reply_to_off_gives_flag_only_and_unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(imap_status, "OTHER_REPLY_IN_REPLY_TO", False)
+    server = server_with(inbox=[x_inbox(flags=(b"\\Answered",))], sent=[follow(5, 60, A_MID, sender=OWNER)])
+    [status] = run(server, [r()])
+    assert facts(status) == (None, None, None, False)
+    assert copy_flags(status)[0] is True  # `replied` comes from `\Answered` alone
+    assert all(box != "Sent Messages" for _, _, box, _ in lookup_commands(server))
+
+
+def test_hit_cap_keeps_lowest_for_replies_highest_for_thread() -> None:
+    """E-im2: 501 hits → the 500 lowest UIDs in sent (earliest replies), the 500 highest in the thread folders
+    (newest descendants), fetched in chunks of 100; the batch is unchecked."""
+    count = MAX_LOOKUP_HITS + 1
+    answers = [follow(uid, 600 - uid / 10, None) for uid in range(1, count + 1)]  # no Message-ID: no thread keys
+    followers = [follow(uid, 300 - uid / 10, f"f{uid}@example.test") for uid in range(2, count + 2)]
+    server = server_with(inbox=[x_inbox(), *followers], sent=answers)
+    assert facts(run(server, [r()])[0]) == (ago(600 - 0.1), None, ago(300 - count / 10 - 0.1), False)
+    fetched = lookup_fetches(server)
+    assert all(len(uids) <= LOOKUP_FETCH_UIDS == 100 for _, uids in fetched)
+    by_box = {box: sorted(uid for b, uids in fetched if b == box for uid in uids) for box, _ in fetched}
+    assert by_box["Sent Messages"] == list(range(1, MAX_LOOKUP_HITS + 1))
+    assert by_box["INBOX"] == list(range(count + 1 - MAX_LOOKUP_HITS + 1, count + 2))
+
+
+def _lossy_fetch(server: FakeImapServer, mailbox_name: str, uid: int) -> None:
+    """Every re-check FETCH in `mailbox_name` loses the row of `uid` (expunged meanwhile)."""
+
+    class Lossy(FakeImapClient):
+        def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+            rows = super().fetch(messages, items)  # type: ignore[arg-type]
+            if self._selected("UID FETCH").raw_name == mailbox_name and DESCENDANT_HEADER_ITEM in items:  # type: ignore[operator]
+                rows.pop(uid, None)
+            return rows
+
+    server.client = lambda: Lossy(server)  # type: ignore[method-assign]
+
+
+def _fail_lookup(server: FakeImapServer, command: str, mailbox_name: str, value: str | None = None) -> None:
+    """`command` answers NO in a reply/thread lookup in `mailbox_name` (a SEARCH only for the batch with `value`)."""
+    original = server.run
+    state = {"box": "", "examined": 0}
+
+    def run(name: str, argument: object = None) -> None:
+        if name == "EXAMINE":
+            state["box"] = str(argument)
+            if argument == mailbox_name:
+                state["examined"] += 1
+                if command == "EXAMINE" and state["examined"] == 2:  # the location opened it first
+                    server.fail["EXAMINE"] = server.no("EXAMINE")
+        lookup = name == command == "UID SEARCH" and b"In-Reply-To" in argument  # type: ignore[operator]
+        if lookup and state["box"] == mailbox_name and value is not None and token(value) in argument:  # type: ignore[operator]
+            server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        original(name, argument)
+
+    server.run = run  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("case", ["search_no_batch_2_of_3", "fetch_loses_a_row", "examine_no_archive"])
+def test_lookup_failures_mark_only_their_batch(case: str) -> None:
+    """B7: a failed batch marks only its refs; positives read elsewhere stay; no map rebuild (TS1, §6.5)."""
+    xs = [f"x{i}@example.test" for i in range(21)]  # batches x0..x9, x10..x19, x20
+    server = server_with(
+        inbox=[msg(i + 1, 200, "x", message_id=f"<{x}>") for i, x in enumerate(xs)],
+        sent=[follow(1, 60, "a0@example.test", to=xs[0]), follow(2, 60, "a15@example.test", to=xs[15])],
+        archive=[follow(1, 30, "f0@example.test", to=xs[0]), follow(2, 30, "f15@example.test", to=xs[15])],
+    )
+    if case == "search_no_batch_2_of_3":
+        _fail_lookup(server, "UID SEARCH", "Sent Messages", xs[12])
+    elif case == "fetch_loses_a_row":
+        _lossy_fetch(server, "Archive", 2)
+    else:
+        _fail_lookup(server, "EXAMINE", "Archive")
+    statuses = run(server, [r(x) for x in xs])
+    assert states(statuses) == [FOUND] * 21
+    checked = [s.thread_checked for s in statuses]
+    if case == "examine_no_archive":
+        assert checked == [False] * 21
+        assert (statuses[0].reply_at, statuses[0].newer_incoming_at) == (ago(60), None)  # the reply read stays
+        assert names(server).count("LIST") == 1  # only the location's
+        return
+    assert facts(statuses[0]) == (ago(60), "a0@example.test", ago(30), True)
+    if case == "search_no_batch_2_of_3":  # reply batches x0..x9 | x10..x19 | x20
+        assert checked == [True] * 10 + [False] * 10 + [True]
+        assert facts(statuses[15]) == (None, None, ago(30), False)
+    else:  # thread keys x0, a0, x1..x8 | x9..x15, a15, x16, x17 | x18..x20: the reply ids join their ref's batch
+        assert checked == [True] * 9 + [False] * 9 + [True] * 3
+        assert facts(statuses[15]) == (ago(60), "a15@example.test", None, False)
+
+
+def test_no_sent_folder_marks_found_refs_unchecked() -> None:
+    """C5, E-im3b: replies cannot be searched; the thread step still runs in inbox, archive and trash with X."""
+    server = server_with(inbox=[x_inbox(flags=(b"\\Answered",)), follow(2, 30)])
+    server.folders = [f for f in server.folders if f.raw_name != "Sent Messages"]
+    [status] = run(server, [r()])
+    assert facts(status) == (None, None, ago(30), False)
+    assert copy_flags(status)[0] is True
+    assert [box for _, name, box, _ in lookup_commands(server) if name == "UID SEARCH"] == [
+        "INBOX",
+        "Archive",
+        "Deleted Messages",
+    ]
+
+
+def test_no_message_id_unchecked_and_replied_from_flag() -> None:
+    """E-mf3: an id read in place without a valid Message-ID takes no part in the lookups."""
+    server = server_with(inbox=[msg(1, 60, "no id", flags=(b"\\Answered",))], sent=[follow(5, 30, A_MID)])
+    [status] = run(server, [m("INBOX", 1)])
+    assert facts(status) == (None, None, None, False)
+    assert copy_flags(status)[0] is True
+    assert "UID SEARCH" not in names(server)
+
+
+def test_refused_lookup_value_marks_only_its_ref() -> None:
+    """D80: a pattern-valid Message-ID that search_value_ok refuses is never sent; only its own ref is unchecked."""
+    raw = "x-gm-raw@example.test"
+    server = server_with(inbox=[msg(2, 60, "a", message_id=f"<{raw}>"), x_inbox()])
+    statuses = run(server, [m("INBOX", 2), r()])
+    assert states(statuses) == [FOUND, FOUND]  # the id's seed stands although its location was refused
+    assert [s.thread_checked for s in statuses] == [False, True]
+    assert all(b"X-GM-RAW" not in key.upper() for key in searches(server))  # type: ignore[attr-defined]
+
+    # a refused reply id: the reply counts, but it cannot be a thread key
+    server = server_with(inbox=[x_inbox()], sent=[follow(5, 60, "x-gm-raw-reply@example.test", sender=OWNER)])
+    assert facts(run(server, [r()])[0]) == (ago(60), "x-gm-raw-reply@example.test", None, False)
+    assert all(b"X-GM-RAW" not in key.upper() for key in searches(server))  # type: ignore[attr-defined]
+
+
+def test_missing_header_item_marks_unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hit whose header item does not come back cannot be re-checked: its batch is unchecked, never a match."""
+    server = server_with(inbox=[x_inbox()], sent=[FakeMessage(5, ago(60), headers=None)])
+    monkeypatch.setattr(server, "client", lambda: LookupHitsClient(server))
+    assert facts(run(server, [r()])[0]) == (None, None, None, False)
+    assert ("Sent Messages", [5]) in lookup_fetches(server)
+
+
+def test_gmail_sends_no_header_lookup() -> None:
+    """GMAIL_REPLY_HEADER_SEARCH is off (T0 P1): no In-Reply-To/References SEARCH on Gmail (its lookups are T10)."""
+    assert imap_status.GMAIL_REPLY_HEADER_SEARCH is False
+    server = gmail(all_mail=[msg(1, 60, "a", INBOX_L, message_id=f"<{MID}>")])
+    [status] = run(server, [r(account="gmail")])
+    assert status.state == "found"
+    assert lookup_searches(server) == []
+
+
+def test_soft_stop_during_lookups_marks_unfinished_refs_unchecked() -> None:
+    """IR2: a stop before the trash batch of x10 leaves x0..x9 checked; x10 keeps the reply already read."""
+    xs = [f"x{i}@example.test" for i in range(11)]  # keys x0..x9 | x10, a10
+
+    def build() -> FakeImapServer:
+        return server_with(
+            inbox=[msg(i + 1, 200, "x", message_id=f"<{x}>") for i, x in enumerate(xs)],
+            sent=[follow(21, 50, "a10@example.test", to=xs[10], sender=OWNER)],
+            trash=[follow(30, 30, "f0@example.test", to=xs[0]), follow(31, 20, "f10@example.test", to=xs[10])],
+            step=1.0,
+        )
+
+    dry = build()
+    run(dry, [r(x) for x in xs], soft=1000.0, hard=2000.0)
+    stop = lookup_search_index(dry, "Deleted Messages", xs[10])
+    server = build()
+    statuses = run(server, [r(x) for x in xs], soft=stop - 0.5, hard=2000.0)
+    assert server.commands[:-1] == dry.commands[:stop]  # nothing sent from the stop on
+    assert names(server)[-1] == "LOGOUT"
+    assert states(statuses) == [FOUND] * 11
+    assert [s.thread_checked for s in statuses] == [True] * 10 + [False]
+    assert facts(statuses[0]) == (None, None, ago(30), True)
+    assert facts(statuses[10]) == (ago(50), "a10@example.test", None, False)
+
+    # a stop in the reply step: nothing of the thread step runs, every ref unchecked, no account error
+    server = build()
+    statuses = run(
+        server, [r(x) for x in xs], soft=lookup_search_index(dry, "Sent Messages", xs[10]) - 0.5, hard=2000.0
+    )
+    assert [s.thread_checked for s in statuses] == [False] * 11
+    assert all(s.newer_incoming_at is None for s in statuses)
+
+
+def test_reply_step_sends_no_examine_after_location() -> None:
+    """E-im5 Design A: the location searched sent last, so the reply SEARCH needs no EXAMINE."""
+    server = server_with(inbox=[x_inbox()])
+    run(server, [r()])
+    assert examined(server) == [*ICLOUD_CORE, "INBOX", "Archive", "Deleted Messages"]
+    [(index, _, box, _), *_] = lookup_commands(server)
+    assert box == "Sent Messages"
+    assert server.commands[index - 1][0] != "EXAMINE"
+
+    # an `other` mailbox searched after sent for an unresolved ref: sent is opened again
+    server = server_with(inbox=[x_inbox()])
+    run(server, [r(), r(OTHER_MID)])
+    assert examined(server) == [*ICLOUD_CORE, "Projects", "Sent Messages", "INBOX", "Archive", "Deleted Messages"]
+
+
+def test_one_examine_per_thread_folder() -> None:
+    xs = [f"x{i}@example.test" for i in range(21)]  # three batches
+    server = server_with(inbox=[msg(i + 1, 200, "x", message_id=f"<{x}>") for i, x in enumerate(xs)])
+    run(server, [r(x) for x in xs])
+    assert examined(server) == [*ICLOUD_CORE, "INBOX", "Archive", "Deleted Messages"]
+    boxes = [box for _, name, box, _ in lookup_commands(server) if name == "UID SEARCH"]
+    assert boxes == ["Sent Messages"] * 3 + ["INBOX"] * 3 + ["Archive"] * 3 + ["Deleted Messages"] * 3
+
+
+def test_lookup_searches_send_bracketed_tokens_and_not_draft() -> None:
+    server = server_with(inbox=[x_inbox()], sent=[follow(5, 60, A_MID, sender=OWNER)])
+    run(server, [r()])
+    x, a = token(MID).decode(), token(A_MID).decode()
+    reply = f"NOT DRAFT OR HEADER In-Reply-To {x} HEADER References {x}"
+    pair = "(OR HEADER In-Reply-To {0} HEADER References {0})"
+    thread = f"NOT DRAFT OR {pair.format(x)} {pair.format(a)}"
+    assert lookup_searches(server) == [reply.encode()] + [thread.encode()] * 3
+    assert {tuple(arg[1]) for _, name, _, arg in lookup_commands(server) if name == "UID FETCH"} == {  # type: ignore[index]
+        ("FLAGS", "INTERNALDATE", DESCENDANT_HEADER_ITEM)
+    }
+
+
+@pytest.mark.parametrize("phase", ["location_examine", "location_search", "reply_search", "thread_fetch"])
+def test_hard_deadline_in_location_or_lookup_fails_the_account(phase: str) -> None:
+    """T8-2, P6: the hard deadline during the location or a lookup fails the account; never incomplete_search or
+    thread_checked false."""
+
+    def build() -> FakeImapServer:
+        return server_with(inbox=[x_inbox(), follow(2, 30)], sent=[follow(5, 60, A_MID, sender=OWNER)], step=1.0)
+
+    dry = build()
+    run(dry, [r()], soft=1000.0, hard=2000.0)
+    location = [i for i, (name, _) in enumerate(dry.commands) if name in ("EXAMINE", "UID SEARCH")]
+    lookups = lookup_commands(dry)
+    at = {
+        "location_examine": location[2],  # Archive
+        "location_search": location[3],
+        "reply_search": lookups[0][0],
+        "thread_fetch": next(index for index, name, box, _ in lookups if name == "UID FETCH" and box == "INBOX"),
+    }[phase]
+    with pytest.raises(ProviderError) as caught:
+        run(build(), [r()], soft=1000.0, hard=at - 0.5)
+    assert (caught.value.code, caught.value.cause) == ("upstream_timeout", "CallDeadline")
+
+
+def test_lookups_log_nothing(hub_log: Capture) -> None:
+    """§9.7: the lookups add no log line (the one line is the location's LIST); no Message-ID, thread key or folder
+    name reaches a log."""
+    hostile_reply = "leak-reply-0002@example.test"
+    server = server_with(
+        inbox=[msg(1, 180, "x", message_id=f"<{HOSTILE_MID}>"), follow(2, 30, "leak-f@example.test", to=hostile_reply)],
+        sent=[follow(5, 60, hostile_reply, to=HOSTILE_MID), follow(6, 50, None, to=HOSTILE_MID)],
+        other=[folder(HOSTILE_FOLDER)],
+    )
+    _fail_lookup(server, "UID SEARCH", "Archive", HOSTILE_MID)
+    [status] = run(server, [r(HOSTILE_MID)], own=OWN)
+    assert (status.reply_at, status.newer_incoming_at, status.thread_checked) == (ago(60), ago(30), False)
+    assert [json.loads(line)["event"] for line in hub_log.lines] == ["folder_map_refreshed"]
+    text = "\n".join(hub_log.lines) + "\n".join(message for _, _, message in hub_log.raw)
+    for value in (HOSTILE_MID, hostile_reply, "leak-f", HOSTILE_FOLDER, "Leak", "owner@example.org"):
+        assert value not in text
+
+
+# --- hostile header blocks (SR2) --------------------------------------------------------------------------------
+
+HOSTILE_UNITS = ("<x@y> ", "<x@y>", "(((( ", "<x@y>\r\n ", "a@x.y ", '"<x@y>" ')
+
+
+def hostile(uid: int, minutes: float, unit: str) -> FakeMessage:
+    """A message whose References fill the whole 64 KiB re-check item with hostile tokens."""
+    head = f"From: Sender <sender@example.test>\r\nMessage-ID: <h{uid}@example.test>\r\nReferences: "
+    return FakeMessage(uid, ago(minutes), headers=(head + unit * (DESCENDANT_HEADER_BYTES // len(unit) + 1)).encode())
+
+
+class LookupHitsClient(FakeImapClient):
+    """Reply and thread searches answer every message of the folder, so every one is re-checked; location searches
+    skip the large blocks (they hold no wanted Message-ID), so that the fake does not parse them."""
+
+    def search(self, criteria: bytes) -> list[int]:
+        selected = self._selected("UID SEARCH")
+        if b"In-Reply-To" in criteria:
+            self._server.run("UID SEARCH", criteria)
+            return sorted(selected.messages)
+        everything = selected.messages
+        selected.messages = {u: m for u, m in everything.items() if len(m.headers or b"") < CANDIDATE_HEADER_BYTES}
+        try:
+            return super().search(criteria)
+        finally:
+            selected.messages = everything
+
+
+def test_hostile_references_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SR2: 50 refs against 50 hostile 64 KiB blocks: a bounded number of commands, a soft check at least every 10
+    rows parsed, and a stop at such a check sends nothing more."""
+    xs = [f"x{i}@example.test" for i in range(50)]
+
+    def build() -> FakeImapServer:
+        server = server_with(
+            inbox=[msg(i + 1, 200, "x", message_id=f"<{x}>") for i, x in enumerate(xs)],
+            archive=[hostile(100 + i, 30, HOSTILE_UNITS[i % len(HOSTILE_UNITS)]) for i in range(50)],
+        )
+        monkeypatch.setattr(server, "client", lambda: LookupHitsClient(server))
+        return server
+
+    server = build()
+    checks: list[str] = []
+    statuses = run_direct(server, [r(x) for x in xs], lambda: checks.append("check"))
+    assert states(statuses) == [FOUND] * 50
+    assert [s.thread_checked for s in statuses] == [False] * 50  # every cut block may hide the ids it does not show
+    assert len(lookup_searches(server)) == 5 * 4  # five batches in sent, inbox, archive and trash
+    fetched = lookup_fetches(server)
+    assert all(len(uids) <= LOOKUP_FETCH_UIDS for _, uids in fetched)
+    assert len(checks) >= sum((len(uids) - 1) // SOFT_CHECK_ROWS for _, uids in fetched) > 0
+
+    server = build()
+
+    def stop_in_archive() -> None:
+        if lookup_commands(server) and lookup_commands(server)[-1][2] == "Archive":
+            raise SoftStop
+
+    statuses = run_direct(server, [r(x) for x in xs], stop_in_archive)
+    assert states(statuses) == [FOUND] * 50
+    assert [s.thread_checked for s in statuses] == [False] * 50
+    assert names(server)[-2:] == ["UID FETCH", "LOGOUT"]  # stopped inside the first archive answer
+
+
+def test_hostile_recheck_wall_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SR2: 500 hostile 64 KiB blocks (one thread batch at the hit cap) are re-checked within 3 s of wall time, or the
+    soft stop fires within 1 s of its instant. The deadline runs on the real clock here."""
+    soft = 1.0
+    blocks = [hostile(uid, 30, HOSTILE_UNITS[uid % len(HOSTILE_UNITS)]) for uid in range(2, MAX_LOOKUP_HITS + 2)]
+    server = server_with(inbox=[x_inbox(), *blocks])
+    monkeypatch.setattr(server, "client", lambda: LookupHitsClient(server))
+    box = mailbox(server)
+    started = time.perf_counter()
+    [status] = box.message_status([r()], CallDeadline(started, soft, 20.0, time.perf_counter))
+    elapsed = time.perf_counter() - started
+    assert (status.state, status.thread_checked) == ("found", False)
+    assert elapsed <= min(3.0, soft + 1.0), elapsed
