@@ -15,8 +15,9 @@ from mcp_hub.providers.base import MailDetail, MailFlags, ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import MAX_LOCATE_FOLDERS, FolderMapCache
 from mcp_hub.providers.headers import candidate_header_item
-from mcp_hub.providers.imap import LOCATE_BATCH_VALUES, FoundCopy, ImapMailbox, ImapSession, LocateResult
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.providers.imap_guard import GuardedImapClient
+from mcp_hub.providers.imap_session import LOCATE_BATCH_VALUES, FoundCopy, ImapSession, LocateResult
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture

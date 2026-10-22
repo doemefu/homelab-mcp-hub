@@ -16,8 +16,8 @@ from imapclient.exceptions import LoginError
 from mcp_hub.ids import MESSAGE_ID_PATTERN
 from mcp_hub.providers import imap_search
 from mcp_hub.providers.folders import EXCLUDED_LAST_NAMES
-from mcp_hub.providers.imap import FETCH_CHUNK_UIDS, LOCATE_BATCH_VALUES
 from mcp_hub.providers.imap_guard import ImapCommandRefused
+from mcp_hub.providers.imap_session import FETCH_CHUNK_UIDS, LOCATE_BATCH_VALUES
 
 
 def _probe_module() -> ModuleType:

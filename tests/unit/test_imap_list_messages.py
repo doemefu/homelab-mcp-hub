@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 import mcp_hub.providers.imap as imap
+import mcp_hub.providers.imap_session as imap_session
 from mcp_hub.cursors import Position
 from mcp_hub.ids import MessageRef, ThreadKey, encode_message_id, location_id, location_k
 from mcp_hub.providers.base import (
@@ -25,8 +26,9 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import FolderMapCache
 from mcp_hub.providers.headers import SUMMARY_HEADER_ITEM, candidate_header_item
-from mcp_hub.providers.imap import FETCH_CHUNK_UIDS, MAX_SEARCH_CANDIDATES, ImapMailbox
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.providers.imap_guard import MAX_EXAMINE_NAME_CHARS
+from mcp_hub.providers.imap_session import FETCH_CHUNK_UIDS, MAX_SEARCH_CANDIDATES
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
@@ -659,7 +661,7 @@ def test_candidate_parse_checks_the_soft_limit_every_100_candidates(monkeypatch:
     """Hostile From blocks cost CPU without any IMAP command: pass 1 checks the soft limit every 100 candidates."""
     server = icloud(inbox=[msg(uid, 5 + uid / 100, f"m{uid}") for uid in range(1, 501)])
     clock = clock_of(server)
-    original = imap.parse_summary_headers
+    original = imap_session.parse_summary_headers
     parsed = {"n": 0}
 
     def slow_parse(raw: bytes | None) -> object:
@@ -667,7 +669,7 @@ def test_candidate_parse_checks_the_soft_limit_every_100_candidates(monkeypatch:
         clock.advance(0.1)
         return original(raw)
 
-    monkeypatch.setattr(imap, "parse_summary_headers", slow_parse)
+    monkeypatch.setattr(imap_session, "parse_summary_headers", slow_parse)
     page = box(server, own=OWN).list_messages(query(direction="incoming"), CallDeadline(clock(), 15.0, 100.0, clock))
     assert parsed["n"] == 200  # soft limit passed at 151; stopped at the next check, not after all 500
     assert (page.items, page.truncated, page.complete) == ([], True, False)
@@ -864,7 +866,9 @@ def snippet_fetch_stops(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 LIST_HANDLERS: dict[str, Callable[[pytest.MonkeyPatch], None]] = {
-    "candidate_parse": lambda mp: mp.setattr(imap, "parse_summary_headers", raise_once(imap.parse_summary_headers)),
+    "candidate_parse": lambda mp: mp.setattr(
+        imap_session, "parse_summary_headers", raise_once(imap_session.parse_summary_headers)
+    ),
     "text_part_choice": lambda mp: mp.setattr(imap, "choose_text_part", raise_once(imap.choose_text_part)),
     "snippet_fetch": snippet_fetch_stops,
     "snippet_decode": lambda mp: mp.setattr(imap, "decode_part", raise_once(imap.decode_part)),
