@@ -38,6 +38,9 @@ _GMAIL_LOCATE_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: drafts, `\S
 _GMAIL_CANDIDATE_ITEM: Final = "X-GM-LABELS"  # Gmail: label drafts and `sent_label` before `limit` (I8, C4)
 MAX_SEARCH_CANDIDATES: Final = 5000  # newest SEARCH hits per folder and call (§5.4, B5)
 FETCH_CHUNK_UIDS: Final = 500  # UIDs per UID FETCH (the guard's MAX_FETCH_UIDS bounds the command line)
+MAX_LOOKUP_HITS: Final = 500  # hits re-checked per reply/thread SEARCH batch and folder (C9)
+LOOKUP_FETCH_UIDS: Final = 50  # UIDs per re-check FETCH: at most 3.2 MiB of 64 KiB header items per answer (C9)
+SOFT_CHECK_ROWS: Final = 10  # fetched rows parsed between two soft checks (SR2: parsing sends no command)
 SOFT_CHECK_EVERY: Final = 100  # candidates parsed between two soft-limit checks in pass 1 (CPU without commands)
 _DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8); as a flag and as a Gmail label (S-r)
 _LABEL_INBOX: Final = b"\\inbox"
@@ -544,3 +547,61 @@ def _examine_bound(session: ImapSession, entry: FolderEntry) -> int | None:
     ):
         raise ProviderError("not_found", "UnboundFolder")
     raise ProviderError("upstream_timeout", "ExamineRefused")
+
+
+def _open(session: ImapSession, entry: FolderEntry) -> bool:
+    """EXAMINE `entry` unless it is selected already (Design A). A NO is the caller's to mark, without a map rebuild
+    (§6.5); a missing UIDVALIDITY is no failure here, since no id is built from it (M6)."""
+    if session.selected == entry.raw_name:
+        return True
+    if entry.raw_name != session.registry_inbox and not examine_name_ok(entry.raw_name):
+        return False  # over 1,000 characters: the guard would refuse the EXAMINE
+    try:
+        session.examine(entry)
+    except PASS_THROUGH:
+        raise
+    except imaplib.IMAP4.error as exc:
+        if not _answered_no(exc):
+            raise
+        return False
+    return True
+
+
+def _rows(
+    session: ImapSession,
+    search: bytes,
+    items: Sequence[str],
+    *,
+    newest: bool,
+    miss: Callable[[], None],
+    soft_check: Callable[[], None],
+) -> Iterator[dict[bytes, object]]:
+    """One lookup `UID SEARCH` in the selected mailbox, then the rows of at most MAX_LOOKUP_HITS hits (the lowest
+    UIDs, or the highest when `newest`; E-im2, C9), fetched in chunks of LOOKUP_FETCH_UIDS, each consumed before the
+    next is fetched. `miss` marks the search's refs incomplete: a SEARCH NO (B7), the hit cap or a lost row."""
+    try:
+        found = session.search(search)
+    except PASS_THROUGH:
+        raise
+    except imaplib.IMAP4.error as exc:
+        if not _answered_no(exc):
+            raise
+        miss()
+        return
+    uids = sorted(set(found))
+    if len(uids) > MAX_LOOKUP_HITS:
+        uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
+        miss()
+    chunks = session.fetch_chunks(uids, items, chunk=LOOKUP_FETCH_UIDS)
+    for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
+        part = uids[start : start + LOOKUP_FETCH_UIDS]
+        if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
+            miss()
+        for count, uid in enumerate(part):
+            if count and count % SOFT_CHECK_ROWS == 0:
+                soft_check()  # SR2: at most 10 blocks of 64 KiB parsed between two checks; parsing sends no command
+            row = rows.get(uid)
+            if row is not None:
+                yield row
+        if start + LOOKUP_FETCH_UIDS < len(uids):
+            soft_check()  # per chunk; the guard checks again before the next FETCH
