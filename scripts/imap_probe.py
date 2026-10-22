@@ -1,9 +1,9 @@
 """Read-only IMAP folder and search probe (WP13a, O35). Run by the owner on their own machine, never in the image.
 
 Measures what the mail history tools depend on: which special-use mailboxes a server announces, how many other
-mailboxes there are, and how long LIST, EXAMINE and UID SEARCH take for the criteria the hub uses. The hub is not
-imported and the cluster Secret is not read: the username and the password are typed at a prompt, nothing is written
-to disk, and the output carries counts, roles and timings only.
+mailboxes there are, and how long LIST, EXAMINE and UID SEARCH take for the criteria the hub uses. These rounds keep
+local copies of the hub's rules (the tests keep them equal), and the cluster Secret is not read: the username and the
+password are typed at a prompt, nothing is written to disk, and the output carries counts, roles and timings only.
 
     uv run python scripts/imap_probe.py --host imap.mail.me.com
     uv run python scripts/imap_probe.py --host imap.gmail.com
@@ -28,6 +28,24 @@ says so, and the marker line is left out.
 The connection goes through ReadOnlyProxy, a runtime allowlist: only CAPABILITY, LOGIN, LIST, EXAMINE (never SELECT),
 UID SEARCH and UID FETCH of INTERNALDATE, FLAGS, X-GM-LABELS and the BODY.PEEK Message-ID header reach the server;
 every other attribute raises PermissionError.
+
+`--status-rounds` (WP13b, ruling E-im5) runs P1-P7 instead of the rounds above; their answers set the
+get_message_status design constants. These rounds import the hub's read-only guard and search builders (and nothing
+that reads configuration or the Secret): every command goes through `GuardedImapClient`, one 60 s deadline per round,
+and every criteria is built by `imap_search`; a Message-ID failing `valid_message_id` or `search_value_ok` is skipped
+and counted (SR4). Samples come from the last 180 days; drafts are dropped. Output: yes/no, counts and ms only.
+
+    uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds
+    uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds
+
+P1 reply match: in sent (Gmail: All Mail with the hub's `\\Sent` label key) the newest non-draft row of the newest 200
+with at least three References tokens; `target_hit` of `HEADER References` for its first, middle and last token and
+of `HEADER In-Reply-To` for its In-Reply-To, or `skipped=no_candidate` (never read as a miss, IR7). P2: the
+In-Reply-To search upper-cased. P3: warm inbox and sent, OR trees of 10/20/40/60 In-Reply-To + References keys over
+the newest inbox ids, median of 3 runs and the criteria bytes. P4: the OR-20 location batch against the widest OR
+within 50 keys and 4,000 bytes, warm inbox. P5 (Gmail): one OR of up to 20 X-GM-THRID keys of the newest All Mail
+rows, accepted or refused (BAD/NO). P6: EXAMINE inbox, sent (Gmail: All Mail), inbox again. P7: the 64 KiB re-check
+header FETCH for the newest 100 sent rows, ms and bytes.
 """
 
 import argparse
@@ -35,14 +53,33 @@ import contextlib
 import getpass
 import re
 import ssl
+import statistics
 import sys
 import time
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, Final, TextIO
 
 from imapclient import IMAPClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # the hub runs from src/ (uv `package = false`)
+
+from mcp_hub.providers import imap_search
+from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.headers import (
+    DESCENDANT_HEADER_BYTES,
+    DESCENDANT_HEADER_ITEM,
+    bare_message_id,
+    candidate_header_item,
+    header_bytes,
+    msg_id_tokens,
+    valid_message_id,
+)
+from mcp_hub.providers.imap_guard import GuardedImapClient, ImapCommandRefused, imap_error_kind
+from mcp_hub.providers.imap_search import GMAIL_SENT_LABEL_KEY, LOCATE_BATCH_VALUES, HeaderField
 
 ALLOWED_HOSTS: Final = frozenset({"imap.mail.me.com", "imap.gmail.com"})
 PORT: Final = 993
@@ -198,15 +235,17 @@ def _recent_message_ids(client: ReadOnlyProxy, uids: list[int]) -> list[str]:
     return ids
 
 
-def _guarded(name: str, emit: Callable[[str], None], measure: Callable[[], None]) -> None:
-    """One round: an error is reported by its class name only and the next round still runs. A PermissionError of
-    the proxy is a bug in the probe and is never swallowed."""
+def _guarded(name: str, emit: Callable[[str], None], measure: Callable[[], None]) -> bool:
+    """One round: an error is reported by its class name only and the next round still runs. A refusal of the proxy
+    or of the hub's guard is a bug in the probe and is never swallowed. True when the round completed."""
     try:
         measure()
-    except PermissionError:
+    except (PermissionError, ImapCommandRefused):
         raise
     except Exception as exc:
         emit(f"{name}: error={type(exc).__name__}")
+        return False
+    return True
 
 
 def _search_round(
@@ -410,13 +449,414 @@ def probe(
     _guarded("text", emit, lambda: _search_round(client, targets, "text", f"NOT DRAFT TEXT {quoted(text_word)}", emit))
 
 
+# --- WP13b status rounds P1-P7 (ruling E-im5): the get_message_status lookup shapes --------------------------------
+# Unlike the O35 rounds above, every command goes through the hub's GuardedImapClient and every criteria is built by
+# the hub's imap_search builders (SR4); a Message-ID failing valid_message_id or search_value_ok is skipped and counted.
+
+ROUND_SECONDS: Final = 60.0  # one CallDeadline per round; the guard sets the socket timeout from it
+_INBOX: Final = "INBOX"  # the registry default inbox
+_NOT_DRAFT: Final = b"NOT DRAFT"  # every criteria starts with it (imap_search.criteria)
+_STATUS_SINCE_DAYS: Final = 180  # window of the UID lists the samples are drawn from
+_P1_SAMPLE: Final = 200
+_P1_MIN_REFERENCES: Final = 3
+_IDS_SAMPLE: Final = 80  # newest inbox rows read for the P3/P4 Message-IDs
+_P3_KEYS: Final = (10, 20, 40, 60)
+_RUNS: Final = 3
+_P4_WIDE: Final = 50
+_P5_SAMPLE: Final = 60
+_P7_UIDS: Final = 100
+_P1_HEADER_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]<0.{DESCENDANT_HEADER_BYTES}>"
+_REPLY_FIELDS: Final[tuple[HeaderField, ...]] = ("In-Reply-To", "References")
+_DRAFT_MARKS: Final = frozenset({b"\\draft", b"\\drafts"})
+_HEADER_FOLD: Final = re.compile(r"\r?\n[ \t]+")
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """The P1 sent row: kept in memory only, never printed."""
+
+    uid: int
+    references: tuple[str, str, str]  # first, middle, last token
+    in_reply_to: str | None
+
+
+def _round_guard(raw: Any) -> GuardedImapClient:
+    deadline = CallDeadline(time.monotonic(), ROUND_SECONDS, ROUND_SECONDS)
+    return GuardedImapClient(raw, deadline, registry_inbox_raw=_INBOX)
+
+
+def _usable(token: str | None) -> str | None:
+    """The id when the hub would search for it (`valid_message_id` and `search_value_ok`), else None (SR4)."""
+    if token is not None and valid_message_id(token) is not None and imap_search.search_value_ok(token):
+        return token
+    return None
+
+
+def _marks(row: Mapping[bytes, object], key: bytes) -> set[bytes]:
+    value = row.get(key)
+    marks: set[bytes] = set()
+    for mark in value if isinstance(value, (tuple, list)) else ():
+        if isinstance(mark, str):
+            mark = mark.encode("utf-8", "replace")
+        if isinstance(mark, bytes):
+            marks.add(mark.lower())
+    return marks
+
+
+def _is_draft(row: Mapping[bytes, object]) -> bool:
+    """`\\Draft` or `\\Drafts` in any case, as a flag or as a Gmail label (the hub's rule S1)."""
+    return bool((_marks(row, b"FLAGS") | _marks(row, b"X-GM-LABELS")) & _DRAFT_MARKS)
+
+
+def _first_fields(raw: bytes) -> dict[str, str]:
+    """The first value of each header field, unfolded; field names lowercased."""
+    fields: dict[str, str] = {}
+    for line in _HEADER_FOLD.sub(" ", raw.decode("ascii", "replace")).splitlines():
+        name, separator, value = line.partition(":")
+        if separator:
+            fields.setdefault(name.strip().lower(), value.strip())
+    return fields
+
+
+def _newest(uids: Sequence[int], count: int) -> list[int]:
+    return sorted(set(uids))[-count:]
+
+
+def _median_search(guard: GuardedImapClient, data: bytes) -> tuple[int, list[int]]:
+    """Median ms of `_RUNS` identical searches, and the hits of the last one."""
+    times: list[int] = []
+    hits: list[int] = []
+    for _ in range(_RUNS):
+        started = time.perf_counter()
+        hits = guard.search(data)
+        times.append(_ms(started))
+    return round(statistics.median(times)), hits
+
+
+def _status_folders(guard: GuardedImapClient) -> dict[str, str]:
+    """Raw names of the first selectable `\\Sent` and `\\All` mailboxes by role; never printed."""
+    found: dict[str, str] = {}
+    for flags, _delimiter, name in guard.list_folders():
+        if {f.lower() for f in flags} & _NOT_SELECTABLE:
+            continue
+        raw_name = name.decode("ascii", "replace") if isinstance(name, bytes) else str(name)
+        role = _role(flags, raw_name)
+        if role in ("sent", "all"):
+            found.setdefault(role, raw_name)
+    return found
+
+
+def _inbox_ids(raw: Any, gmail: bool, since: bytes, emit: Callable[[str], None]) -> list[tuple[str, int]]:
+    """(Message-ID, UID) of the newest inbox rows, newest first, distinct ids, drafts and unusable ids skipped."""
+    guard = _round_guard(raw)
+    started = time.perf_counter()
+    guard.examine(_INBOX)
+    uids = _newest(guard.search(imap_search.criteria(since)), _IDS_SAMPLE)
+    items = [candidate_header_item(("MESSAGE-ID",)), "FLAGS", *(["X-GM-LABELS"] if gmail else [])]
+    rows = guard.fetch(uids, items) if uids else {}
+    pairs: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    drafts = unsafe = 0
+    for uid in sorted(rows, reverse=True):
+        if _is_draft(rows[uid]):
+            drafts += 1
+            continue
+        token = bare_message_id(_first_fields(header_bytes(rows[uid])).get("message-id"))
+        if token is None:
+            continue
+        if _usable(token) is None:
+            unsafe += 1
+        elif token not in seen:
+            seen.add(token)
+            pairs.append((token, uid))
+    emit(f"status_ids: rows={len(rows)} usable={len(pairs)} drafts={drafts} skipped_unsafe={unsafe} ms={_ms(started)}")
+    return pairs
+
+
+def _p1_candidate(raw: Any, mailbox: str, gmail: bool, since: bytes, emit: Callable[[str], None]) -> _Candidate | None:
+    """P1 sample: the newest non-draft sent row with at least three References tokens whose first, middle and last
+    token are usable; its first In-Reply-To token when usable."""
+    guard = _round_guard(raw)
+    started = time.perf_counter()
+    guard.examine(mailbox)
+    listing = imap_search.criteria(since, GMAIL_SENT_LABEL_KEY) if gmail else imap_search.criteria(since)
+    uids = _newest(guard.search(listing), _P1_SAMPLE)
+    items = [_P1_HEADER_ITEM, "FLAGS", *(["X-GM-LABELS"] if gmail else [])]
+    rows = guard.fetch(uids, items) if uids else {}
+    candidate: _Candidate | None = None
+    drafts = unsafe = 0
+    for uid in sorted(rows, reverse=True):
+        if _is_draft(rows[uid]):
+            drafts += 1
+            continue
+        fields = _first_fields(header_bytes(rows[uid]))
+        references = msg_id_tokens(fields.get("references", ""))
+        if len(references) < _P1_MIN_REFERENCES:
+            continue
+        picks = (references[0], references[len(references) // 2], references[-1])
+        refused = sum(1 for token in picks if _usable(token) is None)
+        if refused:
+            unsafe += refused
+            continue
+        in_reply_to = next(iter(msg_id_tokens(fields.get("in-reply-to", ""))), None)
+        if in_reply_to is not None and _usable(in_reply_to) is None:
+            unsafe += 1
+            in_reply_to = None
+        candidate = _Candidate(uid, picks, in_reply_to)
+        break
+    found = "candidate=yes" if candidate is not None else "skipped=no_candidate"
+    emit(f"p1_reply_match: {found} scanned={len(rows)} drafts={drafts} skipped_unsafe={unsafe} ms={_ms(started)}")
+    return candidate
+
+
+def _reply_criteria(gmail: bool, field: HeaderField, token: str) -> bytes:
+    """The hub's reply search for one id: in All Mail on Gmail with the `\\Sent` label key (IR7)."""
+    keys = imap_search.header_or((field,), [token])
+    if gmail:
+        return imap_search.criteria(_NOT_DRAFT, GMAIL_SENT_LABEL_KEY, keys)
+    return imap_search.criteria(_NOT_DRAFT, keys)
+
+
+def _target_search(raw: Any, data: bytes, target: int) -> str:
+    guard = _round_guard(raw)  # the P1 mailbox is still selected
+    started = time.perf_counter()
+    hits = guard.search(data)
+    return f"target_hit={'yes' if target in hits else 'no'} hits={len(hits)} ms={_ms(started)}"
+
+
+def _p1_p2(raw: Any, candidate: _Candidate | None, gmail: bool, emit: Callable[[str], None]) -> None:
+    if candidate is None:
+        emit("p2_case: skipped=no_candidate")
+        return
+    first, middle, last = candidate.references
+    checks: list[tuple[str, HeaderField, str | None]] = [
+        ("references_first", "References", first),
+        ("references_middle", "References", middle),
+        ("references_last", "References", last),
+        ("in_reply_to", "In-Reply-To", candidate.in_reply_to),
+    ]
+    for key, field, token in checks:
+        name = f"p1_reply_match: key={key}"
+        if token is None:
+            emit(f"{name} skipped=no_usable_id")
+            continue
+        data = _reply_criteria(gmail, field, token)
+
+        def check(name: str = name, data: bytes = data, target: int = candidate.uid) -> None:
+            emit(f"{name} {_target_search(raw, data, target)}")
+
+        _guarded(name, emit, check)
+    upper = candidate.in_reply_to.upper() if candidate.in_reply_to is not None else None
+    if upper is None:
+        emit("p2_case: skipped=no_usable_id")
+    elif upper == candidate.in_reply_to:
+        emit("p2_case: skipped=no_case_change")
+    elif _usable(upper) is None:
+        emit("p2_case: skipped=unsafe_id")
+    else:
+        upper_data = _reply_criteria(gmail, "In-Reply-To", upper)
+        target = candidate.uid
+        _guarded("p2_case", emit, lambda: emit(f"p2_case: {_target_search(raw, upper_data, target)}"))
+
+
+def _p3(raw: Any, role: str, mailbox: str, ids: list[str], emit: Callable[[str], None]) -> None:
+    """Warm `mailbox` (EXAMINE + one 10-key search), then 3 runs of each OR size over In-Reply-To + References."""
+
+    def warm() -> None:
+        guard = _round_guard(raw)
+        guard.examine(mailbox)
+        warm_keys = imap_search.header_or(_REPLY_FIELDS, ids[: _P3_KEYS[0] // len(_REPLY_FIELDS)])
+        guard.search(imap_search.criteria(_NOT_DRAFT, warm_keys))
+
+    if len(ids) < _P3_KEYS[0] // len(_REPLY_FIELDS):
+        emit(f"p3_key_scaling: folder={role} skipped=too_few_ids")
+        return
+    if not _guarded(f"p3_key_scaling: folder={role}", emit, warm):
+        return  # another mailbox may still be selected
+    for keys in _P3_KEYS:
+        name = f"p3_key_scaling: folder={role} keys={keys}"
+        count = keys // len(_REPLY_FIELDS)
+        if len(ids) < count:
+            emit(f"{name} skipped=too_few_ids")
+            continue
+
+        def measure(name: str = name, count: int = count) -> None:
+            data = imap_search.criteria(_NOT_DRAFT, imap_search.header_or(_REPLY_FIELDS, ids[:count]))
+            median, hits = _median_search(_round_guard(raw), data)
+            emit(f"{name} ids={count} bytes={len(data)} runs={_RUNS} median_ms={median} hits={len(hits)}")
+
+        _guarded(name, emit, measure)
+
+
+def _p4(raw: Any, pairs: list[tuple[str, int]], emit: Callable[[str], None]) -> None:
+    """OR-20 (the hub's location batch) against the widest OR within 50 keys and 4,000 bytes, warm inbox."""
+    ids = [message_id for message_id, _ in pairs]
+    uid_of = dict(pairs)
+    guard = _round_guard(raw)
+    guard.examine(_INBOX)
+    for width in (LOCATE_BATCH_VALUES, _P4_WIDE):
+        batch = imap_search.or_batches(ids[:width], ("Message-ID",), max_values=width)[0]
+        data = imap_search.criteria(_NOT_DRAFT, imap_search.header_or(("Message-ID",), batch))
+        median, hits = _median_search(guard, data)
+        found = "yes" if {uid_of[i] for i in batch} <= set(hits) else "no"
+        emit(
+            f"p4_location_width: keys={len(batch)} bytes={len(data)} runs={_RUNS} median_ms={median} "
+            f"hits={len(hits)} target_found={found}"
+        )
+
+
+def _p5(raw: Any, all_mail: str, since: bytes, emit: Callable[[str], None]) -> None:
+    """One OR of up to 20 X-GM-THRID keys from the newest All Mail rows: accepted, or refused with BAD/NO."""
+    guard = _round_guard(raw)
+    guard.examine(all_mail)
+    uids = _newest(guard.search(imap_search.criteria(since)), _P5_SAMPLE)
+    rows = guard.fetch(uids, ["X-GM-THRID", "FLAGS", "X-GM-LABELS"]) if uids else {}
+    thread_of: dict[int, int] = {}
+    for uid, row in rows.items():
+        value = row.get(b"X-GM-THRID")
+        if not _is_draft(row) and type(value) is int and 0 <= value < 2**64:
+            thread_of[uid] = value
+    newest_first = [thread_of[uid] for uid in sorted(thread_of, reverse=True)]
+    if not newest_first:
+        emit("p5_gmail_thrid: skipped=no_thread_ids")
+        return
+    batch = imap_search.thrid_batches(newest_first)[0]
+    data = imap_search.criteria(_NOT_DRAFT, imap_search.thrid_or(batch))
+    started = time.perf_counter()
+    try:
+        hits = guard.search(data)
+    except Exception as exc:
+        kind = imap_error_kind(exc)
+        if kind == "other":
+            raise
+        emit(f"p5_gmail_thrid: accepted=no status={kind} keys={len(batch)} ms={_ms(started)}")
+        return
+    ms = _ms(started)
+    members = {uid for uid, thread in thread_of.items() if thread in batch}
+    found = "yes" if members <= set(hits) else "no"
+    emit(
+        f"p5_gmail_thrid: accepted=yes keys={len(batch)} bytes={len(data)} hits={len(hits)} members_found={found} "
+        f"ms={ms}"
+    )
+
+
+def _p6(raw: Any, role: str, other: str, emit: Callable[[str], None]) -> None:
+    guard = _round_guard(raw)
+    times: list[int] = []
+    for mailbox in (_INBOX, other, _INBOX):
+        started = time.perf_counter()
+        guard.examine(mailbox)
+        times.append(_ms(started))
+    emit(f"p6_reexamine: inbox_ms={times[0]} other={role} other_ms={times[1]} inbox_again_ms={times[2]}")
+
+
+def _p7(raw: Any, role: str, mailbox: str, gmail: bool, since: bytes, emit: Callable[[str], None]) -> None:
+    """The 64 KiB re-check item (`headers.DESCENDANT_HEADER_ITEM`) for the newest 100 sent UIDs."""
+    guard = _round_guard(raw)
+    guard.examine(mailbox)
+    listing = imap_search.criteria(since, GMAIL_SENT_LABEL_KEY) if gmail else imap_search.criteria(since)
+    uids = _newest(guard.search(listing), _P7_UIDS)
+    if not uids:
+        emit(f"p7_header_fetch: mailbox={role} skipped=no_sent_rows")
+        return
+    items = [DESCENDANT_HEADER_ITEM, "FLAGS", "INTERNALDATE", *(["X-GM-LABELS", "X-GM-THRID"] if gmail else [])]
+    started = time.perf_counter()
+    rows = guard.fetch(uids, items)
+    ms = _ms(started)
+    sizes = [len(header_bytes(row)) for row in rows.values()]
+    emit(
+        f"p7_header_fetch: mailbox={role} uids={len(uids)} rows={len(rows)} ms={ms} header_bytes={sum(sizes)} "
+        f"max_header_bytes={max(sizes, default=0)} cut={sum(1 for size in sizes if size >= DESCENDANT_HEADER_BYTES)}"
+    )
+
+
+def status_rounds(raw: Any, caps: frozenset[bytes], *, out: TextIO, today: date | None = None) -> None:
+    """P1-P7 on a logged-in raw client; each round runs through its own GuardedImapClient and deadline."""
+    caps = frozenset(c.upper() for c in caps)
+
+    def emit(line: str) -> None:
+        print(line, file=out)
+
+    def flag(name: bytes) -> str:
+        return "yes" if name in caps else "no"
+
+    emit("--- result ---")
+    emit(
+        f"capabilities: special_use={flag(b'SPECIAL-USE')} x_gm_ext_1={flag(b'X-GM-EXT-1')} "
+        f"literal_plus={flag(b'LITERAL+')} move={flag(b'MOVE')}"
+    )
+    gmail = b"X-GM-EXT-1" in caps
+    folders = _status_folders(_round_guard(raw))
+    emit(
+        f"status_folders: gmail={'yes' if gmail else 'no'} sent={'yes' if 'sent' in folders else 'no'} "
+        f"all_mail={'yes' if 'all' in folders else 'no'}"
+    )
+    since_day = (today or datetime.now(UTC).date()) - timedelta(days=_STATUS_SINCE_DAYS)
+    since = imap_search.window_keys(since_day=since_day, before_day=None, unread_only=False)
+    # Gmail: the hub's reply step and the re-check run in All Mail; elsewhere in the sent mailbox.
+    reply_role, reply_box = ("all_mail", folders.get("all")) if gmail else ("sent", folders.get("sent"))
+
+    pairs: list[tuple[str, int]] = []
+    _guarded("status_ids", emit, lambda: pairs.extend(_inbox_ids(raw, gmail, since, emit)))
+    ids = [message_id for message_id, _ in pairs]
+
+    candidate: list[_Candidate | None] = [None]
+    if reply_box is None:
+        emit(f"p1_reply_match: skipped=no_{reply_role}_mailbox")
+    else:
+        box = reply_box
+        _guarded("p1_reply_match", emit, lambda: candidate.__setitem__(0, _p1_candidate(raw, box, gmail, since, emit)))
+    _p1_p2(raw, candidate[0], gmail, emit)
+
+    for role, mailbox in (("inbox", _INBOX), ("sent", folders.get("sent"))):
+        if mailbox is None:
+            emit(f"p3_key_scaling: folder={role} skipped=no_mailbox")
+        else:
+            _p3(raw, role, mailbox, ids, emit)
+
+    if not pairs:
+        emit("p4_location_width: skipped=too_few_ids")
+    else:
+        _guarded("p4_location_width", emit, lambda: _p4(raw, pairs, emit))
+
+    all_mail = folders.get("all")
+    if not gmail:
+        emit("p5_gmail_thrid: skipped=not_gmail")
+    elif all_mail is None:
+        emit("p5_gmail_thrid: skipped=no_all_mail_mailbox")
+    else:
+        _guarded("p5_gmail_thrid", emit, lambda: _p5(raw, all_mail, since, emit))
+
+    if reply_box is None:
+        emit(f"p6_reexamine: skipped=no_{reply_role}_mailbox")
+        emit(f"p7_header_fetch: skipped=no_{reply_role}_mailbox")
+        return
+    box = reply_box
+    _guarded("p6_reexamine", emit, lambda: _p6(raw, reply_role, box, emit))
+    _guarded("p7_header_fetch", emit, lambda: _p7(raw, reply_role, box, gmail, since, emit))
+
+
+_HELP: Final = """\
+Aufruf (durch den Besitzer, auf dem eigenen Rechner, im Repository-Verzeichnis):
+  uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds
+  uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds
+Benutzername und App-Passwort werden abgefragt; nichts wird gespeichert, nur gelesen.
+Nur den Teil ab der Zeile "--- result ---" weitergeben.
+
+Read-only IMAP folder and search probe (O35); --status-rounds runs the get_message_status rounds P1-P7 instead.
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Read-only IMAP folder and search probe (O35).")
+    parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", required=True)
     parser.add_argument("--since-days", type=int, default=14)
     parser.add_argument("--max-folders", type=int, default=30)
     parser.add_argument("--text-word", default="the")
     parser.add_argument("--show-names", action="store_true")
+    parser.add_argument(
+        "--status-rounds", action="store_true", help="run P1-P7 through the hub's guard instead of the O35 rounds"
+    )
     args = parser.parse_args(argv)
     if args.host not in ALLOWED_HOSTS:
         print("host not allowed; use one of: " + ", ".join(sorted(ALLOWED_HOSTS)), file=sys.stderr)
@@ -427,6 +867,15 @@ def main(argv: list[str] | None = None) -> int:
         raw = IMAPClient(
             args.host, port=PORT, ssl=True, ssl_context=ssl.create_default_context(), timeout=SOCKET_TIMEOUT
         )
+        if args.status_rounds:
+            session = _round_guard(raw)
+            try:
+                session.login(username, password)
+                status_rounds(raw, session.capabilities(), out=sys.stdout)
+            finally:
+                with contextlib.suppress(Exception):  # best-effort logout
+                    session.logout()
+            return 0
         client = ReadOnlyProxy(raw)
         try:
             client.login(username, password)
