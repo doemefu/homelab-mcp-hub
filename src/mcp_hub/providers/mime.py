@@ -120,7 +120,7 @@ def safe_decode(raw: bytes, charset: str | None) -> str:
         info = codecs.lookup(name)
         if not getattr(info, "_is_text_encoding", True) or info.name == "idna":
             name = "utf-8"
-    except LookupError:
+    except (LookupError, UnicodeError, ValueError):  # unknown, or a NUL byte or lone surrogate in the name (SC1)
         name = "utf-8"
     for candidate in (name, "utf-8"):
         try:
