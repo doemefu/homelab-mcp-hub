@@ -1,5 +1,6 @@
-"""Graph `get_message_status` (spec 080 §5.2 "Location, Graph" and "Failures", §5.4): the `internetMessageId`
-location batches, the `g` id reads, the failure mapping and the soft stop (T12)."""
+"""Graph `get_message_status` (spec 080 §5.2 "Location, Graph", "Replies and thread, Graph" and "Failures", §5.4): the
+`internetMessageId` location batches, the `g` id reads, the `conversationId` lookups, the failure mapping and the soft
+stop (T12, T13)."""
 
 import json
 import logging
@@ -15,8 +16,8 @@ from mcp_hub.providers import graph
 from mcp_hub.providers.base import MessageStatus, ProviderError, StatusTarget
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import FolderMapCache, GraphFolderIds
-from mcp_hub.providers.graph import EXTENDED_EXPAND, SUMMARY_SELECT, Backoff, GraphMailbox
-from mcp_hub.providers.graph_status import MAX_FILTER_CHARS, STATUS_LOOKUP_TOP
+from mcp_hub.providers.graph import EXTENDED_EXPAND, MAX_THREAD_SPLITS, SUMMARY_SELECT, Backoff, GraphMailbox
+from mcp_hub.providers.graph_status import MAX_FILTER_CHARS, STATUS_LOOKUP_TOP, THREAD_LOOKUP_TOP, THREAD_SELECT
 from tests.support.clock import FakeClock
 from tests.support.graph_fixtures import (
     ARCHIVE_ID,
@@ -52,6 +53,10 @@ def gid(n: int) -> str:
     return f"AAMkMSG{n:04d}="
 
 
+def conv(n: int) -> str:
+    return f"AAQkCONV{n:04d}="
+
+
 def ref(n: int) -> StableRef:
     return StableRef("outlook", mid(n))
 
@@ -70,6 +75,28 @@ def copy(n: int, of: int, at: datetime = LATER, folder_id: str = INBOX_ID, **ext
         n,
         **({"internetMessageId": f"<{mid(of)}>", "receivedDateTime": iso(at), "parentFolderId": folder_id} | extra),
     )
+
+
+def item(
+    n: int,
+    of: int,
+    at: datetime = LATER,
+    folder_id: str = INBOX_ID,
+    *,
+    sender: str = "peer@example.test",
+    message_id: str | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    """Graph item `n` of conversation `conv(of)`, received and sent at `at`, from `sender`."""
+    fields: dict[str, object] = {
+        "conversationId": conv(of),
+        "receivedDateTime": iso(at),
+        "sentDateTime": iso(at),
+        "parentFolderId": folder_id,
+        "from": {"emailAddress": {"name": "Peer", "address": sender}},
+        "internetMessageId": f"<{message_id or mid(n)}>",
+    }
+    return message(n, **(fields | extra))
 
 
 def without(item: dict[str, object], key: str) -> dict[str, object]:
@@ -102,6 +129,22 @@ def store(*items: dict[str, object]) -> Handler:
     return answer
 
 
+def in_conversations(*items: dict[str, object]) -> Handler:
+    """Answers like Graph: the items whose `conversationId` the request's `$filter` names, up to `$top`."""
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        text = request.url.params["$filter"]
+        top = int(request.url.params["$top"])
+        chosen = [i for i in items if f"conversationId eq '{i['conversationId']}'" in text]
+        return values(*chosen[:top])(request)
+
+    return answer
+
+
+def named_conversations(request: httpx2.Request) -> list[str]:
+    return [term.split("'")[1] for term in request.url.params["$filter"].split(" or ")]
+
+
 def sequence(*handlers: Handler) -> Handler:
     """The n-th request gets the n-th handler; the last one answers every later request."""
     calls: list[int] = []
@@ -121,11 +164,19 @@ def advancing(clock: FakeClock, seconds: float, handler: Handler) -> Handler:
     return answer
 
 
-class Server:
-    """Graph by path: the folder GETs answer FOLDER_IDS, PATH the location handler, PATH/<id> the `g` reads."""
+def is_thread(request: httpx2.Request) -> bool:
+    return request.url.path == PATH and request.url.params.get("$filter", "").startswith("conversationId eq ")
 
-    def __init__(self, located: Handler | None = None, reads: dict[str, Handler] | None = None) -> None:
+
+class Server:
+    """Graph by path: the folder GETs answer FOLDER_IDS, PATH the location handler (the `conversationId` lookups the
+    thread handler), PATH/<id> the `g` reads."""
+
+    def __init__(
+        self, located: Handler | None = None, reads: dict[str, Handler] | None = None, threads: Handler | None = None
+    ) -> None:
         self.requests: list[httpx2.Request] = []
+        self.threads = threads or values()
         self.routes: dict[str, Handler] = {
             f"/v1.0/me/mailFolders/{name}": js({"id": folder_id}) for name, folder_id in FOLDER_IDS.items()
         }
@@ -135,14 +186,17 @@ class Server:
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
-        handler = self.routes.get(request.url.path)
+        handler = self.threads if is_thread(request) else self.routes.get(request.url.path)
         return handler(request) if handler is not None else httpx2.Response(404)
 
     def client(self, timeout: float) -> httpx2.Client:
         return httpx2.Client(transport=httpx2.MockTransport(self.handle), trust_env=False, follow_redirects=False)
 
     def located(self) -> list[httpx2.Request]:
-        return [r for r in self.requests if r.url.path == PATH]
+        return [r for r in self.requests if r.url.path == PATH and not is_thread(r)]
+
+    def conversations(self) -> list[httpx2.Request]:
+        return [r for r in self.requests if is_thread(r)]
 
     def reads(self) -> list[str]:
         return [r.url.path.rsplit("/", 1)[1] for r in self.requests if r.url.path.startswith(PATH + "/")]
@@ -267,7 +321,7 @@ def test_message_id_with_specials_round_trips_encoded() -> None:
     server = Server(store(message(1, internetMessageId=f"<{odd}>")))
     [result] = status(mailbox(server, clock, maps=primed(clock)), [StableRef("outlook", odd)], clock)
     assert result.state == "found"
-    [request] = server.requests
+    [request] = server.located()
     assert request.url.path == PATH  # nothing of the value reaches the path
     assert raw_filter(request) == b"internetMessageId+eq+%27%3Ca%2B%26%23%25%3D%3B%2F%3F%40x%3E%27"
     assert request.url.params["$filter"] == f"internetMessageId eq '<{odd}>'"
@@ -304,7 +358,7 @@ def test_found_earliest_copy_and_tie_rank() -> None:
     assert (first.found.meta.folder, first.found.received_at, first.found.message_id) == ("archive", early, mid(1))
     assert location_of(second) == gref(5)
     assert (first.thread_checked, first.reply_at, first.reply_message_id, first.newer_incoming_at) == (
-        False,
+        True,
         None,
         None,
         None,
@@ -357,7 +411,8 @@ def test_full_answer_or_next_link_marks_missing_refs_incomplete(extra: dict[str,
     first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
     assert location_of(first) == gref(1)  # a hit on a full page stays found (R39)
     assert second == MessageStatus("unknown", "incomplete_search")  # never gone (Graph G4)
-    assert [r.url.path for r in server.requests] == [PATH]  # the nextLink is never requested
+    assert len(server.located()) == 1
+    assert {r.url.path for r in server.requests} == {PATH}  # the nextLink is never requested
 
 
 # --- failures ----------------------------------------------------------------------------------------------------
@@ -389,7 +444,10 @@ def test_throttle_stops_later_requests_and_keeps_found_refs() -> None:
     assert states(result) == ["found"] * 10 + ["incomplete_search"] * 12
     assert len(server.located()) == 2  # the third batch and the `g` read fail fast, without a request
     assert server.reads() == []
-    assert [e["exception"] for e in logs.named("provider_call_failed")] == ["Throttled"] * 3  # one per failed batch
+    assert server.conversations() == []  # the conversation batch fails fast as well
+    # The back-off makes later batches fail without a request; only the first throttle is logged (T12-1).
+    assert [e["exception"] for e in logs.named("provider_call_failed")] == ["Throttled"]
+    assert all(s.thread_checked is False for s in result[:10])
 
 
 def test_short_throttle_later_batch_sent_after_backoff() -> None:
@@ -518,6 +576,7 @@ def late_body(clock: FakeClock) -> Handler:
         ("401-twice", "auth_expired", "GraphUnauthorized"),
         ("403", "upstream_error", "Forbidden"),
         ("403-graph-id", "upstream_error", "Forbidden"),
+        ("403-conversation", "upstream_error", "Forbidden"),
         ("folder-ids-500", "upstream_error", "UnexpectedStatus"),
         ("transport", "unreachable", "ConnectError"),
         ("hard-deadline", "upstream_timeout", "CallDeadline"),
@@ -530,6 +589,7 @@ def test_account_failures(case: str, code: str, cause: str) -> None:
     tokens = FakeTokens()
     located: Handler = store(copy(1, 1))
     reads = {gid(2): js(copy(2, 2))}
+    threads: Handler | None = None
     if case == "backoff-at-start":
         backoff.set("outlook", clock(), 30)
     elif case == "token-failure":
@@ -545,13 +605,15 @@ def test_account_failures(case: str, code: str, cause: str) -> None:
         located = js({}, 403)
     elif case == "403-graph-id":
         reads = {gid(2): js({}, 403)}
+    elif case == "403-conversation":
+        threads = js({}, 403)
     elif case == "folder-ids-500":
         maps = None
     elif case == "transport":
         located = connect_error
     elif case == "hard-deadline":
         located = late_body(clock)
-    server = Server(located, reads)
+    server = Server(located, reads, threads)
     if case == "folder-ids-500":
         server.routes["/v1.0/me/mailFolders/archive"] = js({}, 500)
     box = mailbox(server, clock, tokens=tokens, maps=maps, backoff=backoff)
@@ -605,7 +667,7 @@ def test_graph_id_read_shape_without_body() -> None:
     server = Server(reads={gid(1): js(copy(1, 1))})
     [result] = status(mailbox(server, clock, maps=primed(clock)), [gref(1)], clock)
     assert location_of(result) == gref(1)
-    [request] = server.requests
+    [request] = [r for r in server.requests if r.url.path != PATH]
     assert (request.method, request.url.path) == ("GET", f"{PATH}/{gid(1)}")
     assert dict(request.url.params) == {"$select": SUMMARY_SELECT, "$expand": EXTENDED_EXPAND}
     assert "body" not in SUMMARY_SELECT.split(",")
@@ -622,7 +684,7 @@ def test_graph_id_get_follows_move() -> None:
     assert second.found is not None
     assert (first.found.location, first.found.meta.folder, first.found.message_id) == (gref(1), "archive", mid(1))
     assert (second.found.location, second.found.message_id) == (gref(2), None)  # ref null, still found (A-mf2)
-    assert first.thread_checked is False
+    assert (first.thread_checked, second.thread_checked) == (True, True)
     assert server.located() == []  # an immutable id needs no location step
 
 
@@ -712,7 +774,7 @@ def test_unsearchable_targets_marked_alone_without_request() -> None:
     ]
     result = status(mailbox(server, clock, maps=primed(clock)), targets, clock)
     assert states(result) == ["id_mismatch", "incomplete_search", "incomplete_search", "incomplete_search", "found"]
-    [request] = server.requests
+    [request] = server.located()
     assert request.url.params["$filter"] == f"internetMessageId eq '<{mid(1)}>'"
 
 
@@ -778,7 +840,7 @@ def test_every_request_is_get_to_graph_host() -> None:
     clock = FakeClock()
     server = Server(store(copy(1, 1), copy(2, 1, folder_id=OTHER_ID)), {gid(3): js(copy(3, 3))})
     status(mailbox(server, clock), [ref(1), ref(4), gref(3)], clock)
-    assert len(server.requests) == 7 + 1 + 1
+    assert len(server.requests) == 7 + 1 + 1 + 1  # folder ids, location, `g` read, conversations
     for request in server.requests:
         assert (request.method, request.url.scheme, request.url.host, request.url.port) == (
             "GET",
@@ -793,12 +855,14 @@ def test_status_logs_carry_no_filter_values_or_ids() -> None:
     server = Server(
         sequence(store(copy(1, 1), copy(2, 2, id="AAMk/../BAD")), js({}, 500)),
         {gid(3): js(copy(3, 3)), gid(4): js({}, 400)},
+        js({}, 500),
     )
     targets: list[StatusTarget] = [ref(1), ref(2), *(ref(n) for n in range(10, 20)), gref(3), gref(4)]
     with Logs() as logs:
         status(mailbox(server, clock), targets, clock)
+    assert len(server.conversations()) == 1
     failed = logs.named("provider_call_failed")
-    assert [(e["level"], e["exception"]) for e in failed] == [("WARNING", "UnexpectedStatus")] * 2
+    assert [(e["level"], e["exception"]) for e in failed] == [("WARNING", "UnexpectedStatus")] * 3
     assert len(logs.named("item_degraded")) == 1
     for event in logs.events():
         assert set(event) <= allowed_fields(str(event["event"]))
@@ -822,12 +886,366 @@ def test_warm_request_count_for_fifty_refs() -> None:
     server = Server(store(*(copy(n, n) for n in range(50))))
     result = status(mailbox(server, clock, tokens=tokens, maps=primed(clock)), [ref(n) for n in range(50)], clock)
     assert states(result) == ["found"] * 50
+    assert all(s.thread_checked is True for s in result)
     assert server.folder_reads() == 0
     assert len(server.located()) == 5
-    conversation_gets = [r for r in server.located() if "conversationId" in r.url.params["$filter"]]
-    assert len(conversation_gets) <= 5
-    assert len(server.requests) == 5  # no split GETs, no reads
+    conversation_gets = server.conversations()
+    assert len(conversation_gets) == 5  # 50 conversations in batches of 10, none full: no split GET (GR7)
+    assert all(len(named_conversations(r)) == 10 for r in conversation_gets)
+    assert len(server.requests) == 10  # no split GETs, no reads
     assert (tokens.issued, tokens.invalidated) == (1, 0)
+
+
+# --- replies and thread (T13) ------------------------------------------------------------------------------------
+
+ME = "owner@example.test"
+HOUR = timedelta(hours=1)
+
+
+def found_at(n: int, at: datetime = LATER, **extra: object) -> dict[str, object]:
+    """The inbox copy of `mid(n)` with Graph id `gid(n)` in conversation `conv(n)`."""
+    return copy(n, n, at, **extra)
+
+
+def test_conversation_batch_shape() -> None:
+    clock = FakeClock()
+    server = Server(store(*(found_at(n) for n in range(11))))
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(11)], clock)
+    assert [s.thread_checked for s in result] == [True] * 11
+    first, second = server.conversations()
+    assert dict(first.url.params) == {
+        "$filter": " or ".join(f"conversationId eq '{conv(n)}'" for n in range(10)),
+        "$select": THREAD_SELECT,
+        "$top": "100",
+    }
+    assert dict(second.url.params) == dict(first.url.params) | {"$filter": f"conversationId eq '{conv(10)}'"}
+    for request in (first, second):
+        assert request.method == "GET"
+        assert request.url.path == PATH
+        assert request.headers["prefer"] == graph.PREFER
+        assert "$expand" not in request.url.params  # Graph G7
+        assert "$orderby" not in request.url.params
+    assert THREAD_LOOKUP_TOP == 100
+    assert server.requests.index(first) > max(server.requests.index(r) for r in server.located())
+
+
+def test_reply_needs_sentitems_strictly_after_receipt() -> None:
+    clock = FakeClock()
+    entries = (
+        found_at(1),  # the message itself
+        item(10, 1, LATER, SENT_ID, sender=ME),  # an equal time is not after receipt
+        item(11, 1, LATER - HOUR, SENT_ID, sender=ME),  # older
+        item(12, 1, LATER + HOUR, SENT_ID, sender=ME, isDraft=True),  # a sent draft
+        item(13, 1, LATER + HOUR, ARCHIVE_ID, sender=ME),  # a sent copy moved to archive
+        item(14, 1, LATER + HOUR, SENT_ID, sender=ME, id=gid(1)),  # the ref's own copy, by id
+        item(15, 1, LATER + HOUR, SENT_ID, sender=ME, message_id=mid(1)),  # a copy, by Message-ID
+        item(20, 2, LATER + timedelta(seconds=1), SENT_ID, sender=ME),  # one second after receipt
+    )
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(*entries))
+    first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert (first.reply_at, first.reply_message_id, first.newer_incoming_at, first.thread_checked) == (
+        None,
+        None,
+        None,
+        True,
+    )
+    assert (second.reply_at, second.reply_message_id) == (LATER + timedelta(seconds=1), mid(20))
+    assert second.thread_checked is True
+
+
+def test_reply_message_id_and_earliest_reply() -> None:
+    clock = FakeClock()
+    entries = (
+        item(10, 1, LATER + 2 * HOUR, SENT_ID, sender=ME),
+        item(11, 1, LATER + HOUR, SENT_ID, sender=ME),
+        item(12, 1, LATER + 3 * HOUR, SENT_ID, sender=ME),
+        item(20, 2, LATER + HOUR, SENT_ID, sender=ME, internetMessageId="<a b>"),  # no valid Message-ID
+        item(21, 2, LATER + 2 * HOUR, SENT_ID, sender=ME),
+    )
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(*entries))
+    first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert (first.reply_at, first.reply_message_id) == (LATER + HOUR, mid(11))
+    assert (second.reply_at, second.reply_message_id) == (LATER + HOUR, None)  # reply_ref null, replied_at kept
+
+
+def test_forward_counts_as_reply_but_not_answered() -> None:
+    clock = FakeClock()
+    forwarded = found_at(1, singleValueExtendedProperties=extended("104"))
+    server = Server(store(forwarded), threads=in_conversations(item(10, 1, LATER + HOUR, SENT_ID, sender=ME)))
+    [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert result.found is not None
+    assert result.found.meta.flags.answered is False  # 104 is a forward (D77)
+    assert result.reply_at == LATER + HOUR  # a sent item of the conversation after receipt: a reply (A-gr1 residual)
+
+
+def test_flag_only_reply_has_null_reply_fields() -> None:
+    clock = FakeClock()
+    items = (
+        found_at(1, singleValueExtendedProperties=extended("102")),
+        found_at(2, singleValueExtendedProperties=extended("103")),
+    )
+    server = Server(store(*items), threads=in_conversations(*items))
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    for entry in result:
+        assert entry.found is not None
+        assert entry.found.meta.flags.answered is True
+        assert (entry.reply_at, entry.reply_message_id, entry.thread_checked) == (None, None, True)
+
+
+def test_newer_incoming_any_allowed_folder() -> None:
+    clock = FakeClock()
+    alias = "alias@example.test"  # an own address the registry does not know
+    entries = (
+        item(10, 1, LATER + HOUR, INBOX_ID),
+        item(20, 2, LATER + HOUR, ARCHIVE_ID),
+        item(30, 3, LATER + HOUR, TRASH_ID),
+        item(40, 4, LATER + HOUR, OTHER_ID),
+        item(50, 5, LATER + HOUR, JUNK_ID),  # junk never
+        item(60, 6, LATER + HOUR, INBOX_ID, sender=ME),  # own From never
+        item(70, 7, LATER + HOUR, SENT_ID, sender=alias, message_id="s7@example.test"),
+        item(71, 7, LATER + HOUR, INBOX_ID, sender=alias, message_id="s7@example.test"),  # inbox copy of it (MF-R1)
+        item(80, 8, LATER - HOUR, INBOX_ID),  # older
+        item(81, 8, LATER + HOUR, INBOX_ID),
+        item(82, 8, LATER + 3 * HOUR, OTHER_ID),  # the newest wins
+        item(83, 8, LATER + 2 * HOUR, TRASH_ID),
+        item(84, 8, LATER, ARCHIVE_ID),  # an equal time is not newer
+    )
+    server = Server(store(*(found_at(n) for n in range(1, 9))), threads=in_conversations(*entries))
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(1, 9)], clock)
+    assert [s.newer_incoming_at for s in result] == [LATER + HOUR] * 4 + [None] * 3 + [LATER + 3 * HOUR]
+    assert result[6].reply_at == LATER + HOUR  # the sent original still is a reply
+    assert all(s.thread_checked is True for s in result)
+    assert server.folder_reads() == 0  # an unknown parent in a thread answer never forces a re-read
+
+
+def test_401_in_thread_batch_refreshes_not_batch_failure() -> None:
+    clock = FakeClock()
+    tokens = FakeTokens()
+    threads = sequence(js({}, 401), in_conversations(item(10, 1, LATER + HOUR)))
+    server = Server(store(found_at(1)), threads=threads)
+    with Logs() as logs:
+        [result] = status(mailbox(server, clock, tokens=tokens, maps=primed(clock)), [ref(1)], clock)
+    assert (result.newer_incoming_at, result.thread_checked) == (LATER + HOUR, True)
+    assert (tokens.issued, tokens.invalidated) == (2, 1)  # GR1: the refresh path, not a batch failure
+    assert len(server.located()) == 2  # the whole work ran again
+    assert len(server.conversations()) == 2
+    assert logs.named("provider_call_failed") == []
+
+
+def full_batches(*singles: dict[str, object], in_full: Sequence[dict[str, object]] = ()) -> Handler:
+    """A request naming several conversations answers 100 junk items (full); one naming a single conversation answers
+    its items from `singles`. `in_full` is added to the full answer that names conversation 0."""
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        named = named_conversations(request)
+        if len(named) > 1:
+            extra = list(in_full) if conv(0) in named else []
+            junk = [item(1000 + k, 0, folder_id=JUNK_ID, conversationId=named[0]) for k in range(100 - len(extra))]
+            return values(*extra, *junk)(request)
+        return values(*(i for i in singles if i["conversationId"] == named[0]))(request)
+
+    return answer
+
+
+def test_split_budget_in_batch_order_and_union_by_id() -> None:
+    clock = FakeClock()
+    early_reply = item(500, 0, LATER + HOUR, SENT_ID, sender=ME)  # only in the full answer
+    untimed = item(503, 9, LATER + HOUR, receivedDateTime="garbage")  # in the full and in the split answer
+    singles = (item(501, 0, LATER + 2 * HOUR, SENT_ID, sender=ME), item(502, 3, LATER + HOUR), untimed)
+    server = Server(
+        store(*(found_at(n) for n in range(12))), threads=full_batches(*singles, in_full=(early_reply, untimed))
+    )
+    with Logs() as logs:
+        result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(12)], clock)
+    requests = server.conversations()
+    assert [len(named_conversations(r)) for r in requests] == [10, 2] + [1] * MAX_THREAD_SPLITS
+    assert [named_conversations(r) for r in requests[2:]] == [[conv(n)] for n in range(10)]  # in batch order
+    assert all(r.url.params["$top"] == "100" for r in requests)
+    assert MAX_THREAD_SPLITS == 10
+    # Conversation 9 has an untimed entry (GR10); the second batch is beyond the budget.
+    assert [s.thread_checked for s in result] == [True] * 9 + [False] * 3
+    assert (result[0].reply_at, result[0].reply_message_id) == (LATER + HOUR, mid(500))  # entries united by id
+    assert result[3].newer_incoming_at == LATER + HOUR
+    assert len(logs.named("item_degraded")) == 1  # the entry read twice is one entry
+
+
+def test_entry_of_another_conversation_is_ignored() -> None:
+    clock = FakeClock()
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        stray = [item(100, 10, LATER + HOUR)] if conv(0) in named_conversations(request) else []
+        return values(*stray)(request)
+
+    server = Server(store(*(found_at(n) for n in range(11))), threads=answer)
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(11)], clock)
+    assert len(server.conversations()) == 2
+    assert (result[10].newer_incoming_at, result[10].thread_checked) == (None, True)  # only its own batch counts
+
+
+def test_unparsable_thread_time_unchecked() -> None:
+    clock = FakeClock()
+    entries = (
+        item(10, 1, LATER + HOUR, receivedDateTime="garbage"),
+        item(11, 1, LATER + HOUR),
+        item(20, 2, LATER + HOUR, SENT_ID, sender=ME, sentDateTime="garbage"),
+        item(30, 3, LATER + HOUR, sentDateTime="garbage"),  # an inbox item is timed by receivedDateTime only
+    )
+    server = Server(store(*(found_at(n) for n in range(1, 4))), threads=in_conversations(*entries))
+    with Logs() as logs:
+        result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(1, 4)], clock)
+    assert [s.thread_checked for s in result] == [False, False, True]  # GR10
+    assert result[0].newer_incoming_at == LATER + HOUR  # what was read is kept
+    assert result[1].reply_at is None
+    assert result[2].newer_incoming_at == LATER + HOUR
+    degraded = logs.named("item_degraded")
+    assert len(degraded) == 2
+    assert all("item" not in e for e in degraded)
+
+
+@pytest.mark.parametrize("next_link", [False, True], ids=["full-top", "next-link"])
+def test_full_multi_value_answer_split_per_conversation(next_link: bool) -> None:
+    clock = FakeClock()
+    singles = (item(10, 1, LATER + HOUR), item(20, 2, LATER + 2 * HOUR, SENT_ID, sender=ME))
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        named = named_conversations(request)
+        if len(named) > 1:
+            if next_link:
+                return values(found_at(1), **{"@odata.nextLink": f"https://{graph.GRAPH_HOST}/v1.0/next"})(request)
+            return values(*(item(1000 + k, 1, folder_id=JUNK_ID) for k in range(100)))(request)
+        return in_conversations(*singles)(request)
+
+    server = Server(store(found_at(1), found_at(2)), threads=answer)
+    first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert [named_conversations(r) for r in server.conversations()] == [[conv(1), conv(2)], [conv(1)], [conv(2)]]
+    assert all(r.url.params["$top"] == "100" for r in server.conversations())
+    assert {r.url.path for r in server.requests} == {PATH}  # the nextLink is never requested
+    assert (first.newer_incoming_at, first.thread_checked) == (LATER + HOUR, True)
+    assert (second.reply_at, second.thread_checked) == (LATER + 2 * HOUR, True)
+
+
+@pytest.mark.parametrize("next_link", [False, True], ids=["full-top", "next-link"])
+def test_full_single_value_answer_sets_thread_checked_false(next_link: bool) -> None:
+    clock = FakeClock()
+    newer = item(10, 1, LATER + HOUR)
+    if next_link:
+        answer = values(newer, **{"@odata.nextLink": f"https://{graph.GRAPH_HOST}/v1.0/next"})
+    else:
+        answer = values(newer, *(item(1000 + k, 1, folder_id=JUNK_ID) for k in range(99)))
+    server = Server(store(found_at(1)), threads=answer)
+    [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert len(server.conversations()) == 1  # a single value is never split
+    assert {r.url.path for r in server.requests} == {PATH}
+    assert (result.newer_incoming_at, result.thread_checked) == (LATER + HOUR, False)  # positives kept (C14)
+
+
+def test_thread_too_large_retried_with_half_top_then_batch_failure() -> None:
+    clock = FakeClock()
+    tops: list[str] = []
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        tops.append(request.url.params["$top"])
+        return raw(TOO_LARGE)(request)
+
+    server = Server(store(found_at(1)), threads=answer)
+    with Logs() as logs:
+        [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert tops == ["100", "50"]
+    assert (result.state, result.thread_checked) == ("found", False)
+    [failed] = logs.named("provider_call_failed")
+    assert (failed["outcome"], failed["exception"]) == ("too_large", "ResponseTooLarge")
+
+    clock = FakeClock()
+    halved = values(*(item(1000 + k, 1, folder_id=JUNK_ID) for k in range(50)))
+    server = Server(store(found_at(1)), threads=sequence(raw(TOO_LARGE), halved))
+    [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert result.thread_checked is False  # 50 entries fill the effective $top
+
+
+def test_thread_batch_failure_only_its_refs() -> None:
+    clock = FakeClock()
+    threads = sequence(js({}, 500), in_conversations(item(100, 10, LATER + HOUR)))
+    server = Server(store(*(found_at(n) for n in range(11))), threads=threads)
+    with Logs() as logs:
+        result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(11)], clock)
+    assert states(result) == ["found"] * 11  # found refs stay found
+    assert [s.thread_checked for s in result] == [False] * 10 + [True]
+    assert result[10].newer_incoming_at == LATER + HOUR
+    assert len(server.conversations()) == 2  # the next batch is still sent
+    [failed] = logs.named("provider_call_failed")
+    assert (failed["level"], failed["exception"]) == ("WARNING", "UnexpectedStatus")
+
+
+def test_shared_conversation_queried_once() -> None:
+    clock = FakeClock()
+    first_copy = copy(1, 1, LATER, conversationId=conv(7))
+    second_copy = copy(2, 2, LATER + HOUR, conversationId=conv(7))
+    server = Server(store(first_copy, second_copy), threads=in_conversations(first_copy, second_copy))
+    first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    [request] = server.conversations()
+    assert named_conversations(request) == [conv(7)]
+    assert (first.newer_incoming_at, second.newer_incoming_at) == (LATER + HOUR, None)
+    assert (first.thread_checked, second.thread_checked) == (True, True)
+
+
+def test_invalid_conversation_id_no_request_unchecked() -> None:
+    clock = FakeClock()
+    bad = found_at(1, conversationId="AAQk/../BAD", singleValueExtendedProperties=extended("102"))
+    server = Server(
+        store(bad, found_at(3)),
+        {gid(2): js(without(copy(2, 2), "conversationId"))},
+        in_conversations(item(10, 3, LATER + HOUR), item(11, 1, LATER + HOUR, conversationId="AAQk/../BAD")),
+    )
+    targets: list[StatusTarget] = [ref(1), gref(2), ref(3)]
+    result = status(mailbox(server, clock, maps=primed(clock)), targets, clock)
+    assert states(result) == ["found"] * 3
+    assert [s.thread_checked for s in result] == [False, False, True]  # C7
+    assert result[0].found is not None
+    assert result[0].found.meta.flags.answered is True  # replied from the flag alone
+    assert (result[0].reply_at, result[0].newer_incoming_at) == (None, None)
+    [request] = server.conversations()
+    assert named_conversations(request) == [conv(3)]
+
+
+def test_graph_copy_without_message_id_keeps_thread_checked() -> None:
+    clock = FakeClock()
+    no_id = copy(1, 1, internetMessageId="<a b>")
+    server = Server(
+        reads={gid(1): js(no_id)},
+        threads=in_conversations(
+            no_id,
+            item(10, 1, LATER + HOUR),
+            item(11, 1, LATER + 2 * HOUR, SENT_ID, sender=ME),
+            item(12, 1, LATER + HOUR, SENT_ID, sender=ME, internetMessageId="<a b>"),  # a copy: never a reply (C8)
+        ),
+    )
+    [result] = status(mailbox(server, clock, maps=primed(clock)), [gref(1)], clock)
+    assert result.found is not None
+    assert result.found.message_id is None  # ref null (A-mf2)
+    assert (result.newer_incoming_at, result.reply_at, result.thread_checked) == (LATER + HOUR, LATER + 2 * HOUR, True)
+
+
+def test_soft_stop_before_thread_lookup_keeps_location() -> None:
+    clock = FakeClock()
+    server = Server(advancing(clock, 17.0, store(found_at(1))), threads=in_conversations(item(10, 1, LATER + HOUR)))
+    with Logs() as logs:
+        [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert location_of(result) == gref(1)
+    assert (result.thread_checked, result.newer_incoming_at) == (False, None)
+    assert server.conversations() == []
+    assert logs.named("provider_call_failed") == []
+
+
+def test_soft_stop_during_splits_keeps_checked_conversations() -> None:
+    clock = FakeClock()
+    singles = (item(10, 1, LATER + HOUR), item(20, 2, LATER + HOUR))
+    full = values(*(item(1000 + k, 1, folder_id=JUNK_ID) for k in range(100)))
+    threads = sequence(full, advancing(clock, 17.0, in_conversations(*singles)), in_conversations(*singles))
+    server = Server(store(found_at(1), found_at(2)), threads=threads)
+    first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert len(server.conversations()) == 2  # the second split is never sent
+    assert (first.newer_incoming_at, first.thread_checked) == (LATER + HOUR, True)
+    assert (second.newer_incoming_at, second.thread_checked) == (None, False)
 
 
 # --- T17 facts (owner's Graph Explorer run, requests 14, 14b, 15, 16) ----------------------------------------------

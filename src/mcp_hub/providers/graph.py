@@ -4,8 +4,9 @@ Lists cover the well-known folders by id (inbox, sentitems, archive, deleteditem
 §5.5 and keyset paging; GET only, fixed host, no redirects, no nextLink, capped streamed reads against one call
 deadline with the 16 s soft stop. `get_message` reads one message by its immutable id, bound to its parent folder
 (D75), or first locates a `ref` by `internetMessageId` over all folders. `message_status` locates refs in batched
-`internetMessageId` lookups and reads `g` ids without their body (§5.2 `get_message_status`). Blocking; runs through
-providers.base.run_blocking. Returns decoded, unsanitised text; the tool layer sanitises every string (§5.3)."""
+`internetMessageId` lookups, reads `g` ids without their body and looks up replies and newer items by `conversationId`
+(§5.2 `get_message_status`). Blocking; runs through providers.base.run_blocking. Returns decoded, unsanitised text;
+the tool layer sanitises every string (§5.3)."""
 
 import logging
 import re
@@ -64,7 +65,16 @@ from mcp_hub.providers.folders import (
     ListFolder,
     MailFolder,
 )
-from mcp_hub.providers.graph_status import STATUS_LOOKUP_TOP, filter_batches, message_id_filter
+from mcp_hub.providers.graph_status import (
+    STATUS_LOOKUP_TOP,
+    THREAD_LOOKUP_TOP,
+    THREAD_SELECT,
+    ThreadEntry,
+    conversation_filter,
+    filter_batches,
+    message_id_filter,
+    thread_facts,
+)
 from mcp_hub.providers.headers import MAX_REFERENCES, bare_message_id, msg_id_tokens, valid_message_id
 from mcp_hub.sanitize import html_to_text
 
@@ -109,6 +119,7 @@ _FOLDER_RANK: Final[dict[MailFolder, int]] = {"inbox": 0, "archive": 1, "sent": 
 _KEPT_CAUSES: Final = frozenset({"Throttled", "Forbidden"})
 _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anything else is "not a number"
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status provider call (SR6)
+MAX_THREAD_SPLITS: Final = 10  # one-conversation re-requests of full conversationId answers per call (C14)
 _log = logging.getLogger("mcp_hub.providers.graph")
 
 
@@ -311,6 +322,9 @@ class _StatusRun:
         self.located: dict[str, MessageStatus] = {}  # by bare Message-ID
         self.read: dict[GraphMessageRef, MessageStatus] = {}
         self.degraded = 0
+        self.entries: dict[str, dict[str, ThreadEntry]] = {}  # by conversationId, then Graph id (united by id, C14)
+        self.checked: set[str] = set()  # conversations whose answer was complete (not failed, not full)
+        self.throttle_logged = False  # later back-off fast-fails send no request and are not logged again (T12-1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,9 +913,10 @@ class GraphMailbox:
     def _message_status(
         self, client: httpx2.Client, token: str, deadline: CallDeadline, targets: Sequence[StatusTarget]
     ) -> list[MessageStatus]:
-        """Folder ids, then the `ref` location batches, then the `g` reads (A-sec2); T13 adds the conversations.
+        """Folder ids, then the `ref` location batches, then the `g` reads, then the conversations (A-sec2).
 
-        A soft stop inside the loop keeps what was read; every entry not resolved by then is incomplete_search."""
+        A soft stop inside the loop keeps what was read; every entry not resolved by then is incomplete_search, and
+        every found entry whose conversation was not checked by then has `thread_checked: false`."""
         fresh = not isinstance(self._folder_maps.get(self._account), GraphFolderIds)
         ids = self._folder_ids(client, token, deadline)  # a soft stop here: on_soft_stop; a failure fails the account
         run = _StatusRun(client, token, deadline, ids if fresh else None)
@@ -920,9 +935,10 @@ class GraphMailbox:
                 self._locate_batch(run, batch)
             for ref in dict.fromkeys(graph_refs):  # one after another, the soft check before each (A-sec2)
                 run.read[ref] = self._read_status(run, ref)
+            self._thread_lookups(run)
         except SoftStop:
             pass  # what was read is kept (§5.4)
-        return [self._status_of(run, target) for target in targets]
+        return [self._with_thread(run, self._status_of(run, target)) for target in targets]
 
     def _status_of(self, run: _StatusRun, target: StatusTarget) -> MessageStatus:
         if isinstance(target, MessageRef):
@@ -944,10 +960,36 @@ class GraphMailbox:
             run.degraded += 1
             self._degraded(MalformedItemError())
 
-    def _batch_failed(self, exc: ProviderError | MalformedItemError) -> None:
-        """One WARNING per failed batch with the cause class only; the status store and account_errors stay (GR4)."""
+    def _batch_failed(self, run: _StatusRun, exc: ProviderError | MalformedItemError) -> None:
+        """One WARNING per failed batch with the cause class only; the status store and account_errors stay (GR4).
+
+        Only the first `Throttled` of a run is logged: the back-off it starts makes every later batch fail without a
+        request (T12-1)."""
         error = exc if isinstance(exc, ProviderError) else ProviderError("upstream_error", type(exc).__name__)
+        if error.cause == "Throttled":
+            if run.throttle_logged:
+                return
+            run.throttle_logged = True
         log_provider_failure(self._account, "mail", error)
+
+    def _lookup_answer(self, run: _StatusRun, params: dict[str, str], top: int) -> tuple[list[object], bool]:
+        """(values within the effective `$top`, full) of one `GET /me/messages` lookup.
+
+        `too_large` is requested once more with `$top` halved; a second one fails the batch (C10). Full: the effective
+        `$top` reached, or a nextLink, which is never followed."""
+        try:
+            body = self._get(run.client, run.token, run.deadline, "/me/messages", params, MAX_LIST_RESPONSE_BYTES)
+        except ProviderError as exc:
+            if exc.code != "too_large":
+                raise
+            top //= 2
+            params = params | {"$top": str(top)}
+            body = self._get(run.client, run.token, run.deadline, "/me/messages", params, MAX_LIST_RESPONSE_BYTES)
+        values = body.get("value")
+        if not isinstance(values, list):
+            raise ProviderError("upstream_error", "MalformedList")
+        # Entries beyond the requested $top are never inspected (L7).
+        return values[:top], len(values) >= top or "@odata.nextLink" in body
 
     def _locate_batch(self, run: _StatusRun, batch: list[str]) -> None:
         """One `internetMessageId` batch (Graph G1-G5): each value found, gone or incomplete_search.
@@ -961,7 +1003,7 @@ class GraphMailbox:
         except (ProviderError, MalformedItemError) as exc:
             if _fails_account(exc):
                 raise
-            self._batch_failed(exc)
+            self._batch_failed(run, exc)
             return  # the batch's refs stay incomplete_search
         found: dict[str, MessageStatus] = {}
         if hits:
@@ -1006,28 +1048,17 @@ class GraphMailbox:
             "$expand": EXTENDED_EXPAND,
             "$top": str(STATUS_LOOKUP_TOP),
         }
-        top = STATUS_LOOKUP_TOP
-        try:
-            body = self._get(run.client, run.token, run.deadline, "/me/messages", params, MAX_LIST_RESPONSE_BYTES)
-        except ProviderError as exc:
-            if exc.code != "too_large":
-                raise
-            top = STATUS_LOOKUP_TOP // 2  # once more with $top halved; a second too_large fails the batch (C10)
-            params["$top"] = str(top)
-            body = self._get(run.client, run.token, run.deadline, "/me/messages", params, MAX_LIST_RESPONSE_BYTES)
-        values = body.get("value")
-        if not isinstance(values, list):
-            raise ProviderError("upstream_error", "MalformedList")
+        values, full = self._lookup_answer(run, params, STATUS_LOOKUP_TOP)
         wanted = set(batch)
         hits: list[_Hit] = []
         unusable: set[str] = set()
-        for raw in values[:top]:  # entries beyond the requested $top are never inspected (L7)
+        for raw in values:
             hit = self._status_hit(run, raw, wanted)
             if isinstance(hit, str):
                 unusable.add(hit)
             elif hit is not None:
                 hits.append(hit)
-        return hits, unusable, len(values) >= top or "@odata.nextLink" in body
+        return hits, unusable, full
 
     def _status_hit(self, run: _StatusRun, raw: object, wanted: set[str]) -> _Hit | str | None:
         """An acceptable hit, the Message-ID of an exact match that is unusable (GR2), or None (no exact match)."""
@@ -1058,7 +1089,7 @@ class GraphMailbox:
                 raise
             if isinstance(exc, ProviderError) and exc.code == "not_found":
                 return MessageStatus("gone")  # 404: the id follows moves, so the message is gone
-            self._batch_failed(exc)
+            self._batch_failed(run, exc)
             return status_unknown("incomplete_search")  # 400, 5xx, too_large (GR9), throttled
         if body.get("isDraft") is True:
             return MessageStatus("gone")  # turned into a draft (S1)
@@ -1079,6 +1110,110 @@ class GraphMailbox:
             meta=meta,
         )
         return MessageStatus("found", found=found, thread_checked=False)
+
+    def _thread_lookups(self, run: _StatusRun) -> None:
+        """The conversations of the found copies (Graph G7), each value once, in batches of `filter_batches`; then a
+        full answer to a batch of several values is requested again one conversation per request, at most
+        MAX_THREAD_SPLITS per call in batch order (C14). A conversation is checked once one answer for it was
+        complete; what was read from full answers is kept."""
+        found = [*run.located.values(), *run.read.values()]
+        conversations = [c for status in found if (c := _conversation(status)) is not None]
+        if not conversations:
+            return
+        # The map of this call binds the parents as it is: no forced re-read for an unknown parent, which is common
+        # in a conversation; a folder-id failure fails the account (C13).
+        ids = self._folder_ids(run.client, run.token, run.deadline)
+        split: list[str] = []
+        for batch in filter_batches(conversations, conversation_filter):
+            if self._thread_batch(run, batch, ids) and len(batch) > 1:
+                split.extend(batch)
+        for conversation in split[:MAX_THREAD_SPLITS]:  # a single-value answer still full stays unchecked
+            self._thread_batch(run, [conversation], ids)
+
+    def _thread_batch(self, run: _StatusRun, batch: list[str], ids: GraphFolderIds) -> bool:
+        """One `conversationId` request; True when its answer was full. A failed request marks only its
+        conversations unchecked (B7, GR4); account failures, a 401 and the soft stop pass (GR1, P6)."""
+        params = {"$filter": conversation_filter(batch), "$select": THREAD_SELECT, "$top": str(THREAD_LOOKUP_TOP)}
+        try:
+            values, full = self._lookup_answer(run, params, THREAD_LOOKUP_TOP)
+        except _STATUS_PASS_THROUGH:
+            raise
+        except (ProviderError, MalformedItemError) as exc:
+            if _fails_account(exc):
+                raise
+            self._batch_failed(run, exc)
+            return False
+        wanted = set(batch)
+        for raw in values:
+            entry = self._thread_entry(run, raw, wanted, ids)
+            if entry is None:
+                continue
+            known = run.entries.setdefault(entry.conversation_id, {})
+            if entry.graph_id in known:
+                continue  # entries are united by Graph id (C14)
+            known[entry.graph_id] = entry
+            if (entry.sent_at if entry.folder == "sent" else entry.received_at) is None:
+                self._status_degraded(run)  # GR10: its conversation is not checked (ThreadFacts.complete)
+        if not full:
+            run.checked.update(batch)
+        return full
+
+    def _thread_entry(self, run: _StatusRun, raw: object, wanted: set[str], ids: GraphFolderIds) -> ThreadEntry | None:
+        """A conversation item with a valid id, not a draft, in an allowed folder (an unknown parent is `other`) and
+        of a conversation of the batch; None otherwise."""
+        if not isinstance(raw, dict):
+            self._status_degraded(run)
+            return None
+        graph_id = raw.get("id")
+        if not (isinstance(graph_id, str) and GRAPH_ID.fullmatch(graph_id)):
+            self._status_degraded(run)  # no value logged (§9.7)
+            return None
+        conversation = raw.get("conversationId")
+        if raw.get("isDraft") is True or not isinstance(conversation, str) or conversation not in wanted:
+            return None  # drafts never (S1)
+        folder = ids.role_of(_parent(raw))
+        if folder == "excluded":
+            return None  # junk, drafts, outbox or no parent (D75)
+        return ThreadEntry(
+            graph_id=graph_id,
+            conversation_id=conversation,
+            folder=folder,
+            received_at=_timestamp(raw.get("receivedDateTime")),
+            sent_at=_timestamp(raw.get("sentDateTime")),
+            message_id=bare_message_id((_str(raw.get("internetMessageId")) or "")[:MAX_HEADER_BYTES] or None),
+            from_address=_address(raw.get("from"))[1],
+        )
+
+    def _with_thread(self, run: _StatusRun, status: MessageStatus) -> MessageStatus:
+        """The reply and thread fields of a found status (§5.2): `thread_checked` only when its conversation was
+        checked and no entry of it had an unparsable time (GR10). A copy without a valid conversationId keeps
+        `thread_checked: false` and no reply fields; replied then comes from the flag alone (C7)."""
+        found = status.found
+        conversation = _conversation(status)
+        if found is None or conversation is None or not isinstance(found.location, GraphMessageRef):
+            return status
+        facts = thread_facts(
+            found.location.graph_id,
+            found.meta.message_id,  # the bare Message-ID: its copies never count, even when it is not valid (C8)
+            found.received_at,
+            conversation,
+            list(run.entries.get(conversation, {}).values()),
+            self._own_addresses,
+        )
+        return replace(
+            status,
+            reply_at=facts.reply_at,
+            reply_message_id=valid_message_id(facts.reply_message_id),
+            newer_incoming_at=facts.newer_incoming_at,
+            thread_checked=conversation in run.checked and facts.complete,
+        )
+
+
+def _conversation(status: MessageStatus) -> str | None:
+    """The valid conversationId of a found copy, re-checked against the Graph id pattern before any batch (C7)."""
+    thread = status.found.meta.thread if status.found is not None else None
+    value = thread.value if thread is not None and thread.source == "graph" else None
+    return value if isinstance(value, str) and GRAPH_ID.fullmatch(value) else None
 
 
 def _listed_folder(folder: MailFolder | Literal["excluded"]) -> MailFolder:
