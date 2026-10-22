@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final, Literal, Protocol
@@ -38,7 +38,9 @@ from mcp_hub.providers.base import (
     MailFlags,
     MailMeta,
     MailSummary,
+    MessageStatus,
     ProviderError,
+    StatusTarget,
     direction_of,
     load_json_object,
     log_message_skipped,
@@ -462,6 +464,9 @@ class GraphMailbox:
             deadline,
             on_soft_stop=_soft_stopped_page,  # stopped before any folder answered: nothing read, no cursor
         )
+
+    def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]:
+        raise ProviderError("upstream_error", "NotImplemented")  # replaced in T12
 
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         """One message by its Graph id (`id`, D75 binding) or by its Message-ID (`ref`, located first; §5.2)."""

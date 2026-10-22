@@ -32,7 +32,9 @@ from mcp_hub.providers.base import (
     MailFlags,
     MailMeta,
     MailSummary,
+    MessageStatus,
     ProviderError,
+    StatusTarget,
     direction_of,
     log_message_skipped,
     order_key_of,
@@ -672,6 +674,9 @@ class ImapMailbox:
             deadline,
             on_soft_stop=_soft_stopped_page,  # stopped before any folder answered: nothing read, no cursor (D76)
         )
+
+    def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]:
+        raise ProviderError("upstream_error", "NotImplemented")  # replaced in T8
 
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         """By `id` (D75 binding) or by `ref` (the location step); a Graph id is foreign here."""

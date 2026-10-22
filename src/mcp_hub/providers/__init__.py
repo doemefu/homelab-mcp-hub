@@ -1,6 +1,6 @@
 """Provider adapters (spec 080 §6): factories per capability and the per-account connection limit."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +14,8 @@ from mcp_hub.providers.base import (
     FolderPage,
     ListQuery,
     MailDetail,
+    MessageStatus,
+    StatusTarget,
     read_credential,
 )
 from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
@@ -38,6 +40,7 @@ class Mailbox(Protocol):
     def check(self, deadline: CallDeadline) -> None: ...
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail: ...
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage: ...
+    def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]: ...
 
 
 MailboxFactory = Callable[[Account, Path], Mailbox]
