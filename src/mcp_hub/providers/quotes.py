@@ -118,7 +118,7 @@ class _Lines:
         self.stripped = [line.strip() for line in self.original]
         self.kinds = [_kind(line) for line in self.stripped]
         self.n = len(self.kinds)
-        self.blocks_allowed = not _forwarded(subject)  # header blocks of a forward are its content
+        self.blocks_allowed = not _forwarded(subject)  # header blocks and separators of a forward are its content
         self.next_non_blank = [self.n] * self.n
         following = self.n
         for index in range(self.n - 1, -1, -1):
@@ -140,15 +140,19 @@ class _Lines:
         """Rules (a) and (d): this line starts a block that is removed with everything after it."""
         kind = self.kinds[index]
         if kind & _SEPARATOR_LINE:
-            return True
+            return not self._in_forward(index)  # MF-T3-2: a classic Outlook plain-text forward keeps its content
         if kind & _UNDERSCORES:
             last = min(self.n - 1, index + _UNDERSCORE_TO_BLOCK_LINES)
             return any(self._header_block(start) for start in range(index + 1, last + 1))  # MF-P4
         return self._header_block(index)
 
+    def _in_forward(self, index: int) -> bool:
+        """Forwarded content from here on: a forward subject, or a marker in the 3 preceding non-blank lines."""
+        return not self.blocks_allowed or self.after_forward[index]
+
     def _header_block(self, index: int) -> bool:
         """Rule (d) with E-mf7: a From/Von (or Sent/Gesendet) line followed by header lines, one of them Subject."""
-        if not self.blocks_allowed or self.after_forward[index]:
+        if self._in_forward(index):
             return False
         kind = self.kinds[index]
         if kind & _FROM_LINE:

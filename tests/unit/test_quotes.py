@@ -225,6 +225,22 @@ def test_other_subjects_still_cut(subject: str | None) -> None:
     assert remove_quotes(f"Reply\n\n{OUTLOOK_BLOCK}\nold text", subject=subject) == ("Reply", "heuristic")
 
 
+@pytest.mark.parametrize(
+    ("prefix", "subject"),
+    [("", "FW: Meeting"), ("", "[list] WG: Termin"), ("---------- Forwarded message ---------\n", None)],
+)
+def test_dashed_separator_keeps_a_forward(prefix: str, subject: str | None) -> None:
+    # MF-T3-2 (lead ruling): the forward exclusions of (d) apply to the dashed separator too, so a classic Outlook
+    # plain-text forward keeps its content.
+    text = f"FYI, see below.\n\n{prefix}-----Original Message-----\n{OUTLOOK_BLOCK}\nforwarded text"
+    assert remove_quotes(text, subject=subject) == (text, "none")
+
+
+def test_dashed_separator_still_cuts_a_reply() -> None:
+    text = f"See below.\n\n-----Original Message-----\n{OUTLOOK_BLOCK}\nold text"
+    assert remove_quotes(text, subject="Re: Meeting") == ("See below.", "heuristic")
+
+
 def test_forward_does_not_keep_an_attribution() -> None:
     # Forward markers only exclude (d); the forwarded mail's own quoted history is still removed.
     text = f"FYI\n\nBegin forwarded message:\n\n{ATTRIBUTION}\nold text"
@@ -248,6 +264,14 @@ def test_sign_off_before_an_attribution_stays() -> None:
     two = "Thanks\n\nSam Example <sam1@example.org>\nwrote:\n> quoted"
     assert remove_quotes(text, subject=None) == ("Thanks\nSam", "heuristic")
     assert remove_quotes(two, subject=None) == ("Thanks", "heuristic")
+
+
+def test_wrapped_e_attribution_leaves_its_name_line() -> None:
+    # MF-T3-1 residual, pinned: an (e)-only attribution wrapped right before "schrieb am" starts at its second line
+    # (the yield rule), so the name and address line stays. Not yielding when the earlier line has an "@" would
+    # instead take a reply line that mentions an address as the start of the attribution below it.
+    text = "Danke.\n\nAlex Example <alex1@example.org>\nschrieb am Mo., 5. Okt. 2026, 10:00:\n\n> Bitte erledigen."
+    assert remove_quotes(text, subject=None) == ("Danke.\n\nAlex Example <alex1@example.org>", "heuristic")
 
 
 def test_anchored_attribution_keeps_its_first_line() -> None:
