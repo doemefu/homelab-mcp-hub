@@ -481,8 +481,10 @@ def _thread_step(
 
 
 def _count_newer(session: ImapSession, state: _Lookups, hit: _Hit, key_refs: Mapping[str, set[str]]) -> None:
-    """Never newer incoming: an outgoing message (own From, MF-R1; without own addresses a residual, MF-R3), a copy
-    of a sent hit, which includes the owner's replies (MF4, E-mf1), and a copy of X (MF3)."""
+    """Never newer incoming: an outgoing message (own From, MF-R1), a copy of a sent hit, which includes the owner's
+    replies (MF4, E-mf1), and a copy of X (MF3). Residual MF-R3, without an own-addresses file: own messages outside
+    Sent count, including a delivered-back copy of an own reply that does not reference X itself (for example a
+    second reply naming only the first): it is no sent hit of these batches, so `sent_ids` cannot exclude it."""
     if direction_of(in_sent=False, from_address=hit.from_address, own=session.own) == "outgoing":
         return
     if hit.message_id is not None and hit.message_id in state.sent_ids:

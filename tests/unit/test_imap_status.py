@@ -792,6 +792,40 @@ def test_reply_to_follow_up_counts_for_x() -> None:
     assert facts(y_status) == (ago(60), A_MID, None, True)
 
 
+def test_forward_with_references_counts_without_does_not() -> None:
+    """A-gr1 residual: a forward that sets `References: <X>` (Gmail web, Thunderbird) counts as a reply; one with
+    neither header (Apple Mail style) is not seen."""
+    forward = msg(5, 60, "Fwd: x", sender=OWNER, message_id=f"<{A_MID}>", references=f"<{MID}>")
+    server = server_with(inbox=[x_inbox()], sent=[forward])
+    assert facts(run(server, [r()])[0]) == (ago(60), A_MID, None, True)
+
+    bare = msg(5, 60, "Fwd: x", sender=OWNER, message_id=f"<{A_MID}>")
+    server = server_with(inbox=[x_inbox()], sent=[bare])
+    assert facts(run(server, [r()])[0]) == (None, None, None, True)
+
+
+def test_hand_over_both_sides() -> None:
+    """The hand-over: X arrives, the owner replies A (Cc a colleague), the colleague answers B with
+    `In-Reply-To: <A>` and `References: <X> <A>`. X is replied and continued (B counted once although it names two of
+    X's keys); A, as a ref of its own, is outgoing, not replied, and continued through B (the waiting-for side)."""
+    b = FakeMessage(
+        2,
+        ago(30),
+        headers=_block(
+            "From: Colleague <colleague@example.test>",
+            "Cc: Owner <owner@example.org>",
+            f"Message-ID: <{F_MID}>",
+            f"In-Reply-To: <{A_MID}>",
+            f"References: <{MID}> <{A_MID}>",
+        ),
+    )
+    server = server_with(inbox=[x_inbox(), b], sent=[follow(5, 60, A_MID, sender=OWNER)])
+    x_status, a_status = run(server, [r(), r(A_MID)])
+    assert facts(x_status) == (ago(60), A_MID, ago(30), True)
+    assert facts(a_status) == (None, None, ago(30), True)
+    assert (found_folder(a_status), direction(a_status)) == ("sent", "outgoing")
+
+
 def test_earliest_reply_gives_reply_at_and_message_id() -> None:
     later = msg(5, 30, "re", message_id="<a2@example.test>", in_reply_to=f"<{MID}>")
     earlier = msg(6, 90, "re", message_id=f"<{A_MID}>", references=f"<{MID}>")
