@@ -13,6 +13,7 @@ from mcp_hub.ids import (
     ThreadKey,
     decode_message_id,
     decode_ref,
+    decode_status_entry,
     decode_thread_key,
     encode_message_id,
     encode_ref,
@@ -211,3 +212,47 @@ def test_location_k() -> None:
     assert location_id(long_ref) is None
     assert location_k(long_ref) == hashlib.sha256(_raw(["m", "icloud", "\\" * 200, 1, 2]).encode()).hexdigest()[:16]
     assert len(location_k(long_ref)) == 16
+
+
+def test_status_entry_round_trips() -> None:
+    ref = encode_ref("icloud", "abc.123@example.org") or ""
+    assert decode_status_entry(ref) == StableRef(account="icloud", message_id="abc.123@example.org")
+    m = encode_message_id(MessageRef(account="icloud", folder="INBOX", uidvalidity=7, uid=9))
+    assert decode_status_entry(m) == MessageRef(account="icloud", folder="INBOX", uidvalidity=7, uid=9)
+    g = encode_message_id(GraphMessageRef(account="outlook", graph_id="AAMk-1="))
+    assert decode_status_entry(g) == GraphMessageRef(account="outlook", graph_id="AAMk-1=")
+
+
+def test_status_entry_refuses_other_kinds() -> None:
+    thread = encode_thread_key(ThreadKey(account="gmail", source="gmail", value=5)) or ""
+    _invalid(decode_status_entry, thread)
+    _invalid(decode_status_entry, _raw(["e", "icloud", "abcdefghijklmnopqrstuv"]))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        123,
+        None,
+        b"v1.abc",
+        "",
+        "v1." + "a" * 510,
+        (encode_ref("icloud", "a@example.org") or "") + "\n",
+        "v1.!!!not-base64!!!",
+        _raw(["r", "icloud", "bad id@example.org"]),
+        _raw(["r", "icloud", "it's@example.org"]),
+        _raw(["m", "icloud", "INBOX", 0, 1]),
+        _raw(["g", "outlook", "bad'id"]),
+    ],
+)
+def test_status_entry_refuses_malformed(value: object) -> None:
+    _invalid(decode_status_entry, value)  # type: ignore[arg-type]  # non-str inputs are the point
+
+
+def test_status_entry_error_text_is_fixed() -> None:
+    secret = _raw(["r", "icloud", "it's-secret@example.org"])
+    for value in (secret, "x" * 600, 5, _raw(["t", "icloud", "gmail", 1])):
+        with pytest.raises(ToolError) as info:
+            decode_status_entry(value)
+        assert info.value.code == "invalid_argument"
+        assert info.value.message == "Malformed message reference"
