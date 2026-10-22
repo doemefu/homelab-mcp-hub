@@ -44,7 +44,7 @@ with at least three References tokens, those with an In-Reply-To first. A contro
 Message-ID (`control=k/n`); then `HEADER References` for the first, middle and last token and `HEADER In-Reply-To`,
 each `target_hit=k/n` with `result=yes|no|inconclusive`: `no` only at 0/n with the control at n/n, `yes` at n/n with
 the control at n/n, anything else inconclusive. No candidate prints `skipped=no_candidate` (never a miss, IR7). P2:
-the In-Reply-To searches upper-cased (informational). P3: warm inbox and sent, OR trees of 10/20/40/60 In-Reply-To +
+the In-Reply-To searches upper-cased (informational). P3: warm inbox and sent, OR trees of 60/40/20/10 In-Reply-To +
 References keys over the newest inbox ids, 3 runs per size, each on its own ids (no timed criteria repeats), every
 run's ms, the median and the criteria bytes; a size without 3 distinct id sets is `skipped=too_few_ids`. P4: 3
 distinct OR-20 location batches against 3 distinct ORs within 50 keys and 4,000 bytes, warm inbox, `found=k/n`.
@@ -52,10 +52,13 @@ P5 (Gmail): one OR of up to 20 X-GM-THRID keys of the newest All Mail rows, acce
 (BAD/NO, then `single_accepted` for one key). P6: EXAMINE inbox, sent (Gmail: All Mail), inbox again. P7: the 64 KiB
 re-check header FETCH for the newest 100 sent rows, ms and bytes.
 
-Gates (ruling E-im5): P1 acts only on `result=no`. Design B (P3, iCloud inbox) if median(keys=40) <= 1.3 x
-median(keys=20) and median(keys=60) < 1,000 ms; when the 60-key line errors (it can exceed 4,000 bytes), judge B at
-keys=40 alone and record that B is then capped by the 4,000 bytes. P5 `accepted=no` means one SEARCH per thread id,
-and `single_accepted=no` means the Gmail thread design itself needs a ruling.
+Gates (ruling E-im5): P1 acts only on `result=no`; on Gmail the header reply search is turned off only when both
+`references_last` and `in_reply_to` show `result=no`; a `no` on the middle token alone is the R35 residual, and any
+`inconclusive` keeps the search on. Design B (P3, iCloud inbox) if median(keys=40) <= 1.3 x median(keys=20) and
+median(keys=60) < 1,000 ms; when the 60-key line errors (it can exceed 4,000 bytes), judge B at keys=40 alone and
+record that B is then capped by the 4,000 bytes. P3 runs the sizes largest first, so per-term caching biases against B.
+P5 `accepted=no` means one SEARCH per thread id, and `single_accepted=no` means the Gmail thread design itself needs a
+ruling.
 """
 
 import argparse
@@ -473,7 +476,7 @@ _P1_SAMPLE: Final = 200
 _P1_CANDIDATES: Final = 3
 _P1_MIN_REFERENCES: Final = 3
 _IDS_SAMPLE: Final = 160  # newest inbox rows read for the P3/P4 Message-IDs: 3 distinct batches of 50 (T0-2)
-_P3_KEYS: Final = (10, 20, 40, 60)
+_P3_KEYS: Final = (60, 40, 20, 10)  # largest first: per-term caching biases against Design B, not toward it
 _RUNS: Final = 3  # each run searches its own ids, so no timed criteria repeats (T0-2)
 _P4_WIDE: Final = 50
 _P5_SAMPLE: Final = 60

@@ -778,7 +778,7 @@ def test_status_rounds_shapes() -> None:
     p3: list[tuple[str, str]] = []
     for folder in ("INBOX", sent):
         p3.append((folder, _hub_or(("Message-ID",), _newest_inbox_ids(0, 1))))  # warm-up, never a timed shape
-        for keys in (10, 20, 40, 60):
+        for keys in (60, 40, 20, 10):  # largest first: per-term caching biases against Design B (N2)
             count = keys // 2
             p3 += [
                 (folder, _hub_or(("In-Reply-To", "References"), _newest_inbox_ids(r * count, count))) for r in range(3)
@@ -797,6 +797,8 @@ def test_status_rounds_shapes() -> None:
         r"^p3_key_scaling: folder=(inbox|sent) keys=\d+ ids=\d+ bytes=\d+ runs_ms=\d+,\d+,\d+ median_ms=\d+ hits=\d+$"
     )
     assert len(re.findall(p3_line, out, re.M)) == 8
+    sizes = re.findall(r"^p3_key_scaling: folder=(inbox|sent) keys=(\d+) ", out, re.M)
+    assert sizes == [(f, k) for f in ("inbox", "sent") for k in ("60", "40", "20", "10")]
     assert re.search(
         r"^p4_location_width: keys=20 bytes=\d+ runs_ms=\d+,\d+,\d+ median_ms=\d+ found=60/60 "
         r"target_found=yes$",
