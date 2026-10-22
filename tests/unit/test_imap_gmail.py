@@ -388,7 +388,8 @@ def test_german_mailbox_names_same_result(folder_value: str, with_all: bool) -> 
 
 
 def test_without_all_mail() -> None:
-    """All Mail hidden from IMAP: inbox, `\\Sent` and trash only; `archive` empty; `all` = inbox + sent, merged."""
+    """All Mail hidden from IMAP: inbox, `\\Sent` and trash only; `archive` empty; `all` = inbox + sent, merged. A
+    self-sent message (labels `\\Inbox` and `\\Sent`) is `inbox`: the `sent` plan drops `\\Inbox` hits (§5.5)."""
 
     def server() -> FakeImapServer:
         return gmail(
@@ -407,7 +408,7 @@ def test_without_all_mail() -> None:
     page = run(sent, query("sent"))
     assert examined(sent) == ["[Gmail]/Sent Mail"]
     assert searches(sent) == [b"NOT DRAFT SINCE 19-Oct-2026"]  # a real mailbox: no label key
-    assert view(page) == [("self", "sent", "outgoing"), ("out", "sent", "outgoing")]
+    assert view(page) == [("out", "sent", "outgoing")]  # the self-sent copy carries \Inbox: not listed as sent
 
     archive = server()
     page = run(archive, query("archive"))

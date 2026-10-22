@@ -767,12 +767,17 @@ class ImapMailbox:
         base = [*CANDIDATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if session.gmail else list(CANDIDATE_ITEMS)
         items = [*base, candidate_header_item(fields)] if fields else base
         rows = session.fetch(newest, items)
+        # Gmail without `\All`: the `\Sent` mailbox also holds self-sent mail, which is `inbox` (§5.5); its labels
+        # (fetched above) drop it here, as the label key `NOT X-GM-LABELS "\Inbox"` does in All Mail.
+        sent_mailbox = session.gmail and plan.fixed_folder == "sent" and plan.gmail_labels is None
         out: list[Candidate] = []
         for count, uid in enumerate(newest):
             if count and count % SOFT_CHECK_EVERY == 0:
                 self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
             row = rows.get(uid)
             if row is None or _is_draft(row):  # FETCH NO, expunged meanwhile, or a draft (S1)
+                continue
+            if sent_mailbox and _LABEL_INBOX in _labels(row):
                 continue
             received = _aware(row.get(b"INTERNALDATE"))
             if received is None:
