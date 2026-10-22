@@ -585,6 +585,10 @@ def _detail_folder(entry: FolderEntry, row: dict[bytes, object], *, gmail: bool)
     return folder
 
 
+def _soft_stopped_page() -> FolderPage:
+    return FolderPage(items=[], more=False, truncated=True, complete=False)
+
+
 class ImapMailbox:
     def __init__(
         self,
@@ -622,7 +626,11 @@ class ImapMailbox:
                 raw.logout()
             raise
 
-    def _run[T](self, work: Callable[[ImapSession], T], deadline: CallDeadline) -> T:
+    def _run[T](
+        self, work: Callable[[ImapSession], T], deadline: CallDeadline, *, on_soft_stop: Callable[[], T] | None = None
+    ) -> T:
+        """`on_soft_stop` answers a soft stop that reaches this level (at LOGIN or the CAPABILITY after it, before
+        any folder was read); without it the stop is `upstream_timeout` (R2b)."""
         self._deadline = deadline  # started by the tool layer (R2a); never started here
         client: GuardedImapClient | None = None
         try:
@@ -636,6 +644,10 @@ class ImapMailbox:
                 own=self._own_addresses,
             )
             return work(session)
+        except SoftStop:
+            if on_soft_stop is None:
+                raise ProviderError("upstream_timeout", "SoftStop") from None
+            return on_soft_stop()
         except Exception as exc:
             raise _provider_error(exc) from None
         finally:
@@ -652,7 +664,11 @@ class ImapMailbox:
         self._run(lambda session: session.noop(), deadline)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
-        return self._run(lambda session: self._list_messages(session, query), deadline)
+        return self._run(
+            lambda session: self._list_messages(session, query),
+            deadline,
+            on_soft_stop=_soft_stopped_page,  # stopped before any folder answered: nothing read, no cursor (D76)
+        )
 
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         """By `id` (D75 binding) or by `ref` (the location step); a Graph id is foreign here."""
@@ -676,7 +692,7 @@ class ImapMailbox:
             for plan in plans:
                 candidates.extend(self._candidates(session, plan, query, merge, progress))
         except SoftStop:
-            return FolderPage(items=[], more=False, truncated=True, complete=False)
+            return _soft_stopped_page()
         chosen, more = self._choose(candidates, query, merge)
         built: dict[MessageRef, MailSummary] = {}
         try:

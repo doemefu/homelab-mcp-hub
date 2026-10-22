@@ -593,6 +593,28 @@ def test_soft_stop_in_pass_two_gives_no_cursor() -> None:
     assert (page.items, page.truncated, page.complete) == ([], True, False)
 
 
+@pytest.mark.parametrize("command", ["LOGIN", "CAPABILITY"])
+def test_soft_stop_at_login_or_capability_is_a_partial_page_not_an_account_error(command: str) -> None:
+    """D76/§5.4: a list stopped before the first folder answered is an empty partial page (like Graph's), never
+    `upstream_timeout` for the account."""
+
+    def at(commands: Commands) -> int:
+        return nth(commands, lambda name, _: name == command)
+
+    server, page = soft_stop_before(three_folders, query("all"), at)
+    assert (page.items, page.more, page.truncated, page.complete) == ([], False, True, False)
+    assert names(server)[-1] == "LOGOUT"
+
+
+@pytest.mark.parametrize("soft", [-0.5, 0.5])  # before LOGIN, before the post-login CAPABILITY
+def test_soft_stop_at_login_on_get_message_stays_upstream_timeout(soft: float) -> None:
+    server = icloud(inbox=[msg(1, 5, "a")])
+    server.step_seconds = 1.0
+    with pytest.raises(ProviderError) as info:
+        box(server).get_message(MessageRef("icloud", "INBOX", 7, 1), deadline(server, soft=soft))
+    assert (info.value.code, info.value.cause) == ("upstream_timeout", "SoftStop")
+
+
 def test_candidate_parse_checks_the_soft_limit_every_100_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hostile From blocks cost CPU without any IMAP command: pass 1 checks the soft limit every 100 candidates."""
     server = icloud(inbox=[msg(uid, 5 + uid / 100, f"m{uid}") for uid in range(1, 501)])
