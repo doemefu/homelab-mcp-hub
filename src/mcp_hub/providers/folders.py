@@ -78,7 +78,7 @@ class FolderMap:
     gmail: bool
     inbox: FolderEntry  # the registry inbox, always present
     entries: tuple[FolderEntry, ...]  # LIST order, one per raw name: the roles, ≤ 500 excluded, ≤ 500 `other`
-    capped: bool  # a cap dropped mailboxes
+    capped: bool  # the `other` cap dropped mailboxes; dropped excluded names are never read, so they do not count
     _index: dict[str, FolderEntry] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -283,7 +283,7 @@ def build_imap_folder_map(
         if role in counts:
             counts[role] += 1
             if counts[role] > caps[role]:
-                capped = True
+                capped = capped or role == "other"  # an id naming a dropped excluded name is not_found (unknown)
                 continue
         entries.append(FolderEntry(item.raw_name, item.display_name, item.attributes, role))
     return FolderMap(account, gmail, inbox, tuple(entries), capped=capped)

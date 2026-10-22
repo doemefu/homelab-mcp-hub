@@ -471,7 +471,7 @@ def test_excluded_cap_500() -> None:
     listing += [((b"\\Junk",), b"/", f"Spam {i:03d}".encode()) for i in range(600)]
     listing += [((b"\\Sent",), b"/", b"Sent Messages"), ((), b"/", b"Work")]
     folder_map = imap_map(listing)
-    assert folder_map.capped is True
+    assert folder_map.capped is False  # only the `other` cap marks the map: no dropped name is ever searched
     excluded = [e.raw_name for e in folder_map.entries if e.role == "excluded"]
     assert excluded == [f"Spam {i:03d}" for i in range(500)]
     assert len(folder_map.entries) == 503  # inbox, 500 excluded, sent, one other

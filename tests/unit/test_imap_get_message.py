@@ -747,14 +747,29 @@ def test_soft_stop_marks_only_the_refs_still_open(phase: str) -> None:
 
 
 def test_map_cap_marks_only_unresolved_refs() -> None:
-    """More than 500 excluded mailboxes cap the map: an unresolved ref is incomplete, a ref found in a core folder
-    stays certain."""
+    """More than 500 `other` mailboxes cap the map: an unresolved ref is incomplete, a ref found in a core folder
+    stays certain. More than 500 excluded mailboxes leave the search complete: none of them is ever searched."""
     a, b = "a@example.test", "b@example.test"
-    junk = [folder(f"J{i:03d}", (b"\\Junk",)) for i in range(501)]
-    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=junk)
+    boxes = [folder(f"P{i:03d}") for i in range(501)]
+    server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=boxes)
     result = locate(server, [a, b])
     assert (list(result.found), result.incomplete, result.uncertain) == ([a], frozenset({b}), frozenset())
-    assert locate(icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=junk), [a]).complete is True
+    assert locate(icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=boxes), [a]).complete is True
+    junk = [folder(f"J{i:03d}", (b"\\Junk",)) for i in range(501)]
+    result = locate(icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=junk), [a, b])
+    assert (list(result.found), result.incomplete, result.complete) == ([a], frozenset(), True)
+
+
+def test_gmail_with_over_500_labels_answers_not_found(hub_log: Capture) -> None:
+    """Gmail labels are excluded mailboxes: more than 500 of them do not cap the map, so a ref missing from All
+    Mail and Trash is `not_found` (not `upstream_timeout`) and the map refresh is logged `ok`."""
+    server = gmail(all_mail=[msg(1, 5, "other", message_id="<y@example.test>")])
+    server.folders.extend(folder(f"Label {i:03d}") for i in range(600))
+    error = refused(server, ref(account="gmail"))
+    assert (error.code, error.cause) == ("not_found", "NotFound")
+    assert examined(server) == [GMAIL_ALL, GMAIL_TRASH]
+    refreshed = [json.loads(line) for line in hub_log.lines if '"folder_map_refreshed"' in line]
+    assert [(line["account"], line["outcome"]) for line in refreshed] == [("gmail", "ok")]
 
 
 @pytest.mark.parametrize(
