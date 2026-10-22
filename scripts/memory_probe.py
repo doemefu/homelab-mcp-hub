@@ -5,6 +5,10 @@ request from synthetic objects that fill the 5 MiB byte budget, so the process h
 `--scenario graph-message` drives run_get_message for an `outlook` entry through an in-process Graph transport whose
 message answer fills the 2 MiB message cap (non-ASCII body plus 5,000 recipients) and whose attachment answer fills the
 1 MiB list cap; `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process.
+`--scenario status` drives ImapMailbox.message_status for 50 refs through an in-process IMAP fake: every location SEARCH
+and every reply or thread SEARCH answers 500 hits whose header blocks are hostile (8 KiB address header for the 500-UID
+locate chunks, 64 KiB lookup header for the 100-UID lookup chunks; one shared bytes object, so the fake holds
+none of it).
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
@@ -25,23 +29,27 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import anyio
 import httpx2
+from tests.support.clock import FakeClock
 from tests.support.dav_transport import RecordingTransport, collection, dav, home_set, multistatus, principal, report
+from tests.support.imap_fake import FakeFolder, FakeImapServer, FakeMessage
 from tests.support.ms_transport import FAKE_CLIENT_ID, MsTransport, json_answer
 from tests.support.token_fakes import KEY, FakeStore
 
 from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
-from mcp_hub.ids import GraphMessageRef, encode_message_id
+from mcp_hub.ids import GraphMessageRef, StableRef, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.caldav import MAX_REPORT_BYTES_PER_CALL, CalDavCalendarSource, SlowObjectCache
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import GRAPH_WELL_KNOWN, FolderMapCache
 from mcp_hub.providers.graph import MAX_LIST_RESPONSE_BYTES, MAX_MESSAGE_RESPONSE_BYTES, Backoff, GraphMailbox
 from mcp_hub.providers.graph_auth import AccessTokenCache, GraphTokenSource
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.providers.msidentity import GraphAccount
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
@@ -282,6 +290,53 @@ def context(accounts: int, scenario: str | None, calendars: int, graph: bool = F
     )
 
 
+STATUS_REFS, STATUS_HITS = 50, 500
+
+
+def status_server() -> tuple[FakeImapServer, list[StableRef]]:
+    """INBOX holds the 50 refs (UIDs 1-50) and 500 hostile messages that every location and lookup SEARCH hits: they
+    share one header block that names all 50 ids in Message-ID, In-Reply-To and References, carries an 8 KiB From and
+    pads References to 64 KiB, so the locate items (8 KiB) and the lookup items (64 KiB) are always cut."""
+    ids = [f"r{i:02d}@example.test" for i in range(STATUS_REFS)]
+    named = " ".join(f"<{x}>" for x in ids)
+    lines = [
+        f"From: {'a' * 8000} <sender@example.test>",
+        f"Message-ID: {named}",
+        f"In-Reply-To: {named}",
+        f"References: {named} {'x' * 66000}",
+    ]
+    hostile = ("\r\n".join(lines) + "\r\n\r\n").encode()
+    received = datetime(2026, 10, 21, 7, 0, tzinfo=UTC)
+    real = [
+        FakeMessage(i + 1, received, headers=f"From: s@example.test\r\nMessage-ID: <{x}>\r\n\r\n".encode())
+        for i, x in enumerate(ids)
+    ]
+    bulk = [FakeMessage(STATUS_REFS + 1 + i, received, headers=hostile) for i in range(STATUS_HITS)]
+    inbox = FakeFolder("INBOX", (b"\\HasNoChildren",), messages={m.uid: m for m in real + bulk})
+    sent = FakeFolder("Sent Messages", (b"\\HasNoChildren", b"\\Sent"), messages={})
+    return FakeImapServer([inbox, sent], clock=FakeClock()), [StableRef("icloud", x) for x in ids]
+
+
+def status_call(server: FakeImapServer, targets: list[StableRef]) -> str:
+    clock = server.clock
+    if clock is None:
+        raise SystemExit("status server needs a clock")
+    box = ImapMailbox(
+        "icloud",
+        host="imap.example.test",
+        port=993,
+        folder="INBOX",
+        username="u",
+        password="p",
+        client_factory=lambda host, port, context, timeout: server.client(),
+        own_addresses=frozenset(),
+        folder_maps=FolderMapCache(clock=clock),
+    )
+    statuses = box.message_status(targets, CallDeadline(clock(), 16.0, 20.0, clock))
+    checked = sum(s.thread_checked for s in statuses)
+    return f"refs {len(statuses)}, found {sum(s.state == 'found' for s in statuses)}, thread_checked {checked}"
+
+
 def cgroup(name: str) -> str:
     try:
         return Path("/sys/fs/cgroup", name).read_text().strip().replace("\n", ", ")
@@ -323,7 +378,7 @@ async def one_call(ctx: HubContext, calendar: bool, graph: bool) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--scenario", choices=[*sorted(SCENARIOS), "graph-message"], required=True)
+    parser.add_argument("--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status"], required=True)
     parser.add_argument(
         "--with-calendar", choices=sorted(SCENARIOS), help="calendar scenario run next to graph-message"
     )
@@ -331,6 +386,19 @@ def main() -> None:
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
     args = parser.parse_args()
+    if args.scenario == "status":
+        server, targets = status_server()
+        gc.collect()
+        base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+        print(f"baseline peak RSS {base:.0f} MiB (imports and fake)", flush=True)
+        for call in range(1, args.calls + 1):
+            cpu = time.process_time()
+            note = status_call(server, targets)
+            gc.collect()
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+            print(f"call {call}: peak RSS {peak:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, {note}", flush=True)
+        print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
+        return
     graph = args.scenario == "graph-message"
     if args.with_calendar and not graph:
         parser.error("--with-calendar needs --scenario graph-message")
