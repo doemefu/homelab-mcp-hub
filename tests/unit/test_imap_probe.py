@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from imapclient.exceptions import LoginError
 
 from mcp_hub.ids import MESSAGE_ID_PATTERN
 from mcp_hub.providers import imap_search
@@ -530,7 +531,7 @@ class FailingVariant(StubClient):
 
 def test_a_failing_msgid_variant_does_not_stop_the_others() -> None:
     out, _ = _run(FailingVariant(_folders()))
-    assert "msgid_variant: name=msgid_bracketed: error=TimeoutError" in out
+    assert "msgid_variant: name=msgid_bracketed error=TimeoutError" in out
     assert re.search(r"^msgid_variant: name=msgid_bare hits=\d+ ", out, re.MULTILINE)
     assert re.search(r"^msgid_variant: name=msgid_no_not_draft hits=\d+ ", out, re.MULTILINE)
     assert re.search(r"^text: folders=", out, re.MULTILINE)
@@ -552,6 +553,7 @@ class Msg:
 
 _STATUS_TODAY = date(2026, 10, 22)
 _STATUS_SINCE = (_STATUS_TODAY - timedelta(days=180)).strftime("%d-%b-%Y")  # C locale in tests
+_STATUS_BEFORE = (_STATUS_TODAY - timedelta(days=1)).strftime("%d-%b-%Y")  # samples at least one day old (T0-1)
 _STATUS_COMMANDS = {"CAPABILITY", "LOGIN", "LIST", "EXAMINE", "SEARCH", "FETCH", "LOGOUT"}
 _STATUS_FETCH_ITEMS = {
     "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>",
@@ -683,20 +685,23 @@ def _header_block(m: Msg, fields: list[str]) -> bytes:
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
 
 
-def _inbox(count: int = 60) -> list[Msg]:
+def _inbox(count: int = 160) -> list[Msg]:
     return [Msg(uid, f"in{uid}@example.test") for uid in range(1, count + 1)]
 
 
+def _refs(*names: str) -> str:
+    return " ".join(f"<{n}@example.test>" for n in names)
+
+
 def _sent_icloud() -> list[Msg]:
+    """Candidates newest first: s6, s5 and s2 have an In-Reply-To; s4 has none and is passed over (T0-1)."""
     return [
         Msg(1, "s1@example.test", "<r9@example.test>", "<r9@example.test>"),
-        Msg(
-            2,
-            "s2@example.test",
-            "<r4@example.test>",
-            "<r1@example.test> <r2@example.test>\r\n <r3@example.test> <r4@example.test>",
-        ),
-        Msg(3, "s3@example.test", "<r8@example.test>", "<r7@example.test> <r8@example.test>"),
+        Msg(2, "s2@example.test", "<r4@example.test>", "<r1@example.test> <r2@example.test>\r\n " + _refs("r3", "r4")),
+        Msg(3, "s3@example.test", "<r8@example.test>", _refs("r7", "r8")),
+        Msg(4, "s4@example.test", "", _refs("r11", "r12", "r13")),
+        Msg(5, "s5@example.test", "<r23@example.test>", _refs("r21", "r22", "r23")),
+        Msg(6, "s6@example.test", "<r35@example.test>", _refs("r31", "r32", "r33", "r34", "r35")),
     ]
 
 
@@ -711,7 +716,7 @@ def _icloud_stub(**kwargs: Any) -> StatusStub:
     return StatusStub(mailboxes, folders, **kwargs)
 
 
-def _gmail_stub() -> StatusStub:
+def _gmail_stub(cls: type[StatusStub] = StatusStub) -> StatusStub:
     folders: list[Folder] = [
         ((), b"/", "INBOX"),
         ((b"\\HasChildren", b"\\Noselect"), b"/", "[Gmail]"),
@@ -721,25 +726,18 @@ def _gmail_stub() -> StatusStub:
     ]
     all_mail = [Msg(uid, f"in{uid}@example.test", labels=(b"\\Inbox",), thrid=1000 + uid) for uid in range(1, 31)]
     all_mail += [
-        Msg(
-            31,
-            "s31@example.test",
-            "<r3@example.test>",
-            "<r1@example.test> <r2@example.test> <r3@example.test>",
-            labels=(b"\\Sent",),
-            thrid=2000,
-        ),
+        Msg(31, "s31@example.test", "<r3@example.test>", _refs("r1", "r2", "r3"), labels=(b"\\Sent",), thrid=2000),
         Msg(
             32,
             "d32@example.test",
             "<r3@example.test>",
-            "<r1@example.test> <r2@example.test> <r3@example.test>",
+            _refs("r1", "r2", "r3"),
             labels=(b"\\Sent", b"\\Draft"),
             thrid=2001,
         ),
     ]
     mailboxes = {"INBOX": _inbox(30), "[Gmail]/All Mail": all_mail, "[Gmail]/Sent Mail": all_mail[30:31]}
-    return StatusStub(mailboxes, folders, (b"IMAP4REV1", b"X-GM-EXT-1", b"SPECIAL-USE"))
+    return cls(mailboxes, folders, (b"IMAP4REV1", b"X-GM-EXT-1", b"SPECIAL-USE"))
 
 
 def _status_run(stub: StatusStub) -> str:
@@ -752,84 +750,101 @@ def _hub_or(fields: tuple[str, ...], ids: list[str]) -> str:
     return "NOT DRAFT " + imap_search.header_or(fields, ids).decode()  # type: ignore[arg-type]  # literal fields
 
 
-def _newest_inbox_ids(n: int, count: int = 60) -> list[str]:
-    return [f"in{uid}@example.test" for uid in range(count, count - n, -1)]
+def _newest_inbox_ids(start: int, n: int, count: int = 160) -> list[str]:
+    """Newest-first inbox ids `start` .. `start + n - 1` of the sample (index 0 is the newest)."""
+    return [f"in{count - i}@example.test" for i in range(start, start + n)]
+
+
+def _reply_keys(gmail: bool, field: str, names: list[str]) -> list[str]:
+    sent = 'X-GM-LABELS "\\\\Sent" ' if gmail else ""
+    return [f'NOT DRAFT {sent}HEADER {field} "<{n}@example.test>"' for n in names]
 
 
 def test_status_rounds_shapes() -> None:
-    """Every criteria on the wire, per round, as the hub builds it: the sample lists, P1 (first, middle, last
-    References token and In-Reply-To), P2 (upper-cased), P3 (10/20/40/60 keys, warm-up + 3 runs, inbox and sent)
-    and P4 (OR-20 against the widest OR within 50 keys and 4,000 bytes)."""
+    """Every criteria on the wire, per round, as the hub builds it: the aged sample windows; P1 control and
+    first/middle/last References and In-Reply-To for up to 3 candidates (In-Reply-To first); P2 upper-cased; P3
+    a distinct id slice per run in inbox and sent; P4 three distinct OR-20 and OR-50 batches (T0-1, T0-2)."""
     stub = _icloud_stub()
     out = _status_run(stub)
     searches = _searches_by_folder(stub)
-    window = f"NOT DRAFT SINCE {_STATUS_SINCE}"
-    p1 = [
-        ("Sent Messages", 'NOT DRAFT HEADER References "<r1@example.test>"'),
-        ("Sent Messages", 'NOT DRAFT HEADER References "<r3@example.test>"'),
-        ("Sent Messages", 'NOT DRAFT HEADER References "<r4@example.test>"'),
-        ("Sent Messages", 'NOT DRAFT HEADER In-Reply-To "<r4@example.test>"'),
-        ("Sent Messages", 'NOT DRAFT HEADER In-Reply-To "<R4@EXAMPLE.TEST>"'),
-    ]
-    p3 = []
-    for folder in ("INBOX", "Sent Messages"):
-        p3.append((folder, _hub_or(("In-Reply-To", "References"), _newest_inbox_ids(5))))  # warm-up
+    window = f"NOT DRAFT SINCE {_STATUS_SINCE} BEFORE {_STATUS_BEFORE}"
+    sent = "Sent Messages"
+    p1 = _reply_keys(False, "Message-ID", ["s6", "s5", "s2"])
+    p1 += _reply_keys(False, "References", ["r31", "r21", "r1"])
+    p1 += _reply_keys(False, "References", ["r33", "r22", "r3"])
+    p1 += _reply_keys(False, "References", ["r35", "r23", "r4"])
+    p1 += _reply_keys(False, "In-Reply-To", ["r35", "r23", "r4"])
+    p1 += [f'NOT DRAFT HEADER In-Reply-To "<{n}@EXAMPLE.TEST>"' for n in ("R35", "R23", "R4")]  # P2
+    p3: list[tuple[str, str]] = []
+    for folder in ("INBOX", sent):
+        p3.append((folder, _hub_or(("Message-ID",), _newest_inbox_ids(0, 1))))  # warm-up, never a timed shape
         for keys in (10, 20, 40, 60):
-            p3 += [(folder, _hub_or(("In-Reply-To", "References"), _newest_inbox_ids(keys // 2)))] * 3
-    p4 = [("INBOX", _hub_or(("Message-ID",), _newest_inbox_ids(20)))] * 3
-    p4 += [("INBOX", _hub_or(("Message-ID",), _newest_inbox_ids(50)))] * 3
-    p6_p7 = [("Sent Messages", window)]
-    assert searches == [("INBOX", window), ("Sent Messages", window), *p1, *p3, *p4, *p6_p7]
-    assert len(p4[-1][1]) <= 4000 + len("NOT DRAFT ")
-    assert re.search(r"^p1_reply_match: candidate=yes scanned=3 drafts=0 skipped_unsafe=0 ms=\d+$", out, re.M)
+            count = keys // 2
+            p3 += [
+                (folder, _hub_or(("In-Reply-To", "References"), _newest_inbox_ids(r * count, count))) for r in range(3)
+            ]
+    p4 = [("INBOX", _hub_or(("Message-ID",), _newest_inbox_ids(r * 20, 20))) for r in range(3)]
+    p4 += [("INBOX", _hub_or(("Message-ID",), _newest_inbox_ids(r * 50, 50))) for r in range(3)]
+    expected = [("INBOX", window), (sent, window), *[(sent, c) for c in p1], *p3, *p4, (sent, window)]
+    assert searches == expected
+    assert len({c for _, c in p3[1:13]}) == 12  # no timed criteria repeats
+    assert re.search(r"^p1_reply_match: candidates=3 with_irt=3 scanned=6 drafts=0 skipped_unsafe=0 ms=\d+$", out, re.M)
+    assert re.search(r"^p1_reply_match: control=3/3 ms=\d+$", out, re.M)
     for key in ("references_first", "references_middle", "references_last", "in_reply_to"):
-        assert re.search(rf"^p1_reply_match: key={key} target_hit=yes hits=1 ms=\d+$", out, re.M)
-    assert re.search(r"^p2_case: target_hit=no hits=0 ms=\d+$", out, re.M)
-    assert (
-        len(
-            re.findall(
-                r"^p3_key_scaling: folder=(inbox|sent) keys=\d+ ids=\d+ bytes=\d+ runs=3 median_ms=\d+ "
-                r"hits=\d+$",
-                out,
-                re.M,
-            )
-        )
-        == 8
+        assert re.search(rf"^p1_reply_match: key={key} target_hit=3/3 control=3/3 result=yes ms=\d+$", out, re.M)
+    assert re.search(r"^p2_case: target_hit=0/3 ms=\d+$", out, re.M)
+    p3_line = (
+        r"^p3_key_scaling: folder=(inbox|sent) keys=\d+ ids=\d+ bytes=\d+ runs_ms=\d+,\d+,\d+ median_ms=\d+ hits=\d+$"
     )
-    assert re.search(r"^p4_location_width: keys=50 bytes=\d+ runs=3 median_ms=\d+ hits=50 target_found=yes$", out, re.M)
-    assert re.search(r"^p5_gmail_thrid: skipped=not_gmail$", out, re.M)
-    assert re.search(r"^p6_reexamine: inbox_ms=\d+ other=sent other_ms=\d+ inbox_again_ms=\d+$", out, re.M)
+    assert len(re.findall(p3_line, out, re.M)) == 8
     assert re.search(
-        r"^p7_header_fetch: mailbox=sent uids=3 rows=3 ms=\d+ header_bytes=\d+ max_header_bytes=\d+ "
-        r"cut=0$",
+        r"^p4_location_width: keys=20 bytes=\d+ runs_ms=\d+,\d+,\d+ median_ms=\d+ found=60/60 "
+        r"target_found=yes$",
         out,
         re.M,
     )
+    assert re.search(
+        r"^p4_location_width: keys=50 bytes=\d+ runs_ms=\d+,\d+,\d+ median_ms=\d+ found=150/150 "
+        r"target_found=yes$",
+        out,
+        re.M,
+    )
+    assert re.search(r"^p5_gmail_thrid: skipped=not_gmail$", out, re.M)
+    assert re.search(r"^p6_reexamine: inbox_ms=\d+ other=sent other_ms=\d+ inbox_again_ms=\d+$", out, re.M)
+    assert re.search(
+        r"^p7_header_fetch: mailbox=sent uids=6 rows=6 ms=\d+ header_bytes=\d+ max_header_bytes=\d+ cut=0$", out, re.M
+    )
     examined = [text for cmd, text in stub.commands if cmd == "EXAMINE"]
-    assert examined[-4:] == ["INBOX", "Sent Messages", "INBOX", "Sent Messages"]  # P6 inbox, sent, inbox; P7 sent
+    assert examined[-4:] == ["INBOX", sent, "INBOX", sent]  # P6 inbox, sent, inbox; P7 sent
 
 
 def test_status_rounds_shapes_gmail() -> None:
-    """Gmail: P1 in All Mail with exactly the hub's reply criteria (IR7); the `\\Draft`-labelled sent row is
-    dropped; P5 one OR of the newest distinct X-GM-THRIDs; P7 with the Gmail items."""
+    """Gmail: P1 in All Mail with exactly the hub's reply criteria (IR7), the control included; the
+    `\\Draft`-labelled sent row is dropped; P5 one OR of the newest distinct X-GM-THRIDs; P7 with the Gmail
+    items; P3/P4 sizes without enough distinct ids are skipped, never filled by reuse."""
     stub = _gmail_stub()
     out = _status_run(stub)
     searches = _searches_by_folder(stub)
+    all_mail = "[Gmail]/All Mail"
     sent = 'X-GM-LABELS "\\\\Sent"'
-    assert ("[Gmail]/All Mail", f"NOT DRAFT SINCE {_STATUS_SINCE} {sent}") in searches
-    p1 = [s for s in searches if "HEADER References" in s[1] and " OR " not in s[1]]
-    p1 += [s for s in searches if "HEADER In-Reply-To" in s[1] and " OR " not in s[1]]
+    assert (all_mail, f"NOT DRAFT SINCE {_STATUS_SINCE} BEFORE {_STATUS_BEFORE} {sent}") in searches
+    p1 = [s for s in searches if s[1].startswith(f"NOT DRAFT {sent} HEADER")]
     assert p1 == [
-        ("[Gmail]/All Mail", f'NOT DRAFT {sent} HEADER References "<r1@example.test>"'),
-        ("[Gmail]/All Mail", f'NOT DRAFT {sent} HEADER References "<r2@example.test>"'),
-        ("[Gmail]/All Mail", f'NOT DRAFT {sent} HEADER References "<r3@example.test>"'),
-        ("[Gmail]/All Mail", f'NOT DRAFT {sent} HEADER In-Reply-To "<r3@example.test>"'),
-        ("[Gmail]/All Mail", f'NOT DRAFT {sent} HEADER In-Reply-To "<R3@EXAMPLE.TEST>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER Message-ID "<s31@example.test>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER References "<r1@example.test>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER References "<r2@example.test>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER References "<r3@example.test>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER In-Reply-To "<r3@example.test>"'),
+        (all_mail, f'NOT DRAFT {sent} HEADER In-Reply-To "<R3@EXAMPLE.TEST>"'),
     ]
-    assert re.search(r"^p1_reply_match: candidate=yes scanned=2 drafts=1 skipped_unsafe=0 ms=\d+$", out, re.M)
+    assert re.search(r"^p1_reply_match: candidates=1 with_irt=1 scanned=2 drafts=1 skipped_unsafe=0 ms=\d+$", out, re.M)
+    assert re.search(r"^p1_reply_match: key=references_middle target_hit=1/1 control=1/1 result=yes ms=\d+$", out, re.M)
     thrids = [2000, *range(1030, 1011, -1)]  # newest first, distinct, the draft's dropped
-    assert ("[Gmail]/All Mail", "NOT DRAFT " + imap_search.thrid_or(thrids).decode()) in searches
-    assert re.search(r"^p5_gmail_thrid: accepted=yes keys=20 bytes=\d+ hits=20 members_found=yes ms=\d+$", out, re.M)
+    assert (all_mail, "NOT DRAFT " + imap_search.thrid_or(thrids).decode()) in searches
+    assert re.search(r"^p5_gmail_thrid: accepted=yes keys=20 bytes=\d+ hits=20 members_found=20/20 ms=\d+$", out, re.M)
+    assert re.search(r"^p3_key_scaling: folder=inbox keys=20 ids=10 ", out, re.M)  # 30 ids: 3 x 10
+    assert re.search(r"^p3_key_scaling: folder=inbox keys=40 skipped=too_few_ids$", out, re.M)
+    assert re.search(r"^p4_location_width: keys=20 skipped=too_few_ids$", out, re.M)
     assert re.search(r"^p6_reexamine: inbox_ms=\d+ other=all_mail other_ms=\d+ inbox_again_ms=\d+$", out, re.M)
     p7 = [text for cmd, text in stub.commands if cmd == "FETCH"][-1]
     assert p7 == (
@@ -858,14 +873,17 @@ def _split_items(text: str) -> list[str]:
     return re.findall(r"BODY\.PEEK\[[^\]]*\]<[^>]*>|[A-Z-]+", text)
 
 
+_STATUS_LINE = re.compile(r"[a-z0-9_]+: [a-z0-9_]+=[a-z0-9_/,]+( [a-z0-9_]+=[a-z0-9_/,]+)*")
+
+
 def test_status_rounds_print_no_ids_or_names() -> None:
     for stub in (_icloud_stub(), _gmail_stub()):
         out = _status_run(stub)
         lines = out.splitlines()
         assert lines[0] == "--- result ---"
         for line in lines[1:]:
-            assert re.fullmatch(r"[a-z0-9_]+: [a-z0-9_]+=[a-z0-9_]+( [a-z0-9_]+=[a-z0-9_]+)*", line), line
-        for leak in ("@", "example", "Sent Messages", "All Mail", "Gmail", "INBOX", "in60", "r1", "s2"):
+            assert _STATUS_LINE.fullmatch(line), line
+        for leak in ("@", "example", "Sent Messages", "All Mail", "Gmail", "INBOX", "in160", "r31", "s6"):
             assert leak not in out
 
 
@@ -880,22 +898,35 @@ class _FailingMiddle(StatusStub):
 
 
 def test_status_round_error_reported_by_class_and_next_round_runs() -> None:
+    """An error line keeps the `k=v` grammar (T0-S3): `… key=references_middle error=TimeoutError`."""
     stub = _FailingMiddle(_icloud_stub().mailboxes, _icloud_stub().folders)
     out = _status_run(stub)
-    assert "p1_reply_match: key=references_middle: error=TimeoutError" in out
-    assert re.search(r"^p1_reply_match: key=references_last target_hit=yes ", out, re.M)
+    assert "p1_reply_match: key=references_middle error=TimeoutError" in out.splitlines()
+    assert re.search(r"^p1_reply_match: key=references_last target_hit=3/3 ", out, re.M)
     assert re.search(r"^p2_case: target_hit=", out, re.M)
     for name in ("p3_key_scaling", "p4_location_width", "p5_gmail_thrid", "p6_reexamine", "p7_header_fetch"):
         assert re.search(rf"^{name}: ", out, re.M)
+    for line in out.splitlines()[1:]:  # error values are class names
+        assert re.fullmatch(r"[a-z0-9_]+: [a-z0-9_]+=[A-Za-z0-9_/,]+( [a-z0-9_]+=[A-Za-z0-9_/,]+)*", line), line
     assert "timed out" not in out
     assert "r3@" not in out
 
 
-def test_status_round_refused_thrid_or_reported_as_not_accepted() -> None:
-    gmail = _gmail_stub()
-    stub = _FailingMiddle(gmail.mailboxes, gmail.folders, gmail.caps)
+class _RefusingThridOr(StatusStub):
+    def search(self, criteria: Any) -> list[int]:
+        if b"X-GM-THRID" in criteria and b"OR " in criteria:
+            raise imaplib.IMAP4.error("UID command error: BAD [CLIENTBUG] r3@example.test")
+        return super().search(criteria)
+
+
+@pytest.mark.parametrize(("cls", "single"), [(_FailingMiddle, "no"), (_RefusingThridOr, "yes")])
+def test_status_round_refused_thrid_or_reported_as_not_accepted(cls: type[StatusStub], single: str) -> None:
+    """T0-3: a refused OR is followed by one single-key X-GM-THRID search, reported as accepted or not."""
+    stub = _gmail_stub(cls)
     out = _status_run(stub)
-    assert re.search(r"^p5_gmail_thrid: accepted=no status=bad keys=20 ms=\d+$", out, re.M)
+    assert re.search(rf"^p5_gmail_thrid: accepted=no status=bad keys=20 ms=\d+ single_accepted={single}$", out, re.M)
+    singles = [t for c, t in stub.commands if c == "SEARCH" and re.fullmatch(r"NOT DRAFT X-GM-THRID \d+", t)]
+    assert singles == (["NOT DRAFT X-GM-THRID 2000"] if single == "yes" else [])
     assert re.search(r"^p6_reexamine: ", out, re.M)
     assert "CLIENTBUG" not in out
 
@@ -910,9 +941,9 @@ def test_status_round_guard_refusal_is_never_swallowed() -> None:
 def test_status_rounds_skip_unsafe_ids() -> None:
     """SR4: Message-IDs with `"`, `{5}` or `X-GM-RAW` never reach the wire; the skips are counted and printed."""
     inbox = _inbox()
-    inbox += [Msg(61, 'a"b@example.test'), Msg(62, "c{5}@example.test"), Msg(63, "X-GM-RAW@example.test")]
+    inbox += [Msg(161, 'a"b@example.test'), Msg(162, "c{5}@example.test"), Msg(163, "X-GM-RAW@example.test")]
     unsafe_refs = '<a"b@example.test> <r2@example.test> <X-GM-RAW@example.test>'
-    sent = [*_sent_icloud(), Msg(4, "s4@example.test", "<x{5}@example.test>", unsafe_refs)]
+    sent = [*_sent_icloud(), Msg(7, "s7@example.test", "<x{5}@example.test>", unsafe_refs)]
     stub = _icloud_stub()
     stub.mailboxes = {"INBOX": inbox, "Sent Messages": sent}
     out = _status_run(stub)
@@ -920,23 +951,17 @@ def test_status_rounds_skip_unsafe_ids() -> None:
     assert 'a"b' not in wire
     assert "{5}" not in wire
     assert "X-GM-RAW" not in wire.upper()
-    assert re.search(r"^status_ids: rows=63 usable=60 drafts=0 skipped_unsafe=3 ms=\d+$", out, re.M)
-    assert re.search(r"^p1_reply_match: candidate=yes scanned=4 drafts=0 skipped_unsafe=2 ms=\d+$", out, re.M)
-    assert 'NOT DRAFT HEADER References "<r1@example.test>"' in wire  # the next safe candidate is used
+    assert re.search(r"^status_ids: rows=160 usable=157 drafts=0 skipped_unsafe=3 ms=\d+$", out, re.M)
+    assert re.search(r"^p1_reply_match: candidates=3 with_irt=3 scanned=7 drafts=0 skipped_unsafe=2 ms=\d+$", out, re.M)
+    assert 'NOT DRAFT HEADER References "<r1@example.test>"' in wire  # the next safe candidates are used
 
 
 def test_p1_no_candidate_prints_skipped() -> None:
     """IR7: no sent row with three References tokens (the draft that has them is dropped even when the server
-    ignores NOT DRAFT) → `skipped=no_candidate`, no P1/P2 search; never a `target_hit=no`."""
+    ignores NOT DRAFT) → `skipped=no_candidate`, no P1/P2 search; never a `target_hit`."""
     sent = [
-        Msg(1, "s1@example.test", "<r9@example.test>", "<r8@example.test> <r9@example.test>"),
-        Msg(
-            2,
-            "d2@example.test",
-            "<r3@example.test>",
-            "<r1@example.test> <r2@example.test> <r3@example.test>",
-            flags=(b"\\Draft",),
-        ),
+        Msg(1, "s1@example.test", "<r9@example.test>", _refs("r8", "r9")),
+        Msg(2, "d2@example.test", "<r3@example.test>", _refs("r1", "r2", "r3"), flags=(b"\\Draft",)),
     ]
     stub = _icloud_stub(honours_not_draft=False)
     stub.mailboxes = {"INBOX": _inbox(), "Sent Messages": sent}
@@ -944,8 +969,56 @@ def test_p1_no_candidate_prints_skipped() -> None:
     assert re.search(r"^p1_reply_match: skipped=no_candidate scanned=2 drafts=1 skipped_unsafe=0 ms=\d+$", out, re.M)
     assert re.search(r"^p2_case: skipped=no_candidate$", out, re.M)
     assert "target_hit" not in out
-    single = [t for c, t in stub.commands if c == "SEARCH" and re.fullmatch(r'NOT DRAFT HEADER \S+ "<[^"]*>"', t)]
-    assert single == []
+    p1_shape = r'NOT DRAFT HEADER (References|In-Reply-To) "<[^"]*>"|NOT DRAFT HEADER Message-ID "<[sd]\d+@[^"]*>"'
+    assert [t for c, t in stub.commands if c == "SEARCH" and re.fullmatch(p1_shape, t)] == []
+
+
+def test_p1_prefers_candidates_with_in_reply_to() -> None:
+    """T0-1: candidates with a usable In-Reply-To come first; a row without one fills up only when fewer than 3
+    have it, and the In-Reply-To key then counts over its own subset."""
+    sent = [m for m in _sent_icloud() if m.uid != 6]
+    stub = _icloud_stub()
+    stub.mailboxes = {"INBOX": _inbox(), "Sent Messages": sent}
+    out = _status_run(stub)
+    wire = [t for c, t in stub.commands if c == "SEARCH"]
+    assert _reply_keys(False, "Message-ID", ["s5", "s2", "s4"]) == [t for t in wire if "HEADER Message-ID" in t][:3]
+    assert re.search(r"^p1_reply_match: candidates=3 with_irt=2 ", out, re.M)
+    assert re.search(r"^p1_reply_match: key=references_first target_hit=3/3 control=3/3 result=yes ", out, re.M)
+    assert re.search(r"^p1_reply_match: key=in_reply_to target_hit=2/2 control=2/2 result=yes ", out, re.M)
+
+
+class _NoMiddleMatch(StatusStub):
+    """A server that never matches a References token in the middle of the list."""
+
+    def search(self, criteria: Any) -> list[int]:
+        if criteria in {f'NOT DRAFT HEADER References "<{n}@example.test>"'.encode() for n in ("r33", "r22", "r3")}:
+            self.commands.append(("SEARCH", criteria.decode()))
+            return []
+        return super().search(criteria)
+
+
+class _Lagging(StatusStub):
+    """A server whose index does not know s5 yet: no HEADER search finds it, its own Message-ID included."""
+
+    def search(self, criteria: Any) -> list[int]:
+        hits = super().search(criteria)
+        if self.selected == "Sent Messages" and b"HEADER" in criteria:
+            return [uid for uid in hits if uid != 5]
+        return hits
+
+
+def test_p1_key_fails_only_at_zero_with_full_control() -> None:
+    """T0-1 gate: `result=no` only at 0/n with control n/n; a partial hit or a partial control is `inconclusive`."""
+    stub = _NoMiddleMatch(_icloud_stub().mailboxes, _icloud_stub().folders)
+    out = _status_run(stub)
+    assert re.search(r"^p1_reply_match: key=references_middle target_hit=0/3 control=3/3 result=no ms=\d+$", out, re.M)
+    assert re.search(r"^p1_reply_match: key=references_first target_hit=3/3 control=3/3 result=yes ", out, re.M)
+    stub = _Lagging(_icloud_stub().mailboxes, _icloud_stub().folders)
+    out = _status_run(stub)
+    assert re.search(r"^p1_reply_match: control=2/3 ms=\d+$", out, re.M)
+    for key in ("references_first", "references_middle", "references_last", "in_reply_to"):
+        assert re.search(rf"^p1_reply_match: key={key} target_hit=2/3 control=2/3 result=inconclusive ", out, re.M)
+    assert "result=no" not in out
 
 
 def test_status_rounds_main_logs_in_through_the_guard(
@@ -962,6 +1035,25 @@ def test_status_rounds_main_logs_in_through_the_guard(
     assert out.startswith("--- result ---\ncapabilities: ")
     assert "p7_header_fetch: " in out
     assert "examine_search_since" not in out  # the O35 rounds do not run in this mode
+
+
+def test_status_rounds_login_failure_prints_class_name_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T0-S2: a refused LOGIN ends the run with the class name only; its text never reaches the output."""
+
+    class Refusing(StatusStub):
+        def login(self, username: str, password: str) -> bytes:
+            raise LoginError("[AUTHENTICATIONFAILED] user@example.test")
+
+    stub = Refusing(_icloud_stub().mailboxes, _icloud_stub().folders)
+    monkeypatch.setattr(probe_mod, "IMAPClient", lambda *args, **kwargs: stub)
+    monkeypatch.setattr(probe_mod.getpass, "getpass", lambda prompt="": "x")
+    assert probe_mod.main(["--host", "imap.mail.me.com", "--status-rounds"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "error: LoginError\n"
+    assert captured.out == ""
+    assert [cmd for cmd, _ in stub.commands] == ["LOGOUT"]
 
 
 def test_help_starts_with_german_usage(capsys: pytest.CaptureFixture[str]) -> None:
