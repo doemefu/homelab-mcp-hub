@@ -127,11 +127,20 @@ def test_header_block_needs_two_header_lines() -> None:
     assert remove_quotes(text, subject=None) == (text, "none")
 
 
-def test_header_names_are_case_sensitive_and_only_from_may_be_bold() -> None:
-    # As written in §5.2 (d): only From/Von carry the optional asterisks (Option 7c: no case-insensitive match).
+def test_bold_header_names_cut() -> None:
+    # Lead ruling (WP13c implementation amendment): optional *…* on every header name, as in the Gmail plain
+    # rendering of an Outlook block; the Subject/Betreff requirement (E-mf7) stays.
     bold = "Reply\n\n*From:* Alex\n*Sent:* Monday\n*To:* Sam\n*Subject:* Meeting\n\nold text"
+    german = "Reply\n\n*Gesendet:* Montag\n*Von:* Alex\n*An:* Sam\n*Betreff:* Termin\n\nold text"
+    itinerary = "Trip\n\n*From:* Zürich\n*To:* Berlin\n*Date:* 5 Oct 2026\n\nHave a good trip."
+    assert remove_quotes(bold, subject=None) == ("Reply", "heuristic")
+    assert remove_quotes(german, subject=None) == ("Reply", "heuristic")
+    assert remove_quotes(itinerary, subject=None) == (itinerary, "none")
+
+
+def test_header_names_are_case_sensitive() -> None:
+    # As written in §5.2 (d); Option 7c: no case-insensitive match.
     lower = "Reply\n\nfrom: Alex\nsent: Monday\nto: Sam\nsubject: Meeting\n\nold text"
-    assert remove_quotes(bold, subject=None) == (bold, "none")
     assert remove_quotes(lower, subject=None) == (lower, "none")
 
 
@@ -187,7 +196,18 @@ def test_forward_marker_counts_three_preceding_non_blank_lines() -> None:
 
 
 @pytest.mark.parametrize(
-    "subject", ["Fwd: Meeting", "FW: Meeting", "Fw: Meeting", "WG: Termin", "Wtr: Termin", " fwd[2]: x"]
+    "subject",
+    [
+        "Fwd: Meeting",
+        "FW: Meeting",
+        "Fw: Meeting",
+        "WG: Termin",
+        "Wtr: Termin",
+        " fwd[2]: x",
+        "[list] FW: Meeting",  # tags are stripped as in subject normalisation (S-k), lead ruling
+        "[a] [b]  WG: Termin",
+        "\u200bFW: Meeting",  # sanitised first, as in subject normalisation
+    ],
 )
 def test_forward_subject_prefix_keeps_header_blocks(subject: str) -> None:
     for text in (
@@ -197,7 +217,10 @@ def test_forward_subject_prefix_keeps_header_blocks(subject: str) -> None:
         assert remove_quotes(text, subject=subject) == (text, "none")
 
 
-@pytest.mark.parametrize("subject", ["Re: Fwd: Meeting", "AW: WG: Termin", "Meeting", "Fwdx: Meeting", "", None])
+@pytest.mark.parametrize(
+    "subject",
+    ["Re: Fwd: Meeting", "AW: WG: Termin", "[list] Re: FW: Meeting", "Meeting [FW: x]", "Fwdx: Meeting", "", None],
+)
 def test_other_subjects_still_cut(subject: str | None) -> None:
     assert remove_quotes(f"Reply\n\n{OUTLOOK_BLOCK}\nold text", subject=subject) == ("Reply", "heuristic")
 

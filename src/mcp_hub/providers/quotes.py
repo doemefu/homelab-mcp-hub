@@ -10,8 +10,12 @@ nothing is logged.
 """
 
 import re
+import unicodedata
 from collections import deque
 from typing import Final, Literal
+
+from mcp_hub.providers.headers import _PREFIX, _TAG, MAX_SUBJECT_ROUNDS
+from mcp_hub.sanitize import clean
 
 QuoteMode = Literal["heuristic", "none"]
 
@@ -29,15 +33,17 @@ _SENT_TO_FROM_LINES: Final = 2
 _UNDERSCORE_TO_BLOCK_LINES: Final = 3
 _MIN_UNDERSCORES: Final = 10
 _FORWARD_LOOK_BACK: Final = 3
+_SUBJECT_SCAN_CHARS: Final = 1000  # the prefix rounds look at no more (20 rounds of at most a 42-character tag)
 
 _SEPARATOR: Final = re.compile(
     r"-{2,}\s*(?:Original Message|Ursprüngliche Nachricht|Original-Nachricht|Originalnachricht)\s*-{2,}", re.I
 )
+# Every header name may carry *…* emphasis, as in the plain rendering of an Outlook block (lead ruling, WP13c).
 _FROM: Final = re.compile(r"\*?(?:From|Von)\*?:")
-_SENT: Final = re.compile(r"(?:Sent|Gesendet):")
-_HEADER: Final = re.compile(r"(?:Sent|Gesendet|Date|Datum|To|An):")
-_SUBJECT: Final = re.compile(r"(?:Subject|Betreff):")
-_FORWARD_SUBJECT: Final = re.compile(r"\s*(?:fwd?|wg|wtr)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*:", re.I)
+_SENT: Final = re.compile(r"\*?(?:Sent|Gesendet)\*?:")
+_HEADER: Final = re.compile(r"\*?(?:Sent|Gesendet|Date|Datum|To|An)\*?:")
+_SUBJECT: Final = re.compile(r"\*?(?:Subject|Betreff)\*?:")
+_FORWARD_PREFIX: Final = re.compile(r"\s*(?:fwd?|wg|wtr)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*:", re.I)
 _DIGIT: Final = re.compile(r"[0-9]")
 
 # Line kinds, as bits: one line can be several at once.
@@ -53,6 +59,23 @@ _MARKER: Final = 1 << 8
 _COLON_END: Final = 1 << 9
 _HAS_DIGIT: Final = 1 << 10
 _HAS_AT: Final = 1 << 11
+
+
+def _forwarded(subject: str | None) -> bool:
+    """Whether the first prefix of the subject is Fwd/Fw/WG/Wtr, after the tag stripping of normalise_subject (S-k)."""
+    if not subject:
+        return False
+    text = unicodedata.normalize("NFKC", clean(subject[:_SUBJECT_SCAN_CHARS], _SUBJECT_SCAN_CHARS))
+    for _ in range(MAX_SUBJECT_ROUNDS):
+        if _FORWARD_PREFIX.match(text):
+            return True
+        if _PREFIX.match(text):
+            return False
+        tag = _TAG.match(text)
+        if tag is None:
+            return False
+        text = text[tag.end() :]
+    return False
 
 
 def _kind(line: str) -> int:
@@ -95,8 +118,7 @@ class _Lines:
         self.stripped = [line.strip() for line in self.original]
         self.kinds = [_kind(line) for line in self.stripped]
         self.n = len(self.kinds)
-        # The first prefix of the raw subject marks a forward: header blocks are forwarded content then.
-        self.blocks_allowed = not (subject and _FORWARD_SUBJECT.match(subject))
+        self.blocks_allowed = not _forwarded(subject)  # header blocks of a forward are its content
         self.next_non_blank = [self.n] * self.n
         following = self.n
         for index in range(self.n - 1, -1, -1):
@@ -187,7 +209,7 @@ class _Lines:
 def remove_quotes(text: str, *, subject: str | None) -> tuple[str, QuoteMode]:
     """Text without the quoted history, and whether the heuristic removed anything (§5.2 steps 1 to 3).
 
-    `subject` is the raw subject; a first prefix Fwd/Fw/WG/Wtr keeps header blocks (forwarded content).
+    `subject` is the raw subject; a first prefix Fwd/Fw/WG/Wtr (after list tags) keeps header blocks.
     """
     lines = _Lines(text, subject)
     kept = [True] * lines.n
