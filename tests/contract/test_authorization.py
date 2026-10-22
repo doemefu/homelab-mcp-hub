@@ -44,6 +44,7 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
     assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == [
         "get_events",
         "get_message",
+        "get_message_status",
         "list_accounts",
         "list_messages",
         "list_unread",
@@ -77,6 +78,7 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
     assert sorted(t["name"] for t in body(listed)["result"]["tools"]) == [
         "get_events",
         "get_message",
+        "get_message_status",
         "list_accounts",
         "list_messages",
         "list_unread",

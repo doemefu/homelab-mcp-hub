@@ -31,7 +31,7 @@ Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` 
 | Protocol versions | `2026-07-28` (stateless) and `2025-11-25` (initialize handshake) |
 | Scopes | `mail:read calendar:read` (both required) |
 | Image | `ghcr.io/doemefu/homelab-mcp-hub:main-<UTC timestamp>` (linux/amd64 + linux/arm64) |
-| Tools | `list_accounts`, `list_unread`, `list_messages`, `get_message`, `get_events` (all read-only); mail over IMAP or Microsoft Graph (`outlook`), calendars over CalDAV |
+| Tools | `list_accounts`, `list_unread`, `list_messages`, `get_message`, `get_message_status`, `get_events` (all read-only); mail over IMAP or Microsoft Graph (`outlook`), calendars over CalDAV |
 | Stack | Python 3.13, `mcp` 2.2.0, uvicorn, starlette, pydantic, PyJWT, IMAPClient, icalendar, recurring-ical-events |
 | Deployment | Flux from `k8s/` into namespace `apps` (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
 
