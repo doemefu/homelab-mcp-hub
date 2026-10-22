@@ -1153,6 +1153,16 @@ def test_refused_lookup_value_marks_only_its_ref() -> None:
     assert all(b"X-GM-RAW" not in key.upper() for key in searches(server))  # type: ignore[attr-defined]
 
 
+def test_no_searchable_lookup_value_opens_no_lookup_mailbox() -> None:
+    """PR #51 review CR5: when no Message-ID can be searched, the reply and thread steps open no mailbox."""
+    raw = "x-gm-raw@example.test"
+    server = server_with(inbox=[msg(2, 60, "a", message_id=f"<{raw}>")])
+    [status] = run(server, [m("INBOX", 2)])
+    assert (states([status]), status.thread_checked) == ([FOUND], False)
+    assert examined(server) == ["INBOX"]  # the in-place check only
+    assert "UID SEARCH" not in names(server)
+
+
 def test_missing_header_item_marks_unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
     """A hit whose header item does not come back cannot be re-checked: its batch is unchecked, never a match."""
     server = server_with(inbox=[x_inbox()], sent=[FakeMessage(5, ago(60), headers=None)])

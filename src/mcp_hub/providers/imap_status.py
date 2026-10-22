@@ -425,6 +425,8 @@ def _reply_step(
 ) -> None:
     """A sent hit is a reply to every batch id it names, except a hit whose Message-ID is that id (MF3, C8). There
     is no time condition (C8); the earliest reply by INTERNALDATE gives `reply_at` (E-mf1: its id the first key)."""
+    if not searchable:
+        return  # no value to search: sent is not opened
     if not _open(session, sent):
         state.unchecked.update(searchable)
         return
@@ -476,6 +478,8 @@ def _thread_step(
         for key in (x, *_reply_keys(state, x)):
             key_refs.setdefault(key, set()).add(x)
     batches = or_batches(list(key_refs), _LOOKUP_FIELDS, max_values=LOOKUP_BATCH_VALUES)
+    if not batches:
+        return  # no key: no mailbox is opened
     covered = [{x for key in batch for x in key_refs[key]} for batch in batches]
     folders = [entry for role in _THREAD_ROLES if (entry := folder_map.role(role)) is not None]
     left: dict[str, int] = {}
