@@ -118,6 +118,9 @@ _FOLDER_RANK: Final[dict[MailFolder, int]] = {"inbox": 0, "archive": 1, "sent": 
 # Lookup failures that keep their code; every other lookup failure is an incomplete search, never not_found (B6).
 _KEPT_CAUSES: Final = frozenset({"Throttled", "Forbidden"})
 _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anything else is "not a number"
+_LEGACY_DN: Final = re.compile(r"/O=[^/@]+(?:/OU=[^/@]+)*/CN=RECIPIENTS/CN=[^/@]+", re.IGNORECASE)  # fullmatch (T17)
+_PLAIN_ADDRESS: Final = re.compile(r"[^@\s]+@[^@\s]+")  # fullmatch: one "@", no whitespace
+MAX_ADDRESS_CHARS: Final = 254
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status provider call (SR6)
 MAX_FAILURE_LOGS: Final = 20  # provider_call_failed lines per get_message_status call, one per class (SR6, S-F2)
 MAX_THREAD_SPLITS: Final = 10  # one-conversation re-requests of full conversationId answers per call (C14)
@@ -203,12 +206,13 @@ def _address(value: object) -> tuple[str | None, str | None]:
 def _sender_for_direction(raw: Mapping[str, object]) -> str | None:
     """The `from` address that decides the direction; never an output field.
 
-    T17: an own sent item can carry an Exchange legacy DN ("/O=.../CN=...") as the address and the SMTP address as
-    the name; then the stripped name counts, when it holds an "@" and no whitespace."""
+    T17: an own sent item can carry an Exchange legacy DN ("/O=.../CN=RECIPIENTS/CN=...") as the address and the SMTP
+    address as the name; then the stripped name counts, but only for a well-formed DN (no "@") and a plain address
+    of at most 254 characters as the name."""
     name, address = _address(raw.get("from"))
-    if address is not None and address.startswith("/") and name is not None:
+    if address is not None and name is not None and _LEGACY_DN.fullmatch(address):
         stripped = name.strip()
-        if "@" in stripped and not any(c.isspace() for c in stripped):
+        if len(stripped) <= MAX_ADDRESS_CHARS and _PLAIN_ADDRESS.fullmatch(stripped):
             return stripped
     return address
 
