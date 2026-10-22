@@ -45,6 +45,8 @@ from mcp_hub.providers.base import (
     MessageStatus,
     ProviderError,
     StatusTarget,
+    ThreadPage,
+    ThreadQuery,
     direction_of,
     load_json_object,
     log_message_skipped,
@@ -576,6 +578,9 @@ class GraphMailbox:
             raise ProviderError("not_found", "ForeignRef")
         ref = target
         return self._run(lambda client, token, call: self._message(client, token, call, ref), deadline)
+
+    def get_thread(self, query: ThreadQuery, deadline: CallDeadline) -> ThreadPage:
+        raise ProviderError("upstream_error", "NotImplemented")  # WP13c T11
 
     # --- list -----------------------------------------------------------------------------------------------------
     def _list_messages(self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery) -> FolderPage:

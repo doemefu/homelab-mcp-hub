@@ -36,6 +36,8 @@ from mcp_hub.providers.base import (
     MessageStatus,
     ProviderError,
     StatusTarget,
+    ThreadPage,
+    ThreadQuery,
     direction_of,
     log_message_skipped,
     order_key_of,
@@ -374,6 +376,9 @@ class ImapMailbox:
             raise ProviderError("not_found", "ForeignRef")
         own_target: MessageRef | StableRef = target
         return self._run(lambda session: self._get_message(session, own_target), deadline)
+
+    def get_thread(self, query: ThreadQuery, deadline: CallDeadline) -> ThreadPage:
+        raise ProviderError("upstream_error", "NotImplemented")  # WP13c T7
 
     # --- list_messages -----------------------------------------------------------------------------------------
 
