@@ -9,6 +9,11 @@ from typing import Any
 
 import pytest
 
+from mcp_hub.ids import MESSAGE_ID_PATTERN
+from mcp_hub.providers import imap_search
+from mcp_hub.providers.folders import EXCLUDED_LAST_NAMES
+from mcp_hub.providers.imap import FETCH_CHUNK_UIDS, LOCATE_BATCH_VALUES
+
 
 def _probe_module() -> ModuleType:
     path = Path(__file__).parents[2] / "scripts" / "imap_probe.py"
@@ -148,8 +153,11 @@ def test_proxy_search_and_fetch_allowlists() -> None:
         proxy.fetch([1], ["BODY[]"])
     with pytest.raises(PermissionError):
         proxy.fetch([1], ["RFC822"])
+    with pytest.raises(PermissionError):
+        proxy.fetch([1], ["X-GM-THRID"])
     proxy.fetch([1], ["INTERNALDATE"])
     proxy.fetch([1], ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>"])
+    proxy.fetch([1], ["INTERNALDATE", "FLAGS", "X-GM-LABELS"])
 
 
 def test_probe_uses_only_read_only_commands() -> None:
@@ -159,7 +167,7 @@ def test_probe_uses_only_read_only_commands() -> None:
     assert all(text.startswith("NOT DRAFT") or text.startswith("X-GM-LABELS") for text in searches)
     assert not any("X-GM-RAW" in text.upper() for text in searches)
     fetches = [text for cmd, text in stub.commands if cmd == "FETCH"]
-    allowed = {"INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>"}
+    allowed = {"INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.2048>", "INTERNALDATE FLAGS X-GM-LABELS"}
     assert fetches
     assert all(text in allowed for text in fetches)
     assert {cmd for cmd, _ in stub.commands} <= {"CAPABILITY", "LOGIN", "LIST", "EXAMINE", "SEARCH", "FETCH", "LOGOUT"}
@@ -197,7 +205,7 @@ def test_probe_reports_other_count_and_or_test() -> None:
     folders = len({text for cmd, text in stub.commands if cmd == "EXAMINE"})
     assert len(ors) == folders
     first = ors[0]
-    assert first.count('HEADER Message-ID "<id') == 20
+    assert first.count('HEADER Message-ID "id') == 20  # bare ids, as the hub searches them
     assert first.startswith("NOT DRAFT OR (")
     left, right = _or_operands(first.removeprefix("NOT DRAFT "))
     assert left.count("Message-ID") == 10
@@ -215,29 +223,34 @@ def test_probe_caps_folders() -> None:
     assert "header_message_id: folders=30" in out
 
 
-def test_probe_reports_gmail_label_search_when_x_gm_ext_1() -> None:
-    out, stub = _run(StubClient(_folders(), capabilities=(b"X-GM-EXT-1", b"SPECIAL-USE")))
-    labels = [text for cmd, text in stub.commands if cmd == "SEARCH" and "X-GM-LABELS" in text]
-    assert labels == ['X-GM-LABELS "\\\\Sent"']
-    assert re.search(r"^gmail_label_search: hits=3 ms=\d+$", out, re.MULTILINE)
-    out2, stub2 = _run(StubClient(_folders()))
-    assert "gmail_label_search" not in out2
-    assert not any("X-GM-LABELS" in text for _, text in stub2.commands)
+def test_probe_gmail_section_needs_x_gm_ext_1() -> None:
+    out, stub = _run(StubClient(_folders()))
+    assert "gmail_" not in out
+    assert not any("X-GM-LABELS" in text for _, text in stub.commands)
+    out, _ = _run(StubClient(_folders(), capabilities=(b"X-GM-EXT-1", b"SPECIAL-USE")))
+    assert re.search(r"^gmail_all_mail: absent$", out, re.MULTILINE)
+    assert re.search(r"^gmail_sent_mailbox: hits=1 ms=\d+$", out, re.MULTILINE)
 
 
 def test_search_criteria_have_expected_shape() -> None:
     _, stub = _run(StubClient(_folders()), since_days=14, text_word="the")
     searches = [text for cmd, text in stub.commands if cmd == "SEARCH"]
     assert re.fullmatch(r"NOT DRAFT SINCE \d{2}-[A-Z][a-z]{2}-\d{4}", searches[0])
-    assert any(re.fullmatch(r'NOT DRAFT HEADER Message-ID "<id\d+@example\.test>"', s) for s in searches)
-    assert any(re.fullmatch(r'NOT DRAFT HEADER References "<id\d+@example\.test>"', s) for s in searches)
+    assert any(re.fullmatch(r'NOT DRAFT HEADER Message-ID "id\d+@example\.test"', s) for s in searches)
+    assert any(re.fullmatch(r'NOT DRAFT HEADER References "id\d+@example\.test"', s) for s in searches)
     assert 'NOT DRAFT TEXT "the"' in searches
 
 
-def test_quoted_rejects_control_characters_and_escapes() -> None:
-    assert probe_mod.quoted('a"b\\c') == '"a\\"b\\\\c"'
-    with pytest.raises(ValueError, match="control character"):
-        probe_mod.quoted("a\r\nb")
+def test_quoted_is_the_hub_rule() -> None:
+    """P1: nothing escaped; `"`, `\\`, control and non-ASCII characters, empty values and X-GM-RAW refused."""
+    assert probe_mod.quoted("a(b)@x") == '"a(b)@x"'
+    for value in ('a"b', "a\\b", "a\r\nb", "a\x00b", "\u00e4@x", "", "x-gm-raw@x"):
+        with pytest.raises(ValueError, match="search value refused"):
+            probe_mod.quoted(value)
+        with pytest.raises(imap_search.UnsafeSearchValue):
+            imap_search.quoted(value)
+    for value in ("a(b)@x", "x{5}@y", "%*@x", "a+&#%=;/?@x"):
+        assert probe_mod.quoted(value).encode() == imap_search.quoted(value)
 
 
 def test_host_outside_allowlist_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,3 +298,170 @@ def test_client_gets_a_socket_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(probe_mod.getpass, "getpass", lambda prompt="": "x")
     assert probe_mod.main(["--host", "imap.gmail.com"]) == 1
     assert seen["timeout"] == 30.0
+
+
+# --- P1-P4: the hub's search shape, cold timings, per-round errors, Gmail keys ---------------------------------------
+
+
+def test_probe_rules_match_the_hub() -> None:
+    assert probe_mod._MESSAGE_ID.pattern == MESSAGE_ID_PATTERN.pattern
+    assert probe_mod._QUOTABLE.pattern == imap_search._QUOTABLE.pattern
+    assert probe_mod._SKIPPED_NAMES == EXCLUDED_LAST_NAMES
+    assert (probe_mod._OR_VALUES, probe_mod._OR_MAX_BYTES) == (LOCATE_BATCH_VALUES, imap_search.MAX_OR_BYTES)
+    assert probe_mod._GMAIL_FETCH_UIDS == FETCH_CHUNK_UIDS
+    assert {"Junk", "Drafts"} <= set(probe_mod._FALLBACK_NAMES)
+    ids = [f"id{i}@example.test" for i in range(20)]
+    for n in range(1, 21):
+        keys = [f"HEADER Message-ID {probe_mod.quoted(i)}" for i in ids[:n]]
+        assert probe_mod._or_tree(keys).encode() == imap_search.header_or(("Message-ID",), ids[:n])
+    assert f"{probe_mod._GMAIL_SENT} NOT {probe_mod._GMAIL_INBOX}".encode() == imap_search.gmail_label_keys("sent")
+    assert f"NOT {probe_mod._GMAIL_INBOX} NOT {probe_mod._GMAIL_SENT}".encode() == imap_search.gmail_label_keys(
+        "archive"
+    )
+
+
+def test_or_batch_keeps_the_hub_byte_cap() -> None:
+    ids = [f"{'a' * 280}{i:02d}@example.test" for i in range(20)]
+    tree = probe_mod._or_batch(ids)
+    assert len(tree) <= 4000
+    assert tree.encode() == imap_search.header_or(("Message-ID",), [i for i in ids if f'"{i}"' in tree])
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("<ok@example.test>", "ok@example.test"),
+        ("  <ok@example.test>  ", "ok@example.test"),
+        ("plain@example.test", "plain@example.test"),
+        ('<a"b@example.test>', None),
+        ("<a\\b@example.test>", None),
+        ("<a b@example.test>", None),
+        ("<X-GM-RAW@example.test>", None),
+        ("<a@x> <b@x>", None),
+        ("<>", None),
+    ],
+)
+def test_bare_message_id(header: str, expected: str | None) -> None:
+    assert probe_mod._bare_message_id(header) == expected
+
+
+class TimingOutClient(StubClient):
+    """A server whose References search times out on every folder."""
+
+    def search(self, criteria: Any = "ALL", charset: Any = None) -> list[int]:
+        found = super().search(criteria, charset)
+        if b"References" in criteria:
+            raise TimeoutError
+        return found
+
+
+def test_cold_timings_reported() -> None:
+    out, _ = _run(StubClient(_folders()))
+    assert re.search(r"^list: ms=\d+$", out, re.MULTILINE)
+    rows = re.findall(
+        r"^examine_search_since: folder#\d role=\w+ hits=\d+ examine_ms=(\d+) search_ms=(\d+) ms=(\d+)$",
+        out,
+        re.MULTILINE,
+    )
+    assert len(rows) == 4
+    assert all(int(e) + int(s) == int(total) for e, s, total in rows)
+    lines = out.splitlines()
+    assert lines.index(next(line for line in lines if line.startswith("list:"))) < lines.index(
+        next(line for line in lines if line.startswith("examine_search_since:"))
+    )
+
+
+def test_a_failing_round_does_not_lose_the_rest() -> None:
+    """P3: an error is reported per round by its class name; the later rounds and the Gmail section still run, and
+    the text round comes last."""
+    out, _ = _run(TimingOutClient(_folders(), capabilities=(b"X-GM-EXT-1",)))
+    rounds = [line.split(":", 1)[0] for line in out.splitlines() if ":" in line]
+    assert "header_references: error=TimeoutError" in out
+    assert re.search(r"^header_message_id: folders=4 ", out, re.MULTILINE)
+    assert re.search(r"^or20: folders=4 ", out, re.MULTILINE)
+    assert "gmail_sent_mailbox" in rounds
+    assert rounds[-1] == "text"
+    assert re.search(r"^text: folders=4 total_ms=\d+ max_ms=\d+ found_in=\w+$", out, re.MULTILINE)
+
+
+def test_a_refused_text_word_is_reported_not_fatal() -> None:
+    out, _ = _run(StubClient(_folders()), text_word='a"b')
+    assert out.splitlines()[-1] == "text: error=ValueError"
+    assert 'a"b' not in out
+
+
+def test_a_proxy_refusal_is_never_swallowed() -> None:
+    class Refusing(StubClient):
+        def search(self, criteria: Any = "ALL", charset: Any = None) -> list[int]:
+            if b"References" in criteria:
+                raise PermissionError("search")
+            return super().search(criteria, charset)
+
+    with pytest.raises(PermissionError):
+        _run(Refusing(_folders()))
+
+
+class GmailStub(StubClient):
+    """Gmail with All Mail: the window holds 1,200 messages there; FETCH records its UIDs."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            [
+                ((), b"/", "INBOX"),
+                ((b"\\HasChildren", b"\\Noselect"), b"/", "[Gmail]"),
+                ((b"\\All",), b"/", "[Gmail]/All Mail"),
+                ((b"\\Sent",), b"/", "[Gmail]/Sent Mail"),
+                ((b"\\Junk",), b"/", "[Gmail]/Spam"),
+                ((b"\\Drafts",), b"/", "[Gmail]/Drafts"),
+                ((b"\\Trash",), b"/", "[Gmail]/Trash"),
+            ],
+            capabilities=(b"IMAP4REV1", b"X-GM-EXT-1", b"SPECIAL-USE"),
+        )
+        self.fetched: list[tuple[list[int], list[str]]] = []
+
+    def search(self, criteria: Any = "ALL", charset: Any = None) -> list[int]:
+        text = criteria.decode()
+        if self.selected == "[Gmail]/All Mail" and text.startswith("NOT DRAFT SINCE") and "X-GM-LABELS" not in text:
+            self.commands.append(("SEARCH", text))
+            return list(range(1, 1201))
+        return super().search(criteria, charset)
+
+    def fetch(self, messages: Any, data: Any) -> dict[int, dict[bytes, bytes]]:
+        self.fetched.append((list(messages), list(data)))
+        return super().fetch(messages, data)
+
+
+def test_gmail_hub_keys_sent_mailbox_and_candidate_fetch() -> None:
+    """P4: the hub's exact `sent` and `archive` searches in All Mail, the `\\Sent` mailbox for comparison, and one cold
+    candidate FETCH of the newest 500 All Mail hits."""
+    out, stub = _run(GmailStub())
+    searches = _searches_by_folder(stub)
+    since = re.search(r"SINCE (\d{2}-[A-Z][a-z]{2}-\d{4})", searches[0][1])
+    assert since is not None
+    day = since.group(1)
+    assert ("[Gmail]/All Mail", f'NOT DRAFT SINCE {day} X-GM-LABELS "\\\\Sent" NOT X-GM-LABELS "\\\\Inbox"') in searches
+    assert (
+        "[Gmail]/All Mail",
+        f'NOT DRAFT SINCE {day} NOT X-GM-LABELS "\\\\Inbox" NOT X-GM-LABELS "\\\\Sent"',
+    ) in searches
+    assert re.search(r"^gmail_sent_keys: hits=3 ms=\d+$", out, re.MULTILINE)
+    assert re.search(r"^gmail_archive_keys: hits=3 ms=\d+$", out, re.MULTILINE)
+    assert re.search(r"^gmail_sent_mailbox: hits=1 ms=\d+$", out, re.MULTILINE)
+    assert re.search(r"^gmail_sent_compare: sent_keys=3 sent_mailbox=1 difference=-2$", out, re.MULTILINE)
+    assert re.search(r"^gmail_candidate_fetch: uids=500 ms=\d+$", out, re.MULTILINE)
+    candidate = [(uids, items) for uids, items in stub.fetched if "X-GM-LABELS" in items]
+    assert candidate == [(list(range(701, 1201)), ["INTERNALDATE", "FLAGS", "X-GM-LABELS"])]
+    examined = {text for cmd, text in stub.commands if cmd == "EXAMINE"}
+    assert not examined & {"[Gmail]/Spam", "[Gmail]/Drafts", "[Gmail]"}
+    assert "Sent Mail" not in out
+    assert "All Mail" not in out
+
+
+def _searches_by_folder(stub: StubClient) -> list[tuple[str, str]]:
+    selected, out = "", []
+    for cmd, text in stub.commands:
+        if cmd == "EXAMINE":
+            selected = text
+        elif cmd == "SEARCH":
+            out.append((selected, text))
+    return out
