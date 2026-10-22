@@ -6,6 +6,7 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, ValidationError, model_validator
 
 from mcp_hub.errors import ToolError
+from mcp_hub.ids import mailbox_name_ok
 
 Capability = Literal["mail", "calendar"]
 CAPABILITIES: Final[tuple[Capability, ...]] = ("mail", "calendar")
@@ -25,6 +26,12 @@ RESERVED_SECRET_KEYS: Final[frozenset[str]] = frozenset(
 )
 # Secret keys every Graph account needs besides its client id: the token store (spec 080 rev. 4.6 §7.2).
 TOKEN_STORE_REFS: Final[tuple[str, ...]] = ("db-username", "db-password", "token-encryption-key")
+
+
+def _valid_mailbox_name(name: str) -> str:
+    if not mailbox_name_ok(name):
+        raise ValueError("not a valid raw mailbox name")
+    return name
 
 
 def _not_reserved(ref: str) -> str:
@@ -55,7 +62,10 @@ class ImapMail(_Strict):
     port: Annotated[int, Field(ge=1, le=65535)]
     username_ref: SecretRef
     password_ref: SecretRef
-    inbox: Annotated[str, StringConstraints(min_length=1, max_length=100)] = "INBOX"
+    inbox: Annotated[str, StringConstraints(min_length=1, max_length=100), AfterValidator(_valid_mailbox_name)] = (
+        "INBOX"
+    )
+    own_addresses_ref: SecretRef | None = None
 
 
 class CalDavCalendar(_Strict):
@@ -75,6 +85,7 @@ class IcsCalendar(_Strict):
 
 class GraphBlock(_Strict):
     protocol: Literal["graph"]
+    own_addresses_ref: SecretRef | None = None
 
 
 class GraphSettings(_Strict):
@@ -118,6 +129,8 @@ class Account(_Strict):
                 raise ValueError(f"capability {name} is true but its block is missing")
             if not flag and block is not None:
                 raise ValueError(f"capability {name} is false but a block is present")
+        if self.calendar is not None and getattr(self.calendar, "own_addresses_ref", None) is not None:
+            raise ValueError("own_addresses_ref is allowed on a mail block only")
         uses_graph = any(isinstance(b, GraphBlock) for b in (self.mail, self.calendar))
         if uses_graph and self.graph is None:
             raise ValueError("graph settings are required for protocol graph")
@@ -142,6 +155,11 @@ class Account(_Strict):
         if block is None:
             raise KeyError(capability)
         return block.protocol
+
+    @property
+    def own_addresses_ref(self) -> str | None:
+        """File name of the optional own-addresses credential file; not a credential (spec 080 §8.2)."""
+        return self.mail.own_addresses_ref if self.mail is not None else None
 
     def credential_refs(self, capability: Capability) -> tuple[str, ...]:
         block = self._block(capability)

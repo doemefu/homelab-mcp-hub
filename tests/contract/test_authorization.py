@@ -45,8 +45,14 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
         "get_events",
         "get_message",
         "list_accounts",
+        "list_messages",
         "list_unread",
     ]
+    get_message = next(t for t in body(listed)["result"]["tools"] if t["name"] == "get_message")
+    assert {"id", "ref", "max_chars"} <= set(get_message["inputSchema"]["properties"])  # rev. 4.9: id or ref
+    required = get_message["inputSchema"].get("required", [])
+    assert "id" not in required
+    assert "ref" not in required
     called = modern(client, token, "tools/call", {"name": "list_accounts", "arguments": {}}, name="list_accounts")
     assert called.status_code == 200
     assert body(called)["result"]["isError"] is False
@@ -72,6 +78,7 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
         "get_events",
         "get_message",
         "list_accounts",
+        "list_messages",
         "list_unread",
     ]
 

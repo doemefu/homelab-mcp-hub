@@ -23,6 +23,10 @@ FIELD_LIMITS: Final[dict[str, int]] = {
     "content_type": 100,
     "description": 500,
     "original_timezone": 64,
+    "message_id": 300,
+    "in_reply_to": 300,
+    "references": 300,
+    "folder_name": 100,
 }
 # Zero-width (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi controls (U+202A-U+202E, U+2066-U+2069).
 _INVISIBLE: Final = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u202a-\u202e\u2066-\u2069]")

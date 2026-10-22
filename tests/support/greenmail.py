@@ -1,5 +1,6 @@
 """GreenMail test helpers (spec 080 §10.2). Test data only; TLS is verified against GreenMail's pinned certificate."""
 
+import contextlib
 import functools
 import json
 import os
@@ -10,6 +11,7 @@ import ssl
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -108,15 +110,103 @@ def send(login: str, message: EmailMessage) -> None:
         smtp.send_message(message)
 
 
-def append(login: str, message: EmailMessage, when: datetime) -> None:
+@contextlib.contextmanager
+def connected(login: str) -> Iterator[IMAPClient]:
+    """The test's own IMAP client: seeding and inspection only (APPEND, CREATE, COPY, MOVE, EXPUNGE are the test's,
+    never the hub's, spec 080 §10.2)."""
     with IMAPClient(HOST, port=IMAPS_PORT, ssl=True, ssl_context=pinned_context(), timeout=10) as client:
         client.login(login, passwords()[login])
-        client.append("INBOX", bytes(message), msg_time=when)
+        yield client
+
+
+def append(
+    login: str, message: EmailMessage, when: datetime, *, folder: str = "INBOX", flags: Sequence[bytes] = ()
+) -> None:
+    append_many(login, [message], when, folder=folder, flags=flags)
+
+
+def append_many(
+    login: str,
+    messages: Sequence[EmailMessage],
+    when: datetime,
+    *,
+    folder: str = "INBOX",
+    flags: Sequence[bytes] = (),
+) -> None:
+    """APPEND with an explicit INTERNALDATE (`when`) and flags; To and From default as in `send`."""
+    with connected(login) as client:
+        for message in messages:
+            if "To" not in message:
+                message["To"] = f"{login}@{DOMAIN}"
+            if "From" not in message:
+                message["From"] = f"Sender <sender@{DOMAIN}>"
+            client.append(folder, bytes(message), flags=tuple(flags), msg_time=when)
+
+
+def ensure_folders(login: str, *names: str) -> None:
+    with connected(login) as client:
+        for name in names:
+            if not client.folder_exists(name):
+                client.create_folder(name)
+
+
+def _uids(client: IMAPClient, message_id: str) -> list[int]:
+    """The UIDs of the selected folder whose Message-ID header holds `<message_id>`."""
+    found: list[int] = client.search(f'HEADER Message-ID "<{message_id}>"'.encode())
+    if not found:
+        raise AssertionError("seeded message not found")
+    return found
+
+
+def copy(login: str, source: str, message_id: str, target: str) -> None:
+    with connected(login) as client:
+        client.select_folder(source)
+        client.copy(_uids(client, message_id), target)
+
+
+def move(login: str, source: str, message_id: str, target: str) -> str:
+    """MOVE where the server announces it (GreenMail 2.1.14 does, O38), else COPY + STORE \\Deleted + EXPUNGE of
+    exactly those UIDs. Returns the variant used."""
+    with connected(login) as client:
+        client.select_folder(source)
+        uids = _uids(client, message_id)
+        if b"MOVE" in client.capabilities():
+            client.move(uids, target)
+            return "MOVE"
+        client.copy(uids, target)
+        client.add_flags(uids, [b"\\Deleted"])
+        client.uid_expunge(uids)
+        return "COPY+EXPUNGE"
+
+
+def expunge(login: str, folder: str, message_id: str) -> None:
+    with connected(login) as client:
+        client.select_folder(folder)
+        uids = _uids(client, message_id)
+        client.add_flags(uids, [b"\\Deleted"])
+        client.uid_expunge(uids)
+
+
+SNAPSHOT_FLAGS: Final = frozenset({b"\\Seen", b"\\Answered", b"\\Flagged", b"\\Deleted", b"\\Draft"})
+
+
+def snapshot(login: str, folders: Sequence[str]) -> dict[tuple[str, int], tuple[bytes, frozenset[bytes]]]:
+    """Every message of `folders`: (folder, UID) → (Message-ID header, flags). Read through EXAMINE and BODY.PEEK.
+    \\Recent is left out: it belongs to the session that first sees a message, not to the message."""
+    out: dict[tuple[str, int], tuple[bytes, frozenset[bytes]]] = {}
+    with connected(login) as client:
+        for folder in folders:
+            client.select_folder(folder, readonly=True)
+            uids = client.search(["ALL"])
+            rows = client.fetch(uids, ["FLAGS", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]) if uids else {}
+            for uid, row in rows.items():
+                header = bytes(row[b"BODY[HEADER.FIELDS (MESSAGE-ID)]"]).strip()
+                out[(folder, uid)] = (header, frozenset(row[b"FLAGS"]) & SNAPSHOT_FLAGS)
+    return out
 
 
 def flags(login: str) -> dict[int, tuple[bytes, ...]]:
-    with IMAPClient(HOST, port=IMAPS_PORT, ssl=True, ssl_context=pinned_context(), timeout=10) as client:
-        client.login(login, passwords()[login])
+    with connected(login) as client:
         client.select_folder("INBOX", readonly=True)
         return {uid: row[b"FLAGS"] for uid, row in client.fetch(client.search(["ALL"]), ["FLAGS"]).items()}
 

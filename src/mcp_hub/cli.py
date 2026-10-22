@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from mcp_hub.config import REGISTRY_FILE, ConfigError, load_settings
 from mcp_hub.health import missing_credentials
 from mcp_hub.logging import configure_logging, log_event
+from mcp_hub.own_addresses import own_address_count
 from mcp_hub.providers import msidentity
 from mcp_hub.providers.base import ProviderError, read_credential
 from mcp_hub.providers.graph_auth import TokenStoreLike
@@ -212,6 +213,9 @@ def _check_registry(
             status = "ok" if not missing else "missing " + " ".join(missing)
             failed |= bool(missing)
             print(f"account {account.id} {capability} {account.protocol(capability)} {status}", file=out)
+            if capability == "mail" and account.own_addresses_ref is not None:
+                count = own_address_count(settings.secrets_dir, account.own_addresses_ref)  # a count, never a value
+                print(f"account {account.id} own_addresses={'invalid' if count is None else count}", file=out)
         if account.graph is None:
             continue
         try:

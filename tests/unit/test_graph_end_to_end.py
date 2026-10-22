@@ -17,6 +17,7 @@ from mcp_hub.health import StatusStore, capability_status
 from mcp_hub.ids import GraphMessageRef, encode_message_id
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from mcp_hub.providers.graph_auth import AccessTokenCache, GraphTokenSource
 from mcp_hub.providers.msidentity import GraphAccount
@@ -50,7 +51,7 @@ def js(
 class _NoProbe:
     """icloud stays offline in these tests."""
 
-    def check(self) -> None: ...
+    def check(self, deadline: CallDeadline) -> None: ...
 
 
 def hub(secrets_dir: Path, store: FakeStore, ms: MsTransport, graph: RecordingTransport) -> HubContext:
@@ -71,7 +72,6 @@ def hub(secrets_dir: Path, store: FakeStore, ms: MsTransport, graph: RecordingTr
             account.id,
             tokens,
             backoff=backoff,
-            inbox_ids={},
             client_factory=lambda t: httpx2.Client(transport=graph.transport(), trust_env=False),
         )
 
@@ -102,7 +102,7 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
         hostile = {"id": "AAMk/../SENTINEL-ID", "subject": "SUBJECT-SENTINEL"}  # degraded without an item hash
         graph = RecordingTransport(
             {
-                ("GET", f"{BASE}/me/mailFolders/inbox/messages"): js({"value": [leaky, hostile]}),
+                ("GET", f"{BASE}/me/mailFolders/{INBOX_ID}/messages"): js({"value": [leaky, hostile]}),
                 ("GET", f"{BASE}/me/mailFolders/inbox"): js({"id": INBOX_ID}),
                 ("GET", f"{BASE}/me/messages/AAMkMSG0001="): js(
                     leaky
@@ -131,7 +131,7 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
             }
         )
         ctx = hub(secrets_dir, FakeStore(), ms, graph)
-        result, _, outcome = await run_list_unread(ctx, account="outlook", since=None, limit=20, now=NOW)
+        result, _, outcome = await run_list_unread(ctx, account="outlook", since=None, limit=20, cursor=None, now=NOW)
         assert outcome == "ok"
         assert [i.untrusted.subject for i in result.items] == ["SUBJECT-SENTINEL"]
         detail, _ = await run_get_message(
@@ -172,11 +172,16 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
 async def test_duplicate_graph_ids_are_listed_once(secrets_dir: Path) -> None:
     received = (NOW - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     entries = [message(n, receivedDateTime=received) for n in (1, 2, 1, 1)]
-    graph = RecordingTransport({("GET", f"{BASE}/me/mailFolders/inbox/messages"): js({"value": entries})})
+    graph = RecordingTransport(
+        {
+            ("GET", f"{BASE}/me/mailFolders/inbox"): js({"id": INBOX_ID}),
+            ("GET", f"{BASE}/me/mailFolders/{INBOX_ID}/messages"): js({"value": entries}),
+        }
+    )
     answer = {"access_token": "AT-SENTINEL", "refresh_token": "RT-SENTINEL", "expires_in": 3600, "scope": "Mail.Read"}
     ms = MsTransport({TOKEN_PATH: [json_answer(200, answer)]})
     result, _, outcome = await run_list_unread(
-        hub(secrets_dir, FakeStore(), ms, graph), account="outlook", since=None, limit=20, now=NOW
+        hub(secrets_dir, FakeStore(), ms, graph), account="outlook", since=None, limit=20, cursor=None, now=NOW
     )
     assert outcome == "ok"
     ids = [i.id for i in result.items]

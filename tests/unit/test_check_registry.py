@@ -213,3 +213,41 @@ def test_deployment_mounts_the_secret_as_a_whole_volume() -> None:
     """Whole-volume mount is what makes Secret updates (and the ..data snapshot) work (spec 080 §9.6)."""
     manifest = (Path(__file__).parent.parent.parent / "k8s" / "deployment.yaml").read_text()
     assert not re.search(r"^\s*-?\s*subPath\s*:", manifest, flags=re.MULTILINE)
+
+
+def with_own_addresses(secrets: Path, content: str | None) -> None:
+    data = json.loads((secrets / "accounts.json").read_text())
+    data["accounts"][0]["mail"]["own_addresses_ref"] = "icloud-own-addresses"
+    (secrets / "accounts.json").write_text(json.dumps(data))
+    if content is not None:
+        (secrets / "icloud-own-addresses").write_text(content)
+
+
+def test_prints_own_address_count(secrets: Path) -> None:
+    with_own_addresses(secrets, "me@example.org\nalias@example.org\n")
+    code, out, err = run(secrets, [])
+    assert code == 0
+    assert "account icloud own_addresses=2" in out.splitlines()
+    assert "@" not in out + err
+
+
+@pytest.mark.parametrize("content", ["not an address\n", None])
+def test_invalid_own_addresses_file_does_not_fail(secrets: Path, content: str | None) -> None:
+    with_own_addresses(secrets, content)
+    code, out, err = run(secrets, [])
+    assert code == 0
+    assert "account icloud own_addresses=invalid" in out.splitlines()
+    assert "@" not in out + err
+
+
+def test_invalid_own_addresses_file_with_address_text_leaks_nothing(
+    secrets: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with_own_addresses(secrets, "a@b@example.org\nsecretlocal@example.org\n")
+    code, out, err = run(secrets, [])
+    captured = capsys.readouterr()  # the real handler writes the WARN-free log lines to stdout
+    assert code == 0
+    assert "account icloud own_addresses=invalid" in out.splitlines()
+    for text in (out, err, captured.out, captured.err):
+        assert "@" not in text
+        assert "secretlocal" not in text.lower()

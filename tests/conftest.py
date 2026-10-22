@@ -9,6 +9,8 @@ from starlette.testclient import TestClient
 from mcp_hub.app import HubApp, create_app
 from mcp_hub.config import Settings, load_settings
 from mcp_hub.logging import configure_logging
+from mcp_hub.own_addresses import OWN_ADDRESSES
+from mcp_hub.providers.folders import FOLDER_MAPS
 from mcp_hub.registry import load_registry
 from tests.support.clock import FakeClock
 from tests.support.keys import TestKey, jwks
@@ -16,6 +18,12 @@ from tests.support.tokens import SUBJECT, TokenFactory
 
 FIXTURES = Path(__file__).parent / "fixtures"
 JWKS_PATH = "/jwks-7f3a.json"  # sentinel: must never appear in logs
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_caches() -> None:
+    FOLDER_MAPS.clear()
+    OWN_ADDRESSES.reset()
 
 
 @pytest.fixture(scope="session")

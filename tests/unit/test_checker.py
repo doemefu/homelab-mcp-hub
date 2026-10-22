@@ -14,6 +14,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.caldav import CalendarPage
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from tests.support.logfields import allowed_fields
@@ -34,7 +35,7 @@ class Probe:
     ) -> None:
         self.calls, self.account, self.capability, self.error = calls, account, capability, error
 
-    def check(self) -> None:
+    def check(self, deadline: CallDeadline | None = None) -> None:
         self.calls.append((self.account.id, self.capability))
         if self.error is not None:
             raise self.error
@@ -142,7 +143,7 @@ async def test_slow_check_times_out(secrets_dir: Path) -> None:
     release = threading.Event()
 
     class Slow(Probe):
-        def check(self) -> None:
+        def check(self, deadline: CallDeadline | None = None) -> None:
             release.wait(5)
 
     adapters = Adapters(

@@ -168,3 +168,72 @@ def test_a_calendar_url_must_be_https(tmp_path: Path, url: str) -> None:
     data["accounts"][0]["calendar"]["url"] = url
     with pytest.raises(RegistryError):
         load_registry(write(tmp_path, data))
+
+
+def test_own_addresses_ref_on_imap_and_graph_mail_blocks(tmp_path: Path) -> None:
+    data = example()
+    data["accounts"][0]["mail"]["own_addresses_ref"] = "icloud-own-addresses"
+    data["accounts"][2]["mail"]["own_addresses_ref"] = "outlook-own-addresses"
+    registry = load_registry(write(tmp_path, data))
+    icloud, gmail, outlook = (registry.get(i) for i in ("icloud", "gmail", "outlook"))
+    assert icloud is not None
+    assert gmail is not None
+    assert outlook is not None
+    assert icloud.own_addresses_ref == "icloud-own-addresses"
+    assert outlook.own_addresses_ref == "outlook-own-addresses"
+    assert gmail.own_addresses_ref is None
+
+
+def test_own_addresses_ref_on_calendar_block_is_invalid(tmp_path: Path) -> None:
+    data = example()
+    data["accounts"][0]["calendar"]["own_addresses_ref"] = "icloud-own-addresses"
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))
+    data = example()
+    data["accounts"][3] = {
+        **data["accounts"][2],
+        "id": "second",
+        "provider": "microsoft-org",
+        "capabilities": {"mail": False, "calendar": True},
+        "graph": {
+            "tenant": "organizations",
+            "client_id_ref": "x-ms-client-id",
+            "scopes": ["Calendars.Read", "offline_access"],
+        },
+        "calendar": {"protocol": "graph", "own_addresses_ref": "x-own-addresses"},
+    }
+    del data["accounts"][3]["mail"]
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))
+    del data["accounts"][3]["calendar"]["own_addresses_ref"]  # control: without the field the entry is valid
+    assert load_registry(write(tmp_path, data)).get("second") is not None
+
+
+@pytest.mark.parametrize("ref", ["", "../x", "a/b", "UPPER", ".hidden", "accounts.json", "db-password"])
+def test_own_addresses_ref_path_and_reserved_rules(tmp_path: Path, ref: str) -> None:
+    data = example()
+    data["accounts"][0]["mail"]["own_addresses_ref"] = ref
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))
+
+
+def test_own_addresses_ref_not_a_credential_ref(tmp_path: Path) -> None:
+    data = example()
+    data["accounts"][0]["mail"]["own_addresses_ref"] = "icloud-own-addresses"
+    data["accounts"][2]["mail"]["own_addresses_ref"] = "outlook-own-addresses"
+    registry = load_registry(write(tmp_path, data))
+    icloud, outlook = registry.get("icloud"), registry.get("outlook")
+    assert icloud is not None
+    assert outlook is not None
+    assert icloud.credential_refs("mail") == ("icloud-username", "icloud-app-password")
+    assert "outlook-own-addresses" not in outlook.credential_refs("mail")
+
+
+def test_inbox_must_be_a_valid_raw_mailbox_name(tmp_path: Path) -> None:
+    data = example()
+    imap = next(a["mail"] for a in data["accounts"] if a.get("mail", {}).get("protocol") == "imap")
+    imap["inbox"] = "INBOX"
+    load_registry(write(tmp_path, data))
+    imap["inbox"] = "&AMQ-&AMQ-"
+    with pytest.raises(RegistryError):
+        load_registry(write(tmp_path, data))

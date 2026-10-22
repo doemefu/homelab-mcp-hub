@@ -11,6 +11,7 @@ from mcp_hub.health import missing_credentials
 from mcp_hub.logging import log_event
 from mcp_hub.providers import SUPPORTED_PROTOCOLS
 from mcp_hub.providers.base import PROVIDER_TIMEOUT_SECONDS, ProviderError, run_blocking
+from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.registry import CAPABILITIES, Account, Capability
 from mcp_hub.tools import HubContext
 
@@ -55,14 +56,20 @@ class HealthChecker:
         def probe() -> None:
             # IMAP: login + NOOP; CalDAV: one principal PROPFIND.
             if capability == "mail":
-                adapters.mailbox(account, secrets).check()
+                adapters.mailbox(account, secrets).check(deadline)
             else:
                 adapters.calendar(account, secrets).check()
 
+        deadline = CallDeadline.start()  # R2a: started right before run_blocking
         try:
             await run_blocking(probe, slot=adapters.limiters.get(account.id), timeout=self._timeout)
         except Exception as exc:
-            error = exc if isinstance(exc, ProviderError) else ProviderError("upstream_error", type(exc).__name__)
+            if isinstance(exc, ProviderError):
+                error = exc
+            elif isinstance(exc, SoftStop):  # defensive: adapters map it themselves (R2b)
+                error = ProviderError("upstream_timeout", "SoftStop")
+            else:
+                error = ProviderError("upstream_error", type(exc).__name__)
             self._ctx.status.record_failure(account.id, capability, error.code)
             log_event(
                 _log,

@@ -11,12 +11,14 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import MessageRef, encode_message_id
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import UNDECODABLE_NOTE
+from mcp_hub.providers.folders import FolderMapCache
 from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import structured_result
 from mcp_hub.tools.mail import run_get_message, run_list_unread
-from tests.unit.test_imap_adapter import HEADER_KEY, T0, FakeClient, message
+from tests.support.imap_fake import FakeImapServer, FakeMessage
+from tests.unit.test_imap_adapter import T0, message, server
 
 pytestmark = pytest.mark.anyio
 ODD_WORDS = [
@@ -38,21 +40,21 @@ def raw_headers(sender: bytes, subject: bytes, to: bytes = b"owner@example.test"
     return b"From: " + sender + b"\r\nTo: " + to + b"\r\nCc: " + to + b"\r\nSubject: " + subject + b"\r\n\r\n"
 
 
-def hostile_message(header: bytes, uid_minutes: int = 3) -> dict[bytes, object]:
-    row = message(uid_minutes, "unused")
-    row[HEADER_KEY] = header
+def hostile_message(header: bytes, uid: int = 1, minutes_ago: int = 3) -> FakeMessage:
+    row = message(uid, minutes_ago, "unused")
+    row.headers = header
     return row
 
 
-def context(secrets_dir: Path, clients: dict[str, FakeClient]) -> HubContext:
+def context(secrets_dir: Path, servers: dict[str, FakeImapServer]) -> HubContext:
     for ref in ("gmail-username", "gmail-app-password"):
         (secrets_dir / ref).write_text("placeholder")
 
     def factory(account: Account, _dir: Path) -> ImapMailbox:
-        client = clients[account.id]
+        srv = servers[account.id]
         return ImapMailbox(
             account.id, host="imap.example.test", port=993, folder="INBOX", username="u", password="p",
-            client_factory=lambda host, port, ctx, timeout: client,
+            client_factory=lambda host, port, ctx, timeout: srv.client(), folder_maps=FolderMapCache(),
         )  # fmt: skip
 
     settings = load_settings({"HUB_SECRETS_DIR": str(secrets_dir)})
@@ -68,12 +70,9 @@ def assert_strict_json(model: object) -> None:
 
 async def test_raw_latin1_from_header_does_not_fail_the_listing(secrets_dir: Path) -> None:
     hostile = hostile_message(raw_headers(b"M\xfcller <mueller@example.test>", b"Gr\xfcezi"))
-    clients = {
-        "icloud": FakeClient({1: hostile}),
-        "gmail": FakeClient({5: message(10, "fine")}),
-    }
-    ctx = context(secrets_dir, clients)
-    result, _, outcome = await run_list_unread(ctx, account=None, since=None, limit=None, now=T0)
+    servers = {"icloud": server(hostile), "gmail": server(message(5, 10, "fine"))}
+    ctx = context(secrets_dir, servers)
+    result, _, outcome = await run_list_unread(ctx, account=None, since=None, limit=None, cursor=None, now=T0)
     assert outcome == "ok"
     assert [i.account for i in result.items] == ["icloud", "gmail"]
     assert result.items[0].untrusted.from_name == "M�ller"
@@ -92,9 +91,9 @@ async def test_hostile_headers_always_give_strict_json(secrets_dir: Path) -> Non
         sender = rng.choice([noise, word, noise + b" " + word]) + b" <s" + noise[:1] + b"@example.test>"
         subject = rng.choice([noise, word, b"x" + noise + word])
         header = raw_headers(sender, subject, to=rng.choice([word, noise]) + b" <t@example.test>")
-        clients = {"icloud": FakeClient({1: hostile_message(header)}), "gmail": FakeClient({})}
-        ctx = context(secrets_dir, clients)
-        listed, _, outcome = await run_list_unread(ctx, account="icloud", since=None, limit=None, now=T0)
+        servers = {"icloud": server(hostile_message(header)), "gmail": server()}
+        ctx = context(secrets_dir, servers)
+        listed, _, outcome = await run_list_unread(ctx, account="icloud", since=None, limit=None, cursor=None, now=T0)
         assert outcome == "ok", case
         assert len(listed.items) == 1, case
         assert_strict_json(listed)
@@ -115,9 +114,9 @@ async def test_one_item_that_fails_in_the_tool_layer_degrades_only_that_item(
         return original(value, limit, multiline=multiline)
 
     monkeypatch.setattr(mail, "clean", exploding)
-    clients = {"icloud": FakeClient({1: message(3, "BOOM"), 2: message(5, "fine")}), "gmail": FakeClient({})}
+    servers = {"icloud": server(message(1, 3, "BOOM"), message(2, 5, "fine")), "gmail": server()}
     result, _, outcome = await run_list_unread(
-        context(secrets_dir, clients), account=None, since=None, limit=None, now=T0
+        context(secrets_dir, servers), account=None, since=None, limit=None, cursor=None, now=T0
     )
     assert outcome == "ok"
     assert [i.untrusted.subject for i in result.items] == ["", "fine"]

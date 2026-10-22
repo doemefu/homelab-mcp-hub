@@ -313,3 +313,11 @@ def test_end_tag_closes_a_tracked_hiding_cell_while_deeper_elements_overflow() -
     text = html_to_text("<table><tr><td hidden>SECRET" + "<div>" * 300 + "</td>after")
     assert "SECRET" not in text
     assert "after" in text
+
+
+def test_history_field_limits() -> None:
+    assert [FIELD_LIMITS[k] for k in ("message_id", "in_reply_to", "references", "folder_name")] == [300, 300, 300, 100]
+    for key in ("message_id", "in_reply_to", "references", "folder_name"):
+        out = clean("x" * 500, FIELD_LIMITS[key])
+        assert len(out) == FIELD_LIMITS[key]
+        assert out.endswith(TRUNCATION_MARKER)

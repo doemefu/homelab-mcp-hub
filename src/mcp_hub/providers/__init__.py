@@ -7,9 +7,18 @@ from pathlib import Path
 from typing import Final, Protocol
 from zoneinfo import ZoneInfo
 
-from mcp_hub.ids import AnyMessageRef
-from mcp_hub.providers.base import AccountLimiters, MailDetail, UnreadPage, read_credential
+from mcp_hub.ids import AnyMessageRef, StableRef
+from mcp_hub.own_addresses import OWN_ADDRESSES
+from mcp_hub.providers.base import (
+    AccountLimiters,
+    FolderPage,
+    ListQuery,
+    MailDetail,
+    read_credential,
+)
 from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
+from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import FOLDER_MAPS, FolderMapCache
 from mcp_hub.providers.graph import GraphMailbox
 from mcp_hub.providers.graph_auth import GraphTokenSource
 from mcp_hub.providers.imap import ImapMailbox
@@ -26,9 +35,9 @@ SUPPORTED_PROTOCOLS: Final[dict[Capability, frozenset[WireProtocol]]] = {
 
 
 class Mailbox(Protocol):
-    def check(self) -> None: ...
-    def list_unread(self, since: datetime, limit: int) -> UnreadPage: ...
-    def get_message(self, ref: AnyMessageRef) -> MailDetail: ...
+    def check(self, deadline: CallDeadline) -> None: ...
+    def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail: ...
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage: ...
 
 
 MailboxFactory = Callable[[Account, Path], Mailbox]
@@ -51,6 +60,8 @@ class MailboxOpener:
                 folder=block.inbox,
                 username=read_credential(secrets_dir, block.username_ref),
                 password=read_credential(secrets_dir, block.password_ref),
+                own_addresses=OWN_ADDRESSES.read(account.id, secrets_dir, block.own_addresses_ref),
+                folder_maps=FOLDER_MAPS,
             )
         if isinstance(block, GraphBlock) and account.graph is not None and self._store is not None:
             graph = GraphAccount(
@@ -60,7 +71,12 @@ class MailboxOpener:
                 read_credential(secrets_dir, account.graph.client_id_ref),
                 tuple(account.graph.scopes),
             )
-            return GraphMailbox(account.id, GraphTokenSource(graph, TokenStore(self._store)))
+            return GraphMailbox(
+                account.id,
+                GraphTokenSource(graph, TokenStore(self._store)),
+                own_addresses=OWN_ADDRESSES.read(account.id, secrets_dir, block.own_addresses_ref),
+                folder_maps=FOLDER_MAPS,
+            )
         raise ValueError("account has no supported mail block")  # ready_accounts filters on SUPPORTED_PROTOCOLS first
 
 
@@ -94,3 +110,4 @@ class Adapters:
     mailbox: MailboxFactory = open_mailbox
     calendar: CalendarFactory = open_calendar
     limiters: AccountLimiters = field(default_factory=AccountLimiters)
+    folder_maps: FolderMapCache = FOLDER_MAPS

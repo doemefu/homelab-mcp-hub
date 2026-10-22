@@ -5,6 +5,7 @@ import pytest
 
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import GraphMessageRef, MessageRef, decode_message_id, encode_message_id
+from mcp_hub.providers.deadline import CallDeadline
 
 GRAPH_ID = (
     "AAMkAGVmMDEzMTM4LTZmYWUtNDdkNC1hMDZiLTU1OGY5OTZhYmY4OABGAAAAAAAiQ8W967B7TKBjgx9rVEURBwAiIsqMbYjsT5e-"
@@ -16,11 +17,10 @@ def raw(parts: list[object]) -> str:
     return "v1." + base64.urlsafe_b64encode(json.dumps(parts).encode()).rstrip(b"=").decode()
 
 
-def test_graph_ref_round_trip_and_folder() -> None:
+def test_graph_ref_round_trip() -> None:
     ref = GraphMessageRef("outlook", GRAPH_ID)
     value = encode_message_id(ref)
     assert decode_message_id(value) == ref
-    assert ref.folder == "inbox"
     assert len(value) <= 512
 
 
@@ -69,6 +69,6 @@ def test_imap_mailbox_refuses_a_graph_ref_before_connecting() -> None:
         client_factory=refuse,  # type: ignore[arg-type]
     )
     with pytest.raises(ProviderError) as info:
-        box.get_message(GraphMessageRef("outlook", GRAPH_ID))
+        box.get_message(GraphMessageRef("outlook", GRAPH_ID), CallDeadline.start())
     assert (info.value.code, info.value.cause) == ("not_found", "ForeignRef")
     assert opened == []

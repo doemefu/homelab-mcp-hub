@@ -6,12 +6,13 @@ import httpx2
 import pytest
 
 from mcp_hub.logging import configure_logging
-from mcp_hub.providers.base import ProviderError
+from mcp_hub.providers.base import ListQuery, ProviderError
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from tests.support.dav_transport import RecordingTransport
 from tests.support.graph_fixtures import FakeTokens, message
 from tests.support.logcapture import Capture
-from tests.unit.test_graph_adapter import LIST, js
+from tests.unit.test_graph_adapter import js, routes
 
 SINCE = datetime(2026, 9, 29, 6, 0, tzinfo=UTC)
 SURROGATE = "x\ud800y"
@@ -23,7 +24,6 @@ def box(t: RecordingTransport) -> GraphMailbox:
         FakeTokens(),
         client_factory=lambda timeout: httpx2.Client(transport=t.transport(), trust_env=False),
         backoff=Backoff(),
-        inbox_ids={},
     )
 
 
@@ -41,8 +41,11 @@ def box(t: RecordingTransport) -> GraphMailbox:
     ],
 )
 def test_hostile_items_degrade_alone(bad: object) -> None:
-    t = RecordingTransport({LIST: js({"value": [message(1), bad, message(3)]})})
-    ids = [getattr(s.ref, "graph_id", None) for s in box(t).list_unread(SINCE, 20).items]
+    t = RecordingTransport(routes(js({"value": [message(1), bad, message(3)]})))
+    ids = [
+        getattr(s.ref, "graph_id", None)
+        for s in box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start()).items
+    ]
     assert "AAMkMSG0001=" in ids
     assert "AAMkMSG0003=" in ids
 
@@ -53,15 +56,15 @@ def test_lone_surrogates_reach_the_tool_layer_unchanged() -> None:
         "bodyPreview": SURROGATE,
         "from": {"emailAddress": {"name": SURROGATE, "address": SURROGATE + "@example.test"}},
     }
-    t = RecordingTransport({LIST: js({"value": [hostile]})})
-    [item] = box(t).list_unread(SINCE, 20).items
+    t = RecordingTransport(routes(js({"value": [hostile]})))
+    [item] = box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start()).items
     assert item.subject == SURROGATE  # cleaning is the tool layer's job; Task 15 asserts the serialised result
 
 
 def test_items_already_read_or_too_old_are_dropped() -> None:
     t = RecordingTransport(
-        {
-            LIST: js(
+        routes(
+            js(
                 {
                     "value": [
                         message(1) | {"isRead": True},
@@ -70,46 +73,53 @@ def test_items_already_read_or_too_old_are_dropped() -> None:
                     ]
                 }
             )
-        }
+        )
     )
-    assert [getattr(s.ref, "graph_id", None) for s in box(t).list_unread(SINCE, 20).items] == ["AAMkMSG0003="]
+    assert [
+        getattr(s.ref, "graph_id", None)
+        for s in box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start()).items
+    ] == ["AAMkMSG0003="]
 
 
 @pytest.mark.parametrize("value", [{"value": "x"}, {"value": None}, {}, {"value": {"a": 1}}])
 def test_value_not_a_list_is_account_error(value: dict[str, object]) -> None:
-    t = RecordingTransport({LIST: js(value)})
+    t = RecordingTransport(routes(js(value)))
     with pytest.raises(ProviderError) as info:
-        box(t).list_unread(SINCE, 20)
+        box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start())
     assert (info.value.code, info.value.cause) == ("upstream_error", "MalformedList")
 
 
-def test_more_than_51_entries_are_not_read() -> None:
-    t = RecordingTransport({LIST: js({"value": [message(n) for n in range(1, 500)]})})
-    page = box(t).list_unread(SINCE, 50)
+def test_more_than_101_entries_are_not_read() -> None:
+    t = RecordingTransport(routes(js({"value": [message(n) for n in range(1, 500)]})))
+    page = box(t).list_messages(ListQuery("inbox", SINCE, True, None, 50), CallDeadline.start())
     assert len(page.items) == 50
     assert page.more
 
 
-def test_entries_beyond_51_are_never_inspected() -> None:
-    """L7: a hostile entry after the first 51 is not even looked at (no item_degraded line)."""
+def test_entries_beyond_101_are_never_inspected() -> None:
+    """L7 with $top=101 (spec 080 §5.4): a hostile entry after the first 101 is not even looked at."""
     configure_logging("DEBUG")
     capture = Capture()
     logging.getLogger().addHandler(capture)
     try:
-        values: list[object] = [message(n) for n in range(1, 52)] + ["not an object"]
-        page = box(RecordingTransport({LIST: js({"value": values})})).list_unread(SINCE, 50)
+        values: list[object] = [message(n) for n in range(1, 102)] + ["not an object"]
+        page = box(RecordingTransport(routes(js({"value": values})))).list_messages(
+            ListQuery("inbox", SINCE, True, None, 50), CallDeadline.start()
+        )
     finally:
         logging.getLogger().removeHandler(capture)
     assert len(page.items) == 50
     assert [json.loads(line)["event"] for line in capture.lines].count("item_degraded") == 0
 
 
-def test_hostile_entry_inside_the_first_51_is_logged_without_an_item_hash() -> None:
+def test_hostile_entry_inside_the_first_101_is_logged_without_an_item_hash() -> None:
     configure_logging("DEBUG")
     capture = Capture()
     logging.getLogger().addHandler(capture)
     try:
-        box(RecordingTransport({LIST: js({"value": ["not an object", {"id": "a/b"}]})})).list_unread(SINCE, 20)
+        box(RecordingTransport(routes(js({"value": ["not an object", {"id": "a/b"}]})))).list_messages(
+            ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start()
+        )
     finally:
         logging.getLogger().removeHandler(capture)
     events = [json.loads(line) for line in capture.lines]

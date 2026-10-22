@@ -42,19 +42,17 @@ src/mcp_hub/
   sanitize.py      untrusted-content rules and field limits (spec §5.3, §5.4)
   budget.py        output budget (spec §5.4)
   ids.py           opaque message and event ids (spec §5.1)
-  providers/       base.py (deadlines, connection limits, inbound limits), mime.py, imap.py (read-only IMAP adapter), caldav.py (read-only CalDAV adapter and recurrence expansion)
-  tools/           list_accounts, mail (list_unread, get_message); common.py: account selection and aggregation
+  cursors.py       signed paging cursors (spec §5.5)
+  own_addresses.py own-address lookup for the registry
+  providers/       base.py (deadlines, connection limits, inbound limits), deadline.py, folders.py (folder model), headers.py, imap_guard.py, imap_search.py, mime.py, imap.py (read-only IMAP adapter), caldav.py (read-only CalDAV adapter and recurrence expansion), graph.py (read-only Graph mail adapter), graph_auth.py, msidentity.py
+  tools/           list_accounts, mail (list_unread, list_messages, get_message); common.py: account selection and aggregation
 tests/
   unit/            per-module tests
   contract/        gate G6: the authorization rules of spec §10.3 over HTTP
-  integration/     the real process on two ports; test_imap.py against GreenMail (marker `provider`)
-  support/         keys, tokens, clock, MCP wire helpers, GreenMail helpers, log capture
-  fixtures/        example registry (neutral ids, no real data)
-scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh (development only, not in the image)
   integration/     the real process on two ports; test_imap.py against GreenMail, test_caldav.py against Radicale (marker `provider`)
-  support/         keys, tokens, clock, MCP wire helpers, GreenMail and Radicale helpers, ICS fixture loader, canned DAV answers, log capture
+  support/         keys, tokens, clock, MCP wire helpers, GreenMail and Radicale helpers, IMAP fake, ICS fixture loader, canned DAV answers, log capture
   fixtures/        example registry (neutral ids, no real data), ics/ calendar fixtures, radicale/ test server config
-scripts/           dev_token.py, smoke_image.sh, provider_services.sh (development only, not in the image)
+scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh, memory_probe.py, imap_probe.py (development and owner probes, not in the image)
 k8s/               Deployment and Service for namespace apps
 ```
 
@@ -80,6 +78,10 @@ docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /t
 It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` and `memory.events`; `--accounts 2` queries two accounts concurrently. Re-run the scenarios in INTERFACES.md's memory table after any change to the calendar limits.
 
 `--scenario graph-message` drives `get_message` for an `outlook` entry through the real Graph adapter and token source (in-memory token store, in-process Graph transport): the message answer fills the 2 MiB cap with a non-ASCII body and 5,000 recipients, the attachment answer fills the 1 MiB list cap. `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process; the gate for the Graph limits is `--scenario graph-message --with-calendar nonascii-240k --calls 10` with cgroup `memory.peak` at most 230 MiB and `oom_kill 0`. Record both cgroup `memory.peak` and the last call's peak RSS: the cgroup figure also counts page cache and varies between runs and hosts, while peak RSS is the process alone. Re-run it after any change to the Graph response caps.
+
+### IMAP probe
+
+`scripts/imap_probe.py --host <imap host>` is run by the owner on their own machine. It is read-only (an allowlist proxy, `EXAMINE` only), asks for the credentials at a prompt and writes nothing. It prints mailbox roles, counts and LIST/EXAMINE/SEARCH timings, including the bracketed Message-ID search (O35). Paste only the part after `--- result ---`; `--show-names` adds mailbox names, which are private.
 
 ### Provider integration tests
 
