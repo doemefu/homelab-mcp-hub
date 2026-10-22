@@ -75,6 +75,19 @@ T1B_FIELDS: Final = (
 )
 T1B_EXTENDED: Final = ("Integer 0x1081", "String 0x1042", "String 0x1039")
 
+# The facts of the owner's Graph Explorer run for the batched `get_message_status` lookups (T17, plan §4; requests
+# 14, 14b, 15 and 16, each with the same `Prefer` header). None until they are recorded: the strict xfail of
+# `test_fixture_shapes_match_t1c_facts` then turns into a failure, and the marker must go before lane G merges.
+# - "status_14", "status_14b", "status_15", "status_16" -> the HTTP status of each request;
+# - "count_14", "count_14b", "count_15", "count_16" -> the item count of each answer;
+# - "next_link_seen" -> any of the four answers carried `@odata.nextLink`;
+# - "batch_10_at_cap_ok" -> request 14b (10 values, about 1,800 encoded characters of `$filter`) answered 200 (GR3);
+# - "request14_both_found", "request14_replied_last_verb" -> request 14 returned both messages, and `Integer 0x1081`
+#   on the replied one (the `$expand` works on the batch; otherwise the C6 fallback);
+# - "request15_only_c1_c2", "request15_sent_reply_after_receipt" -> request 15 returned only items of C1/C2, among
+#   them a `sentitems` item whose `sentDateTime` is after the replied message's `receivedDateTime`.
+T1C_FACTS: dict[str, bool | int | None] | None = None
+
 
 def extended(
     answered: str | None = None, in_reply_to: str | None = None, references: str | None = None
