@@ -328,6 +328,40 @@ def test_cpu_bounds() -> None:
     assert time.perf_counter() - start < 0.5
 
 
+def _short_tokens(domains: str, count: int) -> list[str]:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    tokens = [f"{a}{b}@{d}" for d in domains for a in alphabet for b in alphabet]
+    return tokens[:count]
+
+
+def test_in_reply_to_scan_is_linear() -> None:
+    """Security M1: 6,000 distinct In-Reply-To tokens against 6,000 distinct References tokens (none shared) in one
+    64 KiB block; the phrase-form scan tests membership in a set and looks at the first 100 tokens only."""
+    in_reply_to = _short_tokens("xy", 6000)
+    references = _short_tokens("zw", 6000)
+    data = raw("From: a@example.test", f"In-Reply-To: {','.join(in_reply_to)}", f"References: {','.join(references)}")
+    assert len(data) <= 65_536
+    parsed = parse_summary_headers(data)
+    assert parsed.in_reply_to == in_reply_to[0]
+    best = min(_elapsed(lambda: parse_summary_headers(data)) for _ in range(5))
+    assert best < 0.020, best
+
+
+def _elapsed(call: object) -> float:
+    start = time.perf_counter()
+    call()  # type: ignore[operator]
+    return time.perf_counter() - start
+
+
+def test_in_reply_to_phrase_form_looks_at_the_first_100_tokens() -> None:
+    tokens = [f"t{i}@example.test" for i in range(150)]
+    in_reply_to = f"In-Reply-To: {' '.join(f'<{t}>' for t in tokens)}"
+    p = parse_summary_headers(raw("From: a@example.test", in_reply_to, f"References: <{tokens[120]}>"))
+    assert p.in_reply_to == tokens[0]  # the shared token sits past the cap: the first non-participant wins
+    p = parse_summary_headers(raw("From: a@example.test", in_reply_to, f"References: <{tokens[99]}>"))
+    assert p.in_reply_to == tokens[99]
+
+
 def test_to_cc_cut_before_parsing() -> None:
     addrs = ", ".join(f"u{i}@example.org" for i in range(2000))
     p = parse_summary_headers(raw("To: " + addrs))

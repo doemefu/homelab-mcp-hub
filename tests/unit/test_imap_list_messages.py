@@ -566,12 +566,25 @@ def three_folders() -> FakeImapServer:
 
 
 def test_soft_stop_returns_partial() -> None:
-    def second_examine_of_archive(commands: Commands) -> int:
-        return nth(commands, lambda name, argument: name == "EXAMINE" and argument == "Archive", 2)
+    """The soft limit passes while pass 2 opens the archive: the inbox items already built are returned, the
+    archive FETCH is never sent. (Each pass-2 item checks the limit, so the stop must come after the inbox items.)"""
+    server = three_folders()
+    clock = clock_of(server)
+    original = server.run
+    examined = {"Archive": 0}
 
-    _, page = soft_stop_before(three_folders, query("all"), second_examine_of_archive)
+    def run_command(command: str, argument: object = None) -> None:
+        original(command, argument)
+        if command == "EXAMINE" and argument == "Archive":
+            examined["Archive"] += 1
+            if examined["Archive"] == 2:  # pass 2
+                clock.advance(20.0)
+
+    server.run = run_command  # type: ignore[method-assign]
+    page = box(server).list_messages(query("all"), CallDeadline(clock(), 16.0, 100.0, clock))
     assert subjects(page) == ["in-1", "in-2"]
     assert (page.truncated, page.complete) == (True, False)
+    assert names(server)[-2:] == ["EXAMINE", "LOGOUT"]
 
 
 def test_soft_stop_in_pass_one_returns_an_empty_partial_page() -> None:
@@ -632,6 +645,43 @@ def test_candidate_parse_checks_the_soft_limit_every_100_candidates(monkeypatch:
     assert parsed["n"] == 200  # soft limit passed at 151; stopped at the next check, not after all 500
     assert (page.items, page.truncated, page.complete) == ([], True, False)
     assert names(server)[-2:] == ["UID FETCH", "LOGOUT"]  # no pass-2 command
+
+
+def test_summary_parse_checks_the_soft_limit_per_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Security M1: pass 2 parses up to 64 KiB of headers per item without a command; it checks the soft limit per
+    item and returns the items built so far as a partial page."""
+    server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b"), msg(3, 7, "c")])
+    clock = clock_of(server)
+    original = imap.parse_summary_headers
+
+    def slow_parse(raw: bytes | None) -> object:
+        clock.advance(10.0)
+        return original(raw)
+
+    monkeypatch.setattr(imap, "parse_summary_headers", slow_parse)
+    page = box(server).list_messages(query(), CallDeadline(clock(), 15.0, 100.0, clock))
+    assert subjects(page) == ["a", "b"]
+    assert (page.truncated, page.complete) == (True, False)
+    assert names(server)[-1] == "LOGOUT"
+
+
+def test_snippet_decode_checks_the_soft_limit_per_member(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The snippet decode of each member checks the soft limit too; the folders built before the stop are kept."""
+    server = icloud(inbox=[msg(1, 5, "a")], archive=[msg(11, 10, "b1"), msg(12, 11, "b2")])
+    clock = clock_of(server)
+    original = imap.decode_part
+    decoded = {"n": 0}
+
+    def slow_decode(raw: bytes, part: object) -> str:
+        decoded["n"] += 1
+        clock.advance(8.0)
+        return original(raw, part)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(imap, "decode_part", slow_decode)
+    page = box(server).list_messages(query("all"), CallDeadline(clock(), 15.0, 100.0, clock))
+    assert decoded["n"] == 2  # a, then b1; stopped before b2
+    assert subjects(page) == ["a"]
+    assert (page.truncated, page.complete) == (True, False)
 
 
 def test_abandoned_worker_stops_after_hard_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

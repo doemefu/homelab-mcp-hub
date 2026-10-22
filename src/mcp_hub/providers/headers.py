@@ -24,6 +24,7 @@ SUMMARY_HEADER_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS ({SUMMARY_HEADER_FIELDS})
 CANDIDATE_HEADER_BYTES: Final = 2048
 MAX_ADDRESS_HEADER_BYTES: Final = 8192
 MAX_REFERENCES: Final = 10
+MAX_IN_REPLY_TO_TOKENS: Final = 100  # the phrase-form scan looks at no more (security M1: no quadratic scan)
 MAX_SUBJECT_ROUNDS: Final = 20
 _SUBJECT_INPUT_CHARS: Final = 4000
 _SUBJECT_KEPT_CHARS: Final = 1000
@@ -174,11 +175,12 @@ def _first(items: Mapping[str, list[str]], name: str) -> str | None:
 def _in_reply_to(value: str | None, references: Sequence[str], people: set[str]) -> str | None:
     if value is None:
         return None
-    tokens = msg_id_tokens(value)
+    tokens = msg_id_tokens(value)[:MAX_IN_REPLY_TO_TOKENS]
     if not tokens:
         return bare_message_id(value)
+    referenced = frozenset(references)
     for token in tokens:  # phrase form: a token that also occurs in References is the id
-        if token in references:
+        if token in referenced:
             return token
     for token in tokens:
         if token.lower() not in people:

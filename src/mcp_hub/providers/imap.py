@@ -515,10 +515,15 @@ def _fetch_summaries(
 
 
 def _fetch_texts(
-    session: ImapSession, rows: dict[int, dict[bytes, object]], length: int, refs: dict[int, MessageRef]
+    session: ImapSession,
+    rows: dict[int, dict[bytes, object]],
+    length: int,
+    refs: dict[int, MessageRef],
+    soft_check: Callable[[], None],
 ) -> dict[int, str]:
     """Partial fetch of each message's chosen text part, one FETCH per section number. Snippets are optional: a
-    FETCH that fails without losing the connection or answering BAD leaves those snippets empty."""
+    FETCH that fails without losing the connection or answering BAD leaves those snippets empty. The decode of
+    each member checks the soft limit first (it costs CPU without a command)."""
     by_section: dict[str, list[tuple[int, Part]]] = {}
     for uid, row in rows.items():
         try:  # per UID: an empty or odd BODYSTRUCTURE leaves this snippet empty
@@ -543,6 +548,7 @@ def _fetch_texts(
             continue
         key = f"BODY[{section}]<0>".encode()
         for uid, part in members:
+            soft_check()
             try:  # per UID: a broken part only empties that message's snippet
                 raw = data.get(uid, {}).get(key)
                 text = decode_part(raw if isinstance(raw, bytes) else b"", part)
@@ -697,8 +703,8 @@ class ImapMailbox:
         built: dict[MessageRef, MailSummary] = {}
         try:
             for entry, group in _by_folder(plans, chosen):
-                built.update(self._summaries(session, entry, folder_of[entry.raw_name], group, progress))
-        except SoftStop:  # SA13: pass 2 incomplete, so the page gets no cursor
+                self._summaries(session, entry, folder_of[entry.raw_name], group, progress, built)
+        except SoftStop:  # SA13: pass 2 incomplete, so the page gets no cursor; the items built so far are kept
             progress.truncated, progress.complete = True, False
         returned = [c for c in chosen if c.ref in built]
         frontier: tuple[int, str] | None = None
@@ -825,12 +831,15 @@ class ImapMailbox:
         folder: MailFolder | None,
         group: list[_Chosen],
         progress: _Progress,
-    ) -> dict[MessageRef, MailSummary]:
-        """Pass 2 for one folder: EXAMINE only when another mailbox is open. A chosen item that cannot be read now
-        (changed UIDVALIDITY, FETCH NO, expunged) is dropped and the page becomes incomplete: a cursor after the
-        items returned would skip it for good. `folder` None (Gmail All Mail): each item's folder follows its
-        X-GM-LABELS; on any other server that fails closed. Under a `direction: incoming` filter, a Gmail item whose
-        `\\Sent` label appeared after pass 1 is dropped like a new draft: it no longer matches the filter."""
+        out: dict[MessageRef, MailSummary],
+    ) -> None:
+        """Pass 2 for one folder, into `out`: EXAMINE only when another mailbox is open. A chosen item that cannot
+        be read now (changed UIDVALIDITY, FETCH NO, expunged) is dropped and the page becomes incomplete: a cursor
+        after the items returned would skip it for good. `folder` None (Gmail All Mail): each item's folder follows
+        its X-GM-LABELS; on any other server that fails closed. Under a `direction: incoming` filter, a Gmail item
+        whose `\\Sent` label appeared after pass 1 is dropped like a new draft: it no longer matches the filter.
+        Each item checks the soft limit first (its header parse costs CPU without a command); a SoftStop leaves the
+        items already in `out`."""
         if folder is None and not session.gmail:  # only Gmail All Mail decides the folder per message
             raise ProviderError("upstream_error", "UnmappedFolder")
         if session.selected != entry.raw_name:
@@ -842,18 +851,19 @@ class ImapMailbox:
                 if not _answered_no(exc):
                     raise
                 progress.complete = False
-                return {}
+                return
             if validity != group[0].candidate.uidvalidity:
                 progress.truncated, progress.complete = True, False
-                return {}
+                return
         uids = [chosen.candidate.uid for chosen in group]
         gmail = session.gmail
         items = [*LIST_SUMMARY_ITEMS, *_GMAIL_SUMMARY_ITEMS] if gmail else list(LIST_SUMMARY_ITEMS)
         flag_items = ["FLAGS", _GMAIL_CANDIDATE_ITEM] if gmail else ["FLAGS"]
         rows, unparsable = _fetch_summaries(session, uids, items, flag_items)
-        texts = _fetch_texts(session, rows, SNIPPET_FETCH_BYTES, {c.candidate.uid: c.ref for c in group})
-        out: dict[MessageRef, MailSummary] = {}
+        refs = {c.candidate.uid: c.ref for c in group}
+        texts = _fetch_texts(session, rows, SNIPPET_FETCH_BYTES, refs, self._soft_check)
         for chosen in group:
+            self._soft_check()
             uid = chosen.candidate.uid
             if uid in unparsable:
                 failure, flag_row = unparsable[uid]
@@ -874,7 +884,6 @@ class ImapMailbox:
                 continue
             item_folder = folder or _gmail_folder(_labels(row))
             out[chosen.ref] = self._summary(entry, item_folder, chosen, row, texts.get(uid, ""), gmail=gmail)
-        return out
 
     def _meta(
         self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, flags: frozenset[bytes], from_address: str | None
