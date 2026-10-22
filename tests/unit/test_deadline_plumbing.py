@@ -17,7 +17,7 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import MessageRef, encode_message_id
 from mcp_hub.providers import Adapters, Mailbox, base
 from mcp_hub.providers import deadline as deadline_module
-from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from mcp_hub.providers.imap import ImapMailbox
@@ -48,9 +48,9 @@ class SpyMailbox:
     def check(self, deadline: CallDeadline) -> None:
         self.seen.append(deadline)
 
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         self.seen.append(deadline)
-        return UnreadPage(items=[], more=False)
+        return FolderPage([], more=False, truncated=False, complete=True)
 
     def get_message(self, ref: object, deadline: CallDeadline) -> MailDetail:
         self.seen.append(deadline)
@@ -83,7 +83,7 @@ async def test_tool_passes_one_deadline_started_before_run_blocking(
     monkeypatch.setattr(mail_tools, "run_blocking", _timed_run_blocking(entered))
     ctx = context(secrets_dir, seen)
 
-    await run_list_unread(ctx, account="icloud", since=None, limit=None)
+    await run_list_unread(ctx, account="icloud", since=None, limit=None, cursor=None)
     await run_get_message(ctx, message_id=ICLOUD_ID, max_chars=None)
 
     assert len(seen) == len(entered) == 2
@@ -184,7 +184,7 @@ def test_graph_honours_a_deadline_on_another_clock_than_its_own() -> None:
 
     t = RecordingTransport(routes(body_advancing_the_mailbox_clock))
     with pytest.raises(ProviderError) as info:
-        _graph_with_own_clock(t, mailbox_clock).list_unread(SINCE, 20, deadline)
+        _graph_with_own_clock(t, mailbox_clock).list_messages(ListQuery("inbox", SINCE, True, None, 20), deadline)
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
 
 
@@ -194,7 +194,7 @@ def test_graph_sends_nothing_when_the_other_clock_deadline_is_over() -> None:
     tool_clock[0] += 21.0
     t = RecordingTransport({LIST: lambda request: httpx2.Response(200, content=b'{"value": []}')})
     with pytest.raises(ProviderError) as info:
-        _graph_with_own_clock(t, [100.0]).list_unread(SINCE, 20, deadline)
+        _graph_with_own_clock(t, [100.0]).list_messages(ListQuery("inbox", SINCE, True, None, 20), deadline)
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "CallDeadline")
     assert t.seen == []
 

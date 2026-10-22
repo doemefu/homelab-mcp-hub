@@ -8,7 +8,7 @@ from mcp_hub.errors import ToolError
 from mcp_hub.health import StatusStore
 from mcp_hub.ids import AnyMessageRef, GraphMessageRef, MessageRef, encode_message_id
 from mcp_hub.providers import SUPPORTED_PROTOCOLS, Adapters
-from mcp_hub.providers.base import MailDetail, MailSummary, ProviderError, UnreadPage
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, MailSummary, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
@@ -43,14 +43,18 @@ def summary(account: str, n: int, *, graph: bool, text: str = "Hi") -> MailSumma
     )
 
 
+def unread_page(items: list[MailSummary], more: bool) -> FolderPage:
+    return FolderPage(items, more, truncated=False, complete=True)
+
+
 class Box:
-    def __init__(self, account: Account, pages: dict[str, UnreadPage | Exception], detail: MailDetail | None) -> None:
+    def __init__(self, account: Account, pages: dict[str, FolderPage | Exception], detail: MailDetail | None) -> None:
         self.account, self.pages, self.detail = account, pages, detail
         self.asked: list[AnyMessageRef] = []
 
     def check(self, deadline: CallDeadline) -> None: ...
 
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         page = self.pages[self.account.id]
         if isinstance(page, Exception):
             raise page
@@ -64,7 +68,7 @@ class Box:
 
 def ctx(
     secrets_dir: Path,
-    pages: dict[str, UnreadPage | Exception],
+    pages: dict[str, FolderPage | Exception],
     detail: MailDetail | None = None,
     budget: str = "10000",
     opened: list[str] | None = None,
@@ -85,12 +89,12 @@ def test_graph_is_a_supported_mail_protocol() -> None:
 
 
 async def test_two_accounts_budget_and_isolation(secrets_dir: Path) -> None:
-    pages: dict[str, UnreadPage | Exception] = {
-        "icloud": UnreadPage([summary("icloud", n, graph=False) for n in range(1, 51)], False),
-        "outlook": UnreadPage([summary("outlook", n, graph=True, text=SURROGATE) for n in range(1, 51)], False),
+    pages: dict[str, FolderPage | Exception] = {
+        "icloud": unread_page([summary("icloud", n, graph=False) for n in range(1, 51)], False),
+        "outlook": unread_page([summary("outlook", n, graph=True, text=SURROGATE) for n in range(1, 51)], False),
     }
     result, accounts, outcome = await run_list_unread(
-        ctx(secrets_dir, pages), account=None, since=None, limit=50, now=NOW
+        ctx(secrets_dir, pages), account=None, since=None, limit=50, cursor=None, now=NOW
     )
     text = result.model_dump_json()
     assert len(text) <= 10_000
@@ -104,11 +108,13 @@ async def test_two_accounts_budget_and_isolation(secrets_dir: Path) -> None:
 
 
 async def test_one_account_failing_keeps_the_other(secrets_dir: Path) -> None:
-    pages: dict[str, UnreadPage | Exception] = {
-        "icloud": UnreadPage([summary("icloud", 1, graph=False)], False),
+    pages: dict[str, FolderPage | Exception] = {
+        "icloud": unread_page([summary("icloud", 1, graph=False)], False),
         "outlook": ProviderError("auth_expired", "InvalidGrant"),
     }
-    result, _, outcome = await run_list_unread(ctx(secrets_dir, pages), account=None, since=None, limit=20, now=NOW)
+    result, _, outcome = await run_list_unread(
+        ctx(secrets_dir, pages), account=None, since=None, limit=20, cursor=None, now=NOW
+    )
     assert outcome == "partial"
     assert [e.account for e in result.account_errors] == ["outlook"]
     assert result.account_errors[0].code == "auth_expired"

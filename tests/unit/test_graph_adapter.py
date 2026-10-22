@@ -7,7 +7,7 @@ import httpx2
 import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef
-from mcp_hub.providers.base import MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import (
     EXTENDED_EXPAND,
@@ -78,8 +78,8 @@ def list_unread(
     tokens: FakeTokens | None = None,
     backoff: Backoff | None = None,
     now: list[float] | None = None,
-) -> UnreadPage:
-    return box(t, tokens, backoff, now).list_unread(SINCE, 20, call_deadline(now))
+) -> FolderPage:
+    return box(t, tokens, backoff, now).list_messages(ListQuery("inbox", SINCE, True, None, 20), call_deadline(now))
 
 
 def test_list_query_shape_and_headers() -> None:
@@ -89,7 +89,9 @@ def test_list_query_shape_and_headers() -> None:
         seen.append(request)
         return js({"value": [message(1)]})(request)
 
-    page = box(RecordingTransport(routes(answer))).list_unread(SINCE, 20, call_deadline())
+    page = box(RecordingTransport(routes(answer))).list_messages(
+        ListQuery("inbox", SINCE, True, None, 20), call_deadline()
+    )
     assert dict(seen[0].url.params) == {
         "$filter": "receivedDateTime ge 2026-09-29T06:00:30Z and isRead eq false",
         "$orderby": "receivedDateTime desc",
@@ -108,11 +110,12 @@ def test_list_query_shape_and_headers() -> None:
 def test_more_when_limit_plus_one_or_next_link() -> None:
     assert (
         box(RecordingTransport(routes(js({"value": [message(n) for n in range(1, 4)]}))))
-        .list_unread(SINCE, 2, call_deadline())
+        .list_messages(ListQuery("inbox", SINCE, True, None, 2), call_deadline())
         .more
     )
     t = RecordingTransport(routes(js({"value": [message(1)], "@odata.nextLink": "https://evil.example.test/next"})))
-    assert box(t).list_unread(SINCE, 20, call_deadline()).more
+    page = box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), call_deadline())
+    assert page.truncated  # a nextLink is never followed: the page is incomplete
     assert {s[0] for s in t.seen} == {"graph.microsoft.com"}
     assert list_requests(t) == 1
 
@@ -128,13 +131,13 @@ def test_next_link_never_requested() -> None:
     t = RecordingTransport(
         routes(js({"value": [], "@odata.nextLink": f"{BASE}/me/mailFolders/{INBOX_ID}/messages?$skip=10"}))
     )
-    box(t).list_unread(SINCE, 20, call_deadline())
+    box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), call_deadline())
     assert list_requests(t) == 1
 
 
 def test_only_graph_host_gets_bearer() -> None:
     t = RecordingTransport(routes(js({"value": [message(1)]})))
-    box(t).list_unread(SINCE, 20, call_deadline())
+    box(t).list_messages(ListQuery("inbox", SINCE, True, None, 20), call_deadline())
     assert all(host == "graph.microsoft.com" and port == 443 for host, port, *_ in t.seen)
 
 
@@ -163,7 +166,9 @@ def test_redirect_not_followed_even_by_a_following_client(status: int) -> None:
         backoff=Backoff(),
     )
     with pytest.raises(ProviderError) as info:
-        following.list_unread(SINCE, 20, CallDeadline.start())  # this client runs on the real clock
+        following.list_messages(
+            ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start()
+        )  # this client runs on the real clock
     assert info.value.cause == "Redirect"
     assert {s[0] for s in t.seen} == {"graph.microsoft.com"}
     assert list_requests(t) == 1

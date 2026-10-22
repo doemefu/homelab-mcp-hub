@@ -40,7 +40,6 @@ from mcp_hub.providers.base import (
     MailMeta,
     MailSummary,
     ProviderError,
-    UnreadPage,
     direction_of,
     load_json_object,
     log_message_skipped,
@@ -456,11 +455,6 @@ class GraphMailbox:
     def check(self, deadline: CallDeadline) -> None:
         """Status check (spec 080 §7.4, rev. 4.6 S10): token (refresh only near expiry) + one inbox folder-id GET."""
         self._run(self._check_inbox, deadline)
-
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
-        """The unread inbox, through list_messages (kept until the tool layer calls list_messages itself)."""
-        page = self.list_messages(ListQuery("inbox", since, True, None, limit), deadline)
-        return UnreadPage(items=page.items, more=page.more or page.truncated)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         return self._run(

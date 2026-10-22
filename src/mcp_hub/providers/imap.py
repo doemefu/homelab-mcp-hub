@@ -35,7 +35,6 @@ from mcp_hub.providers.base import (
     MailMeta,
     MailSummary,
     ProviderError,
-    UnreadPage,
     direction_of,
     log_message_skipped,
     order_key_of,
@@ -651,11 +650,6 @@ class ImapMailbox:
     def check(self, deadline: CallDeadline) -> None:
         """Status check (spec 080 §7.4): login + NOOP."""
         self._run(lambda session: session.noop(), deadline)
-
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
-        """`list_messages(folder="inbox", unread_only=True)` until the tool layer calls it directly (T18)."""
-        page = self.list_messages(ListQuery("inbox", since, True, None, limit), deadline)
-        return UnreadPage(items=page.items, more=page.more or page.truncated or not page.complete)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         return self._run(lambda session: self._list_messages(session, query), deadline)

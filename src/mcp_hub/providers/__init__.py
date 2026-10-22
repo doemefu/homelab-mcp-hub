@@ -14,7 +14,6 @@ from mcp_hub.providers.base import (
     FolderPage,
     ListQuery,
     MailDetail,
-    UnreadPage,
     read_credential,
 )
 from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
@@ -37,7 +36,6 @@ SUPPORTED_PROTOCOLS: Final[dict[Capability, frozenset[WireProtocol]]] = {
 
 class Mailbox(Protocol):
     def check(self, deadline: CallDeadline) -> None: ...
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage: ...
     def get_message(self, ref: AnyMessageRef, deadline: CallDeadline) -> MailDetail: ...
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage: ...
 

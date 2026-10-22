@@ -15,7 +15,7 @@ from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
-from mcp_hub.providers.base import MAX_TEXT_PART_BYTES, ProviderError
+from mcp_hub.providers.base import MAX_TEXT_PART_BYTES, ListQuery, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import load_registry
 from mcp_hub.tools import HubContext
@@ -62,7 +62,11 @@ def test_list_unread_returns_seeded_messages_newest_first() -> None:
     attached.add_attachment(b"%PDF-1.4 test", maintype="application", subtype="pdf", filename="report.pdf")
     for msg in (plain, html, attached):
         greenmail.send("hub-list", msg)
-    items = greenmail.ours(greenmail.mailbox("hub-list").list_unread(since, 20, CallDeadline.start()).items)
+    items = greenmail.ours(
+        greenmail.mailbox("hub-list")
+        .list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start())
+        .items
+    )
     assert [m.subject for m in items] == [S("Third attached"), S("Second html"), S("First plain")]
     assert [m.has_attachments for m in items] == [True, False, False]
     assert items[2].snippet_text.strip() == "Plain body line"
@@ -76,11 +80,13 @@ def test_since_filter_and_limit() -> None:
     since = seeded_since()
     for n in range(3):
         greenmail.send("hub-list", text_mail(S(f"Recent {n}"), "x"))
-    page = greenmail.mailbox("hub-list").list_unread(since, 2, CallDeadline.start())
+    page = greenmail.mailbox("hub-list").list_messages(ListQuery("inbox", since, True, None, 2), CallDeadline.start())
     assert len(page.items) == 2
     assert page.more is True
     recent = greenmail.ours(
-        greenmail.mailbox("hub-list").list_unread(now - timedelta(days=1), 50, CallDeadline.start()).items
+        greenmail.mailbox("hub-list")
+        .list_messages(ListQuery("inbox", now - timedelta(days=1), True, None, 50), CallDeadline.start())
+        .items
     )
     assert S("Old one") not in [m.subject for m in recent]
     assert S("Recent 0") in [m.subject for m in recent]
@@ -90,12 +96,18 @@ def test_reading_never_sets_seen() -> None:
     since = seeded_since()
     greenmail.send("hub-get", text_mail(S("Keep unread"), "body"))
     box = greenmail.mailbox("hub-get")
-    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Keep unread")]
+    [item] = [
+        m
+        for m in box.list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start()).items
+        if m.subject == S("Keep unread")
+    ]
     detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.unread is True
     assert detail.body_text.strip() == "body"
     assert b"\\Seen" not in greenmail.flags("hub-get")[item.ref.uid]
-    assert [m.subject for m in box.list_unread(since, 20, CallDeadline.start()).items].count(S("Keep unread")) == 1
+    assert [
+        m.subject for m in box.list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start()).items
+    ].count(S("Keep unread")) == 1
 
 
 def test_get_message_html_and_attachment_metadata() -> None:
@@ -109,7 +121,11 @@ def test_get_message_html_and_attachment_metadata() -> None:
     msg.add_attachment(b"x" * 5000, maintype="image", subtype="png", filename="pic.png")
     greenmail.send("hub-get", msg)
     box = greenmail.mailbox("hub-get")
-    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Html only")]
+    [item] = [
+        m
+        for m in box.list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start()).items
+        if m.subject == S("Html only")
+    ]
     detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.body_source == "text/html-converted"
     assert "Hello" in detail.body_text
@@ -132,7 +148,11 @@ def test_oversized_text_part_is_fetched_partially(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(imapclient.IMAPClient, "fetch", spy)
     box = greenmail.mailbox("hub-big")
-    [item] = [m for m in box.list_unread(since, 20, CallDeadline.start()).items if m.subject == S("Huge")]
+    [item] = [
+        m
+        for m in box.list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start()).items
+        if m.subject == S("Huge")
+    ]
     detail = box.get_message(item.ref, CallDeadline.start())
     assert detail.body_cut is True
     assert len(detail.body_text.encode()) <= MAX_TEXT_PART_BYTES
@@ -150,7 +170,7 @@ async def test_oversized_message_through_the_tool(secrets_dir: Path) -> None:
         StatusStore(),
         Adapters(mailbox=lambda a, d: greenmail.mailbox("hub-big")),
     )
-    listed, _, _ = await run_list_unread(ctx, account="icloud", since=since.isoformat(), limit=50)
+    listed, _, _ = await run_list_unread(ctx, account="icloud", since=since.isoformat(), limit=50, cursor=None)
     [item] = [i for i in listed.items if i.untrusted.subject == S("Huge tool")]
     result, _ = await run_get_message(ctx, message_id=item.id, max_chars=20000)
     assert result.body_truncated is True
@@ -192,7 +212,7 @@ async def test_imap_logs_contain_no_credentials_or_content(secrets_dir: Path, ca
         StatusStore(),
         Adapters(mailbox=lambda a, d: greenmail.mailbox("hub-logs")),
     )
-    listed, _, _ = await run_list_unread(ctx, account="icloud", since=since.isoformat(), limit=50)
+    listed, _, _ = await run_list_unread(ctx, account="icloud", since=since.isoformat(), limit=50, cursor=None)
     [item] = [i for i in listed.items if i.untrusted.subject == S("Sentinel-Subject-7q")]
     await run_get_message(ctx, message_id=item.id, max_chars=None)
     failing = HubContext(
@@ -201,7 +221,7 @@ async def test_imap_logs_contain_no_credentials_or_content(secrets_dir: Path, ca
         StatusStore(),
         Adapters(mailbox=lambda a, d: greenmail.mailbox("hub-logs", password="not-the-password")),
     )
-    await run_list_unread(failing, account=None, since=since.isoformat(), limit=5)
+    await run_list_unread(failing, account=None, since=since.isoformat(), limit=5, cursor=None)
     text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
     forbidden = (
         "hub-logs",

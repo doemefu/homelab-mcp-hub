@@ -38,7 +38,6 @@ from mcp_hub.providers.base import (
     MailMeta,
     MailSummary,
     ProviderError,
-    UnreadPage,
     order_key,
 )
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
@@ -135,9 +134,6 @@ class FakeMailbox:
         self.fake, self.account = fake, account
 
     def check(self, deadline: CallDeadline) -> None: ...
-
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
-        return UnreadPage([], False)
 
     def get_message(self, ref: object, deadline: CallDeadline) -> MailDetail:
         raise ProviderError("not_found")

@@ -1,6 +1,5 @@
 import json
 from collections.abc import Iterator
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -11,19 +10,16 @@ from mcp_hub.config import Settings
 from mcp_hub.ids import MessageRef
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
-from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderError, UnreadPage
+from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
-from mcp_hub.tools.mail import LIST_MESSAGES_DESCRIPTION
+from mcp_hub.tools.mail import LIST_MESSAGES_DESCRIPTION, LIST_UNREAD_DESCRIPTION
 from tests.support.mcp import body, modern
 from tests.support.tokens import TokenFactory
 
 
 class Mailbox:
     def check(self, deadline: CallDeadline) -> None: ...
-
-    def list_unread(self, since: datetime, limit: int, deadline: CallDeadline) -> UnreadPage:
-        return UnreadPage([], False)
 
     def get_message(self, ref: MessageRef, deadline: CallDeadline) -> MailDetail:
         raise ProviderError("not_found")
@@ -67,6 +63,14 @@ def test_list_unread_wire_result_has_output_schema(wired: TestClient, tokens: To
     assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
     assert result["structuredContent"]["items"] == []
     assert result["structuredContent"]["next_cursor"] is None
+
+
+def test_list_unread_input_has_cursor(wired: TestClient, tokens: TokenFactory) -> None:
+    tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
+    properties = tools["list_unread"]["inputSchema"]["properties"]
+    assert set(properties) == {"account", "since", "limit", "cursor"}
+    assert tools["list_unread"]["inputSchema"].get("required", []) == []
+    assert tools["list_unread"]["description"] == LIST_UNREAD_DESCRIPTION
 
 
 def test_list_messages_wire_result_matches_its_text(wired: TestClient, tokens: TokenFactory) -> None:

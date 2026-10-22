@@ -785,10 +785,12 @@ def test_soft_stop_in_check_and_get_message_is_upstream_timeout() -> None:
     assert tokens.calls == []
 
 
-def test_list_unread_delegates_to_list_messages() -> None:
+def test_unread_inbox_query_filters_on_read_state() -> None:
     clock = FakeClock()
     server = Server({INBOX_ID: values(item(1, LATER), item(2, LATER - timedelta(minutes=1), isRead=True))})
-    page = mailbox(server, clock=clock).list_unread(SINCE, 20, CallDeadline.start(clock))
+    page = mailbox(server, clock=clock).list_messages(
+        ListQuery("inbox", SINCE, True, None, 20), CallDeadline.start(clock)
+    )
     assert [i.ref for i in page.items] == [GraphMessageRef("outlook", "AAMkMSG0001=")]
     assert page.more is False
     [request] = server.lists()

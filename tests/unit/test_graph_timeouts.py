@@ -6,7 +6,7 @@ import httpx2
 import pytest
 
 from mcp_hub.providers import base
-from mcp_hub.providers.base import AccountLimiters, ProviderError, run_blocking
+from mcp_hub.providers.base import AccountLimiters, ListQuery, ProviderError, run_blocking
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.graph import Backoff, GraphMailbox
 from tests.support.dav_transport import RecordingTransport
@@ -41,7 +41,9 @@ async def test_hanging_graph_call_times_out_within_deadline(monkeypatch: pytest.
         deadline = CallDeadline.start()  # as the tool layer does, right before run_blocking
         with pytest.raises(ProviderError) as info:
             await run_blocking(
-                lambda: mailbox.list_unread(datetime(2026, 9, 29, tzinfo=UTC), 20, deadline),
+                lambda: mailbox.list_messages(
+                    ListQuery("inbox", datetime(2026, 9, 29, tzinfo=UTC), True, None, 20), deadline
+                ),
                 slot=AccountLimiters().get("outlook"),
             )
     finally:

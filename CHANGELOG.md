@@ -36,6 +36,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Changed
 
+- `list_unread` is rebuilt on `list_messages` (`folder=inbox`, `unread_only=true`): the signature gains `cursor`, items are the extended `MessageSummary`, and pages continue with `next_cursor` (bound to `list_unread`, `account` and `since`). `folder` in `list_unread` items is now `inbox` for IMAP accounts as well (it was the registry mailbox name, e.g. `INBOX`). The adapter-level unread path (`Mailbox.list_unread`, `UnreadPage`) is removed; both adapters serve `list_messages` only.
 - IMAP `get_message`: an `EXAMINE` of the registry inbox answered `NO` now gives `upstream_timeout` (the read did not complete) instead of `upstream_error`.
 - `list_unread` items carry the extended `MessageSummary`; their `folder` is the normalised `inbox` instead of the registry mailbox name (`INBOX`), for IMAP and Graph accounts alike.
 - `gmail` account live (homelab#172): mail over the existing IMAP adapter, no code change (registry entry and credentials only, runbook in the `homelab` repository's `DEPLOYMENT.md`).

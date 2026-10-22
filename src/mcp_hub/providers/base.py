@@ -96,12 +96,6 @@ class MailSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class UnreadPage:
-    items: list[MailSummary]
-    more: bool  # more unread messages exist than returned
-
-
-@dataclass(frozen=True, slots=True)
 class AttachmentMeta:
     size_bytes: int
     filename: str | None

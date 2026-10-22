@@ -131,7 +131,7 @@ async def test_end_to_end_logs_are_clean(secrets_dir: Path) -> None:
             }
         )
         ctx = hub(secrets_dir, FakeStore(), ms, graph)
-        result, _, outcome = await run_list_unread(ctx, account="outlook", since=None, limit=20, now=NOW)
+        result, _, outcome = await run_list_unread(ctx, account="outlook", since=None, limit=20, cursor=None, now=NOW)
         assert outcome == "ok"
         assert [i.untrusted.subject for i in result.items] == ["SUBJECT-SENTINEL"]
         detail, _ = await run_get_message(
@@ -181,7 +181,7 @@ async def test_duplicate_graph_ids_are_listed_once(secrets_dir: Path) -> None:
     answer = {"access_token": "AT-SENTINEL", "refresh_token": "RT-SENTINEL", "expires_in": 3600, "scope": "Mail.Read"}
     ms = MsTransport({TOKEN_PATH: [json_answer(200, answer)]})
     result, _, outcome = await run_list_unread(
-        hub(secrets_dir, FakeStore(), ms, graph), account="outlook", since=None, limit=20, now=NOW
+        hub(secrets_dir, FakeStore(), ms, graph), account="outlook", since=None, limit=20, cursor=None, now=NOW
     )
     assert outcome == "ok"
     ids = [i.id for i in result.items]

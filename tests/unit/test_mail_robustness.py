@@ -72,7 +72,7 @@ async def test_raw_latin1_from_header_does_not_fail_the_listing(secrets_dir: Pat
     hostile = hostile_message(raw_headers(b"M\xfcller <mueller@example.test>", b"Gr\xfcezi"))
     servers = {"icloud": server(hostile), "gmail": server(message(5, 10, "fine"))}
     ctx = context(secrets_dir, servers)
-    result, _, outcome = await run_list_unread(ctx, account=None, since=None, limit=None, now=T0)
+    result, _, outcome = await run_list_unread(ctx, account=None, since=None, limit=None, cursor=None, now=T0)
     assert outcome == "ok"
     assert [i.account for i in result.items] == ["icloud", "gmail"]
     assert result.items[0].untrusted.from_name == "M�ller"
@@ -93,7 +93,7 @@ async def test_hostile_headers_always_give_strict_json(secrets_dir: Path) -> Non
         header = raw_headers(sender, subject, to=rng.choice([word, noise]) + b" <t@example.test>")
         servers = {"icloud": server(hostile_message(header)), "gmail": server()}
         ctx = context(secrets_dir, servers)
-        listed, _, outcome = await run_list_unread(ctx, account="icloud", since=None, limit=None, now=T0)
+        listed, _, outcome = await run_list_unread(ctx, account="icloud", since=None, limit=None, cursor=None, now=T0)
         assert outcome == "ok", case
         assert len(listed.items) == 1, case
         assert_strict_json(listed)
@@ -116,7 +116,7 @@ async def test_one_item_that_fails_in_the_tool_layer_degrades_only_that_item(
     monkeypatch.setattr(mail, "clean", exploding)
     servers = {"icloud": server(message(1, 3, "BOOM"), message(2, 5, "fine")), "gmail": server()}
     result, _, outcome = await run_list_unread(
-        context(secrets_dir, servers), account=None, since=None, limit=None, now=T0
+        context(secrets_dir, servers), account=None, since=None, limit=None, cursor=None, now=T0
     )
     assert outcome == "ok"
     assert [i.untrusted.subject for i in result.items] == ["", "fine"]

@@ -10,7 +10,7 @@ import pytest
 from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError, ProtocolError
 
 from mcp_hub.ids import MessageRef, encode_message_id
-from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ProviderError, item_hash
+from mcp_hub.providers.base import SNIPPET_FETCH_BYTES, UNDECODABLE_NOTE, ListQuery, ProviderError, item_hash
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import FolderMapCache
 from mcp_hub.providers.headers import ParsedHeaders
@@ -69,7 +69,9 @@ def test_list_unread_filters_on_exact_internaldate_and_sorts_newest_first() -> N
         clients.append(FakeImapClient(s))
         return clients[-1]
 
-    page = mailbox(srv, recording).list_unread(T0 - timedelta(hours=24), 20, CallDeadline.start())  # type: ignore[arg-type]
+    page = mailbox(srv, recording).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=24), True, None, 20), CallDeadline.start()
+    )  # type: ignore[arg-type]
     assert [m.subject for m in page.items] == ["first", "second"]
     assert page.more is False
     assert page.items[0].ref == MessageRef("icloud", "INBOX", 7, 3)
@@ -91,8 +93,8 @@ def test_one_malformed_message_does_not_fail_the_listing() -> None:
     empty.bodystructure = ()
     missing = message(5, 6, "w")
     missing.bodystructure = None
-    page = mailbox(server(message(1, 5, "good"), odd, broken, empty, missing)).list_unread(
-        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    page = mailbox(server(message(1, 5, "good"), odd, broken, empty, missing)).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
     )
     assert len(page.items) == 5
     assert "good" in [m.subject for m in page.items]
@@ -111,7 +113,7 @@ def test_get_message_of_a_malformed_message_still_answers() -> None:
 
 def test_list_unread_limit_sets_more() -> None:
     srv = server(*(message(i, i, f"m{i}") for i in range(1, 6)))
-    page = mailbox(srv).list_unread(T0 - timedelta(hours=1), 2, CallDeadline.start())
+    page = mailbox(srv).list_messages(ListQuery("inbox", T0 - timedelta(hours=1), True, None, 2), CallDeadline.start())
     assert [m.subject for m in page.items] == ["m1", "m2"]
     assert page.more is True
 
@@ -119,7 +121,7 @@ def test_list_unread_limit_sets_more() -> None:
 def test_adapter_only_uses_read_only_commands() -> None:
     srv = server(message(1, 5, "a"))
     box = mailbox(srv)
-    box.list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    box.list_messages(ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start())
     box.get_message(MessageRef("icloud", "INBOX", 7, 1), CallDeadline.start())
     box.check(CallDeadline.start())
     names = [name for name, _ in srv.commands]
@@ -221,7 +223,9 @@ def provider_log() -> Iterator[Capture]:
 def test_undecodable_message_becomes_the_placeholder_with_one_log_line(provider_log: Capture) -> None:
     broken = message(2, 3, "broken")
     broken.bodystructure = 5  # not a structure: walk() raises inside the per-message guards
-    page = mailbox(server(message(1, 5, "good"), broken)).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    page = mailbox(server(message(1, 5, "good"), broken)).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
+    )
     by_uid = {m.ref.uid: m for m in page.items}
     assert by_uid[1].subject == "good"
     assert by_uid[1].snippet_text == "Hello there"
@@ -246,8 +250,8 @@ def test_item_degraded_logs_the_exception_class_name_only(
         return original(raw)
 
     monkeypatch.setattr(imap, "parse_summary_headers", exploding)
-    page = mailbox(server(message(1, 3, "secret"), message(2, 4, "fine"))).list_unread(
-        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    page = mailbox(server(message(1, 3, "secret"), message(2, 4, "fine"))).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
     )
     assert [m.snippet_text for m in page.items] == [UNDECODABLE_NOTE, "Hello there"]
     text = "\n".join(provider_log.lines) + "\n".join(m for _, _, m in provider_log.raw)
@@ -268,7 +272,7 @@ def test_a_part_that_fails_to_decode_only_empties_its_snippet(monkeypatch: pytes
 
     monkeypatch.setattr(imap, "decode_part", exploding)
     srv = server(message(1, 3, "a", text=b"boom"), message(2, 4, "b"))
-    page = mailbox(srv).list_unread(T0 - timedelta(hours=1), 20, CallDeadline.start())
+    page = mailbox(srv).list_messages(ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start())
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "Hello there")]
 
 
@@ -284,8 +288,8 @@ def snippet_failing(error: Exception) -> type[FakeImapClient]:
 
 def test_failing_snippet_fetch_degrades_to_no_snippet(provider_log: Capture) -> None:
     srv = server(message(1, 3, "a"), message(2, 4, "b"))
-    page = mailbox(srv, snippet_failing(ProtocolError("SENTINEL odd literal"))).list_unread(
-        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    page = mailbox(srv, snippet_failing(ProtocolError("SENTINEL odd literal"))).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
     )
     assert [(m.subject, m.snippet_text) for m in page.items] == [("a", ""), ("b", "")]
     lines = [json.loads(line) for line in provider_log.lines]
@@ -305,8 +309,8 @@ def test_connection_failure_or_bad_during_the_snippet_fetch_still_fails_the_acco
     error: Exception, code: str
 ) -> None:
     with pytest.raises(ProviderError) as caught:
-        mailbox(server(message(1, 3, "a")), snippet_failing(error)).list_unread(
-            T0 - timedelta(hours=1), 20, CallDeadline.start()
+        mailbox(server(message(1, 3, "a")), snippet_failing(error)).list_messages(
+            ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
         )
     assert caught.value.code == code
 
@@ -323,8 +327,8 @@ class DeepStructureClient(FakeImapClient):
 
 
 def test_parser_recursion_on_one_message_degrades_only_that_message(provider_log: Capture) -> None:
-    page = mailbox(server(message(1, 3, "deep"), message(2, 4, "fine")), DeepStructureClient).list_unread(
-        T0 - timedelta(hours=1), 20, CallDeadline.start()
+    page = mailbox(server(message(1, 3, "deep"), message(2, 4, "fine")), DeepStructureClient).list_messages(
+        ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
     )
     by_uid = {m.ref.uid: m for m in page.items}
     assert by_uid[1].snippet_text == UNDECODABLE_NOTE

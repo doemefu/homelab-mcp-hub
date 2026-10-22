@@ -175,7 +175,7 @@ def test_inbox_keeps_examine_inbox() -> None:
     assert view(page) == [("a", "inbox", "incoming"), ("b", "inbox", "incoming")]
     assert [item.ref for item in page.items] == [MessageRef("gmail", "INBOX", 7, uid) for uid in (1, 2)]
     unread = gmail(inbox=[gm(1, 5, "a", INBOX_L), gm(2, 6, "b", INBOX_L, flags=(b"\\Seen",))])
-    listed = box(unread).list_unread(SINCE, 20, deadline(unread))
+    listed = box(unread).list_messages(ListQuery("inbox", SINCE, True, None, 20), deadline(unread))
     assert [item.subject for item in listed.items] == ["a"]
     assert examined(unread) == ["INBOX"]
     assert searches(unread) == [b"NOT DRAFT UNSEEN SINCE 19-Oct-2026"]
@@ -472,7 +472,7 @@ def test_no_x_gm_raw_in_any_command() -> None:
             for unread_only in (False, True):
                 q = query(folder_value, direction="outgoing", unread_only=unread_only)
                 mailbox.list_messages(q, deadline(server))
-        mailbox.list_unread(SINCE, 20, deadline(server))
+        mailbox.list_messages(ListQuery("inbox", SINCE, True, None, 20), deadline(server))
         mailbox.check(deadline(server))
         assert set(names(server)) <= COMMAND_ALLOWLIST
         assert "X-GM-RAW" not in repr(server.commands).upper()

@@ -113,26 +113,15 @@ Lists the configured accounts and whether each capability currently works. It ne
 
 ### `list_unread` (§5.2)
 
-Unread messages in each account's configured inbox, newest first, across all mail accounts or one `account`.
+Unread messages in each account's configured inbox, newest first, across all mail accounts or one `account`. Since spec rev. 4.9 this is `list_messages` with `folder=inbox` and `unread_only=true`: the same adapters, the same extended `MessageSummary` items and the same paging; the old adapter-level unread path no longer exists.
 
-- Input: `account?` (registry id), `since?` (RFC 3339 with offset; default now − 24 h; older than 30 days or more than 60 s in the future → `invalid_argument`), `limit?` (1–50, default 20).
-- Output:
-
-```json
-{
-  "untrusted_content_notice": "…",
-  "items": [ { "id": "v1.…", "account": "icloud", "folder": "inbox", "…": "extended MessageSummary, see list_messages" } ],
-  "next_cursor": null,
-  "truncated": false,
-  "account_errors": [ { "account": "gmail", "capability": "mail", "code": "auth_expired", "message": "Credential rejected by provider; re-login required" } ]
-}
-```
-
-- `received_at` is the IMAP `INTERNALDATE` in `HUB_DEFAULT_TIMEZONE`. The snippet (≤ 200 characters) comes from a partial fetch of at most 4 KiB of the first text part (plain preferred over HTML).
-- `truncated: true` when more unread messages exist than returned (limit, the 500 newest search candidates, or the output budget).
+- Input: `account?` (registry id), `since?` (RFC 3339 with offset; default now − 24 h; older than 30 days or more than 60 s in the future → `invalid_argument`), `limit?` (1–50, default 20), `cursor?` (the `next_cursor` of the previous page; valid 1 h). A cursor is bound to `list_unread` and to `account` and `since` as given; a `list_messages` cursor or one from other arguments answers `invalid_cursor`.
+- Output: the envelope and items of `list_messages` (see below): `untrusted_content_notice`, `items` (extended `MessageSummary`; `folder` is `inbox` for IMAP accounts too, not the registry mailbox name), `next_cursor`, `truncated`, `account_errors`.
+- `next_cursor` is set exactly when more items can be fetched with the same arguments plus `cursor`. `truncated: true` with `next_cursor: null` means more mail exists that cannot be paged (a soft stop, an incomplete search, a failed account): narrow `since` or pick one account.
+- `received_at` is the message's receipt time in `HUB_DEFAULT_TIMEZONE`. The snippet (≤ 200 characters) comes from a partial fetch of at most 4 KiB of the first text part (plain preferred over HTML).
 - Accounts on a protocol without an adapter yet, or with a missing credential file, are skipped when `account` is omitted and answer `capability_unavailable` when named (spec rev. 4.4 §5.1). One failing or slow account yields an `account_errors` entry; the other accounts' items are still returned.
 - `has_attachments` counts every part that is not the chosen body text, including inline images (IMAP); for Graph it is the message's `hasAttachments` flag.
-- **Graph accounts** (`outlook`, spec rev. 4.6 §6.3): one `GET /v1.0/me/mailFolders/inbox/messages` with `$filter=receivedDateTime ge <since, UTC, whole seconds> and isRead eq false`, `$orderby=receivedDateTime desc`, `$select=id,receivedDateTime,isRead,hasAttachments,from,subject,bodyPreview`, `$top=<limit + 1>`. Only the first page is read: `@odata.nextLink` is never followed, and its presence, or more than `limit` entries, sets `truncated`. At most 51 entries of the page are looked at. `folder` is always `inbox`, `received_at` is Graph's `receivedDateTime`, the snippet is Graph's `bodyPreview`. An entry without a usable id (`^[A-Za-z0-9=_-]{1,300}$`) or timestamp is left out (one `item_degraded` line; without `item` when the id itself is unusable); an entry with wrong field types keeps its id with empty third-party fields. A `value` that is not a list is an `upstream_error` for the account.
+- The provider queries are those of `list_messages` for the inbox: IMAP `EXAMINE` of the registry inbox (Gmail too, never All Mail) with `UID SEARCH NOT DRAFT UNSEEN SINCE`; Graph `GET /v1.0/me/mailFolders/inbox/messages` with an `isRead eq false` filter. `@odata.nextLink` is never followed.
 - A message the hub cannot decode is listed with empty third-party fields and the fixed note `[the hub could not decode this message]` in `untrusted.snippet` (one `item_degraded` log line). A snippet that cannot be fetched (a protocol error, not a lost connection) is left empty. Header bytes in an unknown charset appear as U+FFFD.
 
 ### `list_messages` (§5.2, §5.5; spec rev. 4.9)
@@ -141,7 +130,7 @@ Mail of one folder, or of inbox, sent and archive together, received at or after
 
 - Input: `account?` (registry id), `folder?` (`inbox` default, `sent`, `archive`, `trash`, `all`), `since?` (as for `list_unread`), `unread_only?` (boolean, default `false`), `direction?` (`incoming`, `outgoing`), `limit?` (1–50, default 20), `cursor?`. The input schema lists the `folder` and `direction` values; any other value answers `invalid_argument` before any provider call; a bad cursor answers `invalid_cursor`. With a `cursor`, `since` is checked for its format only: the window comes from the cursor and the cursor's argument digest binds `since`, so a page near the 30-day limit does not fail on its age.
 - `all` = inbox + sent + archive, deduplicated within the account; trash, junk and drafts are never part of it.
-- Output: the envelope of `list_unread` with extended `MessageSummary` items:
+- Output: `untrusted_content_notice`, `items`, `next_cursor`, `truncated` and `account_errors`, with extended `MessageSummary` items:
 
 ```json
 {

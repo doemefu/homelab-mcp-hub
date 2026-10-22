@@ -838,7 +838,7 @@ def test_only_allowlisted_commands() -> None:
     mailbox = box(server, own=OWN)
     for folder_value in ("inbox", "sent", "archive", "trash", "all"):
         mailbox.list_messages(query(folder_value, direction="outgoing", unread_only=True), deadline(server))
-    mailbox.list_unread(SINCE, 20, deadline(server))
+    mailbox.list_messages(ListQuery("inbox", SINCE, True, None, 20), deadline(server))
     mailbox.get_message(MessageRef("icloud", "INBOX", 7, 1), deadline(server))
     mailbox.check(deadline(server))
     assert set(names(server)) <= COMMAND_ALLOWLIST
@@ -846,9 +846,9 @@ def test_only_allowlisted_commands() -> None:
     assert examined == {"INBOX", "Sent Messages", "Archive", "Deleted Messages"}  # never junk, drafts or other
 
 
-def test_list_unread_is_the_unread_inbox_list() -> None:
+def test_unread_inbox_query_searches_unseen() -> None:
     server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b", flags=(b"\\Seen",)), msg(3, 7, "c")])
-    page = box(server).list_unread(SINCE, 1, deadline(server))
+    page = box(server).list_messages(ListQuery("inbox", SINCE, True, None, 1), deadline(server))
     assert [item.subject for item in page.items] == ["a"]
     assert page.more is True
     assert searches(server) == [b"NOT DRAFT UNSEEN SINCE 19-Oct-2026"]
