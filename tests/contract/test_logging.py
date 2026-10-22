@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 
 from mcp_hub.app import create_app
 from mcp_hub.config import Settings
-from mcp_hub.ids import encode_ref
+from mcp_hub.ids import GraphMessageRef, MessageRef, encode_ref, location_id
 from mcp_hub.logging import JsonFormatter, configure_logging
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.imap import ImapMailbox
@@ -215,6 +215,84 @@ def test_list_messages_log_fields_allowed(settings: Settings, secrets_dir: Path,
     forbidden = {cursor, "@", "imap.example.test", *HISTORY_SENTINELS}
     for item in [*items, *opened]:
         forbidden.update(value for value in (item["id"], item["ref"], item["thread_key"]) if value)
+    text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
+    for value in sorted(forbidden):
+        assert value not in text, value
+
+
+def test_get_message_status_log_fields_allowed(settings: Settings, secrets_dir: Path, tokens: TokenFactory) -> None:
+    """Spec 080 §9.7 for get_message_status (WP13b), through the MCP endpoint and the IMAP adapter: found, gone,
+    unknown (stale_id, id_mismatch, account_unavailable) and refused calls log only allowed fields, one `tool_call`
+    line each, and no entry, `input`, ref, id, `reply_ref`, Message-ID, folder name or address."""
+    server = _history_server()
+
+    def mailbox(account: Account, _dir: Path) -> ImapMailbox:
+        return ImapMailbox(
+            account.id,
+            host="imap.example.test",
+            port=993,
+            folder="INBOX",
+            username="u",
+            password="p",
+            client_factory=lambda host, port, context, timeout: server.client(),
+        )
+
+    absent = encode_ref("icloud", "absent-sentinel9x@x.test")
+    unavailable = encode_ref("uzh", "uzh-sentinel9x@x.test")
+    stale = location_id(MessageRef("icloud", "INBOX", 7, 999))
+    foreign = location_id(GraphMessageRef("icloud", "AAMkSentinel9x"))
+    assert None not in (absent, unavailable, stale, foreign)
+    configure_logging(settings.log_level)
+    hub = create_app(settings, load_registry(secrets_dir / "accounts.json"), adapters=Adapters(mailbox=mailbox))
+    handler = Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        with TestClient(hub.public, base_url="https://mcp.furchert.ch") as client:
+            listed = [
+                item
+                for folder in ("all", "trash")
+                for item in _call(client, tokens, "list_messages", {"account": "icloud", "folder": folder})[
+                    "structuredContent"
+                ]["items"]
+            ]
+            entries = [value for item in listed for value in (item["ref"], item["id"])]
+            calls = {
+                "found": _call(client, tokens, "get_message_status", {"refs": entries}),
+                "gone": _call(client, tokens, "get_message_status", {"refs": [absent]}),
+                "unknown": _call(client, tokens, "get_message_status", {"refs": [stale, foreign, unavailable]}),
+                "too_many": _call(client, tokens, "get_message_status", {"refs": [absent] * 51}),
+                "malformed": _call(client, tokens, "get_message_status", {"refs": [absent, "sentinel9x-not-a-ref"]}),
+            }
+    finally:
+        logging.getLogger().removeHandler(handler)
+
+    states = {
+        name: [(i["state"], i["reason"]) for i in call["structuredContent"]["items"]]
+        for name, call in calls.items()
+        if not call.get("isError")
+    }
+    assert {item["folder"] for item in listed} == {"inbox", "sent", "archive", "trash"}
+    assert states == {
+        "found": [("found", None)] * len(entries),
+        "gone": [("gone", None)],
+        "unknown": [("unknown", "stale_id"), ("unknown", "id_mismatch"), ("unknown", "account_unavailable")],
+    }
+    assert (calls["too_many"]["isError"], calls["malformed"]["isError"]) == (True, True)
+    events = [json.loads(line) for line in handler.lines]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    status_calls = [e for e in events if e["event"] == "tool_call" and e["tool"] == "get_message_status"]
+    assert [(e["outcome"], e["accounts"], e["result_count"]) for e in status_calls] == [
+        ("ok", ["icloud"], len(entries)),
+        ("ok", ["icloud"], 1),
+        ("ok", ["icloud"], 3),  # stale_id needs the adapter; id_mismatch and account_unavailable do not
+        ("invalid_argument", [], 0),
+        ("invalid_argument", [], 0),
+    ]
+    forbidden = {absent, unavailable, stale, foreign, "sentinel9x-not-a-ref", "@", "imap.example.test"}
+    forbidden.update(HISTORY_SENTINELS)
+    for call in calls.values():
+        for item in call.get("structuredContent", {}).get("items", []):
+            forbidden.update(item[key] for key in ("input", "ref", "id", "reply_ref") if item.get(key))
     text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
     for value in sorted(forbidden):
         assert value not in text, value
