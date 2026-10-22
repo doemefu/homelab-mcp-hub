@@ -1,19 +1,25 @@
 import time
+from collections.abc import Callable
 
 import pytest
 
 from mcp_hub.ids import ThreadKey
 from mcp_hub.providers import headers as h
 from mcp_hub.providers.headers import (
+    DESCENDANT_HEADER_BYTES,
+    DESCENDANT_HEADER_ITEM,
+    Descendant,
     ParsedHeaders,
     bare_message_id,
     imap_thread_key,
     is_own,
     msg_id_tokens,
     normalise_subject,
+    parse_descendant,
     parse_summary_headers,
     subject_digest,
 )
+from mcp_hub.providers.imap_guard import _fetch_item_ok
 
 
 def raw(*lines: str) -> bytes:
@@ -367,3 +373,146 @@ def test_to_cc_cut_before_parsing() -> None:
     p = parse_summary_headers(raw("To: " + addrs))
     assert 0 < len(p.to) < 2000
     assert len(p.to) <= 8192 // 15 + 1
+
+
+# --- descendant re-check (reply/thread step) ----------------------------------------------------------------------
+
+X = frozenset({"a@x"})
+
+
+def referenced(*lines: str, wanted: frozenset[str] = X) -> frozenset[str]:
+    return parse_descendant(raw(*lines), wanted).referenced
+
+
+def test_descendant_item_passes_the_guard() -> None:
+    assert DESCENDANT_HEADER_ITEM == "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES FROM)]<0.65536>"
+    assert DESCENDANT_HEADER_ITEM.endswith(f"<0.{DESCENDANT_HEADER_BYTES}>")
+    assert _fetch_item_ok(DESCENDANT_HEADER_ITEM)
+
+
+def test_parse_descendant_fields() -> None:
+    d = parse_descendant(
+        raw(
+            "From: Alice <alice@example.org>",
+            "Message-ID: <m@example.org>",
+            "In-Reply-To: <a@x>",
+            "References: <r@example.org> <a@x>",
+        ),
+        frozenset({"a@x", "r@example.org", "other@example.org"}),
+    )
+    assert d == Descendant("m@example.org", "alice@example.org", frozenset({"a@x", "r@example.org"}), False)
+    long_id = "<" + "a" * 301 + "@example.org>"
+    d = parse_descendant(raw(f"Message-ID: {long_id}", "References: <a@x>"), X)
+    assert d.message_id is None  # not a valid Message-ID
+    assert d.from_address is None
+    assert d.referenced == X
+
+
+def test_parse_descendant_whole_tokens_only() -> None:
+    assert referenced("References: <a@x.y>") == frozenset()
+    assert referenced("References: <ba@x>", "In-Reply-To: <a@x.y> <a@xy>") == frozenset()
+    assert referenced("References: <A@x>", "In-Reply-To: <a@X>") == frozenset()  # compared case-sensitively
+    assert referenced("References: (see <a@x>) <b@x>") == frozenset()  # inside a comment
+    assert referenced('In-Reply-To: "<a@x>" <b@x>', 'References: "re <a@x>" <c@x>') == frozenset()  # quoted string
+    assert referenced("References: <a@x>") == X
+    assert referenced("In-Reply-To: <a@x>") == X
+    # Phrase form of In-Reply-To.
+    assert referenced("In-Reply-To: Your message of Mon, 19 Oct 2026 <a@x>") == X
+    assert referenced("In-Reply-To: Alice <alice@example.org>'s message <a@x>") == X
+    # In-Reply-To with two ids, X second (MF T12).
+    assert referenced("In-Reply-To: <other@example.org> <a@x>") == X
+    # A folded References.
+    assert referenced("References: <r1@example.org>", " <a@x>", "\t<r2@example.org>") == X
+    assert referenced("References: <r1@example.org>", "\t<a@x>") == X
+    # X at position 1 of a References of 40 entries (MF T4).
+    entries = ["<a@x>", *(f"<r{index}@example.org>" for index in range(39))]
+    assert referenced("References: " + entries[0], *(f" {entry}" for entry in entries[1:])) == X
+    assert referenced("References: " + " ".join(entries)) == X
+    # Several wanted ids, from both fields.
+    wanted = frozenset({"a@x", "b@x", "c@x"})
+    assert referenced("In-Reply-To: <b@x>", "References: <a@x> <z@x>", wanted=wanted) == frozenset({"a@x", "b@x"})
+
+
+def test_parse_descendant_in_reply_to_first_100_tokens() -> None:
+    tokens = [f"<t{index}@example.test>" for index in range(150)]
+    assert referenced("In-Reply-To: " + " ".join([*tokens[:99], "<a@x>"])) == X
+    assert referenced("In-Reply-To: " + " ".join([*tokens[:100], "<a@x>"])) == frozenset()
+    assert referenced("In-Reply-To: " + " ".join(tokens), "References: " + " ".join([*tokens, "<a@x>"])) == X
+
+
+def test_parse_descendant_reports_cut() -> None:
+    entries = " ".join(f"<r{index}@example.org>" for index in range(5000))
+    block = ("From: a@example.test\r\nMessage-ID: <m@example.org>\r\nReferences: " + entries + " <a@x>").encode()
+    data = block[:DESCENDANT_HEADER_BYTES]
+    assert len(data) == 65_536
+    d = parse_descendant(data, X)
+    assert d.cut is True
+    assert d.referenced == frozenset()  # X sat in the cut-off tail
+    assert d.message_id == "m@example.org"
+    assert d.from_address == "a@example.test"
+    assert parse_descendant(block[: DESCENDANT_HEADER_BYTES - 1], X).cut is False
+    assert parse_descendant(block, X).cut is True
+    early = ("References: <a@x> " + entries).encode()[:DESCENDANT_HEADER_BYTES]
+    d = parse_descendant(early, X)
+    assert d.cut is True
+    assert d.referenced == X
+    assert d.message_id is None
+    assert parse_descendant(raw("References: <a@x>"), X).cut is False
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\xff\xfe\x00From: \x80\x81 <a@b>\r\nReferences: <\xff@x> <a@x>\r\n\r\n",
+        b"References: <a@x\r\n\r\n",
+        b'References: <<<<<<\r\nIn-Reply-To: ((("\r\n',
+        b"From:\r\nMessage-ID:\r\nIn-Reply-To:\r\nReferences:\r\n\r\n",
+        b"garbage without colon\r\n\r\n",
+        "References: <ä@x> <a@x>\r\n".encode(),
+    ],
+)
+def test_parse_descendant_none_and_garbage(data: bytes) -> None:
+    empty = Descendant(None, None, frozenset(), False)
+    assert parse_descendant(None, X) == empty
+    assert parse_descendant(b"", X) == empty
+    d = parse_descendant(data, X)
+    assert d.referenced <= X
+    assert d.cut is False
+    assert d.message_id is None
+    assert parse_descendant(b"References: <a@x\r\n\r\n", X).referenced == frozenset()  # an unterminated `<`
+    assert parse_descendant("References: <ä@x> <a@x>\r\n".encode(), X).referenced == X
+
+
+def _best_of(call: object, runs: int = 7) -> float:
+    return min(_elapsed(call) for _ in range(runs))
+
+
+def _hostile_block(field: str, unit: str, size: int) -> bytes:
+    head = "From: a@example.test\r\nMessage-ID: <m@example.test>\r\n" + field + ": "
+    return (head + unit * (size // len(unit) + 1)).encode()[:size]
+
+
+@pytest.mark.parametrize(
+    ("field", "unit"),
+    [
+        ("References", lambda size: " ".join(f"<{index:x}@y>" for index in range(size // 4))),
+        ("References", lambda size: "<x@y> "),
+        ("References", lambda size: "<x@y>"),
+        ("In-Reply-To", lambda size: "<x@y> "),
+        ("References", lambda size: "x" * (size - 100) + "<x@y>"),
+        ("From", lambda size: "<x@y> "),
+    ],
+    ids=["distinct", "spaced", "adjacent", "in-reply-to", "padding", "from"],
+)
+def test_parse_descendant_cpu_bound(field: str, unit: Callable[[int], str]) -> None:
+    """SR2: a block of hostile `<x@y>` tokens against 50 wanted ids is one linear pass: 64 KiB costs at most 16 times
+    8 KiB (8 would be exactly linear) and stays below 20 ms, as `test_in_reply_to_scan_is_linear`; best of 7 runs."""
+    wanted = frozenset(f"w{index}@example.test" for index in range(50))
+    small = _hostile_block(field, unit(8192), 8192)
+    large = _hostile_block(field, unit(DESCENDANT_HEADER_BYTES), DESCENDANT_HEADER_BYTES)
+    assert (len(small), len(large)) == (8192, DESCENDANT_HEADER_BYTES)
+    assert parse_descendant(large, wanted).referenced == frozenset()
+    small_best = _best_of(lambda: parse_descendant(small, wanted))
+    large_best = _best_of(lambda: parse_descendant(large, wanted))
+    assert large_best <= 16 * small_best, (large_best, small_best)
+    assert large_best < 0.020, large_best

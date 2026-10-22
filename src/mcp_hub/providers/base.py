@@ -16,7 +16,7 @@ import anyio.to_thread
 
 from mcp_hub.cursors import Position
 from mcp_hub.errors import ErrorCode
-from mcp_hub.ids import AnyMessageRef, ThreadKey, location_id, location_k
+from mcp_hub.ids import AnyMessageRef, GraphMessageRef, MessageRef, StableRef, ThreadKey, location_id, location_k
 from mcp_hub.logging import log_event
 from mcp_hub.providers.folders import ListFolder, MailFolder
 from mcp_hub.providers.headers import is_own
@@ -140,6 +140,58 @@ class FolderPage:
     # Graph gives the frontier second as (second, "f" * 16), so that whole second is read again on the next page.
     # None with `more`: a full page, whose last item is the frontier.
     frontier: tuple[int, str] | None = None
+
+
+StatusState = Literal["found", "gone", "unknown"]
+StatusReason = Literal["account_error", "account_unavailable", "id_mismatch", "stale_id", "incomplete_search"]
+StatusTarget = StableRef | MessageRef | GraphMessageRef  # one distinct entry of one account
+
+
+@dataclass(frozen=True, slots=True)
+class FoundMessage:
+    """The earliest found copy of a message; third-party strings are decoded, not yet sanitised.
+
+    `location`, `received_at` and `meta.folder` are those of the earliest copy, but `meta.direction` is `outgoing`
+    when any found copy of the Message-ID is in sent (ruling MF-R2); an `uncertain` copy still counts as found (C3)."""
+
+    location: AnyMessageRef  # the copy found (-> `id`)
+    message_id: str | None  # valid bare Message-ID of that copy (-> `ref`), else None
+    received_at: datetime  # timezone-aware
+    unread: bool
+    meta: MailMeta  # folder, flags (answered, flagged), direction
+
+
+@dataclass(frozen=True, slots=True)
+class MessageStatus:
+    state: StatusState
+    reason: StatusReason | None = None
+    found: FoundMessage | None = None
+    reply_at: datetime | None = None  # earliest reply found (IMAP INTERNALDATE / Graph sentDateTime)
+    reply_message_id: str | None = None  # its valid bare Message-ID (-> `reply_ref`)
+    newer_incoming_at: datetime | None = None  # newest incoming thread message (rules per provider)
+    # Every reply/thread batch covering this ref completed: a bool when found, None otherwise (ruling E-td1).
+    thread_checked: bool | None = None
+
+    def __post_init__(self) -> None:
+        if (self.found is not None) != (self.state == "found"):
+            raise ValueError("found is set exactly when state is found")
+        if (self.reason is None) != (self.state != "unknown"):
+            raise ValueError("reason is set exactly when state is unknown")
+        if (self.found is not None) != (self.thread_checked is not None):
+            raise ValueError("thread_checked is a bool exactly when state is found")
+        if self.reply_message_id is not None and self.reply_at is None:
+            raise ValueError("reply_message_id needs reply_at")
+        if self.found is None and (
+            self.reply_at is not None
+            or self.reply_message_id is not None
+            or self.newer_incoming_at is not None
+            or self.thread_checked is not None
+        ):
+            raise ValueError("reply and thread fields need a found message")
+
+
+def status_unknown(reason: StatusReason) -> MessageStatus:
+    return MessageStatus("unknown", reason)
 
 
 def read_credential(secrets_dir: Path, ref: str) -> str:

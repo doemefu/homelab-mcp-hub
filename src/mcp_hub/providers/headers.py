@@ -25,6 +25,10 @@ CANDIDATE_HEADER_BYTES: Final = 2048
 MAX_ADDRESS_HEADER_BYTES: Final = 8192
 MAX_REFERENCES: Final = 10
 MAX_IN_REPLY_TO_TOKENS: Final = 100  # the phrase-form scan looks at no more (security M1: no quadratic scan)
+DESCENDANT_HEADER_BYTES: Final = 65536
+DESCENDANT_HEADER_ITEM: Final = (
+    f"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES FROM)]<0.{DESCENDANT_HEADER_BYTES}>"
+)
 MAX_SUBJECT_ROUNDS: Final = 20
 _SUBJECT_INPUT_CHARS: Final = 4000
 _SUBJECT_KEPT_CHARS: Final = 1000
@@ -51,6 +55,16 @@ class ParsedHeaders:
     in_reply_to: str | None
     references: tuple[str, ...]
     root: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Descendant:
+    """One reply/thread hit as the re-check sees it (`parse_descendant`)."""
+
+    message_id: str | None  # valid bare Message-ID of the hit
+    from_address: str | None
+    referenced: frozenset[str]  # the wanted ids among its In-Reply-To (first 100 tokens) and References tokens
+    cut: bool  # the block reached DESCENDANT_HEADER_BYTES: the tail of References may be missing
 
 
 def header_bytes(row: Mapping[bytes, object]) -> bytes:
@@ -188,12 +202,17 @@ def _in_reply_to(value: str | None, references: Sequence[str], people: set[str])
     return None
 
 
-def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
-    if not raw:
-        return ParsedHeaders(None, None, (), (), None, None, None, (), None)
+def _header_items(raw: bytes) -> dict[str, list[str]]:
     items: dict[str, list[str]] = {}
     for name, value in _PARSER.parsebytes(raw).raw_items():
         items.setdefault(name.lower(), []).append(_FOLD.sub("", str(value)).strip())
+    return items
+
+
+def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
+    if not raw:
+        return ParsedHeaders(None, None, (), (), None, None, None, (), None)
+    items = _header_items(raw)
     sender = (address_pairs(_first(items, "from") or "") or [("", "")])[0]
     to = tuple(a for _, a in address_pairs(_first(items, "to") or "") if a)
     cc = tuple(a for _, a in address_pairs(_first(items, "cc") or "") if a)
@@ -216,6 +235,29 @@ def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
         in_reply_to=in_reply_to,
         references=tuple(valid_refs[-MAX_REFERENCES:]),
         root=root,
+    )
+
+
+def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
+    """Which `wanted` Message-IDs a reply/thread hit names: whole msg-id tokens of its `In-Reply-To` (the first 100)
+    and `References`, compared exactly, so `<a@x.y>` never counts for `a@x` and ids in comments or quoted strings are
+    skipped. `msg_id_tokens` is one linear pass and the comparison a set lookup: no quadratic scan (security M1).
+    The first value of each field counts, as in `parse_summary_headers`."""
+    if not raw:
+        return Descendant(None, None, frozenset(), False)
+    items = _header_items(raw)
+    in_reply_to = _first(items, "in-reply-to")
+    references = _first(items, "references")
+    return Descendant(
+        message_id=valid_message_id(bare_message_id(_first(items, "message-id"))),
+        from_address=(address_pairs(_first(items, "from") or "") or [("", "")])[0][1] or None,
+        referenced=wanted.intersection(
+            [
+                *(msg_id_tokens(in_reply_to)[:MAX_IN_REPLY_TO_TOKENS] if in_reply_to else ()),
+                *(msg_id_tokens(references) if references else ()),
+            ]
+        ),
+        cut=len(raw) >= DESCENDANT_HEADER_BYTES,
     )
 
 

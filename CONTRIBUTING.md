@@ -49,7 +49,7 @@ src/mcp_hub/
 tests/
   unit/            per-module tests
   contract/        gate G6: the authorization rules of spec §10.3 over HTTP
-  integration/     the real process on two ports; test_imap.py against GreenMail, test_caldav.py against Radicale (marker `provider`)
+  integration/     the real process on two ports; test_imap.py against GreenMail, test_imap_history.py (mail history and the `get_message_status` scenarios, GreenMail), test_caldav.py against Radicale (marker `provider`)
   support/         keys, tokens, clock, MCP wire helpers, GreenMail and Radicale helpers, IMAP fake, ICS fixture loader, canned DAV answers, log capture
   fixtures/        example registry (neutral ids, no real data), ics/ calendar fixtures, radicale/ test server config
 scripts/           dev_token.py, smoke_image.sh, html_scaling_check.py, provider_services.sh, memory_probe.py, imap_probe.py (development and owner probes, not in the image)
@@ -79,9 +79,13 @@ It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` a
 
 `--scenario graph-message` drives `get_message` for an `outlook` entry through the real Graph adapter and token source (in-memory token store, in-process Graph transport): the message answer fills the 2 MiB cap with a non-ASCII body and 5,000 recipients, the attachment answer fills the 1 MiB list cap. `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process; the gate for the Graph limits is `--scenario graph-message --with-calendar nonascii-240k --calls 10` with cgroup `memory.peak` at most 230 MiB and `oom_kill 0`. Record both cgroup `memory.peak` and the last call's peak RSS: the cgroup figure also counts page cache and varies between runs and hosts, while peak RSS is the process alone. Re-run it after any change to the Graph response caps.
 
+`--scenario status` drives the IMAP `get_message_status` path for 50 refs through an in-process IMAP fake: every location, reply and thread SEARCH answers 500 hits with hostile header blocks (8 KiB in the 500-UID location chunks, 64 KiB in the 50-UID lookup chunks). `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 230 MiB, `oom_kill 0`). Re-run it after any change to the status caps (`MAX_LOOKUP_HITS`, `LOOKUP_FETCH_UIDS`, the header item sizes).
+
 ### IMAP probe
 
 `scripts/imap_probe.py --host <imap host>` is run by the owner on their own machine. It is read-only (an allowlist proxy, `EXAMINE` only), asks for the credentials at a prompt and writes nothing. It prints mailbox roles, counts and LIST/EXAMINE/SEARCH timings, including the bracketed Message-ID search (O35). Paste only the part after `--- result ---`; `--show-names` adds mailbox names, which are private.
+
+`--status-rounds` runs the `get_message_status` rounds P1–P7 instead (WP13b): reply-header matching, OR width and timing, Gmail `X-GM-THRID` ORs, re-`EXAMINE` and header-`FETCH` cost. Every command goes through the hub's `GuardedImapClient` and every criteria through `imap_search`; the output is yes/no, counts and milliseconds only. Run it once per host (`uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds`, then `--host imap.gmail.com`); `--help` starts with the owner's usage lines.
 
 ### Provider integration tests
 

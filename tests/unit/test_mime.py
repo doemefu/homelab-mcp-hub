@@ -3,7 +3,7 @@ import quopri
 
 import pytest
 
-from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
+from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, safe_decode, walk
 
 PLAIN = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 120, 4, None, None, None, None)
 HTML = (b"text", b"html", (b"charset", b"iso-8859-1"), None, None, b"quoted-printable", 300, 9, None, None, None, None)
@@ -98,6 +98,18 @@ def test_non_text_charsets_fall_back_to_utf8(charset: str) -> None:
     part = Part("1", "text/plain", {"charset": charset}, "8bit", 10, None, None)
     assert decode_part("Grüezi".encode(), part) == "Grüezi"
     assert isinstance(decode_part(b"\xff\xfe\x00bad", part), str)  # never raises
+
+
+@pytest.mark.parametrize(
+    "charset",
+    ["utf-8\x00", "\x00", "utf-\ud800", "\udcff", "x" * 10_000, "x-unknown-7", "", None],
+    ids=["nul", "only-nul", "surrogate", "lone-surrogate", "overlong", "unknown", "empty", "none"],
+)
+def test_safe_decode_never_raises_for_a_hostile_charset(charset: str | None) -> None:
+    """Security SC1: a charset name from the wire (an RFC 2231 `%00`, a lone surrogate) never makes decoding raise;
+    it falls back to UTF-8 with replacement."""
+    assert safe_decode("Grüezi".encode(), charset) == "Grüezi"
+    assert "\ufffd" in safe_decode(b"\xff\xfe bad", charset)
 
 
 def test_unknown_charset_falls_back_to_utf8_with_replacement() -> None:

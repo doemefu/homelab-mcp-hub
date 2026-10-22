@@ -46,6 +46,7 @@ from tests.support.graph_fixtures import (
     ARCHIVE_ID,
     FOLDER_IDS,
     INBOX_ID,
+    LEGACY_DN,
     SENT_ID,
     T1B_EXTENDED,
     T1B_FACTS,
@@ -53,6 +54,7 @@ from tests.support.graph_fixtures import (
     FakeTokens,
     extended,
     message,
+    sender,
 )
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
@@ -359,6 +361,56 @@ def test_direction_and_folder_roles() -> None:
         with pytest.raises(ProviderError) as info:
             graph_meta(message(5, parentFolderId=parent), IDS, OWN, "outlook")
         assert info.value.code == "not_found"
+
+
+@pytest.mark.parametrize(
+    ("address", "name", "direction"),
+    [
+        (LEGACY_DN, "owner@example.test", "outgoing"),
+        (LEGACY_DN, " Owner@Example.test ", "outgoing"),  # the name is stripped; is_own ignores case
+        (LEGACY_DN, "Owner Name", "incoming"),  # no SMTP address in the name
+        (LEGACY_DN, "owner @example.test", "incoming"),  # whitespace inside: not an address
+        ("x@example.org", "owner@example.test", "incoming"),  # an SMTP address is never replaced by the name
+        ("/x", "owner@example.test", "incoming"),  # a slash alone is not a legacy DN
+        ("/O=EXAMPLE/CN=RECIPIENTS/CN=X@evil", "owner@example.test", "incoming"),  # no "@" inside a DN
+        (LEGACY_DN, "owner@example.test evil", "incoming"),  # the name is not a plain address
+    ],
+    ids=[
+        "dn-own",
+        "dn-own-padded",
+        "dn-display-name",
+        "dn-name-with-space",
+        "smtp-own-name",
+        "slash-only",
+        "dn-with-at",
+        "name-with-suffix",
+    ],
+)
+def test_graph_meta_legacy_dn_own_is_outgoing(address: str, name: str, direction: str) -> None:
+    """T17: an own item outside sentitems whose `from.address` is a legacy DN is outgoing by its SMTP name."""
+    raw = message(1, parentFolderId=ARCHIVE_ID, **{"from": sender(address, name)})
+    meta = graph_meta(raw, IDS, OWN, "outlook")
+    assert meta.direction == direction
+
+
+@pytest.mark.parametrize(
+    ("address", "name", "direction"),
+    [
+        ("/O=EXAMPLE ORG/OU=EXCHANGE ADMINISTRATIVE GROUP (TEST)/CN=RECIPIENTS/CN=OWNER", "o@example.test", "outgoing"),
+        ("/o=example/cn=recipients/cn=owner", "o@example.test", "outgoing"),  # case-insensitive, OU optional
+        (LEGACY_DN, "o" * 241 + "@example.test", "outgoing"),  # 254 characters
+        (LEGACY_DN, "o" * 242 + "@example.test", "incoming"),  # 255 characters
+        (LEGACY_DN, "a@b@example.test", "incoming"),  # two "@"
+        ("/O=EXAMPLE/OU=TEST/CN=OWNER", "o@example.test", "incoming"),  # no CN=RECIPIENTS
+        (LEGACY_DN + "/", "o@example.test", "incoming"),  # an empty last part
+    ],
+    ids=["dn-spaces", "dn-lower-no-ou", "name-254", "name-255", "name-two-at", "dn-no-recipients", "dn-trailing"],
+)
+def test_legacy_dn_shape_and_name_shape(address: str, name: str, direction: str) -> None:
+    """The name is compared only for a well-formed legacy DN and a plain address name; `own` holds the name itself,
+    so only the shape checks decide."""
+    raw = message(1, parentFolderId=ARCHIVE_ID, **{"from": sender(address, name)})
+    assert graph_meta(raw, IDS, frozenset({name}), "outlook").direction == direction
 
 
 @pytest.mark.parametrize("missing", ["absent", None, "garbage", {"id": "Integer 0x1081", "value": "102"}])

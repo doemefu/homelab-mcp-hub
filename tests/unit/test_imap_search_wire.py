@@ -4,7 +4,7 @@ import pytest
 
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap_guard import GuardedImapClient
-from mcp_hub.providers.imap_search import UnsafeSearchValue, criteria, header_or
+from mcp_hub.providers.imap_search import GMAIL_SENT_LABEL_KEY, UnsafeSearchValue, criteria, header_or, thrid_or
 from tests.support.imap_wire import WireRecorder, wire_client
 
 ATOM_SPECIALS = ["a(b)@x", "a{b@x", "%*@x", "a]b@x", "x{5}@y", "x{5}", "a+&#%=;/?@x"]
@@ -71,6 +71,34 @@ def test_no_hidden_capability_before_search() -> None:
     assert start < end
     assert commands[start + 1 : end] == []
     assert b"CAPABILITY" not in commands[start:]
+
+
+def test_thrid_or_wire_bytes() -> None:
+    # Gmail thread ids go out as bare numbers of the hub's own formatting, in one command after the login CAPABILITY.
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(wire_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.examine("INBOX")
+        guard.search(criteria(b"NOT DRAFT", thrid_or([1, 2**64 - 1])))
+        guard.logout()
+        lines = list(recorder.lines)
+        literals = list(recorder.literals)
+    commands = [_command(line) for line in lines]
+    start = commands.index(b"EXAMINE")
+    assert commands[start:] == [b"EXAMINE", b"UID SEARCH", b"LOGOUT"]
+    assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [
+        b"UID SEARCH NOT DRAFT OR X-GM-THRID 1 X-GM-THRID 18446744073709551615"
+    ]
+    assert literals == []
+
+
+def test_gmail_sent_label_key_wire_bytes() -> None:
+    search = criteria(b"NOT DRAFT", GMAIL_SENT_LABEL_KEY, header_or(("In-Reply-To", "References"), ["a@x"]))
+    lines, literals = _search_once(search)
+    assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [
+        b'UID SEARCH NOT DRAFT X-GM-LABELS "\\\\Sent" OR HEADER In-Reply-To "<a@x>" HEADER References "<a@x>"'
+    ]
+    assert literals == []
 
 
 def test_library_item_quoting_sends_atoms() -> None:

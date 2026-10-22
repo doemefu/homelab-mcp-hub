@@ -8,17 +8,21 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, ThreadKey, location_k
+from mcp_hub.providers import Mailbox
 from mcp_hub.providers.base import (
     FolderPage,
+    FoundMessage,
     MailDetail,
     MailFlags,
     MailMeta,
     MailSummary,
+    MessageStatus,
     direction_of,
     log_message_skipped,
     order_key,
     order_key_of,
     placeholder_summary,
+    status_unknown,
 )
 from tests.support.logcapture import Capture
 
@@ -106,3 +110,66 @@ def test_log_message_skipped_omits_item_for_unencodable_location(provider_log: C
     assert len(lines) == 2
     assert all("item" not in line for line in lines)
     assert all(line["exception"] == "ValueError" for line in lines)
+
+
+def _found() -> FoundMessage:
+    return FoundMessage(
+        location=MessageRef(account="icloud", folder="INBOX", uidvalidity=1, uid=2),
+        message_id="a@example.org",
+        received_at=T0,
+        unread=True,
+        meta=MailMeta(),
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"state": "found"},  # found without a copy
+        {"state": "gone", "found": "copy"},
+        {"state": "unknown", "found": "copy", "reason": "stale_id"},
+        {"state": "found", "found": "copy", "reason": "stale_id"},
+        {"state": "gone", "reason": "stale_id"},
+        {"state": "unknown"},  # unknown without a reason
+        {"state": "gone", "reply_at": T0},
+        {"state": "unknown", "reason": "stale_id", "reply_message_id": "r@example.org"},
+        {"state": "gone", "newer_incoming_at": T0},
+        {"state": "gone", "thread_checked": True},
+        {"state": "unknown", "reason": "stale_id", "thread_checked": True},
+        {"state": "unknown", "reason": "stale_id", "thread_checked": False},
+        {"state": "unknown", "reason": "stale_id", "reply_at": T0},
+        {"state": "unknown", "reason": "stale_id", "newer_incoming_at": T0},
+        {"state": "found", "found": "copy"},  # found needs thread_checked
+        {"state": "found", "found": "copy", "thread_checked": True, "reply_message_id": "r@example.org"},
+    ],
+)
+def test_message_status_invariants(kwargs: dict[str, object]) -> None:
+    values = dict(kwargs)
+    if values.get("found") == "copy":
+        values["found"] = _found()
+    with pytest.raises(ValueError, match=r"exactly when|need a found|needs reply_at"):
+        MessageStatus(**values)  # type: ignore[arg-type]  # deliberately invalid combinations
+
+
+def test_message_status_valid_shapes() -> None:
+    found = MessageStatus("found", found=_found(), reply_at=T0, newer_incoming_at=T0, thread_checked=False)
+    assert found.reason is None
+    plain = MessageStatus("found", found=_found(), thread_checked=True)
+    assert plain.reply_at is None
+    assert MessageStatus("found", found=_found(), reply_at=T0, reply_message_id="r@example.org", thread_checked=True)
+    no_id = FoundMessage(location=_found().location, message_id=None, received_at=T0, unread=False, meta=MailMeta())
+    assert MessageStatus("found", found=no_id, thread_checked=False).found is no_id
+    assert MessageStatus("gone").thread_checked is None
+    assert MessageStatus("unknown", "incomplete_search").found is None
+
+
+def test_status_unknown_helper() -> None:
+    status = status_unknown("account_error")
+    assert (status.state, status.reason) == ("unknown", "account_error")
+    assert status.found is None
+    assert status.reply_at is None
+    assert status.thread_checked is None
+
+
+def test_mailbox_protocol_lists_message_status() -> None:
+    assert "message_status" in Mailbox.__protocol_attrs__  # type: ignore[attr-defined]  # runtime introspection

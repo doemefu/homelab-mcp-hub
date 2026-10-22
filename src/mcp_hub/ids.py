@@ -220,6 +220,22 @@ def decode_ref(value: str) -> StableRef:
     return StableRef(account=account, message_id=message_id)
 
 
+def decode_status_entry(value: object) -> StableRef | MessageRef | GraphMessageRef:
+    """One `get_message_status` entry: a `ref` (kind "r") or a MessageId (kind "m"/"g"); anything else is refused."""
+    if not isinstance(value, str):
+        _bad_ref()
+    data = _decode_list(value)
+    kind = data[0] if isinstance(data, list) and data else None
+    try:
+        if kind == "r":
+            return decode_ref(value)
+        if kind in ("m", "g"):
+            return decode_message_id(value)
+    except ToolError:
+        pass  # the per-kind decoders word their own text; the entry error is fixed
+    _bad_ref()
+
+
 def _thread_value_ok(source: object, value: object) -> bool:
     if source == "gmail":
         return type(value) is int and 0 <= value < 2**64

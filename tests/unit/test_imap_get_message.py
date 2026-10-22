@@ -15,8 +15,9 @@ from mcp_hub.providers.base import MailDetail, MailFlags, ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import MAX_LOCATE_FOLDERS, FolderMapCache
 from mcp_hub.providers.headers import candidate_header_item
-from mcp_hub.providers.imap import LOCATE_BATCH_VALUES, FoundCopy, ImapMailbox, ImapSession, LocateResult
+from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.providers.imap_guard import GuardedImapClient
+from mcp_hub.providers.imap_session import LOCATE_BATCH_VALUES, FoundCopy, ImapSession, LocateResult
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
@@ -26,7 +27,7 @@ OWN = frozenset({"owner@example.org"})
 MID = "m1@example.test"
 THREAD = 1781234567890123456
 INBOX_L, SENT_L, DRAFT_L = b"\\Inbox", b"\\Sent", b"\\Draft"
-ICLOUD_CORE = ["INBOX", "Archive", "Sent Messages", "Deleted Messages"]
+ICLOUD_CORE = ["INBOX", "Archive", "Deleted Messages", "Sent Messages"]  # search order: the reply mailbox last
 GMAIL_ALL, GMAIL_SENT, GMAIL_TRASH = "[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Trash"
 
 
@@ -157,7 +158,7 @@ def refused(
 
 def locate(server: FakeImapServer, ids: Sequence[str], **kwargs: object) -> LocateResult:
     box = mailbox(server, account="gmail" if b"X-GM-EXT-1" in server.capabilities else "icloud")
-    return box._run(lambda session: session.locate(ids, **kwargs), deadline(server))  # type: ignore[arg-type]
+    return box._run(lambda session: session.locate(ids, soft_check=box._soft_check, **kwargs), deadline(server))  # type: ignore[arg-type]
 
 
 def prime(box: ImapMailbox, server: FakeImapServer) -> None:
@@ -531,7 +532,7 @@ def test_ref_gmail_all_mail_then_trash() -> None:
     detail = get(server, ref(account="gmail"))
     assert detail.ref == MessageRef("gmail", GMAIL_TRASH, 7, 5)
     assert (detail.meta.folder, detail.meta.direction) == ("trash", "outgoing")
-    assert examined(server) == [GMAIL_ALL, GMAIL_TRASH]  # no INBOX, label, Sent, Spam or Drafts mailbox
+    assert examined(server) == [GMAIL_TRASH, GMAIL_ALL, GMAIL_TRASH]  # no INBOX, label, Sent, Spam or Drafts mailbox
     assert all("X-GM-LABELS" in items for items in fetch_items(server) if "FLAGS" in items)  # every draft check
 
     same_time = [msg(1, 60, "all mail copy", INBOX_L, message_id=f"<{MID}>")]
@@ -542,7 +543,7 @@ def test_ref_gmail_all_mail_then_trash() -> None:
 
     server = gmail(sent=[msg(3, 60, "sent copy", SENT_L, message_id=f"<{MID}>")], with_all=False)
     assert get(server, ref(account="gmail")).ref == MessageRef("gmail", GMAIL_SENT, 7, 3)
-    assert examined(server) == ["INBOX", GMAIL_SENT, GMAIL_TRASH, GMAIL_SENT]
+    assert examined(server) == ["INBOX", GMAIL_TRASH, GMAIL_SENT]  # \Sent last: the copy stays open for the read
 
 
 @pytest.mark.parametrize(
@@ -570,7 +571,7 @@ def test_locate_batches_of_at_most_20_values() -> None:
     result = locate(server, ids)
     assert result.complete is True
     assert sorted(result.found) == ids
-    assert result.found[ids[0]] == FoundCopy(result.found[ids[0]].entry, 7, 1, NOW - timedelta(minutes=30))
+    assert result.found[ids[0]] == FoundCopy(result.found[ids[0]].entry, 7, 1, NOW - timedelta(minutes=30), "sent")
     assert {copy.entry.raw_name for copy in result.found.values()} == {"Sent Messages"}
     per_folder = searches(server)
     assert len(per_folder) == 2 * len(ICLOUD_CORE)  # 20 + 5 values per core folder; no other mailbox
@@ -589,7 +590,9 @@ def test_locate_fetches_flags_date_and_message_id_only() -> None:
     assert fetch_items(server) == [["FLAGS", "INTERNALDATE", candidate_header_item(["MESSAGE-ID"])]]
     server = gmail(all_mail=[msg(1, 5, "a", message_id=f"<{MID}>")])
     locate(server, [MID])
-    assert fetch_items(server) == [["FLAGS", "INTERNALDATE", candidate_header_item(["MESSAGE-ID"]), "X-GM-LABELS"]]
+    assert fetch_items(server) == [
+        ["FLAGS", "INTERNALDATE", candidate_header_item(["MESSAGE-ID"]), "X-GM-LABELS", "X-GM-THRID"]
+    ]
 
 
 def test_locate_other_mailboxes_search_only_unresolved_refs() -> None:
@@ -639,10 +642,12 @@ def test_locate_refuses_values_it_cannot_search(value: str) -> None:
 
 def test_locate_without_searchable_values_sends_nothing() -> None:
     server = icloud()
-    assert locate(server, []) == LocateResult({}, complete=True, incomplete=frozenset(), uncertain=frozenset())
+    assert locate(server, []) == LocateResult(
+        {}, complete=True, incomplete=frozenset(), uncertain=frozenset(), in_sent=frozenset()
+    )
     refused_value = "X-GM-RAW@example.test"  # pattern-valid but never searchable: stays incomplete (accepted)
     assert locate(server, [refused_value]) == LocateResult(
-        {}, complete=False, incomplete=frozenset({refused_value}), uncertain=frozenset()
+        {}, complete=False, incomplete=frozenset({refused_value}), uncertain=frozenset(), in_sent=frozenset()
     )
     assert "LIST" not in names(server)
 
@@ -803,9 +808,9 @@ def test_soft_stop_marks_only_the_refs_still_open(phase: str) -> None:
     compared); a stop among the `other` mailboxes leaves it certain, because they are never searched for it."""
     a, b = "a@example.test", "b@example.test"
     server = icloud(inbox=[msg(1, 5, "a", message_id=f"<{a}>")], other=[folder("P1"), folder("P2")], step=1.0)
-    soft = 8.5 if phase == "core" else 13.5  # stops before the Sent EXAMINE, or before the P2 EXAMINE
+    soft = 8.5 if phase == "core" else 13.5  # stops before the Trash SEARCH (Sent unsearched), or before the P2 EXAMINE
     box = mailbox(server)
-    result = box._run(lambda session: session.locate([a, b]), deadline(server, soft))
+    result = box._run(lambda session: session.locate([a, b], soft_check=box._soft_check), deadline(server, soft))
     assert list(result.found) == [a]
     assert result.incomplete == frozenset({b})
     assert result.uncertain == (frozenset({a}) if phase == "core" else frozenset())
@@ -833,7 +838,7 @@ def test_gmail_with_over_500_labels_answers_not_found(hub_log: Capture) -> None:
     server.folders.extend(folder(f"Label {i:03d}") for i in range(600))
     error = refused(server, ref(account="gmail"))
     assert (error.code, error.cause) == ("not_found", "NotFound")
-    assert examined(server) == [GMAIL_ALL, GMAIL_TRASH]
+    assert examined(server) == [GMAIL_TRASH, GMAIL_ALL]
     refreshed = [json.loads(line) for line in hub_log.lines if '"folder_map_refreshed"' in line]
     assert [(line["account"], line["outcome"]) for line in refreshed] == [("gmail", "ok")]
 
@@ -850,7 +855,7 @@ def test_locate_parameters_are_clamped(max_folders: int, batch_values: int) -> N
         client, account="icloud", registry_inbox="INBOX", folder_maps=FolderMapCache(), own=frozenset()
     )
     with pytest.raises(ValueError, match="out of range"):
-        session.locate([MID], max_folders=max_folders, batch_values=batch_values)
+        session.locate([MID], soft_check=lambda: None, max_folders=max_folders, batch_values=batch_values)
     assert "LIST" not in names(server)
 
 

@@ -14,6 +14,7 @@ from mcp_hub.providers.base import FolderPage, ListQuery, MailDetail, ProviderEr
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools.mail import LIST_MESSAGES_DESCRIPTION, LIST_UNREAD_DESCRIPTION
+from mcp_hub.tools.mail_status import GET_MESSAGE_STATUS_DESCRIPTION
 from tests.support.mcp import body, modern
 from tests.support.tokens import TokenFactory
 
@@ -42,7 +43,9 @@ def wired(settings: Settings, secrets_dir: Path) -> Iterator[TestClient]:
 
 def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, tokens: TokenFactory) -> None:
     tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
-    assert set(tools) == {"list_accounts", "list_unread", "get_message", "get_events", "list_messages"}
+    assert set(tools) == {
+        "list_accounts", "list_unread", "get_message", "get_events", "list_messages", "get_message_status",
+    }  # fmt: skip
     for name in ("list_unread", "get_message", "list_messages"):
         assert tools[name]["annotations"]["readOnlyHint"] is True
         assert tools[name]["annotations"]["destructiveHint"] is False
@@ -54,6 +57,44 @@ def test_mail_tools_are_listed_read_only_with_output_schema(wired: TestClient, t
     assert tools["list_messages"]["inputSchema"].get("required", []) == []
     assert properties["folder"]["enum"] == ["inbox", "sent", "archive", "trash", "all", None]
     assert properties["direction"]["enum"] == ["incoming", "outgoing", None]
+
+
+def test_get_message_status_schema(wired: TestClient, tokens: TokenFactory) -> None:
+    tools = {t["name"]: t for t in body(modern(wired, tokens.mint(), "tools/list"))["result"]["tools"]}
+    tool = tools["get_message_status"]
+    assert tool["description"] == GET_MESSAGE_STATUS_DESCRIPTION
+    assert tool["annotations"] == {
+        "title": "Re-check messages",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+    schema = tool["inputSchema"]
+    assert set(schema["properties"]) == {"refs"}
+    assert schema["required"] == ["refs"]  # C11
+    refs = schema["properties"]["refs"]
+    assert (refs["type"], refs["items"], refs["minItems"], refs["maxItems"]) == ("array", {"type": "string"}, 1, 50)
+    output = tool["outputSchema"]
+    assert output["properties"]["next_cursor"] == {"title": "Next Cursor", "type": "null"}
+    item = output["$defs"]["StatusItem"]
+    assert "input" not in item["required"]  # present only when it differs from `ref`
+    assert set(item["required"]) == set(item["properties"]) - {"input"}
+
+    def enum(name: str) -> list[str | None]:
+        spec = item["properties"][name]
+        return [value for option in spec.get("anyOf", [spec]) for value in option.get("enum", [None])]  # null: None
+
+    assert enum("state") == ["found", "gone", "unknown"]
+    assert enum("reason") == [
+        "account_error",
+        "account_unavailable",
+        "id_mismatch",
+        "stale_id",
+        "incomplete_search",
+        None,
+    ]
+    assert enum("folder") == ["inbox", "sent", "archive", "trash", "other", None]
 
 
 def test_list_unread_wire_result_has_output_schema(wired: TestClient, tokens: TokenFactory) -> None:

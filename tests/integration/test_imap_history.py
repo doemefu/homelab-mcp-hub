@@ -1,10 +1,12 @@
-"""Mail history (WP13a) against GreenMail (spec 080 §10.2): folders, `folder: all` dedup, keyset paging, a `ref`
-after moves, the read-only flag snapshot and log capture. The test seeds the folders through its own IMAP client
-(APPEND, CREATE, COPY, MOVE, EXPUNGE); the hub only reads. Every subject and Message-ID carries the run token."""
+"""Mail history (WP13a, WP13b) against GreenMail (spec 080 §10.2): folders, `folder: all` dedup, keyset paging, a
+`ref` after moves, the `get_message_status` scenarios "hand-over" and "archived", the read-only flag snapshot and log
+capture. The test seeds the folders through its own IMAP client (APPEND, CREATE, COPY, MOVE, EXPUNGE); the hub only
+reads. Every subject and Message-ID carries the run token."""
 
+import itertools
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -17,10 +19,12 @@ from mcp_hub.health import StatusStore
 from mcp_hub.ids import encode_ref
 from mcp_hub.logging import configure_logging
 from mcp_hub.providers import Adapters
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import NAME_FALLBACK
 from mcp_hub.registry import load_registry
-from mcp_hub.tools import HubContext
+from mcp_hub.tools import HubContext, mail_status
 from mcp_hub.tools.mail import ListMessagesResult, MessageSummary, run_get_message, run_list_messages, run_list_unread
+from mcp_hub.tools.mail_status import MessageStatusResult, StatusItem, run_get_message_status
 from tests.support import greenmail
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
@@ -34,6 +38,7 @@ PROJECTS = f"Projects-{RUN}"  # an `other` folder: listed by no folder value, st
 FOLDERS = ("INBOX", SENT, ARCHIVE, TRASH, PROJECTS)
 LIST_FOLDERS = ("inbox", "sent", "archive", "trash", "all")
 OWNER = f"owner@{greenmail.DOMAIN}"
+THIRD = f"Third <third@{greenmail.DOMAIN}>"
 
 
 @pytest.fixture
@@ -56,15 +61,27 @@ def message_id(tag: str) -> str:
     return f"{RUN}-{tag}@{greenmail.DOMAIN}"
 
 
-def mail(tag: str, *, outgoing: bool = False, references: tuple[str, ...] = ()) -> EmailMessage:
+def mail(
+    tag: str,
+    *,
+    outgoing: bool = False,
+    references: tuple[str, ...] = (),
+    in_reply_to: str | None = None,
+    cc: tuple[str, ...] = (),
+) -> EmailMessage:
+    """`In-Reply-To` defaults to the last of `references`."""
     msg = EmailMessage()
     msg["Subject"] = S(tag)
     msg["Message-ID"] = f"<{message_id(tag)}>"
     if outgoing:
         msg["From"] = f"Owner <{OWNER}>"
         msg["To"] = f"Peer <peer@{greenmail.DOMAIN}>"
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    parent = in_reply_to or (references[-1] if references else None)
+    if parent:
+        msg["In-Reply-To"] = f"<{parent}>"
     if references:
-        msg["In-Reply-To"] = f"<{references[-1]}>"
         msg["References"] = " ".join(f"<{r}>" for r in references)
     msg.set_content(f"body of {tag}")
     return msg
@@ -78,9 +95,13 @@ def seed(
     flags: tuple[bytes, ...] = (),
     outgoing: bool = False,
     references: tuple[str, ...] = (),
+    in_reply_to: str | None = None,
+    cc: tuple[str, ...] = (),
+    when: datetime | None = None,
 ) -> str:
-    when = datetime.now(UTC) - timedelta(minutes=5)
-    greenmail.append(login, mail(tag, outgoing=outgoing, references=references), when, folder=folder, flags=flags)
+    """APPENDs the message with INTERNALDATE `when` (default: five minutes ago) and returns its Message-ID."""
+    message = mail(tag, outgoing=outgoing, references=references, in_reply_to=in_reply_to, cc=cc)
+    greenmail.append(login, message, when or datetime.now(UTC) - timedelta(minutes=5), folder=folder, flags=flags)
     return message_id(tag)
 
 
@@ -128,6 +149,39 @@ def tagged(result: ListMessagesResult, prefix: str) -> dict[str, MessageSummary]
             assert item.untrusted.subject not in out, "listed twice"
             out[item.untrusted.subject] = item
     return out
+
+
+async def statuses(ctx: HubContext, *entries: str) -> list[StatusItem]:
+    """get_message_status for an account that answers: every entry answered, nothing cut, no account error."""
+    result, _, _ = await run_get_message_status(ctx, refs=list(entries))
+    assert (result.truncated, result.next_cursor, result.account_errors) == (False, None, [])
+    assert len(result.items) == len(entries)
+    return result.items
+
+
+def ref_of(tag: str) -> str:
+    ref = encode_ref("icloud", message_id(tag))
+    assert ref is not None
+    return ref
+
+
+def instant(value: str | None) -> datetime | None:
+    """A reported local timestamp as an aware instant (the hub reports HUB_DEFAULT_TIMEZONE offsets)."""
+    return None if value is None else datetime.fromisoformat(value)
+
+
+def stepping_deadline(monkeypatch: pytest.MonkeyPatch, soft_ticks: int) -> None:
+    """Every read of the call clock advances one tick, so the soft stop lands after a fixed number of deadline checks
+    (`soft_ticks`), at a different step of the call for each value; the hard deadline stays out of reach."""
+    ticks = itertools.count()
+
+    def clock() -> float:
+        return float(next(ticks))
+
+    def start() -> CallDeadline:
+        return CallDeadline(clock(), float(soft_ticks), 1e9, clock)
+
+    monkeypatch.setattr(mail_status, "CallDeadline", type("SteppingDeadline", (), {"start": staticmethod(start)}))
 
 
 def test_greenmail_capabilities_recorded() -> None:
@@ -206,9 +260,10 @@ async def test_all_has_no_duplicate_for_inbox_and_archive_copy(secrets_dir: Path
         assert items[0].ref == next(iter(in_archive.values())).ref  # one ref for both copies
 
 
-async def test_read_only_snapshot_unchanged(secrets_dir: Path) -> None:
+async def test_read_only_snapshot_unchanged(secrets_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Spec §10.2 read-only: FLAGS and folder of every message are identical before and after each tool path of
-    WP13a (list_messages for every folder value, list_unread, get_message by `id` and by `ref`)."""
+    WP13a and WP13b (list_messages for every folder value, list_unread, get_message by `id` and by `ref`,
+    get_message_status over every `ref` and `id`, also when the call runs into the soft stop at any step)."""
     login = "hub-get"
     greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
     combos: tuple[tuple[bytes, ...], ...] = (
@@ -241,6 +296,27 @@ async def test_read_only_snapshot_unchanged(secrets_dir: Path) -> None:
     unread, _, _ = await run_list_unread(ctx, account="icloud", since=last_hour(), limit=50, cursor=None)
     assert tagged(unread, "ro-")
     assert opened == {S(f"ro-{index}-{n}") for index in range(len(FOLDERS) - 1) for n in range(len(combos))}
+    entries = [value for item in listed.values() for value in (item.ref or "", item.id or "")]
+    checked = await statuses(ctx, *entries)
+    assert [(item.state, item.thread_checked) for item in checked] == [("found", True)] * len(entries)
+    assert [item.folder for item in checked] == [item.folder for item in listed.values() for _ in range(2)]
+    partial = []
+    for soft_ticks in (2, 8, 20, 40, 80, 160, 320):  # the soft stop at login, in place, during location and lookups
+        stepping_deadline(monkeypatch, soft_ticks)
+        result, _, _ = await run_get_message_status(ctx, refs=entries)
+        assert (result.truncated, result.account_errors) == (False, [])
+        states = [(item.state, item.reason, item.thread_checked) for item in result.items]
+        assert all(
+            state in {("found", None, True), ("found", None, False), ("unknown", "incomplete_search", None)}
+            for state in states
+        )
+        partial.append(states)
+    assert any(all(state[0] == "unknown" for state in states) for states in partial)  # stopped before any read
+    assert any(
+        any(state[0] == "found" for state in states) and any(state != ("found", None, True) for state in states)
+        for states in partial
+    )  # stopped in the middle: what was read is kept
+    assert any(("found", None, False) in states for states in partial)  # stopped inside the reply and thread lookups
     assert greenmail.snapshot(login, FOLDERS) == before
 
 
@@ -303,6 +379,139 @@ async def test_get_message_ref_follows_moves(secrets_dir: Path) -> None:
     assert caught.value.code == "not_found"
 
 
+def seed_hand_over(
+    login: str, prefix: str, follow_up_references: Callable[[str, str], tuple[str, ...]]
+) -> tuple[datetime, tuple[str, str, str]]:
+    """The request R from the sender at t0, the owner's reply A in sent at t0 + 1 min (without `\\Answered` on R),
+    and the sender's hand-over B at t0 + 2 min, copying a third person; B's `References` from
+    `follow_up_references(R, A)`, its `In-Reply-To` naming A. Returns t0 and the refs of R, A and B."""
+    t0 = (datetime.now(UTC) - timedelta(minutes=30)).replace(microsecond=0)
+    request = seed(login, "INBOX", f"{prefix}-request", when=t0)
+    reply = seed(
+        login,
+        SENT,
+        f"{prefix}-reply",
+        flags=(b"\\Seen",),
+        outgoing=True,
+        references=(request,),
+        when=t0 + timedelta(minutes=1),
+    )
+    seed(
+        login,
+        "INBOX",
+        f"{prefix}-handover",
+        references=follow_up_references(request, reply),
+        in_reply_to=reply,
+        cc=(THIRD,),
+        when=t0 + timedelta(minutes=2),
+    )
+    return t0, (ref_of(f"{prefix}-request"), ref_of(f"{prefix}-reply"), ref_of(f"{prefix}-handover"))
+
+
+def assert_hand_over(items: list[StatusItem], t0: datetime, refs: tuple[str, str, str]) -> None:
+    """R: answered by A (found in sent, the flag unset) and continued by B. A (the waiting-for side, MF-R5): an
+    outgoing ref, not replied, continued by B. B: neither answered nor continued."""
+    request, reply, follow_up = items
+    assert [item.ref for item in items] == list(refs)
+    assert all((item.state, item.reason, item.thread_checked) == ("found", None, True) for item in items)
+    assert (request.folder, request.direction, instant(request.received_at)) == ("inbox", "incoming", t0)
+    assert request.flags is not None
+    assert (request.flags.seen, request.flags.answered) == (False, False)
+    assert (request.replied, instant(request.replied_at), request.reply_ref) == (
+        True,
+        t0 + timedelta(minutes=1),
+        refs[1],
+    )
+    assert (request.newer_incoming_in_thread, instant(request.newer_incoming_at)) == (True, t0 + timedelta(minutes=2))
+    assert (reply.folder, reply.direction, instant(reply.received_at)) == (
+        "sent",
+        "outgoing",
+        t0 + timedelta(minutes=1),
+    )
+    assert (reply.replied, reply.replied_at, reply.reply_ref) == (False, None, None)
+    assert (reply.newer_incoming_in_thread, instant(reply.newer_incoming_at)) == (True, t0 + timedelta(minutes=2))
+    assert (follow_up.folder, follow_up.direction) == ("inbox", "incoming")
+    assert follow_up.flags is not None
+    assert follow_up.flags.seen is False
+    assert (follow_up.replied, follow_up.newer_incoming_in_thread, follow_up.newer_incoming_at) == (False, False, None)
+
+
+async def test_status_hand_over(secrets_dir: Path) -> None:
+    """Scenario "hand-over" (spec 080 §10.2): the request is answered (`replied_at`, `reply_ref` = the owner's reply)
+    and continued by the hand-over; B names R and A in `References`."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "ho", lambda request, reply: (request, reply))
+    before = greenmail.snapshot(login, FOLDERS)  # read-only also on the reply and thread hits (64 KiB header item)
+    assert_hand_over(await statuses(hub(secrets_dir, login), *refs), t0, refs)
+    assert greenmail.snapshot(login, FOLDERS) == before
+
+
+async def test_status_hand_over_outlook_style(secrets_dir: Path) -> None:
+    """E-mf1: an Outlook-style hand-over names only the owner's reply A in `References`, never the request R; R is
+    still continued, found through A as an extra thread key, and A reports the same values (MF-R5)."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "hoo", lambda _request, reply: (reply,))
+    before = greenmail.snapshot(login, FOLDERS)
+    assert_hand_over(await statuses(hub(secrets_dir, login), *refs), t0, refs)
+    assert greenmail.snapshot(login, FOLDERS) == before
+
+
+async def test_status_archived(secrets_dir: Path) -> None:
+    """Scenario "archived" (spec 080 §10.2): a mail listed by list_unread is moved by the test; its `ref` reports
+    the new folder each time with the same `ref`; its old `id` is `stale_id` (an IMAP id cannot follow a move); once
+    expunged it is `gone`, like a ref that was never seen."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    seeded = seed(login, "INBOX", "st-archived")
+    ctx = hub(secrets_dir, login)
+    unread, _, _ = await run_list_unread(ctx, account="icloud", since=last_hour(), limit=50, cursor=None)
+    [listed] = tagged(unread, "st-archived").values()
+    assert listed.ref is not None
+    assert listed.id is not None
+    ref, old_id = listed.ref, listed.id
+    by_ref, by_id = await statuses(ctx, ref, old_id)
+    assert (by_ref.state, by_ref.folder, by_ref.ref, by_ref.id, by_ref.input) == ("found", "inbox", ref, old_id, None)
+    assert (by_id.state, by_id.folder, by_id.ref, by_id.id, by_id.input) == ("found", "inbox", ref, old_id, old_id)
+    assert by_ref.flags is not None
+    assert by_ref.flags.seen is False  # list_unread and the status calls did not read it
+
+    source = "INBOX"
+    for target, folder in ((ARCHIVE, "archive"), (TRASH, "trash")):
+        greenmail.move(login, source, seeded, target)
+        source = target
+        moved, stale = await statuses(ctx, ref, old_id)
+        assert (moved.state, moved.reason, moved.folder, moved.ref, moved.input) == ("found", None, folder, ref, None)
+        assert moved.id is not None
+        assert moved.id != old_id
+        assert (moved.direction, moved.thread_checked) == ("incoming", True)
+        assert (stale.state, stale.reason, stale.ref, stale.input, stale.folder) == (
+            "unknown",
+            "stale_id",
+            None,
+            old_id,
+            None,
+        )
+
+    greenmail.expunge(login, TRASH, seeded)
+    expunged, never_seen = await statuses(ctx, ref, ref_of("st-never-seen"))
+    for item in (expunged, never_seen):
+        assert (item.state, item.reason, item.id, item.folder, item.thread_checked) == ("gone", None, None, None, None)
+        assert (item.replied, item.newer_incoming_in_thread) == (False, False)
+    assert (expunged.ref, never_seen.ref) == (ref, ref_of("st-never-seen"))
+
+
+async def test_status_other_folder(secrets_dir: Path) -> None:
+    """A mail in a folder that no folder value lists (`Projects-<RUN>`) is found by its `ref` as `other`."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    seed(login, PROJECTS, "st-other")
+    [item] = await statuses(hub(secrets_dir, login), ref_of("st-other"))
+    assert (item.state, item.folder, item.direction, item.thread_checked) == ("found", "other", "incoming", True)
+    assert item.id is not None
+
+
 @pytest.fixture
 def captured() -> Iterator[Capture]:
     configure_logging("DEBUG")
@@ -318,9 +527,10 @@ async def test_logs_contain_no_history_values(secrets_dir: Path, captured: Captu
     login = "hub-logs"
     greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
     parent = message_id("Hist5k-Parent")
+    inbox = seed(login, "INBOX", "Hist5k-Inbox", references=(parent,))
     seeded = [
-        seed(login, "INBOX", "Hist5k-Inbox", references=(parent,)),
-        seed(login, SENT, "Hist5k-Sent", outgoing=True, references=(parent,)),
+        inbox,
+        seed(login, SENT, "Hist5k-Sent", outgoing=True, references=(parent, inbox)),  # a reply: reply_ref, newer
         seed(login, ARCHIVE, "Hist5k-Archive", flags=(b"\\Seen",)),
         seed(login, TRASH, "Hist5k-Trash"),
         seed(login, PROJECTS, "Hist5k-Other"),
@@ -348,10 +558,18 @@ async def test_logs_contain_no_history_values(secrets_dir: Path, captured: Captu
     with pytest.raises(ToolError) as caught:
         await run_get_message(ctx, ref=absent, max_chars=None)
     assert caught.value.code == "not_found"
+    entries = sorted({value for item in items for value in (item.ref, item.id) if value})
+    checked = await statuses(ctx, *entries, absent)
+    assert {item.state for item in checked[:-1]} == {"found"}
+    assert checked[-1].state == "gone"
+    assert any(item.reply_ref for item in checked)
     failing = hub(secrets_dir, login, password="not-the-password")
     await listing(failing, "all")
     with pytest.raises(ToolError):
         await run_get_message(failing, ref=items[0].ref, max_chars=None)
+    failed: MessageStatusResult = (await run_get_message_status(failing, refs=entries))[0]
+    assert {(item.state, item.reason) for item in failed.items} == {("unknown", "account_error")}
+    assert [error.account for error in failed.account_errors] == ["icloud"]
 
     text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
     forbidden = {
@@ -380,9 +598,14 @@ async def test_logs_contain_no_history_values(secrets_dir: Path, captured: Captu
         forbidden.update(v for v in (item.id, item.ref, item.thread_key) if v)
     for detail in opened:
         forbidden.update(v for v in (detail.id, detail.ref, detail.thread_key) if v)
+    for status in [*checked, *failed.items]:
+        forbidden.update(v for v in (status.input, status.ref, status.id, status.reply_ref) if v)
     for value in sorted(forbidden):
         assert value not in text, value
     assert not [r for r in captured.raw if r[0].startswith("imapclient") and r[1] < logging.WARNING]
     events = [json.loads(line) for line in captured.lines]
     assert all(set(e) <= allowed_fields(e["event"]) for e in events)
     assert any(e["event"] == "provider_call_failed" and e["outcome"] == "auth_expired" for e in events)
+    assert not [
+        e for e in events if e["event"] not in {"provider_call_failed", "item_degraded", "folder_map_refreshed"}
+    ]
