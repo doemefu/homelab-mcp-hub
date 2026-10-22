@@ -2,9 +2,10 @@
 FETCH and the location step of Message-IDs. Moved out of `imap.py` so that the status lookups can share it (WP13b)."""
 
 import imaplib
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Final, Literal
 
 from mcp_hub.ids import MessageRef
@@ -20,12 +21,20 @@ from mcp_hub.providers.folders import (
     inbox_entry,
     is_gmail,
 )
-from mcp_hub.providers.headers import candidate_header_item, header_bytes, parse_summary_headers, valid_message_id
+from mcp_hub.providers.headers import (
+    CANDIDATE_HEADER_BYTES,
+    MAX_ADDRESS_HEADER_BYTES,
+    candidate_header_item,
+    header_bytes,
+    parse_summary_headers,
+    valid_message_id,
+)
 from mcp_hub.providers.imap_guard import PASS_THROUGH, GuardedImapClient, examine_name_ok, imap_error_kind
-from mcp_hub.providers.imap_search import criteria, header_or, or_batches, search_value_ok
+from mcp_hub.providers.imap_search import LOCATE_BATCH_VALUES, criteria, header_or, or_batches, search_value_ok
 
-LOCATE_ITEMS: Final = ("FLAGS", "INTERNALDATE", candidate_header_item(["MESSAGE-ID"]))  # the re-check of a hit
-LOCATE_BATCH_VALUES: Final = 20  # Message-IDs per UID SEARCH in the location step (F6; or_batches bounds the bytes)
+# The re-check item of a location hit: the Message-ID, with FROM 8 KiB so that a long From rarely cuts it (A-sec3).
+_LOCATE_FROM_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM)]<0.{MAX_ADDRESS_HEADER_BYTES}>"
+_GMAIL_LOCATE_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: drafts, `\Sent` and the thread id of a copy
 _GMAIL_CANDIDATE_ITEM: Final = "X-GM-LABELS"  # Gmail: label drafts and `sent_label` before `limit` (I8, C4)
 MAX_SEARCH_CANDIDATES: Final = 5000  # newest SEARCH hits per folder and call (§5.4, B5)
 FETCH_CHUNK_UIDS: Final = 500  # UIDs per UID FETCH (the guard's MAX_FETCH_UIDS bounds the command line)
@@ -33,6 +42,7 @@ SOFT_CHECK_EVERY: Final = 100  # candidates parsed between two soft-limit checks
 _DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8); as a flag and as a Gmail label (S-r)
 _LABEL_INBOX: Final = b"\\inbox"
 _LABEL_SENT: Final = b"\\sent"
+_THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
 
 
 class MissingInternalDate(Exception):  # noqa: N818
@@ -76,6 +86,19 @@ def _is_draft(row: dict[bytes, object]) -> bool:
     return bool((_flags(row) | _labels(row)) & _DRAFT)
 
 
+def _thread_id(row: dict[bytes, object]) -> int | None:
+    """Gmail `X-GM-THRID` as the server returned it: an `int` (not `bool`) in 0..2^64-1, else None."""
+    value = row.get(b"X-GM-THRID")
+    return value if type(value) is int and 0 <= value < _THRID_LIMIT else None
+
+
+def locate_items(*, gmail: bool, with_from: bool) -> list[str]:
+    """FETCH items of the location re-check: FLAGS, INTERNALDATE and the Message-ID header (2 KiB), with FROM in
+    8 KiB (A-sec3); Gmail also its labels and thread id."""
+    header = _LOCATE_FROM_ITEM if with_from else candidate_header_item(["MESSAGE-ID"])
+    return ["FLAGS", "INTERNALDATE", header, *(_GMAIL_LOCATE_ITEMS if gmail else ())]
+
+
 def _gmail_folder(labels: frozenset[bytes]) -> MailFolder:
     """All Mail decides per message (§5.5): `\\Inbox` → inbox, `\\Sent` → sent, else archive (drafts are dropped
     before this)."""
@@ -86,21 +109,45 @@ def _gmail_folder(labels: frozenset[bytes]) -> MailFolder:
 
 @dataclass(frozen=True, slots=True)
 class FoundCopy:
-    """One located copy of a Message-ID: where it is and when it arrived."""
+    """One located copy of a Message-ID: where it is, when it arrived, and what the status needs of it."""
 
     entry: FolderEntry
     uidvalidity: int
     uid: int
     received_at: datetime
+    folder: MailFolder  # normalised; Gmail All Mail by the copy's labels (`_detail_folder`)
+    flags: frozenset[bytes] = frozenset()  # lowercased
+    labels: frozenset[bytes] = frozenset()  # Gmail X-GM-LABELS, lowercased
+    from_address: str | None = None  # only when FROM was fetched (own addresses configured)
+    thread_id: int | None = None  # Gmail X-GM-THRID
 
 
 @dataclass(frozen=True, slots=True)
 class LocateResult:
-    # Message-ID → copy with the earliest received_at; ties by folder order (spec §5.5 matching rule, C3)
+    # Message-ID → copy with the earliest received_at; ties by folder rank (spec §5.5 matching rule, C3)
     found: dict[str, FoundCopy]
     complete: bool  # not incomplete and not uncertain
     incomplete: frozenset[str]  # not found, and a step that covered it did not complete (WP13b: incomplete_search)
     uncertain: frozenset[str]  # found, but a failed step may hide an earlier copy (S-e): not a reliable answer
+    in_sent: frozenset[str]  # any accepted copy in sent (Gmail: label `\Sent`), for `direction` (MF-R2)
+
+
+_NO_SEEDS: Final[Mapping[str, FoundCopy]] = MappingProxyType({})
+
+
+def _replaces(copy: FoundCopy, current: FoundCopy | None, rank: Mapping[str, int]) -> bool:
+    """Whether `copy` beats `current` by `(received_at, folder rank)`. The rank is the index in the core list of
+    `FolderMap.locate_order` (the tie order of §5.5); any other mailbox ranks after it (IR3). The same copy (folder,
+    UIDVALIDITY and UID) never replaces itself, so a seed read in place stays as read."""
+    if current is None:
+        return True
+    if (copy.entry.raw_name, copy.uidvalidity, copy.uid) == (current.entry.raw_name, current.uidvalidity, current.uid):
+        return False
+    after = len(rank)
+    return (copy.received_at, rank.get(copy.entry.raw_name, after)) < (
+        current.received_at,
+        rank.get(current.entry.raw_name, after),
+    )
 
 
 class ImapSession:
@@ -203,43 +250,77 @@ class ImapSession:
                     raise ProviderError("upstream_timeout", "FetchRefused") from None
         return rows
 
+    def fetch_chunks(
+        self, uids: Sequence[int], items: Sequence[str], *, chunk: int
+    ) -> Iterator[dict[int, dict[bytes, object]]]:
+        """UID FETCH in ascending chunks of at most `chunk` (≤ 500) UIDs, one answer per chunk, fetched only when the
+        caller asks for it, so that rows are reduced per chunk and never accumulated. A chunk answered NO yields `{}`:
+        the caller sees its UIDs as lost (S-p). Every other error propagates."""
+        if type(chunk) is not int or not 1 <= chunk <= FETCH_CHUNK_UIDS:
+            raise ValueError("chunk out of range")
+        ordered = sorted(set(uids))
+        for start in range(0, len(ordered), chunk):
+            try:
+                rows = self._client.fetch(ordered[start : start + chunk], items)
+            except PASS_THROUGH:
+                raise
+            except imaplib.IMAP4.error as exc:
+                if not _answered_no(exc):
+                    raise
+                rows = {}
+            yield rows
+
     def locate(
         self,
         message_ids: Sequence[str],
         *,
+        seeds: Mapping[str, FoundCopy] = _NO_SEEDS,
         max_folders: int = MAX_LOCATE_FOLDERS,
         batch_values: int = LOCATE_BATCH_VALUES,
     ) -> LocateResult:
         """The location step of spec §5.5 (matching rule, C3) and §5.2 (`get_message_status` lookups).
 
-        Every core folder of `FolderMap.locate_order` is searched for every ref, so the copies there are compared;
-        the `other` mailboxes follow in LIST order, only for refs still unresolved, until none is left. At most
+        Every core folder of `FolderMap.locate_order` is searched for every ref, so the copies there are compared,
+        with the reply mailbox last (sent; Gmail: All Mail), so that the reply lookup continues in it (E-im5); the
+        `other` mailboxes follow in LIST order, only for refs still unresolved, until none is left. At most
         `max_folders` mailboxes in all (core first). Per mailbox: EXAMINE, then per batch of at most `batch_values`
         Message-IDs (and 4,000 bytes of keys) one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` keys, then
-        `UID FETCH` of FLAGS, INTERNALDATE and the Message-ID header of the hits (Gmail: also X-GM-LABELS); a hit
-        counts only on exact equality and without a draft flag or label. The earliest `received_at` wins; on a tie
-        the first in folder order. A SoftStop ends the search early; other errors propagate.
+        `UID FETCH` of `locate_items` for the hits in chunks of 500, each reduced before the next; a hit counts only
+        on exact equality and without a draft flag or label. Copies compare by `(received_at, folder rank)`, the
+        rank being the core list's tie order, so the search order never decides a tie. A SoftStop ends the search
+        early; other errors propagate.
+
+        `seeds` are copies read in place (an `m` id; E-im4): each enters `found` first and competes like any copy,
+        ranked after the core folders when its mailbox is not one of them (IR3); a seeded ref counts as resolved
+        for the `other` mailboxes. Every seed must name one of `message_ids`.
 
         A ref is "missed" when a step that covered it did not complete: a refused value, the folder cap, the
-        folder map's mailbox cap, an EXAMINE or SEARCH answered NO, a FETCH that lost hits or came back without
-        the Message-ID header, or the soft stop. A missed ref is `incomplete` when it was not found and
-        `uncertain` when it was (B6, B7). A copy without INTERNALDATE is dropped like a non-match (S-p)."""
+        folder map's mailbox cap, an EXAMINE or SEARCH answered NO, a FETCH that lost hits, came back without
+        the Message-ID header or with a header block at its cap without a parsed Message-ID (A-sec3), or the soft
+        stop. A missed ref is `incomplete` when it was not found and `uncertain` when it was (B6, B7); a seed thus
+        stands. A copy without INTERNALDATE is dropped like a non-match (S-p)."""
         if type(max_folders) is not int or not 1 <= max_folders <= MAX_LOCATE_FOLDERS:
             raise ValueError("max_folders out of range")
         if type(batch_values) is not int or not 1 <= batch_values <= LOCATE_BATCH_VALUES:
             raise ValueError("batch_values out of range")
         wanted = list(dict.fromkeys(message_ids))
+        if not seeds.keys() <= set(wanted):
+            raise ValueError("seed for a Message-ID that is not located")
         # A pattern-valid value that search_value_ok refuses (one containing `X-GM-RAW`) can never be searched: it
         # stays incomplete, so get_message answers upstream_timeout for it every time (accepted, never not_found).
         searchable = [v for v in wanted if valid_message_id(v) is not None and search_value_ok(v)]
         missed = set(wanted) - set(searchable)
-        found: dict[str, FoundCopy] = {}
+        found: dict[str, FoundCopy] = dict(seeds)
+        in_sent = {message_id for message_id, copy in seeds.items() if _in_sent(copy)}
         in_core = True
         if searchable:
             try:
                 folder_map = self.folder_map()
                 core, other = folder_map.locate_order()
-                ordered = [(entry, True) for entry in core] + [(entry, False) for entry in other]
+                rank = {entry.raw_name: index for index, entry in enumerate(core)}
+                reply = "all" if self.gmail and any(entry.role == "all" for entry in core) else "sent"
+                search = sorted(core, key=lambda entry: entry.role == reply)  # stable: the reply mailbox last
+                ordered = [(entry, True) for entry in search] + [(entry, False) for entry in other]
                 for index, (entry, is_core) in enumerate(ordered):
                     in_core = is_core
                     refs = searchable if is_core else [v for v in searchable if v not in found]
@@ -248,7 +329,7 @@ class ImapSession:
                     if index >= max_folders:
                         missed.update(refs)
                         break
-                    self._locate_in(entry, refs, batch_values, found, missed)
+                    self._locate_in(entry, refs, batch_values, found, missed, in_sent, rank)
                 else:
                     if folder_map.capped:  # mailboxes the map dropped were never searched for the open refs
                         missed.update(v for v in searchable if v not in found)
@@ -257,11 +338,22 @@ class ImapSession:
         incomplete = frozenset(missed - found.keys())
         uncertain = frozenset(missed & found.keys())
         return LocateResult(
-            found=found, complete=not incomplete and not uncertain, incomplete=incomplete, uncertain=uncertain
+            found=found,
+            complete=not incomplete and not uncertain,
+            incomplete=incomplete,
+            uncertain=uncertain,
+            in_sent=frozenset(in_sent),
         )
 
     def _locate_in(
-        self, entry: FolderEntry, refs: list[str], batch_values: int, found: dict[str, FoundCopy], missed: set[str]
+        self,
+        entry: FolderEntry,
+        refs: list[str],
+        batch_values: int,
+        found: dict[str, FoundCopy],
+        missed: set[str],
+        in_sent: set[str],
+        rank: Mapping[str, int],
     ) -> None:
         if entry.raw_name != self.registry_inbox and not examine_name_ok(entry.raw_name):
             missed.update(refs)  # over 1,000 characters: the guard would refuse the EXAMINE
@@ -280,7 +372,8 @@ class ImapSession:
         if validity is None:  # missing UIDVALIDITY on a folder other than the registry inbox (I11)
             missed.update(refs)
             return
-        items = [*LOCATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if self.gmail else list(LOCATE_ITEMS)
+        items = locate_items(gmail=self.gmail, with_from=bool(self.own))
+        cap = MAX_ADDRESS_HEADER_BYTES if self.own else CANDIDATE_HEADER_BYTES
         for batch in or_batches(refs, ("Message-ID",), max_values=batch_values):
             try:
                 hits = self.search(criteria(b"NOT DRAFT", header_or(("Message-ID",), batch)))
@@ -295,36 +388,58 @@ class ImapSession:
             if len(uids) > MAX_SEARCH_CANDIDATES:  # substring hits of short values: the newest are re-checked
                 uids = uids[-MAX_SEARCH_CANDIDATES:]
                 missed.update(batch)
-            rows = self.fetch(uids, items) if uids else {}
-            if len(rows.keys() & set(uids)) < len(uids):  # FETCH NO or expunged meanwhile: a hit is unchecked
-                missed.update(batch)
             wanted = set(batch)
-            for uid in uids:
-                row = rows.get(uid)
-                if row is None:
-                    continue
-                if not header_bytes(row):  # the Message-ID item did not come back: the hit cannot be re-checked
+            chunks = self.fetch_chunks(uids, items, chunk=FETCH_CHUNK_UIDS)
+            for start, rows in zip(range(0, len(uids), FETCH_CHUNK_UIDS), chunks, strict=True):
+                part = uids[start : start + FETCH_CHUNK_UIDS]
+                if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
                     missed.update(batch)
-                    continue
-                message_id, _ = _candidate_headers(row)
-                if message_id is None or message_id not in wanted or _is_draft(row):
-                    continue
-                received = _aware(row.get(b"INTERNALDATE"))
-                if received is None:  # S-p: dropped like a non-match, never a lasting upstream_timeout
-                    log_message_skipped(
-                        MessageRef(self.account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
+                for uid in part:
+                    row = rows.get(uid)
+                    if row is None:
+                        continue
+                    block = header_bytes(row)
+                    if not block:  # the Message-ID item did not come back: the hit cannot be re-checked
+                        missed.update(batch)
+                        continue
+                    message_id, sender = _candidate_headers(row)
+                    if message_id is None and len(block) >= cap:  # cut before its Message-ID: unchecked (A-sec3)
+                        missed.update(batch)
+                        continue
+                    if message_id is None or message_id not in wanted or _is_draft(row):
+                        continue
+                    received = _aware(row.get(b"INTERNALDATE"))
+                    if received is None:  # S-p: dropped like a non-match, never a lasting upstream_timeout
+                        log_message_skipped(
+                            MessageRef(self.account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
+                        )
+                        continue
+                    copy = FoundCopy(
+                        entry,
+                        validity,
+                        uid,
+                        received,
+                        _detail_folder(entry, row, gmail=self.gmail),
+                        flags=_flags(row),
+                        labels=_labels(row),
+                        from_address=sender,
+                        thread_id=_thread_id(row),
                     )
-                    continue
-                current = found.get(message_id)
-                if current is None or received < current.received_at:  # a tie keeps the earlier folder (S-e)
-                    found[message_id] = FoundCopy(entry, validity, uid, received)
+                    if _in_sent(copy):
+                        in_sent.add(message_id)
+                    if _replaces(copy, found.get(message_id), rank):
+                        found[message_id] = copy
 
     def noop(self) -> None:
         self._client.noop()
 
 
+def _in_sent(copy: FoundCopy) -> bool:
+    return copy.folder == "sent" or _LABEL_SENT in copy.labels
+
+
 def _candidate_headers(row: dict[bytes, object]) -> tuple[str | None, str | None]:
-    """(valid Message-ID, From address) of the candidate header block (at most 2 KiB, Sec5)."""
+    """(valid Message-ID, From address) of the candidate header block (at most 2 KiB, Sec5; 8 KiB in `locate`)."""
     try:
         parsed = parse_summary_headers(header_bytes(row))
     except PASS_THROUGH:
