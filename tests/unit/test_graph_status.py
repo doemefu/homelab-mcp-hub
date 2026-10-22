@@ -1102,6 +1102,80 @@ def test_unparsable_thread_time_unchecked() -> None:
     assert all("item" not in e for e in degraded)
 
 
+def test_thread_entry_invalid_id_unchecks_its_conversation() -> None:
+    clock = FakeClock()
+    entries = (item(10, 1, LATER + 2 * HOUR, id="AAMk/../BAD"), item(11, 1, LATER + HOUR), item(20, 2, LATER + HOUR))
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(*entries))
+    with Logs() as logs:
+        first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert (first.newer_incoming_at, first.thread_checked) == (LATER + HOUR, False)  # T13-1: what was read is kept
+    assert (second.newer_incoming_at, second.thread_checked) == (LATER + HOUR, True)
+    [degraded] = logs.named("item_degraded")
+    assert "item" not in degraded
+
+
+@pytest.mark.parametrize("parent", [None, "AQMk/../BAD"], ids=["missing", "malformed"])
+def test_thread_entry_missing_parent_unchecks_its_conversation(parent: str | None) -> None:
+    clock = FakeClock()
+    unusable = item(10, 1, LATER + HOUR, SENT_ID, sender=ME)
+    unusable = without(unusable, "parentFolderId") if parent is None else unusable | {"parentFolderId": parent}
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(unusable, item(20, 2, LATER + HOUR)))
+    with Logs() as logs:
+        first, second = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert (first.reply_at, first.thread_checked) == (None, False)  # it may be the reply
+    assert second.thread_checked is True
+    assert len(logs.named("item_degraded")) == 1
+
+
+@pytest.mark.parametrize(
+    "stray", ["not-an-object", without(item(10, 0), "conversationId")], ids=["non-dict", "no-conv"]
+)
+def test_unattributable_thread_item_unchecks_the_batch(stray: object) -> None:
+    clock = FakeClock()
+    others = in_conversations(item(11, 1, LATER + HOUR), item(100, 10, LATER + HOUR))
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        if conv(0) not in named_conversations(request):
+            return others(request)
+        body = json.loads(others(request).content)
+        return values(stray, *body["value"])(request)
+
+    server = Server(store(*(found_at(n) for n in range(11))), threads=answer)
+    with Logs() as logs:
+        result = status(mailbox(server, clock, maps=primed(clock)), [ref(n) for n in range(11)], clock)
+    assert [s.thread_checked for s in result] == [False] * 10 + [True]  # only the batch the item came with
+    assert result[1].newer_incoming_at == LATER + HOUR
+    assert len(logs.named("item_degraded")) == 1
+
+
+def test_valid_excluded_parent_or_draft_stays_checked() -> None:
+    clock = FakeClock()
+    dropped = (
+        item(10, 1, LATER + HOUR, JUNK_ID),
+        item(11, 1, LATER + HOUR, OUTBOX_ID, sender=ME),
+        item(12, 1, LATER + HOUR, DRAFTS_ID, sender=ME),
+        item(13, 1, LATER + HOUR, SENT_ID, sender=ME, isDraft=True),
+        item(14, 1, LATER + HOUR, SENT_ID, sender=ME, isDraft=True, id="AAMk/../BAD"),  # a draft: never looked at
+        item(15, 99, LATER + HOUR),  # a conversation outside the batch
+        item(16, 1, LATER + HOUR, conversationId="AAQk/../BAD"),  # not a conversation of the batch either
+    )
+    server = Server(store(found_at(1)), threads=values(*dropped))
+    with Logs() as logs:
+        [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert (result.reply_at, result.newer_incoming_at, result.thread_checked) == (None, None, True)
+    assert logs.named("item_degraded") == []
+
+
+def test_no_sentitems_folder_unchecks_threads() -> None:
+    clock = FakeClock()
+    maps = FolderMapCache(clock=clock)
+    maps.put(GraphFolderIds("outlook", FOLDER_IDS | {"sentitems": None}))  # type: ignore[arg-type]  # str keys
+    server = Server(store(found_at(1)), threads=in_conversations(item(10, 1, LATER + HOUR)))
+    [result] = status(mailbox(server, clock, maps=maps), [ref(1)], clock)
+    assert len(server.conversations()) == 1  # newer incoming items are still looked up
+    assert (result.newer_incoming_at, result.thread_checked) == (LATER + HOUR, False)  # no reply can be found (C5)
+
+
 @pytest.mark.parametrize("next_link", [False, True], ids=["full-top", "next-link"])
 def test_full_multi_value_answer_split_per_conversation(next_link: bool) -> None:
     clock = FakeClock()

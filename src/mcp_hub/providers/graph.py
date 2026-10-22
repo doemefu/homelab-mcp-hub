@@ -323,7 +323,8 @@ class _StatusRun:
         self.read: dict[GraphMessageRef, MessageStatus] = {}
         self.degraded = 0
         self.entries: dict[str, dict[str, ThreadEntry]] = {}  # by conversationId, then Graph id (united by id, C14)
-        self.checked: set[str] = set()  # conversations whose answer was complete (not failed, not full)
+        self.checked: set[str] = set()  # conversations whose answer was complete (not failed, not full, all usable)
+        self.no_sent = False  # the account has no sentitems folder: no reply can be found (C5)
         self.throttle_logged = False  # later back-off fast-fails send no request and are not logged again (T12-1)
 
 
@@ -1123,6 +1124,7 @@ class GraphMailbox:
         # The map of this call binds the parents as it is: no forced re-read for an unknown parent, which is common
         # in a conversation; a folder-id failure fails the account (C13).
         ids = self._folder_ids(run.client, run.token, run.deadline)
+        run.no_sent = ids.ids.get("sentitems") is None
         split: list[str] = []
         for batch in filter_batches(conversations, conversation_filter):
             if self._thread_batch(run, batch, ids) and len(batch) > 1:
@@ -1144,8 +1146,9 @@ class GraphMailbox:
             self._batch_failed(run, exc)
             return False
         wanted = set(batch)
+        spoiled: set[str] = set()  # conversations with an unusable item: it may be the reply or the newer item
         for raw in values:
-            entry = self._thread_entry(run, raw, wanted, ids)
+            entry = self._thread_entry(run, raw, wanted, ids, spoiled)
             if entry is None:
                 continue
             known = run.entries.setdefault(entry.conversation_id, {})
@@ -1155,25 +1158,40 @@ class GraphMailbox:
             if (entry.sent_at if entry.folder == "sent" else entry.received_at) is None:
                 self._status_degraded(run)  # GR10: its conversation is not checked (ThreadFacts.complete)
         if not full:
-            run.checked.update(batch)
+            run.checked.update(c for c in batch if c not in spoiled)
         return full
 
-    def _thread_entry(self, run: _StatusRun, raw: object, wanted: set[str], ids: GraphFolderIds) -> ThreadEntry | None:
+    def _thread_entry(
+        self, run: _StatusRun, raw: object, wanted: set[str], ids: GraphFolderIds, spoiled: set[str]
+    ) -> ThreadEntry | None:
         """A conversation item with a valid id, not a draft, in an allowed folder (an unknown parent is `other`) and
-        of a conversation of the batch; None otherwise."""
+        of a conversation of the batch; None otherwise.
+
+        Fail closed (T13-1): an unusable item of a batch conversation (an invalid id, a missing or malformed parent)
+        leaves that conversation unchecked, an item that cannot be attributed (not an object, no conversationId)
+        every conversation of the batch. Drafts, a valid excluded parent and other conversations are dropped."""
         if not isinstance(raw, dict):
             self._status_degraded(run)
+            spoiled.update(wanted)
+            return None
+        if raw.get("isDraft") is True:
+            return None  # drafts never (S1)
+        conversation = raw.get("conversationId")
+        if not isinstance(conversation, str):
+            self._status_degraded(run)
+            spoiled.update(wanted)
+            return None
+        if conversation not in wanted:
             return None
         graph_id = raw.get("id")
-        if not (isinstance(graph_id, str) and GRAPH_ID.fullmatch(graph_id)):
+        parent = _parent(raw)  # None: missing or malformed, told apart from a valid excluded parent
+        if not (isinstance(graph_id, str) and GRAPH_ID.fullmatch(graph_id)) or parent is None:
             self._status_degraded(run)  # no value logged (§9.7)
+            spoiled.add(conversation)
             return None
-        conversation = raw.get("conversationId")
-        if raw.get("isDraft") is True or not isinstance(conversation, str) or conversation not in wanted:
-            return None  # drafts never (S1)
-        folder = ids.role_of(_parent(raw))
+        folder = ids.role_of(parent)
         if folder == "excluded":
-            return None  # junk, drafts, outbox or no parent (D75)
+            return None  # junk, drafts, outbox (D75)
         return ThreadEntry(
             graph_id=graph_id,
             conversation_id=conversation,
@@ -1186,8 +1204,9 @@ class GraphMailbox:
 
     def _with_thread(self, run: _StatusRun, status: MessageStatus) -> MessageStatus:
         """The reply and thread fields of a found status (§5.2): `thread_checked` only when its conversation was
-        checked and no entry of it had an unparsable time (GR10). A copy without a valid conversationId keeps
-        `thread_checked: false` and no reply fields; replied then comes from the flag alone (C7)."""
+        checked, no entry of it had an unparsable time (GR10) and the account has a sentitems folder (C5). A copy
+        without a valid conversationId keeps `thread_checked: false` and no reply fields; replied then comes from the
+        flag alone (C7)."""
         found = status.found
         conversation = _conversation(status)
         if found is None or conversation is None or not isinstance(found.location, GraphMessageRef):
@@ -1205,7 +1224,7 @@ class GraphMailbox:
             reply_at=facts.reply_at,
             reply_message_id=valid_message_id(facts.reply_message_id),
             newer_incoming_at=facts.newer_incoming_at,
-            thread_checked=conversation in run.checked and facts.complete,
+            thread_checked=conversation in run.checked and facts.complete and not run.no_sent,
         )
 
 
