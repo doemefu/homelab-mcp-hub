@@ -701,6 +701,18 @@ def test_401_in_graph_id_read_refreshes() -> None:
     assert len(server.located()) == 2
 
 
+def test_401_restart_keeps_the_folder_ids_read_in_this_call() -> None:
+    """PR #51 review CR4: the folder ids read before a 401 are this call's map after the restart too, so an
+    excluded parent forces no second read of the seven folders."""
+    clock = FakeClock()
+    tokens = FakeTokens()
+    server = Server(reads={gid(1): sequence(js({}, 401), js(copy(1, 1, folder_id=JUNK_ID)))})
+    [result] = status(mailbox(server, clock, tokens=tokens), [gref(1)], clock)
+    assert result == MessageStatus("gone")
+    assert (tokens.issued, tokens.invalidated) == (2, 1)
+    assert server.folder_reads() == 7
+
+
 # --- `g` reads ---------------------------------------------------------------------------------------------------
 
 

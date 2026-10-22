@@ -553,8 +553,10 @@ class GraphMailbox:
         """One status per target, in order (spec 080 §5.2 `get_message_status`). Account failures raise; a soft stop
         before the token or the folder ids makes every entry incomplete_search."""
         logged: set[tuple[str, str | None]] = set()  # outlives a 401 restart: the log cap holds per call (S-F2)
+        # Decided once: after a 401 restart, the folder ids read before it are still this call's (PR #51 review CR4).
+        fresh = not isinstance(self._folder_maps.get(self._account), GraphFolderIds)
         return self._run(
-            lambda client, token, call: self._message_status(client, token, call, targets, logged),
+            lambda client, token, call: self._message_status(client, token, call, targets, logged, fresh=fresh),
             deadline,
             on_soft_stop=lambda: [status_unknown("incomplete_search") for _ in targets],
         )
@@ -944,12 +946,14 @@ class GraphMailbox:
         deadline: CallDeadline,
         targets: Sequence[StatusTarget],
         logged: set[tuple[str, str | None]],
+        *,
+        fresh: bool,
     ) -> list[MessageStatus]:
-        """Folder ids, then the `ref` location batches, then the `g` reads, then the conversations (A-sec2).
+        """Folder ids, then the `ref` location batches, then the `g` reads, then the conversations (A-sec2). `fresh`:
+        the call found no cached folder ids, so the ids it uses were read in this call.
 
         A soft stop inside the loop keeps what was read; every entry not resolved by then is incomplete_search, and
         every found entry whose conversation was not checked by then has `thread_checked: false`."""
-        fresh = not isinstance(self._folder_maps.get(self._account), GraphFolderIds)
         ids = self._folder_ids(client, token, deadline)  # a soft stop here: on_soft_stop; a failure fails the account
         run = _StatusRun(client, token, deadline, ids if fresh else None, logged)
         message_ids = [
