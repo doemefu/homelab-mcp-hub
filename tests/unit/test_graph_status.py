@@ -25,6 +25,7 @@ from tests.support.graph_fixtures import (
     FOLDER_IDS,
     INBOX_ID,
     JUNK_ID,
+    LEGACY_DN,
     OUTBOX_ID,
     SENT_ID,
     T1C_FACTS,
@@ -32,6 +33,7 @@ from tests.support.graph_fixtures import (
     FakeTokens,
     extended,
     message,
+    sender,
 )
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
@@ -1056,6 +1058,44 @@ def test_newer_incoming_any_allowed_folder() -> None:
     assert result[6].reply_at == LATER + HOUR  # the sent original still is a reply
     assert all(s.thread_checked is True for s in result)
     assert server.folder_reads() == 0  # an unknown parent in a thread answer never forces a re-read
+
+
+def test_legacy_dn_sent_item_counts_as_reply() -> None:
+    """T17: an own sent item whose `from.address` is a legacy DN is a reply by its folder; its inbox copy is not
+    newer incoming."""
+    clock = FakeClock()
+    own = sender(LEGACY_DN, ME)
+    entries = (
+        found_at(1),
+        item(10, 1, LATER + HOUR, SENT_ID, **{"from": own}),
+        item(11, 1, LATER + HOUR, INBOX_ID, message_id=mid(10), **{"from": own}),
+    )
+    server = Server(store(found_at(1)), threads=in_conversations(*entries))
+    [result] = status(mailbox(server, clock, maps=primed(clock)), [ref(1)], clock)
+    assert (result.reply_at, result.reply_message_id) == (LATER + HOUR, mid(10))
+    assert (result.newer_incoming_at, result.thread_checked) == (None, True)
+
+
+def test_legacy_dn_own_copy_outside_sent_not_newer() -> None:
+    clock = FakeClock()
+    entries = (
+        item(10, 1, LATER + HOUR, ARCHIVE_ID, **{"from": sender(LEGACY_DN, ME)}),  # own mail filed away
+        item(20, 2, LATER + HOUR, INBOX_ID, **{"from": sender(LEGACY_DN, f" {ME} ")}),  # the name is stripped
+    )
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(*entries))
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert [(s.newer_incoming_at, s.reply_at) for s in result] == [(None, None)] * 2
+
+
+def test_legacy_dn_needs_an_smtp_name_and_a_dn_address() -> None:
+    clock = FakeClock()
+    entries = (
+        item(10, 1, LATER + HOUR, INBOX_ID, **{"from": sender(LEGACY_DN, "Owner Name")}),  # no SMTP name
+        item(20, 2, LATER + HOUR, INBOX_ID, **{"from": sender("x@example.org", ME)}),  # an SMTP address stays
+    )
+    server = Server(store(found_at(1), found_at(2)), threads=in_conversations(*entries))
+    result = status(mailbox(server, clock, maps=primed(clock)), [ref(1), ref(2)], clock)
+    assert [s.newer_incoming_at for s in result] == [LATER + HOUR] * 2
 
 
 def test_401_in_thread_batch_refreshes_not_batch_failure() -> None:

@@ -74,6 +74,14 @@ T1B_FIELDS: Final = (
     "singleValueExtendedProperties",
 )
 T1B_EXTENDED: Final = ("Integer 0x1081", "String 0x1042", "String 0x1039")
+# T17 (request 16): an own sent item can carry an Exchange legacy DN as `from.address`, the SMTP address as the name.
+LEGACY_DN: Final = "/O=EXAMPLE/OU=TEST/CN=RECIPIENTS/CN=OWNER"
+
+
+def sender(address: str, name: str) -> dict[str, object]:
+    """A Graph `from` (or recipient) value."""
+    return {"emailAddress": {"name": name, "address": address}}
+
 
 # The facts of the owner's Graph Explorer run for the batched `get_message_status` lookups (T17, plan §4; requests
 # 14, 14b, 15 and 16, each with the same `Prefer` header). None until they are recorded: the strict xfail of

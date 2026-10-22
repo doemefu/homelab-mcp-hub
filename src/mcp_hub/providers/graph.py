@@ -200,6 +200,19 @@ def _address(value: object) -> tuple[str | None, str | None]:
     return _str(inner.get("name")), _str(inner.get("address"))
 
 
+def _sender_for_direction(raw: Mapping[str, object]) -> str | None:
+    """The `from` address that decides the direction; never an output field.
+
+    T17: an own sent item can carry an Exchange legacy DN ("/O=.../CN=...") as the address and the SMTP address as
+    the name; then the stripped name counts, when it holds an "@" and no whitespace."""
+    name, address = _address(raw.get("from"))
+    if address is not None and address.startswith("/") and name is not None:
+        stripped = name.strip()
+        if "@" in stripped and not any(c.isspace() for c in stripped):
+            return stripped
+    return address
+
+
 def _timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or len(value) > 40:
         return None
@@ -301,7 +314,7 @@ def graph_meta(raw: Mapping[str, object], ids: GraphFolderIds, own: frozenset[st
             answered=_answered(props.get(_LAST_VERB)),
             flagged=isinstance(flag, dict) and flag.get("flagStatus") == "flagged",
         ),
-        direction=direction_of(in_sent=folder == "sent", from_address=_address(raw.get("from"))[1], own=own),
+        direction=direction_of(in_sent=folder == "sent", from_address=_sender_for_direction(raw), own=own),
         message_id=message_id,
         in_reply_to=bare_message_id(props.get(_IN_REPLY_TO)),
         references=tuple(references[-MAX_REFERENCES:]),
@@ -1214,7 +1227,7 @@ class GraphMailbox:
             received_at=_timestamp(raw.get("receivedDateTime")),
             sent_at=_timestamp(raw.get("sentDateTime")),
             message_id=bare_message_id((_str(raw.get("internetMessageId")) or "")[:MAX_HEADER_BYTES] or None),
-            from_address=_address(raw.get("from"))[1],
+            from_address=_sender_for_direction(raw),  # a legacy-DN own item is not newer incoming (T17)
         )
 
     def _with_thread(self, run: _StatusRun, status: MessageStatus) -> MessageStatus:
