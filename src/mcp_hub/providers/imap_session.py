@@ -190,6 +190,19 @@ class ImapSession:
         self._map: FolderMap | None = None
         self._listed = False
         self._selected: str | None = None
+        self._degraded_left: int | None = None  # item_degraded lines this call may still log; None: no cap
+
+    def cap_degraded_logs(self, limit: int) -> None:
+        """At most `limit` item_degraded lines for the rest of this call (SR6, `get_message_status`)."""
+        self._degraded_left = limit
+
+    def log_skipped(self, ref: MessageRef, exc: Exception) -> None:
+        """`log_message_skipped` for a mail message, within the cap of `cap_degraded_logs`."""
+        if self._degraded_left is not None:
+            if self._degraded_left <= 0:
+                return
+            self._degraded_left -= 1
+        log_message_skipped(ref, "mail", exc)
 
     @property
     def inbox(self) -> FolderEntry:
@@ -436,9 +449,7 @@ class ImapSession:
                         continue
                     received = _aware(row.get(b"INTERNALDATE"))
                     if received is None:  # S-p: dropped like a non-match, never a lasting upstream_timeout
-                        log_message_skipped(
-                            MessageRef(self.account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
-                        )
+                        self.log_skipped(MessageRef(self.account, entry.raw_name, validity, uid), MissingInternalDate())
                         continue
                     copy = FoundCopy(
                         entry,

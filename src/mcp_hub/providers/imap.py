@@ -20,6 +20,7 @@ import imapclient
 from imapclient.exceptions import LoginError
 
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
+from mcp_hub.providers import imap_status
 from mcp_hub.providers.base import (
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
@@ -358,7 +359,14 @@ class ImapMailbox:
         )
 
     def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]:
-        raise ProviderError("upstream_error", "NotImplemented")  # replaced in T8
+        """One status per target, in order (spec 080 §5.2). `imap_status` keeps what it read on a soft stop; a stop
+        that reaches this level (at LOGIN or the CAPABILITY after it) makes every entry incomplete_search (IR2)."""
+        wanted = list(targets)
+        return self._run(
+            lambda session: imap_status.message_status(session, wanted, soft_check=self._soft_check),
+            deadline,
+            on_soft_stop=lambda: imap_status.soft_stopped(wanted),
+        )
 
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail:
         """By `id` (D75 binding) or by `ref` (the location step); a Graph id is foreign here."""
