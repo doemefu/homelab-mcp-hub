@@ -54,7 +54,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 
 ## Agent Team
 
-Project agents in `.claude/agents/`: `architect` (contract first), `implementer`, `reviewer`, `plan-reviewer` (Phase 3), `doc-auditor` (Phase 6), `documenter`, `devops` (read-only cluster checks).
+Project agents in `.claude/agents/`: `architect` (contract first), `implementer`, `reviewer`, `plan-reviewer` (Phase 3), `doc-auditor` (Phase 6), `documenter`, `devops` (read-only cluster checks). Domain advisors for plan and final reviews of mail and tool work, run as a named team that messages each other: `imap-advisor`, `graph-advisor`, `mailformat-advisor`, `security-advisor`, `tooldesign-advisor`.
 
 ## Process & Conventions
 
