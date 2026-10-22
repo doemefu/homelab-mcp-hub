@@ -32,9 +32,12 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 - Background status check for IMAP and CalDAV accounts (`HUB_STATUS_CHECK_ENABLED`, `HUB_HEALTH_CHECK_INTERVAL_SECONDS`), feeding `list_accounts`.
 - CalDAV integration tests against Radicale in the `providers` job.
 - Token store and `mcp-hub login` for Graph accounts (inert until the token-store keys and the `outlook` account exist): refresh tokens AES-256-GCM-encrypted in PostgreSQL (`psycopg[binary]` 3.3.6) with key ids derived from the key, built-in migrations, a row-locked rotation that commits before a new token is used, a Microsoft identity client for the device-code and refresh grants (one call deadline, capped streamed answers, no redirects), the `mcp-hub` wrapper in the image, and a PostgreSQL 17 container for the provider tests.
-- Microsoft Graph mail adapter for `outlook` (`list_unread`, `get_message`, background status check): inbox only, `GET` only to `graph.microsoft.com:443`, no redirects, `@odata.nextLink` never followed (first page only), uncompressed answers capped at 1 MiB (lists) and 2 MiB (one message, with a preview fallback above it), one 20 s deadline per call including a token refresh, Graph message ids (kind `g`, folder `inbox`) bound to the inbox through `parentFolderId`; 401 → one refresh and retry, then `auth_expired`; 403 → `upstream_error` (`Forbidden`); 429/503 → a per-account back-off from `Retry-After`. Registry rules for Graph accounts: scope pattern, `offline_access` required, per-provider scope allow-lists, token-store files counted as credentials.
+- Microsoft Graph mail adapter for `outlook` (`list_unread`, `get_message`, background status check): inbox only, `GET` only to `graph.microsoft.com:443`, no redirects, `@odata.nextLink` never followed (first page only), uncompressed answers capped at 1 MiB (lists) and 2 MiB (one message, with a preview fallback above it), one 20 s deadline per call including a token refresh, Graph message ids (kind `g`, folder `inbox`) bound to the inbox through `parentFolderId` (widened by D75, see Changed); 401 → one refresh and retry, then `auth_expired`; 403 → `upstream_error` (`Forbidden`); 429/503 → a per-account back-off from `Retry-After`. Registry rules for Graph accounts: scope pattern, `offline_access` required, per-provider scope allow-lists, token-store files counted as credentials.
 - `mcp-hub check-registry [--expect-sha <12 hex>]`: validates the mounted `accounts.json` with the server's own model before a pod deletion, proves its freshness by hash, checks credential files, the token key and the key id of each Graph account's stored token.
 - `scripts/memory_probe.py --scenario graph-message [--with-calendar <scenario>]`: memory gate for the Graph caps next to the worst calendar call.
+- Folder model and per-account folder map (spec 080 §5.5, D75; IMAP `LIST`, Graph well-known folder ids; in memory, at most 1 h) with the INFO event `folder_map_refreshed`.
+- Read-only IMAP guard (`providers/imap_guard.py`): an allowlist of commands and arguments in front of every IMAP call; all SEARCH criteria are built by `providers/imap_search.py` (D74).
+- `scripts/imap_probe.py`: owner-run, read-only probe of IMAP folder roles and search timings (O35).
 
 ### Changed
 
@@ -45,6 +48,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Fixed
 
+- `scripts/memory_probe.py --scenario graph-message` runs again with the folder map of `get_message`.
 - IMAP searches on `Message-ID`, `In-Reply-To` and `References` send the id as the bracketed token `"<id>"`: iCloud matches only whole tokens, so `get_message` by `ref` found nothing there (O35).
 - Undecodable header bytes no longer make `list_unread` fail for every account; one message that cannot be processed degrades only its own entry.
 - `get_message` stays within `HUB_RESPONSE_BUDGET_CHARS` when recipients and attachments alone exceed it.
