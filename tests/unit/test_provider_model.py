@@ -263,6 +263,7 @@ def _overview(count: int = 1) -> ThreadOverview:
         {"outcome": "ok", "overview": _overview()},
         {"outcome": "ok", "members": tuple(_member(i) for i in range(1, 52)), "overview": _overview(51)},
         {"outcome": "ok", "members": (_member(1), _member(2)), "overview": _overview(1)},  # count < members
+        {"outcome": "ok", "members": (_member(1),), "overview": _overview(2)},  # members missing, not truncated (P11)
         {"outcome": "ok", "members": (_member(1, T0 + timedelta(seconds=1)), _member(2, T0)), "overview": _overview(2)},
         {"outcome": "source_mismatch", "members": (_member(1),)},
         {"outcome": "source_mismatch", "overview": _overview()},

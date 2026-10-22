@@ -59,13 +59,13 @@ def test_participants_of_direction_rules() -> None:
     to = ("Bob@example.org", "me@example.org")
     cc = ("carol@example.org", "BOB@example.org", "Me+List@Example.org", "")
     incoming = participants_of("incoming", "Alice@Example.org", to, cc, OWN)
-    assert incoming == ("alice@example.org", "carol@example.org", "bob@example.org")  # From + Cc, header order
+    assert incoming == ("Alice@Example.org", "carol@example.org", "BOB@example.org")  # From + Cc, header order
     outgoing = participants_of("outgoing", "me@example.org", to, cc, OWN)
-    assert outgoing == ("bob@example.org", "carol@example.org")  # To + Cc; own and +tag removed, deduped
+    assert outgoing == ("Bob@example.org", "carol@example.org")  # To + Cc; own and +tag removed, first spelling kept
     assert participants_of("incoming", None, to, (), OWN) == ()
     assert participants_of("incoming", "me+news@example.org", (), (), OWN) == ()
-    assert participants_of("outgoing", "x@example.org", ("a@example.org", "A@EXAMPLE.ORG"), (), frozenset()) == (
-        "a@example.org",
+    assert participants_of("outgoing", "x@example.org", ("A@Example.org", "a@example.org"), (), frozenset()) == (
+        "A@Example.org",
     )
 
 
@@ -75,12 +75,12 @@ def test_merge_copies_earliest_then_rank_outgoing_if_any_in_sent() -> None:
         1, at=T0, folder="sent", message_id="m1@example.org", direction="outgoing", participants=("b@example.test",)
     )
     inbox = copy(2, at=T0 + timedelta(seconds=3), message_id="m1@example.org", participants=("c@example.test",))
-    [merged] = merge_copies([inbox, sent])
+    [merged] = merge_copies([inbox, sent], include_trash=True)
     assert merged.summary.ref == sent.summary.ref  # earliest received_at wins (S-e)
     assert (merged.in_sent, merged.summary.meta.direction) == (True, "outgoing")
     # The inbox copy wins when it is earlier, but the member stays outgoing with the sent copy's participants.
     early = replace(inbox, summary=replace(inbox.summary, received_at=T0 - timedelta(seconds=1)))
-    [merged] = merge_copies([sent, early])
+    [merged] = merge_copies([sent, early], include_trash=True)
     assert merged.summary.ref == early.summary.ref
     assert merged.summary.meta.folder == "inbox"
     assert (merged.in_sent, merged.summary.meta.direction) == (True, "outgoing")
@@ -89,15 +89,16 @@ def test_merge_copies_earliest_then_rank_outgoing_if_any_in_sent() -> None:
     trash = copy(3, folder="trash", message_id="m2@example.org")
     archive = copy(4, folder="archive", message_id="m2@example.org")
     other = copy(5, folder="other", message_id="m2@example.org")
-    [merged] = merge_copies([other, trash, archive])
+    [merged] = merge_copies([other, trash, archive], include_trash=True)
     assert merged.summary.ref == archive.summary.ref
     assert (merged.in_sent, merged.summary.meta.direction) == (False, "incoming")
     # Without a valid Message-ID copies are never merged.
     loose = [copy(6), copy(7), copy(8, message_id="not valid"), copy(9, message_id="not valid")]
-    assert [c.summary.ref for c in merge_copies(loose)] == [c.summary.ref for c in loose]
+    assert [c.summary.ref for c in merge_copies(loose, include_trash=True)] == [c.summary.ref for c in loose]
     # Distinct Message-IDs stay apart, in first-seen order.
     a, b = copy(10, message_id="a@example.org"), copy(11, message_id="b@example.org")
-    assert merge_copies([b, a, replace(b, summary=replace(b.summary, received_at=T0 + timedelta(1)))]) == [b, a]
+    later_b = replace(b, summary=replace(b.summary, received_at=T0 + timedelta(1)))
+    assert merge_copies([b, a, later_b], include_trash=True) == [b, a]
 
 
 def test_merge_keeps_seed_flag_when_other_copy_wins() -> None:
@@ -106,19 +107,42 @@ def test_merge_keeps_seed_flag_when_other_copy_wins() -> None:
     seed = replace(seed, linked_by="server")
     earlier = copy(2, at=T0, message_id="s@example.org", linked_by="subject")
     for order in ([seed, earlier], [earlier, seed]):
-        [merged] = merge_copies(order)
+        [merged] = merge_copies(order, include_trash=False)
         assert merged.summary.ref == earlier.summary.ref
         assert (merged.seed, merged.linked_by) == (True, "server")
     # G-R3: a seed copy in trash plus a non-trash copy, without include_trash, is one member: the earliest copy.
     in_trash = copy(3, at=T0, folder="trash", message_id="t@example.org", seed=True)
     later = copy(4, at=T0 + timedelta(seconds=1), message_id="t@example.org")
-    counted, kept, capped = choose_members(merge_copies([later, in_trash]), include_trash=False)
+    counted, kept, capped = choose_members(merge_copies([later, in_trash], include_trash=False), include_trash=False)
     assert [m.summary.ref for m in kept] == [m.summary.ref for m in counted] == [in_trash.summary.ref]
     assert (kept[0].seed, capped) == (True, False)
     in_trash_later = replace(in_trash, summary=replace(in_trash.summary, received_at=T0 + timedelta(seconds=5)))
-    _, kept, _ = choose_members(merge_copies([in_trash_later, later]), include_trash=False)
+    _, kept, _ = choose_members(merge_copies([in_trash_later, later], include_trash=False), include_trash=False)
     assert [m.summary.ref for m in kept] == [later.summary.ref]
     assert kept[0].seed
+
+
+def test_merge_drops_non_seed_trash_copies_first() -> None:
+    # F-2: without include_trash, an earlier trash copy of a non-seed message does not hide its inbox copy.
+    in_trash = copy(1, at=T0, folder="trash", message_id="n@example.org")
+    in_inbox = copy(2, at=T0 + timedelta(seconds=4), message_id="n@example.org")
+    counted, kept, _ = choose_members(merge_copies([in_trash, in_inbox], include_trash=False), include_trash=False)
+    assert [m.summary.ref for m in counted] == [m.summary.ref for m in kept] == [in_inbox.summary.ref]
+    assert kept[0].summary.meta.folder == "inbox"
+    counted, _, _ = choose_members(merge_copies([in_trash, in_inbox], include_trash=True), include_trash=True)
+    assert [m.summary.ref for m in counted] == [in_trash.summary.ref]  # S-e: the earliest copy
+    # A message only in trash, with or without a Message-ID, is gone; a seed group keeps all its copies (G-R3).
+    only_trash = [copy(3, folder="trash", message_id="o@example.org"), copy(4, folder="trash")]
+    assert merge_copies(only_trash, include_trash=False) == []
+    assert len(merge_copies(only_trash, include_trash=True)) == 2
+    seed_group = [copy(5, at=T0, folder="trash", message_id="s@example.org"), copy(6, message_id="s@example.org")]
+    seed_group[1] = replace(
+        seed_group[1], seed=True, summary=replace(seed_group[1].summary, received_at=T0 + timedelta(1))
+    )
+    [merged] = merge_copies(seed_group, include_trash=False)
+    assert (merged.summary.ref, merged.seed) == (seed_group[0].summary.ref, True)
+    lone_seed = copy(7, folder="trash", seed=True)
+    assert merge_copies([lone_seed], include_trash=False) == [lone_seed]
 
 
 def test_choose_members_newest_fifty_seed_from_trash() -> None:
@@ -176,10 +200,10 @@ def test_overview_participants_newest_first_twenty() -> None:
     assert list(view.participants) == expected
     assert len(view.participants) == MAX_PARTICIPANTS
     mixed = [
-        copy(1, participants=("A@example.org",)),
-        copy(2, at=T0 + timedelta(seconds=1), participants=("a@example.org",)),
+        copy(1, participants=("ann@example.org",)),
+        copy(2, at=T0 + timedelta(seconds=1), participants=("Ann@Example.org",)),
     ]
-    assert overview(mixed, exact=True).participants == ("a@example.org",)
+    assert overview(mixed, exact=True).participants == ("Ann@Example.org",)  # the newest spelling, casefold dedupe
 
 
 QUOTED = (

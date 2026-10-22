@@ -47,13 +47,14 @@ class ThreadCopy:
 def participants_of(
     direction: Direction, from_address: str | None, to: Sequence[str], cc: Sequence[str], own: frozenset[str]
 ) -> tuple[str, ...]:
-    """Incoming: From and Cc; outgoing: To and Cc (§5.5). Lower-cased, deduplicated in header order, own removed."""
+    """Incoming: From and Cc; outgoing: To and Cc (§5.5), own removed, in header order. Deduplicated by casefold, the
+    first spelling kept; so compare casefolded values (the shared-participant check of the subject round, Q3)."""
     addresses = (from_address, *cc) if direction == "incoming" else (*to, *cc)
-    seen: dict[str, None] = {}
+    seen: dict[str, str] = {}
     for address in addresses:
         if address and not is_own(address, own):
-            seen.setdefault(address.lower())
-    return tuple(seen)
+            seen.setdefault(address.casefold(), address)
+    return tuple(seen.values())
 
 
 def _rank(item: ThreadCopy) -> tuple[datetime, int, str]:
@@ -79,24 +80,41 @@ def _merged(group: Sequence[ThreadCopy]) -> ThreadCopy:
     )
 
 
-def merge_copies(copies: Iterable[ThreadCopy]) -> list[ThreadCopy]:
+def _in_trash(item: ThreadCopy) -> bool:
+    return item.summary.meta.folder == "trash"
+
+
+def merge_copies(copies: Iterable[ThreadCopy], *, include_trash: bool) -> list[ThreadCopy]:
     """One entry per valid Message-ID, in first-seen order; copies without one are never merged (A-mf3).
 
-    The merged entry is the S-e copy; it is the seed, with the seed's `linked_by`, when any copy is the seed (MF-P3,
-    G-R3), and `in_sent` when any copy is."""
+    Without `include_trash`, the trash copies of every message but the seed are dropped first, so a later copy
+    outside trash stays a member; a group holding the seed keeps all its copies (SG3, G-R3). The merged entry is the
+    S-e copy; it is the seed, with the seed's `linked_by`, when any copy is the seed (MF-P3), and `in_sent` when any
+    copy is."""
     entries: list[str | ThreadCopy] = []
     groups: dict[str, list[ThreadCopy]] = {}
     for item in copies:
         message_id = valid_message_id(item.summary.meta.message_id)
         if message_id is None:
-            entries.append(item)
+            if include_trash or item.seed or not _in_trash(item):
+                entries.append(item)
             continue
         group = groups.get(message_id)
         if group is None:
             group = groups[message_id] = []
             entries.append(message_id)
         group.append(item)
-    return [_merged(groups[entry]) if isinstance(entry, str) else entry for entry in entries]
+    merged: list[ThreadCopy] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            merged.append(entry)
+            continue
+        group = groups[entry]
+        if not include_trash and not any(item.seed for item in group):
+            group = [item for item in group if not _in_trash(item)]
+        if group:
+            merged.append(_merged(group))
+    return merged
 
 
 def choose_members(
@@ -105,9 +123,10 @@ def choose_members(
     """(counted, kept, capped): every member after the trash filter, the newest 50 of them, and whether the cap cut.
 
     Both lists are oldest first by (received_at, k). The seed is exempt from the trash filter only; the cap applies
-    to it like any member (SG3, Q1, P6)."""
+    to it like any member (SG3, Q1, P6). `merge_copies` already dropped the trash copies; the filter here only
+    guards input that did not pass through it."""
     counted = sorted(
-        (item for item in merged if include_trash or item.seed or item.summary.meta.folder != "trash"),
+        (item for item in merged if include_trash or item.seed or not _in_trash(item)),
         key=lambda item: order_key(item.summary),
     )
     return counted, counted[-MAX_THREAD_MESSAGES:], len(counted) > MAX_THREAD_MESSAGES
@@ -124,7 +143,7 @@ def overview(counted: Sequence[ThreadCopy], *, exact: bool) -> ThreadOverview:
     for address in (address for item in newest_first for address in item.participants):
         if len(participants) == MAX_PARTICIPANTS:
             break
-        participants.setdefault(address.lower(), address)
+        participants.setdefault(address.casefold(), address)
     return ThreadOverview(
         message_count=len(newest_first),
         message_count_exact=exact,

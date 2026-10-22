@@ -290,6 +290,8 @@ class ThreadPage:
             raise ValueError("an ok page holds 1 to 50 members")
         if self.overview.message_count < len(self.members):
             raise ValueError("message_count is below the number of members")
+        if self.overview.message_count > len(self.members) and not self.truncated:
+            raise ValueError("message_count above the members needs truncated")  # the cap (P11)
         keys = [order_key(member.summary) for member in self.members]
         if keys != sorted(keys):
             raise ValueError("members are not oldest first")
