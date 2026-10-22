@@ -17,6 +17,7 @@ Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` 
 | WP5c | CalDAV adapter, `get_events`, background status check | Done |
 | WP5d | Metrics and alerts on the internal port (`search_mail` moved to WP13d) | Planned |
 | WP13a | Mail history part a: `list_messages`, extended summaries, cursors, `get_message` by ref (story #44) | In review |
+| WP13b | Mail history part b: `get_message_status` (story #44) | In review |
 | WP9 | Microsoft Graph for `outlook`: token store, `mcp-hub login`, mail adapter, `mcp-hub check-registry` | Done (live) |
 | WP8 | `gmail` mail over the existing IMAP adapter (registry entry and credentials only) | Done (live) |
 | WP10 | Further accounts (calendar feed) | Planned |
