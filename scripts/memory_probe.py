@@ -17,6 +17,7 @@ Run inside the production image with the repository mounted read-only (see CONTR
       -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \\
       python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
     ... python /work/scripts/memory_probe.py --scenario graph-message --with-calendar nonascii-240k --calls 10
+    ... python /work/scripts/memory_probe.py --scenario status --accounts 2 --parallel 2 --calls 10
 """
 
 import argparse
@@ -27,6 +28,7 @@ import json
 import resource
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -376,28 +378,50 @@ async def one_call(ctx: HubContext, calendar: bool, graph: bool) -> list[str]:
     return notes
 
 
+def status_worker(worker: tuple[FakeImapServer, list[StableRef]], notes: list[str], index: int) -> None:
+    notes[index] = status_call(*worker)
+
+
+def status_main(args: argparse.Namespace) -> None:
+    """`--accounts` IMAP accounts times `--parallel` concurrent calls each, one worker thread per call with its own fake
+    server; `--with-calendar` runs get_events for `--accounts` calendar accounts at the same time."""
+    workers = [status_server() for _ in range(args.accounts * args.parallel)]
+    ctx = context(args.accounts, args.with_calendar, args.calendars) if args.with_calendar else None
+    gc.collect()
+    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+    print(f"baseline peak RSS {base:.0f} MiB (imports and fakes)", flush=True)
+    for call in range(1, args.calls + 1):
+        cpu = time.process_time()
+        notes = [""] * len(workers)
+        threads = [threading.Thread(target=status_worker, args=(workers[i], notes, i)) for i in range(len(workers))]
+        for thread in threads:
+            thread.start()
+        extra = asyncio.run(one_call(ctx, True, False)) if ctx else []
+        for thread in threads:
+            thread.join()
+        gc.collect()
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+        print(
+            f"call {call}: peak RSS {peak:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, "
+            f"{len(workers)} status workers: {notes[0]}" + "".join(f"; {n}" for n in extra),
+            flush=True,
+        )
+    print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status"], required=True)
     parser.add_argument(
-        "--with-calendar", choices=sorted(SCENARIOS), help="calendar scenario run next to graph-message"
+        "--with-calendar", choices=sorted(SCENARIOS), help="calendar scenario run next to graph-message or status"
     )
     parser.add_argument("--accounts", type=int, default=1)
+    parser.add_argument("--parallel", type=int, default=1, help="concurrent status calls per account")
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
     args = parser.parse_args()
     if args.scenario == "status":
-        server, targets = status_server()
-        gc.collect()
-        base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
-        print(f"baseline peak RSS {base:.0f} MiB (imports and fake)", flush=True)
-        for call in range(1, args.calls + 1):
-            cpu = time.process_time()
-            note = status_call(server, targets)
-            gc.collect()
-            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
-            print(f"call {call}: peak RSS {peak:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, {note}", flush=True)
-        print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
+        status_main(args)
         return
     graph = args.scenario == "graph-message"
     if args.with_calendar and not graph:

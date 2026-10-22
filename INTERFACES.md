@@ -266,6 +266,7 @@ Calendar event **instances** overlapping the window, recurrences expanded, sorte
   | Worst passing objects: 999 overrides (1 MiB), 1,000 `RDATE` (1 MiB), 1,000 zone sub-components, 20 zones looked up in 9999 | 102 / 100 / 114 / 106 MiB | 1.2 / 0.7 / 5.3 / 8.2 s |
   | Refused time-zone rules (review F1 shape) | 105 MiB | 1.3 s |
   | Two accounts concurrently (information): non-ASCII 240 KB / 999 overrides / emoji zones | 165 / 127 / 256 MiB (the limit; no OOM kill) | 1.6 / 2.4 / 5.3 s |
+| `get_message_status` (hostile `--scenario status`: 500 hits per SEARCH, 8 KiB and 64 KiB headers), 2 IMAP accounts × 2 concurrent calls, 10 calls, 2026-10-22; baseline 85 MiB. Alone / with 2 concurrent `get_events` accounts (`nonascii-240k`, 5 calls) | 153 MiB (148) / 237 MiB (255); `oom_kill` 0; the second run is above the 230 MiB Graph gate | 17–18 / 21 s (4 workers, one CPU) |
 
   `MALLOC_ARENA_MAX=2` changed nothing measurable (119, 113 and 165 MiB).
 
