@@ -1,6 +1,6 @@
 """IMAP `get_message_status` (spec 080 §5.2 "Location, IMAP", §5.4, §6.5; WP13b T8, T9): the in-place check of `m`
 ids, the location step, the mapping to `MessageStatus` and the reply and thread lookups on servers other than Gmail
-(the Gmail lookups are T10)."""
+(the Gmail lookups: `test_imap_status_gmail.py`)."""
 
 import json
 import logging
@@ -1151,7 +1151,7 @@ def test_missing_header_item_marks_unchecked(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_gmail_sends_no_header_lookup() -> None:
-    """GMAIL_REPLY_HEADER_SEARCH is off (T0 P1): no In-Reply-To/References SEARCH on Gmail (its lookups are T10)."""
+    """GMAIL_REPLY_HEADER_SEARCH is off (T0 P1): no In-Reply-To/References SEARCH on Gmail (`_gmail_lookups`)."""
     assert imap_status.GMAIL_REPLY_HEADER_SEARCH is False
     server = gmail(all_mail=[msg(1, 60, "a", INBOX_L, message_id=f"<{MID}>")])
     [status] = run(server, [r(account="gmail")])

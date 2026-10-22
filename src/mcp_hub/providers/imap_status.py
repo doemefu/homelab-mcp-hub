@@ -1,6 +1,6 @@
 """IMAP `get_message_status` (spec 080 §5.2 "Location, IMAP", "Replies and thread, IMAP", §5.4, §6.5; WP13b): the
-in-place check of `m` ids, the location step, the mapping to `MessageStatus` and, on servers other than Gmail, the
-reply and thread lookups, inside one `ImapSession` (one connection, one deadline, D76).
+in-place check of `m` ids, the location step, the mapping to `MessageStatus` and the reply and thread lookups (by
+descendant headers, on Gmail by `X-GM-THRID`), inside one `ImapSession` (one connection, one deadline, D76).
 
 Read-only through the guard: EXAMINE, UID SEARCH and UID FETCH of FLAGS, INTERNALDATE, the Message-ID (and FROM)
 header item, the 64 KiB re-check item of the lookups and, on Gmail, X-GM-LABELS and X-GM-THRID. Nothing here is
@@ -10,6 +10,7 @@ import imaplib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from functools import partial
 from typing import Final
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, StableRef
@@ -36,14 +37,18 @@ from mcp_hub.providers.headers import (
 )
 from mcp_hub.providers.imap_guard import PASS_THROUGH, examine_name_ok
 from mcp_hub.providers.imap_search import (
+    GMAIL_SENT_LABEL_KEY,
     LOOKUP_BATCH_VALUES,
     HeaderField,
     criteria,
     header_or,
     or_batches,
     search_value_ok,
+    thrid_batches,
+    thrid_or,
 )
 from mcp_hub.providers.imap_session import (
+    _LABEL_SENT,
     FoundCopy,
     ImapSession,
     LocateResult,
@@ -77,6 +82,9 @@ SOFT_CHECK_ROWS: Final = 10  # fetched rows parsed between two soft checks (SR2:
 _LOOKUP_FIELDS: Final[tuple[HeaderField, ...]] = ("In-Reply-To", "References")
 _LOOKUP_ITEMS: Final = ("FLAGS", "INTERNALDATE", DESCENDANT_HEADER_ITEM)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "archive", "trash")
+_GMAIL_REPLY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", DESCENDANT_HEADER_ITEM)
+_GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", DESCENDANT_HEADER_ITEM)
+_GMAIL_NO_ALL_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "trash", "sent")  # Gmail without `\All` (E-im3a)
 _TOKEN_ENDS: Final = (b" ", b"\t", b"\r", b"\n", b",", b">")  # where a msg-id token can end
 _SEEN: Final = b"\\seen"
 _ANSWERED: Final = b"\\answered"
@@ -113,11 +121,11 @@ def message_status(
        Message-ID header; E-im4, C4). A copy with a valid Message-ID seeds step 2; one without is final (A-td4).
     2. The location step for the refs and the seeded Message-IDs, each Message-ID once (`ImapSession.locate`).
     3. The mapping: found (also when uncertain, C3), gone after a complete search, else incomplete_search.
-    4. On servers other than Gmail, the reply and thread lookups of the found Message-IDs (`_lookups`); the Gmail
-       lookups are T10, so `thread_checked` stays false there for now.
+    4. The reply and thread lookups of the found copies: by descendant headers (`_lookups`), on Gmail by thread id
+       (`_gmail_lookups`).
 
     A soft stop in step 1 keeps the copies read (found) and leaves every other entry incomplete_search, without a
-    location (IR2, P7); one in step 2 is handled by `locate`, one in step 4 by `_lookups`. A BAD, an abort, a lost
+    location (IR2, P7); one in step 2 is handled by `locate`, one in step 4 by the lookups. A BAD, an abort, a lost
     connection or the hard deadline propagate: the account fails (B7)."""
     session.cap_degraded_logs(MAX_DEGRADED_LOGS)
     in_place = _InPlace()
@@ -126,8 +134,10 @@ def message_status(
     except SoftStop:
         return [_after_soft_stop(session, index, in_place) for index in range(len(targets))]
     result = _locate(session, targets, in_place, soft_check)
-    statuses = [_answer(session, index, target, in_place, result) for index, target in enumerate(targets)]
-    return statuses if session.gmail else _lookups(session, statuses, soft_check)
+    answers = [_answer(session, index, target, in_place, result) for index, target in enumerate(targets)]
+    if session.gmail:
+        return _gmail_lookups(session, answers, soft_check)
+    return _lookups(session, [status for status, _ in answers], soft_check)
 
 
 # --- step 1: `m` ids in place ------------------------------------------------------------------------------------
@@ -299,24 +309,25 @@ def _unsearched(wanted: Sequence[str], seeds: Mapping[str, FoundCopy]) -> Locate
 
 def _answer(
     session: ImapSession, index: int, target: StatusTarget, state: _InPlace, result: LocateResult
-) -> MessageStatus:
+) -> tuple[MessageStatus, FoundCopy | None]:
+    """The status of one target and the copy it reports, if found (the Gmail lookups need its thread id)."""
     if index in state.decided:
-        return state.decided[index]
+        return state.decided[index], None
     if isinstance(target, StableRef):
         message_id = target.message_id
     elif index in state.copies:
         copy, seeded = state.copies[index]
         if seeded is None:  # no valid Message-ID: the copy read in place is final (A-td4)
-            return _found(session, copy, None, in_sent=False)
+            return _found(session, copy, None, in_sent=False), copy
         message_id = seeded
     else:
-        return status_unknown("incomplete_search")  # defensive: every `m` id was decided or read in step 1
+        return status_unknown("incomplete_search"), None  # defensive: every `m` id was decided or read in step 1
     found = result.found.get(message_id)
     if found is not None:  # also when uncertain: the copy reported may not be the earliest (C3)
-        return _found(session, found, message_id, in_sent=message_id in result.in_sent)
+        return _found(session, found, message_id, in_sent=message_id in result.in_sent), found
     if message_id in result.incomplete:
-        return status_unknown("incomplete_search")
-    return MessageStatus("gone")
+        return status_unknown("incomplete_search"), None
+    return MessageStatus("gone"), None
 
 
 def _found(session: ImapSession, copy: FoundCopy, message_id: str | None, *, in_sent: bool) -> MessageStatus:
@@ -521,6 +532,46 @@ def _open(session: ImapSession, entry: FolderEntry) -> bool:
     return True
 
 
+def _rows(
+    session: ImapSession,
+    search: bytes,
+    items: Sequence[str],
+    *,
+    newest: bool,
+    miss: Callable[[], None],
+    soft_check: Callable[[], None],
+) -> Iterator[dict[bytes, object]]:
+    """One lookup `UID SEARCH` in the selected mailbox, then the rows of at most MAX_LOOKUP_HITS hits (the lowest
+    UIDs, or the highest when `newest`; E-im2, C9), fetched in chunks of LOOKUP_FETCH_UIDS, each consumed before the
+    next is fetched. `miss` marks the search's refs incomplete: a SEARCH NO (B7), the hit cap or a lost row."""
+    try:
+        found = session.search(search)
+    except PASS_THROUGH:
+        raise
+    except imaplib.IMAP4.error as exc:
+        if not _answered_no(exc):
+            raise
+        miss()
+        return
+    uids = sorted(set(found))
+    if len(uids) > MAX_LOOKUP_HITS:
+        uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
+        miss()
+    chunks = session.fetch_chunks(uids, items, chunk=LOOKUP_FETCH_UIDS)
+    for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
+        part = uids[start : start + LOOKUP_FETCH_UIDS]
+        if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
+            miss()
+        for count, uid in enumerate(part):
+            if count and count % SOFT_CHECK_ROWS == 0:
+                soft_check()  # SR2: at most 10 blocks of 64 KiB parsed between two checks; parsing sends no command
+            row = rows.get(uid)
+            if row is not None:
+                yield row
+        if start + LOOKUP_FETCH_UIDS < len(uids):
+            soft_check()  # per chunk; the guard checks again before the next FETCH
+
+
 def _hits(
     session: ImapSession,
     batch: list[str],
@@ -530,37 +581,14 @@ def _hits(
     miss: Callable[[Iterable[str]], None],
     soft_check: Callable[[], None],
 ) -> Iterator[_Hit]:
-    """One `UID SEARCH NOT DRAFT` with OR-ed `HEADER In-Reply-To` and `HEADER References` keys for `batch` in the
-    selected mailbox, then the re-check of at most MAX_LOOKUP_HITS hits (the lowest UIDs, or the highest when
-    `newest`; E-im2, C9), fetched in chunks of LOOKUP_FETCH_UIDS, each reduced before the next is fetched. `miss`
-    marks the batch ids whose answer is incomplete: a SEARCH NO (B7), the hit cap, a lost row or a failed re-check."""
-    try:
-        found = session.search(criteria(b"NOT DRAFT", header_or(_LOOKUP_FIELDS, batch)))
-    except PASS_THROUGH:
-        raise
-    except imaplib.IMAP4.error as exc:
-        if not _answered_no(exc):
-            raise
-        miss(batch)
-        return
-    uids = sorted(set(found))
-    if len(uids) > MAX_LOOKUP_HITS:
-        uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
-        miss(batch)
+    """The `_rows` of one `UID SEARCH NOT DRAFT` with OR-ed `HEADER In-Reply-To` and `HEADER References` keys for
+    `batch`, each re-checked (`_recheck`). `miss` marks the batch ids whose answer is incomplete: a SEARCH NO (B7),
+    the hit cap, a lost row or a failed re-check."""
     wanted = frozenset(batch)
-    chunks = session.fetch_chunks(uids, _LOOKUP_ITEMS, chunk=LOOKUP_FETCH_UIDS)
-    for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
-        part = uids[start : start + LOOKUP_FETCH_UIDS]
-        if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
-            miss(batch)
-        for count, uid in enumerate(part):
-            if count and count % SOFT_CHECK_ROWS == 0:
-                soft_check()  # SR2: at most 10 blocks of 64 KiB parsed between two checks; parsing sends no command
-            row = rows.get(uid)
-            if row is not None and (hit := _recheck(row, wanted, thread=thread, miss=miss)) is not None:
-                yield hit
-        if start + LOOKUP_FETCH_UIDS < len(uids):
-            soft_check()  # per chunk; the guard checks again before the next FETCH
+    search = criteria(b"NOT DRAFT", header_or(_LOOKUP_FIELDS, batch))
+    for row in _rows(session, search, _LOOKUP_ITEMS, newest=newest, miss=partial(miss, batch), soft_check=soft_check):
+        if (hit := _recheck(row, wanted, thread=thread, miss=miss)) is not None:
+            yield hit
 
 
 def _recheck(
@@ -612,4 +640,293 @@ def _with_facts(status: MessageStatus, state: _Lookups) -> MessageStatus:
         reply_message_id=None if first is None else first[1],
         newer_incoming_at=max(newer, default=None),
         thread_checked=x in state.done and x not in state.unchecked,
+    )
+
+
+# --- step 4, Gmail: reply and thread lookups by X-GM-THRID -------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GmailRef:
+    """A found Gmail copy taking part in the lookups."""
+
+    message_id: str | None  # valid Message-ID; without one the reply part is unchecked (E-mf3)
+    thread_id: int | None  # X-GM-THRID of the copy; without one the thread part is unchecked (T0)
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _Member:
+    """A thread member that passed the re-check."""
+
+    thread_id: int
+    sent: bool  # labelled `\\Sent`, or read in the `\\Sent` mailbox (Gmail without `\\All`)
+    message_id: str | None  # valid bare Message-ID, else None
+    from_address: str | None  # None when absent or cut
+    received_at: datetime
+    referenced: frozenset[str]  # its thread's ref Message-IDs among its In-Reply-To and References tokens
+    unseen: frozenset[str] = frozenset()  # ref Message-IDs a cut `\\Sent` member may hide (C9)
+
+
+@dataclass(frozen=True, slots=True)
+class _GmailLookups:
+    """What the Gmail lookups learned, by target position."""
+
+    unchecked: set[int] = field(default_factory=set)  # a lookup covering the ref did not complete or could not run
+    done: set[int] = field(default_factory=set)  # every thread batch covering the ref was answered (or failed)
+    first_reply: dict[int, tuple[datetime, str | None]] = field(default_factory=dict)  # earliest reply, its id
+    sent_ids: set[str] = field(default_factory=set)  # Message-IDs of every `\\Sent` hit and member (MF4)
+    newer: dict[int, dict[str, datetime]] = field(default_factory=dict)  # incoming member id → earliest copy (MF6)
+    newer_without_id: dict[int, datetime] = field(default_factory=dict)  # newest later member without a Message-ID
+
+
+def _gmail_lookups(
+    session: ImapSession,
+    answers: Sequence[tuple[MessageStatus, FoundCopy | None]],
+    soft_check: Callable[[], None],
+) -> list[MessageStatus]:
+    """§5.2 "Replies and thread, IMAP" on Gmail (T0 rulings, A-mf5): the thread lookup by the copies' X-GM-THRID in
+    All Mail, inside the EXAMINE the location left (E-im5 Design A); without `\\All` in `\\Sent`, INBOX and
+    `\\Trash`, where `thread_checked` stays true although archived mail is not seen (E-im3a). A reply is
+    `\\Answered`, or a `\\Sent` member of the thread whose re-checked In-Reply-To/References name the copy's
+    Message-ID; the All Mail header search runs only while GMAIL_REPLY_HEADER_SEARCH is on (T0 P1: off), and E-mf1
+    reply keys are not used. Residual (R35): a reply whose subject the owner changed lands in a new Gmail thread and
+    is seen only through `\\Answered`.
+
+    A copy without a valid Message-ID keeps the thread lookup (E-mf3); one without a valid X-GM-THRID gets none.
+    Both stay unchecked. A NO marks the refs of its batch (or, for an EXAMINE, of the mailbox) unchecked; the folder
+    map is never rebuilt here (§6.5, TS1). A soft stop keeps what was read and leaves every ref whose thread batches
+    did not all finish unchecked (IR2)."""
+    statuses = [status for status, _ in answers]
+    refs = {
+        index: _GmailRef(status.found.message_id, copy.thread_id, copy.received_at)
+        for index, (status, copy) in enumerate(answers)
+        if status.found is not None and copy is not None
+    }
+    if not refs:
+        return statuses
+    state = _GmailLookups()
+    try:
+        folder_map = session.folder_map()  # the location's map: never rebuilt here (Sec16, TS1)
+        all_mail = folder_map.role("all")
+        reply_box: FolderEntry | None = all_mail
+        if all_mail is not None:
+            folders = [all_mail]
+        else:
+            reply_box = folder_map.role("sent")
+            folders = sorted(  # the mailbox still selected first: one EXAMINE fewer (Design A)
+                (entry for role in _GMAIL_NO_ALL_ROLES if (entry := folder_map.role(role)) is not None),
+                key=lambda entry: entry.raw_name != session.selected,
+            )
+        if reply_box is None:
+            state.unchecked.update(refs)  # no `\\Sent` mailbox: replies cannot be read (C5)
+        elif GMAIL_REPLY_HEADER_SEARCH:
+            _gmail_reply_step(session, reply_box, refs, state, soft_check)
+        _gmail_thread_step(session, folders, refs, state, soft_check)
+    except SoftStop:
+        pass  # positives read stay; refs not in `done` are unchecked
+    return [_with_gmail_facts(status, refs.get(index), index, state) for index, status in enumerate(statuses)]
+
+
+def _gmail_reply_step(
+    session: ImapSession,
+    entry: FolderEntry,
+    refs: Mapping[int, _GmailRef],
+    state: _GmailLookups,
+    soft_check: Callable[[], None],
+) -> None:
+    """Option 17 (a), only while GMAIL_REPLY_HEADER_SEARCH is on: OR-ed `HEADER In-Reply-To` and `HEADER References`
+    keys, in All Mail with the label key `\\Sent` (never the `sent` list filter, IMAP M2), in the `\\Sent` mailbox
+    without it. A `\\Sent` hit is a reply to every batch id it names, except a hit whose Message-ID is that id (C8)."""
+    by_id: dict[str, list[int]] = {}
+    for index, ref in refs.items():
+        if ref.message_id is not None:
+            if search_value_ok(ref.message_id):
+                by_id.setdefault(ref.message_id, []).append(index)
+            else:
+                state.unchecked.add(index)  # a refused value is never searched (D80)
+
+    def miss(ids: Iterable[str]) -> None:
+        state.unchecked.update(index for value in ids for index in by_id[value])
+
+    if not by_id:
+        return
+    if not _open(session, entry):
+        miss(by_id)
+        return
+    label = (GMAIL_SENT_LABEL_KEY,) if entry.role == "all" else ()
+    for batch in or_batches(list(by_id), _LOOKUP_FIELDS, max_values=LOOKUP_BATCH_VALUES):
+        wanted = frozenset(batch)
+        search = criteria(b"NOT DRAFT", *label, header_or(_LOOKUP_FIELDS, batch))
+        for row in _rows(
+            session, search, _GMAIL_REPLY_ITEMS, newest=False, miss=partial(miss, batch), soft_check=soft_check
+        ):
+            if not _gmail_sent(entry, row) or (hit := _recheck(row, wanted, thread=False, miss=miss)) is None:
+                continue
+            if hit.message_id is not None:
+                state.sent_ids.add(hit.message_id)
+            for x in hit.referenced:
+                if hit.message_id != x:
+                    for index in by_id[x]:
+                        _gmail_reply(state, index, hit.received_at, hit.message_id)
+
+
+def _gmail_thread_step(
+    session: ImapSession,
+    folders: Sequence[FolderEntry],
+    refs: Mapping[int, _GmailRef],
+    state: _GmailLookups,
+    soft_check: Callable[[], None],
+) -> None:
+    """Per `thrid_batches` batch (at most 20 keys, P5) one `UID SEARCH NOT DRAFT` with OR-ed `X-GM-THRID` keys in
+    every lookup mailbox, without SINCE (Option 13), each mailbox opened once. Refs that share a thread id share its
+    key; `_count_member` decides per ref."""
+    by_thread: dict[int, list[int]] = {}
+    for index, ref in refs.items():
+        if ref.thread_id is not None:
+            by_thread.setdefault(ref.thread_id, []).append(index)
+    wanted = {
+        thread_id: frozenset(x for index in indexes if (x := refs[index].message_id) is not None)
+        for thread_id, indexes in by_thread.items()
+    }
+    batches = thrid_batches(list(by_thread))
+    if not batches:
+        return  # no copy with a thread id: no mailbox is opened
+    left = {index: len(folders) for indexes in by_thread.values() for index in indexes}
+
+    def miss(thread_ids: Iterable[int]) -> None:
+        state.unchecked.update(index for thread_id in thread_ids for index in by_thread[thread_id])
+
+    for entry in folders:
+        opened = _open(session, entry)
+        for batch in batches:
+            if opened:
+                search = criteria(b"NOT DRAFT", thrid_or(batch))
+                for row in _rows(
+                    session, search, _GMAIL_MEMBER_ITEMS, newest=True, miss=partial(miss, batch), soft_check=soft_check
+                ):
+                    member = _gmail_member(entry, row, frozenset(batch), wanted, miss)
+                    if member is None:
+                        continue
+                    indexes = by_thread[member.thread_id]
+                    state.unchecked.update(index for index in indexes if refs[index].message_id in member.unseen)
+                    _count_member(session, state, member, indexes, refs)
+            else:
+                miss(batch)
+            for thread_id in batch:
+                for index in by_thread[thread_id]:
+                    left[index] -= 1
+                    if not left[index]:
+                        state.done.add(index)
+
+
+def _gmail_member(
+    entry: FolderEntry,
+    row: dict[bytes, object],
+    batch: frozenset[int],
+    wanted: Mapping[int, frozenset[str]],
+    miss: Callable[[Iterable[int]], None],
+) -> _Member | None:
+    """The member as its fetched row shows it. Drafts (flag or label, any case; S1) and rows without INTERNALDATE are
+    dropped; a row without a valid X-GM-THRID cannot be attributed (its batch is unchecked), and one of a thread
+    outside the batch is no member. A missing header item leaves its thread unchecked. A block cut at 64 KiB (A-sec3,
+    C9) is matched without its last token (T4-3); the member is not used, and its thread unchecked, when its
+    Message-ID did not end before the cut (it may be a copy of X or of a reply) or, for an incoming member, its From
+    (MF-R4). A cut `\\Sent` member reports the ref Message-IDs it does not show as `unseen`."""
+    if _is_draft(row):
+        return None
+    received = _aware(row.get(b"INTERNALDATE"))
+    if received is None:
+        return None
+    thread_id = _thread_id(row)
+    if thread_id is None:
+        miss(batch)
+        return None
+    if thread_id not in batch:
+        return None
+    block = header_bytes(row)
+    if not block:
+        miss((thread_id,))
+        return None
+    sent = _gmail_sent(entry, row)
+    ids = wanted[thread_id]
+    if len(block) < DESCENDANT_HEADER_BYTES:
+        parsed = parse_descendant(block, ids)
+        return _Member(thread_id, sent, parsed.message_id, parsed.from_address, received, parsed.referenced)
+    parsed = parse_descendant(block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1], ids)
+    sender = parsed.from_address if _field_complete(block, b"from") else None
+    complete_id = parsed.message_id is not None and _field_complete(block, b"message-id")
+    if not complete_id or (not sent and sender is None):
+        miss((thread_id,))
+        return None
+    unseen = ids - parsed.referenced if sent else frozenset()
+    return _Member(thread_id, sent, parsed.message_id, sender, received, parsed.referenced, unseen)
+
+
+def _gmail_sent(entry: FolderEntry, row: dict[bytes, object]) -> bool:
+    return entry.role == "sent" or _LABEL_SENT in _labels(row)
+
+
+def _count_member(
+    session: ImapSession,
+    state: _GmailLookups,
+    member: _Member,
+    indexes: Sequence[int],
+    refs: Mapping[int, _GmailRef],
+) -> None:
+    """A `\\Sent` member is a reply to every ref of its thread whose Message-ID it names, except a copy of that ref
+    (C8, A-mf5 (b)); it is never newer incoming, nor is a copy of its Message-ID (MF4: applied at the end, since a
+    `\\Sent` copy may come later in the answer). An incoming member counts for a ref unless it is a copy of the ref
+    (MF3) or its From is own (MF-R1); §5.2 keeps the strict time comparison on Gmail (E-mf2), applied to the
+    earliest copy of each Message-ID (MF6)."""
+    if member.sent:
+        if member.message_id is not None:
+            state.sent_ids.add(member.message_id)
+        for index in indexes:
+            x = refs[index].message_id
+            if x is not None and x in member.referenced and member.message_id != x:
+                _gmail_reply(state, index, member.received_at, member.message_id)
+        return
+    if direction_of(in_sent=False, from_address=member.from_address, own=session.own) == "outgoing":
+        return
+    for index in indexes:
+        ref = refs[index]
+        if member.message_id is None:
+            newest = state.newer_without_id.get(index)
+            if member.received_at > ref.received_at and (newest is None or member.received_at > newest):
+                state.newer_without_id[index] = member.received_at
+        elif member.message_id != ref.message_id:
+            copies = state.newer.setdefault(index, {})
+            seen = copies.get(member.message_id)
+            if seen is None or member.received_at < seen:
+                copies[member.message_id] = member.received_at
+
+
+def _gmail_reply(state: _GmailLookups, index: int, received_at: datetime, message_id: str | None) -> None:
+    first = state.first_reply.get(index)
+    if first is None or received_at < first[0]:
+        state.first_reply[index] = (received_at, message_id)
+
+
+def _with_gmail_facts(status: MessageStatus, ref: _GmailRef | None, index: int, state: _GmailLookups) -> MessageStatus:
+    """The lookup fields of a found copy. A counted Message-ID is newer only when it is no `\\Sent` message (MF4) and
+    its earliest copy came strictly after the ref's (MF6); `thread_checked` needs a Message-ID and every batch
+    covering the ref completed (a ref without a thread id has no batch, so it is never done)."""
+    if ref is None:
+        return status
+    first = state.first_reply.get(index)
+    newer = [
+        at
+        for message_id, at in state.newer.get(index, {}).items()
+        if message_id not in state.sent_ids and at > ref.received_at
+    ]
+    if index in state.newer_without_id:
+        newer.append(state.newer_without_id[index])
+    checked = ref.message_id is not None and index in state.done
+    return replace(
+        status,
+        reply_at=None if first is None else first[0],
+        reply_message_id=None if first is None else first[1],
+        newer_incoming_at=max(newer, default=None),
+        thread_checked=checked and index not in state.unchecked,
     )
