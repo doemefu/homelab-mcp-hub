@@ -239,6 +239,12 @@ def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
     )
 
 
+def trim_cut(block: bytes) -> bytes:
+    """A header block cut at its byte cap, up to and including its last token end, so that a token the cut shortened
+    (`a@x` of `a@x.y`) is dropped before parsing; empty when no token ended."""
+    return block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1]
+
+
 def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
     """Which `wanted` Message-IDs a reply/thread hit names: whole msg-id tokens of its `In-Reply-To` (the first 100)
     and `References`, compared exactly, so `<a@x.y>` never counts for `a@x` and ids in comments or quoted strings are
@@ -249,7 +255,7 @@ def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
         return Descendant(None, None, frozenset(), False)
     cut = len(raw) >= DESCENDANT_HEADER_BYTES
     if cut:
-        raw = raw[: max(raw.rfind(end) for end in _TOKEN_ENDS) + 1]
+        raw = trim_cut(raw)
     items = _header_items(raw)
     in_reply_to = _first(items, "in-reply-to")
     references = _first(items, "references")

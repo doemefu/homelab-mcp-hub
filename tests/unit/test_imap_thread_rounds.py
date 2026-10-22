@@ -383,10 +383,28 @@ def test_iteration_one_includes_seed_id() -> None:
 
 def test_outlook_follow_up_finds_request_upward() -> None:
     """E-mf4: from the follow-up B (In-Reply-To and References name only A), the owner's reply A (in sent, its
-    References name R) and the request R are found: R through an upward Message-ID key."""
+    References name R) and the request R are found: R through an upward Message-ID key. A sibling C of A (a reply to
+    R) then joins downward from R; an unrelated message whose References share no id with the thread does not
+    (MF-T8-2)."""
     server = icloud(
         inbox=[
             msg(1, 120, "request", message_id="<r@example.test>"),
+            msg(
+                4,
+                45,
+                "sibling",
+                message_id="<c@example.test>",
+                in_reply_to="<r@example.test>",
+                references="<r@example.test>",
+            ),
+            msg(
+                5,
+                40,
+                "unrelated",
+                message_id="<u@example.test>",
+                in_reply_to="<u-root@example.test>",
+                references="<u-root@example.test>",
+            ),
             msg(
                 3,
                 30,
@@ -409,11 +427,73 @@ def test_outlook_follow_up_finds_request_upward() -> None:
         ],
     )
     page = thread(server, seed=seed_in_inbox(server, 3))
-    assert subjects(page) == ["request", "answer", "follow-up"]
-    assert [m.summary.meta.direction for m in page.members] == ["incoming", "outgoing", "incoming"]
+    assert subjects(page) == ["request", "answer", "sibling", "follow-up"]
+    assert [m.summary.meta.direction for m in page.members] == ["incoming", "outgoing", "incoming", "incoming"]
     upward = [c for _, c in round_two(server) if ("Message-ID", "r@example.test") in keys(c)]
     assert upward
     assert exact(page) is True
+
+
+def test_up_keys_are_irt_and_root_only() -> None:
+    """A-mf4, MF-T8-2: a new member adds at most two upward keys, its In-Reply-To and its References root, never the
+    ids in the middle of its References. Iteration 1 also carries the seed's own id upward (MF-T8-1)."""
+    server = icloud(
+        inbox=[
+            msg(
+                2,
+                30,
+                "seed",
+                message_id="<s@example.test>",
+                in_reply_to="<m@example.test>",
+                references="<m@example.test>",
+            ),
+        ],
+        archive=[
+            msg(
+                1,
+                60,
+                "member",
+                message_id="<m@example.test>",
+                in_reply_to="<p@example.test>",
+                references="<r@example.test> <m1@example.test> <m2@example.test> <p@example.test>",
+            ),
+        ],
+    )
+    page = thread(server, seed=seed_in_inbox(server, 2))
+    assert subjects(page) == ["member", "seed"]
+    first = round_two(server)[0][1]
+    assert {value for field, value in keys(first) if field == "Message-ID"} == {
+        "s@example.test",
+        "p@example.test",
+        "r@example.test",
+    }
+    upward = {value for _, c in round_two(server) for field, value in keys(c) if field == "Message-ID"}
+    assert not upward & {"m1@example.test", "m2@example.test"}
+
+
+def test_self_cc_seed_with_sent_copy_is_outgoing() -> None:
+    """MF-T8-1, A-mf3, MF-R2: the seed's own id is an upward key in iteration 1, so a copy of the seed in sent is
+    found and merged: one member, outgoing, even without an own-addresses file."""
+    seed = {
+        "subject": "seed",
+        "sender": OWNER,
+        "to": "Peer <peer@example.test>",
+        "cc": OWNER,
+        "message_id": "<s@example.test>",
+        "in_reply_to": "<r@example.test>",
+        "references": "<r@example.test>",
+    }
+    server = icloud(
+        inbox=[msg(1, 90, "request", message_id="<r@example.test>"), msg(2, 30, **seed)],
+        sent=[msg(7, 30, **seed)],
+    )
+    page = thread(server, seed=seed_in_inbox(server, 2), box=mailbox(server, own=frozenset()))
+    assert subjects(page) == ["request", "seed"]
+    assert count(page) == 2
+    assert page.members[1].summary.ref == MessageRef("icloud", "INBOX", 7, 2)  # S-e: the inbox copy on a tie
+    assert page.members[1].summary.meta.direction == "outgoing"
+    assert page.overview is not None
+    assert page.overview.last_direction == "outgoing"
 
 
 def test_overflow_keys_go_to_further_searches() -> None:
@@ -495,7 +575,8 @@ def test_three_iterations_cap_marks_inexact() -> None:
 
 
 def test_reserve_spent_stops_new_iteration() -> None:
-    """G2: no round starts once the 12 s reserve is spent; the keys left make the list partial (P11)."""
+    """G2, T8-1: once the 12 s reserve is spent no further folder is opened and no SEARCH sent, also inside a
+    round that has started; the list is partial (P11)."""
     server = icloud(inbox=_chain(3))
     original = server.run
 
@@ -507,7 +588,8 @@ def test_reserve_spent_stops_new_iteration() -> None:
     server.run = run  # type: ignore[method-assign]
     page = thread(server, seed=seed_in_inbox(server))
     assert subjects(page) == ["m0"]
-    assert len(round_one(server)) == 4  # a round that started finishes
+    assert len(round_one(server)) == 1  # round (1) stops before its next folder
+    assert examined(server) == ["INBOX"]  # not even opened: the body pass reads the seed in INBOX, still selected
     assert round_two(server) == []
     assert page.truncated is True
     assert exact(page) is False
@@ -518,6 +600,33 @@ def test_reserve_spent_stops_new_iteration() -> None:
     assert searched(server) == []
     assert page.truncated is True
     assert exact(page) is False
+
+
+def test_reserve_checked_before_every_folder_and_search() -> None:
+    """T8-1, G2: a large iteration stops at the reserve before its next folder or SEARCH, so the body pass keeps its
+    time: the newest members still get their bodies; the list is truncated and not exact."""
+    replies = [
+        msg(
+            i,
+            1000 - i,
+            f"reply {i}",
+            message_id=f"<m{i}@example.test>",
+            in_reply_to="<r@example.test>",
+            references="<r@example.test>",
+        )
+        for i in range(2, 602)
+    ]
+    server = icloud(inbox=[msg(1, 2000, "root", message_id="<r@example.test>"), *replies])
+    server.step_seconds = 0.15  # every command costs 150 ms on the fake clock
+    page = thread(server, seed=seed_in_inbox(server))
+    assert page.outcome == "ok"
+    assert page.truncated is True
+    assert exact(page) is False
+    newest = page.members[-1]
+    assert newest.summary.subject == "reply 601"
+    assert newest.body.omitted is False
+    assert newest.body.text == "Hello"
+    assert len(round_two(server)) < 4 * 26  # iteration 1 (501 downward keys) did not run to its end
 
 
 def _spent(server: FakeImapServer, seconds: float) -> CallDeadline:

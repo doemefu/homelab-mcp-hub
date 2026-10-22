@@ -32,13 +32,13 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import FolderEntry, FolderRole
 from mcp_hub.providers.headers import (
-    _TOKEN_ENDS,
     SUMMARY_HEADER_ITEM,
     ParsedHeaders,
     header_bytes,
     imap_thread_key,
     parse_descendant,
     parse_summary_headers,
+    trim_cut,
     valid_message_id,
 )
 from mcp_hub.providers.imap_guard import PASS_THROUGH
@@ -447,7 +447,7 @@ def _headers(
     does not parse degrades only this copy (SC1)."""
     block = header_bytes(row)
     try:
-        parsed = parse_summary_headers(_trimmed(block) if len(block) >= MAX_HEADER_BYTES else block)
+        parsed = parse_summary_headers(trim_cut(block) if len(block) >= MAX_HEADER_BYTES else block)
     except PASS_THROUGH:
         raise
     except Exception as exc:
@@ -463,12 +463,6 @@ def _headers(
             state.inexact()
         parsed = replace(parsed, message_id=known_id, root=known_id if own_root else parsed.root)
     return parsed
-
-
-def _trimmed(block: bytes) -> bytes:
-    """A block cut at its cap up to its last token end, as `parse_descendant` trims it (T0), so that an unbracketed
-    References tail cut inside an id never yields a shortened id."""
-    return block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1]
 
 
 # --- header rounds (other servers) -----------------------------------------------------------------------------
@@ -493,11 +487,12 @@ def _header_members(
     reserve_spent: Callable[[], bool],
 ) -> None:
     """Option 3a: round (1) from `ids` (the seed's, or a `headers` key's root), then round (2) with the upward
-    closure. No round starts once the reserve is spent (G2); keys left then make the list partial. A SoftStop
-    propagates with the copies read so far kept in `state`."""
+    closure. No folder is opened and no SEARCH sent once the reserve is spent (G2, T8-1): the rounds stop there, the
+    list is partial, and the body pass keeps its time. A SoftStop propagates with the copies read so far kept in
+    `state`."""
     rounds = _Rounds()
-    _round_one(session, ids, query, state, rounds, seed, soft_check, reserve_spent)
-    _round_two(session, query, state, rounds, seed, soft_check, reserve_spent)
+    if _round_one(session, ids, query, state, rounds, seed, soft_check, reserve_spent):
+        _round_two(session, query, state, rounds, seed, soft_check, reserve_spent)
 
 
 def _round_one(
@@ -509,23 +504,22 @@ def _round_one(
     seed: _Seed | None,
     soft_check: Callable[[], None],
     reserve_spent: Callable[[], bool],
-) -> None:
+) -> bool:
     """Round (1): per folder one `UID SEARCH NOT DRAFT` with OR-ed `HEADER Message-ID` and `HEADER References` keys
     for the ids (two commands only when the 4,000-byte cap splits them). A hit is a member when its Message-ID is one
-    of the ids or its In-Reply-To or References name one."""
+    of the ids or its In-Reply-To or References name one. False when the reserve stopped it."""
     rounds.up.update(ids)
     values = _searchable(ids, state)
     if not values:
-        return
-    if reserve_spent():
-        state.partial()
-        return
+        return True
     searches = [
         criteria(b"NOT DRAFT", header_or(_ROUND_ONE_FIELDS, batch))
         for batch in or_batches(values, _ROUND_ONE_FIELDS, max_values=THREAD_SEED_IDS)
     ]
     wanted = frozenset(ids)
-    _round_pass(session, searches, query, state, seed, soft_check, ancestors=wanted, linked_to=wanted)
+    return _round_pass(
+        session, searches, query, state, seed, soft_check, reserve_spent, ancestors=wanted, linked_to=wanted
+    )
 
 
 def _round_two(
@@ -540,20 +534,21 @@ def _round_two(
     """Round (2), at most MAX_ROUND_ITERATIONS iterations: downward `HEADER In-Reply-To` keys for the Message-IDs of
     the members new in the last pass (iteration 1: every member so far, the seed included; A-mf2), then upward
     `HEADER Message-ID` keys for each new member's In-Reply-To and References root not yet a member or searched
-    (E-mf4, A-mf4), batched by `mixed_batches` (downward first; overflow goes to further SEARCHes, A-mf4a). A hit is
-    a member when its Message-ID is an upward key or its In-Reply-To or References name a downward key. Ends when an
-    iteration adds no member; keys left after the last iteration are never searched (not exact), keys left at the
-    reserve make the list partial (G2, P11)."""
+    (E-mf4, A-mf4) and, in iteration 1, the seed's own id, so that its copies are found and merged (MF-T8-1),
+    batched by `mixed_batches` (downward first; overflow goes to further SEARCHes, A-mf4a). A hit is a member when
+    its Message-ID is an upward key or its In-Reply-To or References name a downward key. Ends when an iteration adds
+    no member; keys left after the last iteration are never searched (not exact); the reserve stops the rounds
+    (`_round_pass`)."""
     new = list(state.copies)
     for iteration in range(MAX_ROUND_ITERATIONS + 1):
         down, up = _round_keys(new, state, rounds)
+        if iteration == 0:
+            own = [mid for copy in new if copy.seed and (mid := valid_message_id(copy.summary.meta.message_id))]
+            up = [*(mid for mid in own if mid not in rounds.up and mid not in up), *up]
         if not down and not up:
             return
         if iteration == MAX_ROUND_ITERATIONS:
             state.inexact()
-            return
-        if reserve_spent():
-            state.partial()
             return
         rounds.down.update(down)
         rounds.up.update(up)
@@ -565,9 +560,18 @@ def _round_two(
             criteria(b"NOT DRAFT", mixed_or(batch)) for batch in mixed_batches(keys, max_keys=THREAD_ROUND_KEYS)
         ]
         before = len(state.copies)
-        _round_pass(
-            session, searches, query, state, seed, soft_check, ancestors=frozenset(up), linked_to=frozenset(down)
-        )
+        if not _round_pass(
+            session,
+            searches,
+            query,
+            state,
+            seed,
+            soft_check,
+            reserve_spent,
+            ancestors=frozenset(up),
+            linked_to=frozenset(down),
+        ):
+            return
         new = state.copies[before:]
         if not new:
             return
@@ -618,19 +622,28 @@ def _round_pass(
     state: _Members,
     seed: _Seed | None,
     soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
     *,
     ancestors: frozenset[str],
     linked_to: frozenset[str],
-) -> None:
+) -> bool:
     """The searches in every round folder. A folder that cannot be opened (EXAMINE NO, no UIDVALIDITY) or a SEARCH
     answered NO leaves the list partial (G4, P1); the hit cap leaves it inexact (P11). Locations read already are not
-    fetched again (P7); each other hit is re-checked (`_linked`) and drafts are dropped (S1)."""
+    fetched again (P7); each other hit is re-checked (`_linked`) and drafts are dropped (S1). Before every folder and
+    every SEARCH the reserve is checked: once spent, the pass stops, the list is partial, and False is returned
+    (G2, T8-1), since one iteration can hold dozens of SEARCHes per folder."""
     for entry in _round_folders(session, query):
+        if reserve_spent():
+            state.partial()
+            return False
         if not _open(session, entry) or session.selected_uidvalidity is None:
             state.partial()
             continue
         validity = session.selected_uidvalidity
         for search in searches:
+            if reserve_spent():
+                state.partial()
+                return False
             read = {uid for name, value, uid in state.seen if name == entry.raw_name and value == validity}
             rows = _uid_rows(
                 session,
@@ -648,6 +661,7 @@ def _round_pass(
                 ref = MessageRef(session.account, entry.raw_name, validity, uid)
                 if _linked(session, ref, row, state, ancestors=ancestors, linked_to=linked_to):
                     _add(session, entry, validity, uid, row, state, linked_by="headers", seed=seed)
+    return True
 
 
 def _linked(
