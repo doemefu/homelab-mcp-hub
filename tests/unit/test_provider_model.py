@@ -20,7 +20,6 @@ from mcp_hub.providers.base import (
     MailMeta,
     MailSummary,
     MessageStatus,
-    ProviderError,
     ThreadBody,
     ThreadMember,
     ThreadOverview,
@@ -33,8 +32,6 @@ from mcp_hub.providers.base import (
     placeholder_summary,
     status_unknown,
 )
-from mcp_hub.providers.deadline import CallDeadline
-from mcp_hub.providers.imap import ImapMailbox
 from tests.support.logcapture import Capture
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -301,22 +298,3 @@ def test_thread_overview_invariants(kwargs: dict[str, object]) -> None:
     } | kwargs
     with pytest.raises(ValueError, match=r"message_count|participants"):
         ThreadOverview(**values)  # type: ignore[arg-type]  # deliberately invalid combinations
-
-
-def test_get_thread_stubs_are_not_implemented_yet() -> None:
-    def refuse(*args: object, **kwargs: object) -> object:
-        raise AssertionError("no connection expected")
-
-    query = ThreadQuery(seed=StableRef("icloud", "a@example.org"), key=None, include_trash=True, max_chars=2000)
-    imap = ImapMailbox(
-        "icloud",
-        host="h",
-        port=993,
-        folder="INBOX",
-        username="u",
-        password="p",
-        client_factory=refuse,  # type: ignore[arg-type]
-    )
-    with pytest.raises(ProviderError) as info:  # GraphMailbox.get_thread: tests/unit/test_graph_thread.py (T11)
-        imap.get_thread(query, CallDeadline.start())
-    assert (info.value.code, info.value.cause) == ("upstream_error", "NotImplemented")

@@ -14,13 +14,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from email.message import Message
 from email.parser import BytesHeaderParser
+from functools import partial
 from typing import Final, Literal, cast
 
 import imapclient
 from imapclient.exceptions import LoginError
 
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
-from mcp_hub.providers import imap_status
+from mcp_hub.providers import imap_status, imap_thread
 from mcp_hub.providers.base import (
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
@@ -92,6 +93,7 @@ from mcp_hub.providers.imap_session import (
     _is_draft,
     _labels,
 )
+from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
@@ -130,6 +132,12 @@ def _provider_error(exc: Exception) -> ProviderError:
     if isinstance(exc, OSError):  # DNS, connect, TLS (ssl.SSLError is an OSError)
         return ProviderError("unreachable", cause)
     return ProviderError("upstream_error", cause)  # IMAPClientError, a BAD answer, a refused command, anything else
+
+
+def _check_soft(deadline: CallDeadline) -> None:
+    """The soft limit of the call's own deadline (P9: new code never reads the stored `_deadline`)."""
+    if deadline.soft_expired():
+        raise SoftStop
 
 
 def _addresses(message: Message, name: str) -> list[tuple[str, str]]:
@@ -378,7 +386,19 @@ class ImapMailbox:
         return self._run(lambda session: self._get_message(session, own_target), deadline)
 
     def get_thread(self, query: ThreadQuery, deadline: CallDeadline) -> ThreadPage:
-        raise ProviderError("upstream_error", "NotImplemented")  # WP13c T7
+        """Spec 080 §5.2 `get_thread` (`imap_thread`); a Graph id is foreign here. No `on_soft_stop`: a stop at LOGIN or
+        before the seed was read is `upstream_timeout`; later stops are answered inside `imap_thread`."""
+        if query.seed is not None and not isinstance(query.seed, (MessageRef, StableRef)):
+            raise ProviderError("not_found", "ForeignRef")
+        return self._run(
+            lambda session: imap_thread.get_thread(
+                session,
+                query,
+                soft_check=partial(_check_soft, deadline),
+                reserve_spent=lambda: deadline.elapsed() > BODY_RESERVE_SECONDS,
+            ),
+            deadline,
+        )
 
     # --- list_messages -----------------------------------------------------------------------------------------
 
