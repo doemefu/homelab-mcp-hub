@@ -242,8 +242,9 @@ def _sender_for_direction(raw: Mapping[str, object]) -> str | None:
 
 
 def _participant(name: str | None, address: str | None) -> str | None:
-    """A participant address (§5.5): a DN ("/O=...") becomes its plain-address name or is dropped (gr-G4)."""
-    if address is not None and _DN_ADDRESS.match(address):
+    """A participant address (§5.5): a DN ("/O=...") or any other value that is not a plain address becomes the
+    name of a strict legacy DN or is dropped (gr-G4), so a participant is always an address."""
+    if address is not None and (_DN_ADDRESS.match(address) or not _PLAIN_ADDRESS.fullmatch(address.strip())):
         return _legacy_dn_name(name, address)
     return address
 

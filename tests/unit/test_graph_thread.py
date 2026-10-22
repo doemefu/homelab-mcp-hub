@@ -551,6 +551,51 @@ def test_unauthorized_in_single_read_refreshes() -> None:
     assert logs.failures() == []  # a 401 is not a body failure
 
 
+def connect_error(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ConnectError("refused", request=request)
+
+
+@pytest.mark.parametrize(
+    ("make", "code", "cause"),
+    [
+        (lambda clock: status(403), "upstream_error", "Forbidden"),
+        (lambda clock: connect_error, "unreachable", "ConnectError"),
+        (lambda clock: advancing(clock, 21.0, read_ok), "upstream_timeout", "CallDeadline"),
+    ],
+    ids=["403", "transport", "hard-deadline"],
+)
+def test_account_failure_in_single_read_fails_the_call(
+    make: Callable[[FakeClock], Handler], code: str, cause: str
+) -> None:
+    # T11-1 (P6, GR1): an account-class failure in a body read is a tool error, never body_omitted.
+    clock = FakeClock()
+    tokens = FakeTokens()
+    items = newest_first(*(without(thread_item(n), "uniqueBody") for n in range(1, 4)))
+    server = Server(values(*items), reads={gid(3): make(clock)})
+    error = refused(server, clock=clock, tokens=tokens)
+    assert (error.code, error.cause) == (code, cause)
+    assert server.read_ids() == [gid(3)]  # no later read is sent
+    assert tokens.invalidated == (1 if code == "upstream_error" else 0)  # a 403 drops the token (D63)
+
+
+def test_forbidden_list_is_a_tool_error_without_fallback() -> None:
+    server = Server(status(403))
+    error = refused(server)
+    assert (error.code, error.cause) == ("upstream_error", "Forbidden")
+    assert len(server.lists()) == 1
+
+
+def test_unauthorized_on_the_list_refreshes_once() -> None:
+    # T11-3: a 401 on the list request refreshes the token once and runs the call again.
+    tokens = FakeTokens()
+    server = Server(sequence(status(401), values(thread_item(1))))
+    page = thread(server, tokens=tokens)
+    assert (tokens.issued, tokens.invalidated) == (2, 1)
+    assert len(server.lists()) == 2
+    assert [m.body.text for m in page.members] == ["Unique 1"]
+    assert server.requests[1].headers["authorization"] == "Bearer AT-SENTINEL-2"
+
+
 def test_get_only_no_next_link_and_at_most_twenty_reads() -> None:
     link = f"https://{graph.GRAPH_HOST}/v1.0/me/messages?$skiptoken=next"
     items = newest_first(*(without(thread_item(n), "uniqueBody") for n in range(1, 31)))
@@ -783,6 +828,9 @@ def test_legacy_dn_participants() -> None:
         ("Peer", "peer@example.test", "peer@example.test", "peer@example.test"),
         ("owner@example.test", "peer@example.test", "peer@example.test", "peer@example.test"),
         ("Peer", None, None, None),
+        ("Group", "/OU=X/CN=Y", "/OU=X/CN=Y", None),  # another X.500 form: never a participant (T11-2)
+        ("Group", "Some Group", "Some Group", None),  # display text without "@"
+        ("owner@example.test", "Some Group", "Some Group", None),  # only a strict DN maps to its name
     ],
 )
 def test_dn_predicate_shared_by_direction_and_participants(
