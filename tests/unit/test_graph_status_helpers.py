@@ -67,29 +67,47 @@ def test_filter_batches_values_and_chars() -> None:
     def render(vs: list[str]) -> str:
         return "x" * sum(len(v) for v in vs)
 
-    exact = filter_batches(["a" * 900, "b" * 900], render, max_chars=1800)
-    assert exact == [["a" * 900, "b" * 900]]
+    at_cap = filter_batches(["a" * 900, "b" * 900], render, max_chars=1800)
+    assert at_cap == [["a" * 900, "b" * 900]]
     assert len(filter_batches(["a" * 900, "b" * 901], render, max_chars=1800)) == 2
 
     ids = [f"{i}" * 300 for i in range(10)]
     batches = filter_batches(ids, gs.message_id_filter)
     assert sum(len(b) for b in batches) == 10
     assert all(gs.encoded_filter_length(gs.message_id_filter(b)) <= gs.MAX_FILTER_CHARS for b in batches if len(b) > 1)
-    huge = ["#" * 300]
-    assert filter_batches(huge, gs.message_id_filter) == [huge]
+    assert filter_batches(["#" * 300], gs.message_id_filter) == [["#" * 300]]
+
+
+def test_filter_batches_refuses_any_invalid_value() -> None:
+    for values in (["a'b", "ok"], ["ok", "a'b"], ["ok", "a b", "fine"]):
+        with pytest.raises(ValueError, match="refused"):
+            filter_batches(values, gs.message_id_filter)
+
+
+def test_percent_message_id_fits_the_cap_alone() -> None:
+    text = gs.message_id_filter(["%" * 300])
+    assert gs.encoded_filter_length(text) <= gs.MAX_FILTER_CHARS
+    assert filter_batches(["%" * 300], gs.message_id_filter) == [["%" * 300]]
+
+
+def test_thread_facts_newer_incoming_in_archive_trash_and_other() -> None:
+    for folder in ("archive", "trash", "other"):
+        later = T0 + timedelta(hours=1)
+        facts = _facts([_entry("a", folder, received=later, message_id="a@example.org")])
+        assert facts.newer_incoming_at == later
 
 
 def test_thread_facts_reply_strictly_after_receipt() -> None:
-    later = T0 + timedelta(seconds=1)
-    earlier = T0 + timedelta(seconds=5)
+    first_reply = T0 + timedelta(seconds=1)
+    late_reply = T0 + timedelta(hours=1, seconds=5)
     entries = [
         _entry("s0", "sent", sent=T0, message_id="r0@example.org"),
-        _entry("s2", "sent", sent=earlier + timedelta(hours=1), message_id="r2@example.org"),
-        _entry("s1", "sent", sent=later, message_id="r1@example.org"),
+        _entry("s2", "sent", sent=late_reply, message_id="r2@example.org"),
+        _entry("s1", "sent", sent=first_reply, message_id="r1@example.org"),
         _entry("s-before", "sent", sent=T0 - timedelta(seconds=1), message_id="r3@example.org"),
     ]
     facts = _facts(entries)
-    assert facts.reply_at == later
+    assert facts.reply_at == first_reply
     assert facts.reply_message_id == "r1@example.org"
     assert facts.complete
     assert _facts(entries[:1]).reply_at is None

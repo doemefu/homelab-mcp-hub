@@ -44,10 +44,16 @@ def filter_batches(
     max_values: int = MAX_FILTER_VALUES,
     max_chars: int = MAX_FILTER_CHARS,
 ) -> list[list[str]]:
-    """Unique values in input order; a batch closes before a value would break a cap, one value always fits alone."""
+    """Unique values in input order; a batch closes before a value would break a cap, one value always fits alone.
+
+    Every value is rendered alone first, so `render` refuses an invalid one (`ValueError`) before any batch is
+    built; callers validate per ref beforehand to mark only that ref."""
+    unique = list(dict.fromkeys(values))
+    for value in unique:
+        render([value])
     batches: list[list[str]] = []
     current: list[str] = []
-    for value in dict.fromkeys(values):
+    for value in unique:
         if current and (len(current) >= max_values or encoded_filter_length(render([*current, value])) > max_chars):
             batches.append(current)
             current = []
