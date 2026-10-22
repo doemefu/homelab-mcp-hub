@@ -19,6 +19,7 @@ from mcp_hub.providers.imap_search import (
     gmail_label_keys,
     header_or,
     imap_date,
+    msg_id_token,
     or_batches,
     quoted,
     search_value_ok,
@@ -103,22 +104,34 @@ def test_window_keys() -> None:
 
 def test_header_or_balanced_shapes() -> None:
     mid = ("Message-ID",)
-    assert header_or(mid, ["a@x"]) == b'HEADER Message-ID "a@x"'
-    assert header_or(mid, ["a@x", "b@x"]) == b'OR HEADER Message-ID "a@x" HEADER Message-ID "b@x"'
+    assert header_or(mid, ["a@x"]) == b'HEADER Message-ID "<a@x>"'
+    assert header_or(mid, ["a@x", "b@x"]) == b'OR HEADER Message-ID "<a@x>" HEADER Message-ID "<b@x>"'
     assert header_or(mid, ["a@x", "b@x", "c@x"]) == (
-        b'OR (OR HEADER Message-ID "a@x" HEADER Message-ID "b@x") HEADER Message-ID "c@x"'
+        b'OR (OR HEADER Message-ID "<a@x>" HEADER Message-ID "<b@x>") HEADER Message-ID "<c@x>"'
     )
     assert header_or(mid, ["a@x", "b@x", "c@x", "d@x"]) == (
-        b'OR (OR HEADER Message-ID "a@x" HEADER Message-ID "b@x") (OR HEADER Message-ID "c@x" HEADER Message-ID "d@x")'
+        b'OR (OR HEADER Message-ID "<a@x>" HEADER Message-ID "<b@x>") '
+        b'(OR HEADER Message-ID "<c@x>" HEADER Message-ID "<d@x>")'
     )
-    assert header_or(("In-Reply-To", "References"), ["a@x"]) == (b'OR HEADER In-Reply-To "a@x" HEADER References "a@x"')
+    assert header_or(("In-Reply-To", "References"), ["a@x"]) == (
+        b'OR HEADER In-Reply-To "<a@x>" HEADER References "<a@x>"'
+    )
 
 
 def test_header_or_leaf_order_is_value_by_value_then_field_by_field() -> None:
     assert header_or(("In-Reply-To", "References"), ["a@x", "b@x"]) == (
-        b'OR (OR HEADER In-Reply-To "a@x" HEADER References "a@x") '
-        b'(OR HEADER In-Reply-To "b@x" HEADER References "b@x")'
+        b'OR (OR HEADER In-Reply-To "<a@x>" HEADER References "<a@x>") '
+        b'(OR HEADER In-Reply-To "<b@x>" HEADER References "<b@x>")'
     )
+
+
+def test_msg_id_token_brackets_the_bare_value() -> None:
+    # O35: iCloud matches HEADER msg-id searches against whole `<id>` tokens; the bare value is checked, not escaped.
+    assert msg_id_token("a@x") == b'"<a@x>"'
+    assert msg_id_token("a(b)%*]{5}@x") == b'"<a(b)%*]{5}@x>"'
+    for value in ['a"b@x', "a\\b@x", "", "X-GM-RAW@x", "ä@x", "a\r\nb@x"]:
+        with pytest.raises(UnsafeSearchValue):
+            msg_id_token(value)
 
 
 def test_or_tree_depth_is_logarithmic() -> None:
@@ -196,6 +209,22 @@ def test_or_batches_byte_cap_is_exact_at_the_boundary() -> None:
             assert len(header_or(fields, batch)) <= cap
             if index + 1 < len(batches):
                 assert len(header_or(fields, [*batch, batches[index + 1][0]])) > cap
+
+
+def test_or_batches_count_the_brackets_of_each_value() -> None:
+    mid = ("Message-ID",)
+    assert len(header_or(mid, ["a@x"])) == 25  # `HEADER Message-ID "<a@x>"`: the bare form had 23
+    assert or_batches(["a@x"], mid, max_values=20, max_bytes=25) == [["a@x"]]
+    with pytest.raises(UnsafeSearchValue):
+        or_batches(["a@x"], mid, max_values=20, max_bytes=24)
+    assert len(header_or(mid, ["a@x", "b@x"])) == 54
+    assert or_batches(["a@x", "b@x"], mid, max_values=20, max_bytes=54) == [["a@x", "b@x"]]
+    assert or_batches(["a@x", "b@x"], mid, max_values=20, max_bytes=53) == [["a@x"], ["b@x"]]
+    both = ("In-Reply-To", "References")
+    assert len(header_or(both, ["a@x"])) == 55  # 26 + 25 + `OR ` and one space
+    assert or_batches(["a@x"], both, max_values=20, max_bytes=55) == [["a@x"]]
+    with pytest.raises(UnsafeSearchValue):
+        or_batches(["a@x"], both, max_values=20, max_bytes=54)
 
 
 def test_or_batches_edge_cases() -> None:
@@ -340,7 +369,7 @@ def test_criteria_joins_with_single_spaces() -> None:
     assert criteria(window, gmail_label_keys("sent")) == (
         b'NOT DRAFT SINCE 19-Oct-2026 X-GM-LABELS "\\\\Sent" NOT X-GM-LABELS "\\\\Inbox"'
     )
-    assert criteria(b"NOT DRAFT", header_or(("Message-ID",), ["a@x"])) == b'NOT DRAFT HEADER Message-ID "a@x"'
+    assert criteria(b"NOT DRAFT", header_or(("Message-ID",), ["a@x"])) == b'NOT DRAFT HEADER Message-ID "<a@x>"'
     assert criteria(b"NOT DRAFT") == b"NOT DRAFT"
 
 

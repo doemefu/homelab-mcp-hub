@@ -20,6 +20,8 @@ _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
 _PLAIN_ITEMS = {"FLAGS", "INTERNALDATE", "BODYSTRUCTURE", "X-GM-LABELS", "X-GM-THRID"}
 _PEEK = re.compile(r"BODY\.PEEK\[([^\]]*)\]<0\.(\d+)>")
 _TOKEN = re.compile(r'\s*(\(|\)|"(?:[^"\\]|\\.)*"|[^\s()"]+)')
+_MSGID_FIELDS = frozenset({"message-id", "in-reply-to", "references"})
+_MSGID_TOKEN = re.compile(r"<[^<>]*>")
 
 
 @dataclass
@@ -87,6 +89,8 @@ class FakeImapServer:
         self.commands: list[tuple[str, object]] = []
         self.fail: dict[str, Exception] = _FailMap()
         self.honour_not_draft = True
+        # iCloud-like (O35): HEADER on a msg-id field matches a whole bracketed `<id>` token, never a substring.
+        self.whole_msgid_tokens = False
         self.socket_timeouts: list[float] = []
         self.no, self.bad, self.abort = no, bad, abort
 
@@ -161,7 +165,7 @@ class FakeImapClient:
         self._server.run("UID SEARCH", criteria)
         folder = self._selected("UID SEARCH")
         tokens = [m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))]
-        pos, node = _parse_list(tokens, 0)
+        pos, node = _parse_list(tokens, 0, self._server.whole_msgid_tokens)
         if pos != len(tokens):
             raise bad("UID SEARCH")
         return [uid for uid, msg in sorted(folder.messages.items()) if node(msg, self._server.honour_not_draft)]
@@ -233,30 +237,30 @@ def _fill(row: dict[bytes, object], item: str, msg: FakeMessage) -> None:
 # --- mini evaluator of the hub's UID SEARCH grammar -------------------------------------------------------------
 
 
-def _parse_list(tokens: list[str], pos: int) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
+def _parse_list(tokens: list[str], pos: int, whole: bool) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     parts: list[Callable[[FakeMessage, bool], bool]] = []
     while pos < len(tokens) and tokens[pos] != ")":
-        pos, node = _parse_key(tokens, pos)
+        pos, node = _parse_key(tokens, pos, whole)
         parts.append(node)
     return pos, lambda msg, honour: all(p(msg, honour) for p in parts)
 
 
-def _parse_key(tokens: list[str], pos: int) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
+def _parse_key(tokens: list[str], pos: int, whole: bool) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     word = tokens[pos].upper()
     pos += 1
     if word == "(":
-        pos, node = _parse_list(tokens, pos)
+        pos, node = _parse_list(tokens, pos, whole)
         if pos >= len(tokens):
             raise bad("UID SEARCH")
         return pos + 1, node
     if word == "NOT":
         if pos < len(tokens) and tokens[pos].upper() == "DRAFT":
             return pos + 1, lambda msg, honour: not honour or b"\\Draft" not in msg.flags
-        pos, inner = _parse_key(tokens, pos)
+        pos, inner = _parse_key(tokens, pos, whole)
         return pos, lambda msg, honour: not inner(msg, honour)
     if word == "OR":
-        pos, left = _parse_key(tokens, pos)
-        pos, right = _parse_key(tokens, pos)
+        pos, left = _parse_key(tokens, pos, whole)
+        pos, right = _parse_key(tokens, pos, whole)
         return pos, lambda msg, honour: left(msg, honour) or right(msg, honour)
     if word == "UNSEEN":
         return pos, lambda msg, honour: b"\\Seen" not in msg.flags
@@ -273,10 +277,12 @@ def _parse_key(tokens: list[str], pos: int) -> tuple[int, Callable[[FakeMessage,
         return pos + 1, by_date
     if word == "HEADER":
         name, needle = tokens[pos], _unquote(tokens[pos + 1]).casefold()
+        tokens_only = whole and name.casefold() in _MSGID_FIELDS
 
         def by_header(msg: FakeMessage, honour: bool) -> bool:
             parsed = email.message_from_bytes(msg.headers or b"", policy=email.policy.compat32)
-            return needle in str(parsed.get(name, "")).casefold()
+            value = str(parsed.get(name, "")).casefold()
+            return needle in _MSGID_TOKEN.findall(value) if tokens_only else needle in value
 
         return pos + 2, by_header
     if word == "X-GM-LABELS":

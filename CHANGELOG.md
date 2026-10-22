@@ -44,6 +44,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Fixed
 
+- IMAP searches on `Message-ID`, `In-Reply-To` and `References` send the id as the bracketed token `"<id>"`: iCloud matches only whole tokens, so `get_message` by `ref` found nothing there (O35).
 - Undecodable header bytes no longer make `list_unread` fail for every account; one message that cannot be processed degrades only its own entry.
 - `get_message` stays within `HUB_RESPONSE_BUDGET_CHARS` when recipients and attachments alone exceed it.
 - HTML with many unclosed tags converts in linear time.

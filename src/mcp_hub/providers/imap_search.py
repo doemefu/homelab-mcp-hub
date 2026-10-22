@@ -4,6 +4,9 @@ Every value goes out as a hub-built quoted string; the whole criteria is one pri
 `GuardedImapClient.search`, which IMAPClient 4.1.0 sends unchanged. IMAPClient's per-item quoting is not used: it
 leaves atom-special values such as `a(b)@x` unquoted. Values that cannot be a quoted string (`"`, `\\`, control
 characters, non-ASCII) are refused, never escaped or sent as literals.
+
+Header searches on the msg-id fields send the bracketed token `"<id>"` (O35): iCloud matches them against whole
+`<...>` tokens only, so a bare id finds nothing there, while RFC 3501 substring servers match `"<id>"` as well.
 """
 
 import re
@@ -48,6 +51,14 @@ def quoted(value: str) -> bytes:
     return b'"' + value.encode("ascii") + b'"'
 
 
+def msg_id_token(value: str) -> bytes:
+    """The bare msg-id `value` as the quoted bracketed token `"<value>"`, for HEADER searches on the msg-id fields.
+    `search_value_ok` applies to the bare value; the brackets add two bytes and need no escaping."""
+    if not search_value_ok(value):
+        raise UnsafeSearchValue("search value refused")
+    return b'"<' + value.encode("ascii") + b'>"'
+
+
 def imap_date(day: date) -> bytes:
     """RFC 3501 `date` with fixed English month names (never the locale's): `05-Mar-2026`."""
     return b"%02d-%s-%04d" % (day.day, _MONTHS[day.month - 1], day.year)
@@ -71,7 +82,8 @@ def gmail_label_keys(kind: GmailLabelFilter) -> bytes:
 
 
 def _leaves(fields: Sequence[HeaderField], values: Sequence[str]) -> list[bytes]:
-    """`HEADER <field> "<value>"` keys, value by value and field by field within a value."""
+    """`HEADER <field> "<<value>>"` keys with the value as a bracketed msg-id token (`msg_id_token`), value by
+    value and field by field within a value."""
     if isinstance(fields, (str, bytes)) or isinstance(values, (str, bytes)):
         raise ValueError("fields and values must be sequences, not one string")
     field_list = list(fields)
@@ -80,7 +92,7 @@ def _leaves(fields: Sequence[HeaderField], values: Sequence[str]) -> list[bytes]
     for field in field_list:
         if type(field) is not str or field not in _HEADER_FIELDS:
             raise ValueError("unknown header field")
-    return [b"HEADER " + field.encode("ascii") + b" " + quoted(value) for value in values for field in field_list]
+    return [b"HEADER " + field.encode("ascii") + b" " + msg_id_token(value) for value in values for field in field_list]
 
 
 def _or_tree(leaves: Sequence[bytes]) -> bytes:
@@ -113,7 +125,8 @@ def or_batches(
     values: Sequence[str], fields: Sequence[HeaderField], *, max_values: int, max_bytes: int = MAX_OR_BYTES
 ) -> list[list[str]]:
     """Consecutive batches in input order; each holds at most `max_values` values and its `header_or` at most
-    `max_bytes` bytes. A batch is closed when the next value would break either cap.
+    `max_bytes` bytes, the two brackets of every value's msg-id token included. A batch is closed when the next
+    value would break either cap.
 
     Raises `UnsafeSearchValue` at the first value that fails `search_value_ok` (or whose own leaves exceed
     `max_bytes`). Callers with third-party values filter them one by one with `search_value_ok` first, so that one

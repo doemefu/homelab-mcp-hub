@@ -79,6 +79,25 @@ def test_fake_search_honours_not_draft_header_substring_and_nested_or() -> None:
     assert client.search(b"NOT DRAFT") == [1, 2, 3, 4]
 
 
+def test_fake_whole_msgid_tokens_mode_matches_bracketed_tokens_only() -> None:
+    headers = (
+        b"Message-ID: <m1@example.test>\r\nReferences: <r0@example.test> <r1@example.test>\r\n"
+        b"From: a@example.org\r\n\r\n"
+    )
+    srv = FakeImapServer([FakeFolder("INBOX", messages={1: FakeMessage(1, D, headers=headers)})])
+    client = srv.client()
+    client.select_folder("INBOX", readonly=True)
+    assert client.search(b'HEADER Message-ID "m1@example.test"') == [1]  # default: substring (RFC 3501)
+    srv.whole_msgid_tokens = True  # iCloud-like (O35)
+    assert client.search(b'HEADER Message-ID "m1@example.test"') == []
+    assert client.search(b'HEADER Message-ID "m1"') == []
+    assert client.search(b'HEADER Message-ID "<m1@example.test>"') == [1]
+    assert client.search(b'HEADER message-id "<m1@example.test>"') == [1]
+    assert client.search(b'HEADER References "r1@example.test"') == []
+    assert client.search(b'HEADER References "<r1@example.test>"') == [1]
+    assert client.search(b'HEADER From "example"') == [1]  # other fields keep substring matching
+
+
 def test_fake_failures_raise_once_and_commands_are_recorded() -> None:
     srv = server()
     client = srv.client()

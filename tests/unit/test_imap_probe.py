@@ -205,7 +205,7 @@ def test_probe_reports_other_count_and_or_test() -> None:
     folders = len({text for cmd, text in stub.commands if cmd == "EXAMINE"})
     assert len(ors) == folders
     first = ors[0]
-    assert first.count('HEADER Message-ID "id') == 20  # bare ids, as the hub searches them
+    assert first.count('HEADER Message-ID "<id') == 20  # bracketed tokens, as the hub searches them (O35)
     assert first.startswith("NOT DRAFT OR (")
     left, right = _or_operands(first.removeprefix("NOT DRAFT "))
     assert left.count("Message-ID") == 10
@@ -236,8 +236,9 @@ def test_search_criteria_have_expected_shape() -> None:
     _, stub = _run(StubClient(_folders()), since_days=14, text_word="the")
     searches = [text for cmd, text in stub.commands if cmd == "SEARCH"]
     assert re.fullmatch(r"NOT DRAFT SINCE \d{2}-[A-Z][a-z]{2}-\d{4}", searches[0])
-    assert any(re.fullmatch(r'NOT DRAFT HEADER Message-ID "id\d+@example\.test"', s) for s in searches)
-    assert any(re.fullmatch(r'NOT DRAFT HEADER References "id\d+@example\.test"', s) for s in searches)
+    assert any(re.fullmatch(r'NOT DRAFT HEADER Message-ID "<id\d+@example\.test>"', s) for s in searches)
+    assert any(re.fullmatch(r'NOT DRAFT HEADER References "<id\d+@example\.test>"', s) for s in searches)
+    assert any(re.fullmatch(r'NOT DRAFT HEADER Message-ID "id\d+@example\.test"', s) for s in searches)  # msgid_bare
     assert 'NOT DRAFT TEXT "the"' in searches
 
 
@@ -251,6 +252,10 @@ def test_quoted_is_the_hub_rule() -> None:
             imap_search.quoted(value)
     for value in ("a(b)@x", "x{5}@y", "%*@x", "a+&#%=;/?@x"):
         assert probe_mod.quoted(value).encode() == imap_search.quoted(value)
+        assert probe_mod.msg_id_token(value).encode() == imap_search.msg_id_token(value)
+    for value in ('a"b', "", "x-gm-raw@x"):
+        with pytest.raises(ValueError, match="search value refused"):
+            probe_mod.msg_id_token(value)
 
 
 def test_host_outside_allowlist_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -312,7 +317,7 @@ def test_probe_rules_match_the_hub() -> None:
     assert {"Junk", "Drafts"} <= set(probe_mod._FALLBACK_NAMES)
     ids = [f"id{i}@example.test" for i in range(20)]
     for n in range(1, 21):
-        keys = [f"HEADER Message-ID {probe_mod.quoted(i)}" for i in ids[:n]]
+        keys = [f"HEADER Message-ID {probe_mod.msg_id_token(i)}" for i in ids[:n]]
         assert probe_mod._or_tree(keys).encode() == imap_search.header_or(("Message-ID",), ids[:n])
     assert f"{probe_mod._GMAIL_SENT} NOT {probe_mod._GMAIL_INBOX}".encode() == imap_search.gmail_label_keys("sent")
     assert f"NOT {probe_mod._GMAIL_INBOX} NOT {probe_mod._GMAIL_SENT}".encode() == imap_search.gmail_label_keys(
@@ -324,7 +329,7 @@ def test_or_batch_keeps_the_hub_byte_cap() -> None:
     ids = [f"{'a' * 280}{i:02d}@example.test" for i in range(20)]
     tree = probe_mod._or_batch(ids)
     assert len(tree) <= 4000
-    assert tree.encode() == imap_search.header_or(("Message-ID",), [i for i in ids if f'"{i}"' in tree])
+    assert tree.encode() == imap_search.header_or(("Message-ID",), [i for i in ids if f'"<{i}>"' in tree])
 
 
 @pytest.mark.parametrize(

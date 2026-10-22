@@ -396,7 +396,7 @@ def test_core_folders_always_searched() -> None:
     detail = get(server, ref())
     assert detail.ref == MessageRef("icloud", "INBOX", 7, 1)
     assert examined(server) == [*ICLOUD_CORE, "INBOX"]  # every core folder, then the copy is opened again
-    assert searches(server) == [f'NOT DRAFT HEADER Message-ID "{MID}"'.encode()] * 4
+    assert searches(server) == [f'NOT DRAFT HEADER Message-ID "<{MID}>"'.encode()] * 4
 
 
 def test_other_folders_only_for_unresolved_refs_and_stop_when_resolved() -> None:
@@ -432,7 +432,8 @@ def test_ref_substring_hit_rechecked() -> None:
     )
     detail = get(server, ref())
     assert (detail.ref, detail.subject) == (MessageRef("icloud", "Archive", 7, 4), "exact")
-    assert [1, 2, 3] in [list(argument[0]) for name, argument in server.commands if name == "UID FETCH"]  # type: ignore[index]
+    # The bracketed token `"<id>"` no longer matches longer ids (1, 2); a case-insensitive hit (3) is re-checked.
+    assert [3] in [list(argument[0]) for name, argument in server.commands if name == "UID FETCH"]  # type: ignore[index]
 
 
 def test_ref_not_found_after_complete_search() -> None:
@@ -478,7 +479,7 @@ def _examine_no() -> tuple[FakeImapServer, float]:
 
 
 def _fetch_no() -> tuple[FakeImapServer, float]:
-    server = icloud(inbox=[msg(1, 60, "substring", message_id=f"<x{MID}>")])
+    server = icloud(inbox=[msg(1, 60, "case-insensitive hit", message_id=f"<{MID.upper()}>")])
     server.fail["UID FETCH"] = server.no("UID FETCH")
     return server, 16.0
 
@@ -565,7 +566,7 @@ def test_locate_batches_of_at_most_20_values() -> None:
     assert first.startswith(b"NOT DRAFT OR ")
     assert first.count(b"HEADER Message-ID") == 20
     assert second.count(b"HEADER Message-ID") == 5
-    assert all(f'"{value}"'.encode() in first + second for value in ids)
+    assert all(f'"<{value}>"'.encode() in first + second for value in ids)
 
 
 def test_locate_fetches_flags_date_and_message_id_only() -> None:
@@ -589,8 +590,28 @@ def test_locate_other_mailboxes_search_only_unresolved_refs() -> None:
         "b@example.test": "Projects",
     }
     *core, last = searches(server)
-    assert all(b'"a@example.test"' in criteria and b'"b@example.test"' in criteria for criteria in core)  # type: ignore[operator]
-    assert last == b'NOT DRAFT HEADER Message-ID "b@example.test"'
+    assert all(b'"<a@example.test>"' in criteria and b'"<b@example.test>"' in criteria for criteria in core)  # type: ignore[operator]
+    assert last == b'NOT DRAFT HEADER Message-ID "<b@example.test>"'
+
+
+def test_locate_and_ref_find_messages_on_a_whole_token_server() -> None:
+    # O35: iCloud matches HEADER Message-ID against whole bracketed tokens; a bare-id search finds nothing there.
+    server = icloud(
+        inbox=[msg(1, 5, "wanted", message_id=f"<{MID}>")],
+        archive=[msg(4, 60, "other", message_id="<b@example.test>")],
+    )
+    server.whole_msgid_tokens = True
+    result = locate(server, [MID, "b@example.test"])
+    assert result.complete is True
+    assert {value: copy.entry.raw_name for value, copy in result.found.items()} == {
+        MID: "INBOX",
+        "b@example.test": "Archive",
+    }
+    assert (
+        searches(server)[0] == f'NOT DRAFT OR HEADER Message-ID "<{MID}>" HEADER Message-ID "<b@example.test>"'.encode()
+    )
+    detail = get(server, ref())
+    assert (detail.ref, detail.subject, detail.meta.message_id) == (MessageRef("icloud", "INBOX", 7, 1), "wanted", MID)
 
 
 @pytest.mark.parametrize("value", ["X-GM-RAW@example.test", 'a"b@example.test', "a b@example.test", ""])
@@ -618,7 +639,7 @@ def test_locate_failed_batch_marks_only_its_refs() -> None:
     original = server.run
 
     def run(command: str, argument: object = None) -> None:
-        if command == "UID SEARCH" and b'"r20@example.test"' not in argument:  # type: ignore[operator]
+        if command == "UID SEARCH" and b'"<r20@example.test>"' not in argument:  # type: ignore[operator]
             server.fail["UID SEARCH"] = server.no("UID SEARCH")  # every batch of the first 20 refs fails
         original(command, argument)
 
@@ -638,7 +659,7 @@ def fail_search_in(server: FakeImapServer, plan: dict[str, str]) -> None:
             selected["name"] = str(argument)
         if command == "UID SEARCH":
             for value, mailbox_name in plan.items():
-                if selected["name"] == mailbox_name and f'"{value}"'.encode() in argument:  # type: ignore[operator]
+                if selected["name"] == mailbox_name and f'"<{value}>"'.encode() in argument:  # type: ignore[operator]
                     server.fail["UID SEARCH"] = server.no("UID SEARCH")
         original(command, argument)
 

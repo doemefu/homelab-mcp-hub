@@ -33,7 +33,7 @@ def test_message_id_with_atom_specials_is_one_quoted_string(value: str) -> None:
     assert len(searches) == 1
     tag, _, rest = searches[0].partition(b" ")
     assert tag.isalnum()
-    assert rest == b'UID SEARCH NOT DRAFT HEADER Message-ID "' + value.encode("ascii") + b'"'
+    assert rest == b'UID SEARCH NOT DRAFT HEADER Message-ID "<' + value.encode("ascii") + b'>"'
     assert literals == []
 
 
@@ -42,6 +42,19 @@ def test_or_tree_goes_out_unchanged() -> None:
     lines, literals = _search_once(search)
     assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [b"UID SEARCH " + search]
     assert literals == []
+
+
+def test_message_id_key_exact_wire_bytes() -> None:
+    # O35: the msg-id goes out bracketed inside one quoted string; iCloud matches only whole `<id>` tokens.
+    lines, literals = _search_once(criteria(b"NOT DRAFT", header_or(("Message-ID",), ["m1@example.test"])))
+    assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [
+        b'UID SEARCH NOT DRAFT HEADER Message-ID "<m1@example.test>"'
+    ]
+    lines, literals2 = _search_once(criteria(b"NOT DRAFT", header_or(("In-Reply-To", "References"), ["a@x"])))
+    assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [
+        b'UID SEARCH NOT DRAFT OR HEADER In-Reply-To "<a@x>" HEADER References "<a@x>"'
+    ]
+    assert literals == literals2 == []
 
 
 def test_no_hidden_capability_before_search() -> None:

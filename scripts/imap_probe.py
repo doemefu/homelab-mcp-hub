@@ -14,12 +14,13 @@ as junk or drafts by name, and virtual folders such as \\Flagged or \\Important,
 and by the hub's last-component names, capped at --max-folders); use it to size MAX_LOCATE_FOLDERS.
 
 Timings: `list` and the `examine_search_since` pass are the first commands of the connection on each mailbox, so
-their `examine_ms` and `search_ms` are cold; the later rounds run warm. The searches have the hub's shape: bare
-Message-IDs (no angle brackets) of the hub's Message-ID pattern, each as one quoted string with nothing escaped, and
-the hub's balanced OR tree. Every round is timed on its own and an error (a socket timeout included) is reported by
-its class name and does not stop the next round; a timeout can leave the connection unusable, so the `text` round
-runs last. On Gmail the hub's `sent` and `archive` label keys are timed in All Mail, compared with the `\\Sent`
-mailbox, and one cold candidate FETCH (INTERNALDATE FLAGS X-GM-LABELS) of the newest 500 All Mail hits is timed.
+their `examine_ms` and `search_ms` are cold; the later rounds run warm. The searches have the hub's shape: Message-IDs
+of the hub's Message-ID pattern, each sent as the bracketed token `"<id>"` in one quoted string with nothing escaped
+(iCloud matches only whole tokens), and the hub's balanced OR tree. Every round is timed on its own and an error (a
+socket timeout included) is reported by its class name and does not stop the next round; a timeout can leave the
+connection unusable, so the `text` round runs last. On Gmail the hub's `sent` and `archive` label keys are timed in
+All Mail, compared with the `\\Sent` mailbox, and one cold candidate FETCH (INTERNALDATE FLAGS X-GM-LABELS) of the
+newest 500 All Mail hits is timed.
 
 Paste only the part after the `--- result ---` line. With --show-names the output contains mailbox names, a banner
 says so, and the marker line is left out.
@@ -116,6 +117,13 @@ def quoted(value: str) -> str:
     return f'"{value}"'
 
 
+def msg_id_token(value: str) -> str:
+    """The hub's imap_search.msg_id_token (O35): the bare id as the bracketed token `"<id>"` in one quoted string; the
+    bare id must pass `quoted`."""
+    quoted(value)
+    return f'"<{value}>"'
+
+
 def _imap_date(moment: datetime) -> str:
     return f"{moment.day:02d}-{_MONTHS[moment.month - 1]}-{moment.year}"
 
@@ -145,7 +153,7 @@ def _or_tree(keys: Sequence[str]) -> str:
 
 def _or_batch(ids: Sequence[str]) -> str:
     """The OR tree of the first ids that fit the hub's batch: at most 20 values and 4,000 bytes."""
-    keys = [f"HEADER Message-ID {quoted(i)}" for i in ids[:_OR_VALUES]]
+    keys = [f"HEADER Message-ID {msg_id_token(i)}" for i in ids[:_OR_VALUES]]
     while len(keys) > 1 and len(_or_tree(keys)) > _OR_MAX_BYTES:
         keys.pop()
     return _or_tree(keys)
@@ -386,8 +394,8 @@ def probe(
         if inbox_name is not None:
             _msgid_variants(client, inbox_name, first, emit)
         criteria = {
-            "header_message_id": f"NOT DRAFT HEADER Message-ID {quoted(first)}",
-            "header_references": f"NOT DRAFT HEADER References {quoted(first)}",
+            "header_message_id": f"NOT DRAFT HEADER Message-ID {msg_id_token(first)}",
+            "header_references": f"NOT DRAFT HEADER References {msg_id_token(first)}",
             "or20": f"NOT DRAFT {_or_batch(inbox_ids)}",
         }
         for round_name in _HEADER_ROUNDS:
