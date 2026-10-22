@@ -1,7 +1,10 @@
 import base64
 import codecs
+import encodings
 import encodings.aliases
+import pkgutil
 import quopri
+import random
 import time
 from collections.abc import Callable
 
@@ -161,6 +164,11 @@ _HOSTILE: dict[str, Callable[[int], bytes]] = {
     "unicode_escapes": lambda n: b"\\u00e9" * (n // 6),
     "punycode_like": lambda n: b"xn--" + b"a-" * (n // 2),
     "escape_prefixes": lambda n: b"\\U\\x\\N{" * (n // 6),
+    "random": lambda n: random.Random(0).randbytes(n),  # noqa: S311 - deterministic test data
+    "punycode_digits": lambda n: b"-" + b"9" * (n - 1),
+    "utf7_shift": lambda n: b"+" + b"A" * (n - 1),
+    "iso2022_escapes": lambda n: b"\x1b$B" * (n // 3),
+    "named_escapes": lambda n: b"\\N{LATIN SMALL LETTER A}" * (n // 24),
 }
 
 
@@ -173,16 +181,20 @@ def _best_of(fn: Callable[[], object], runs: int = 5) -> float:
     return best
 
 
-def _assert_linear(charset: str, make: Callable[[int], bytes]) -> None:
+def _assert_linear(charset: str, payload: str) -> None:
+    make = _HOSTILE[payload]
     small, large = make(_SIZE), make(2 * _SIZE)
     t_small = _best_of(lambda: safe_decode(small, charset))
     t_large = _best_of(lambda: safe_decode(large, charset))
-    assert t_large <= max(t_small * _RATIO_BOUND, 0.005)  # 5 ms floor against timer noise on trivial inputs
+    # 5 ms floor against timer noise on trivial inputs
+    assert t_large <= max(t_small * _RATIO_BOUND, 0.005), f"{charset}/{payload}: {t_small:.4f}s -> {t_large:.4f}s"
 
 
 def _text_codecs() -> list[str]:
+    candidates = {m.name for m in pkgutil.iter_modules(encodings.__path__)} | set(encodings.aliases.aliases.values())
+    candidates |= DENIED_CODECS
     names = []
-    for name in sorted(set(encodings.aliases.aliases.values())):
+    for name in sorted(candidates - {"aliases", "charmap", "undefined"}):  # the last two cannot decode on their own
         try:
             info = codecs.lookup(name)
         except LookupError:
@@ -194,15 +206,15 @@ def _text_codecs() -> list[str]:
 
 def test_decode_time_bound_over_text_codecs() -> None:
     names = _text_codecs()
-    assert len(names) > 50
+    assert len(names) >= 110
     for name in names:
-        for make in _HOSTILE.values():
-            _assert_linear(name, make)
+        for payload in _HOSTILE:
+            _assert_linear(name, payload)
 
 
 @pytest.mark.parametrize("charset", sorted(DENIED_CODECS))
 def test_denied_codec_timing_each(charset: str) -> None:
-    for make in _HOSTILE.values():
-        _assert_linear(charset, make)
+    for payload in _HOSTILE:
+        _assert_linear(charset, payload)
     punycode_like = _HOSTILE["punycode_like"](_SIZE)
     assert safe_decode(punycode_like, charset) == punycode_like.decode("utf-8", "replace")
