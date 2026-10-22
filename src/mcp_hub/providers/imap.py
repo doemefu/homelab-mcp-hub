@@ -192,6 +192,7 @@ def _sent_since_pass_one(chosen: _Chosen, row: dict[bytes, object]) -> bool:
     return chosen.direction == "incoming" and _LABEL_SENT in _labels(row)
 
 
+@dataclass(slots=True)
 class _Progress:
     truncated: bool = False
     complete: bool = True
