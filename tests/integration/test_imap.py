@@ -60,8 +60,10 @@ def test_list_unread_returns_seeded_messages_newest_first() -> None:
     html.add_alternative("<p>Visible</p><div style='display:none'>HIDDEN</div>", subtype="html")
     attached = text_mail(S("Third attached"), "See attachment")
     attached.add_attachment(b"%PDF-1.4 test", maintype="application", subtype="pdf", filename="report.pdf")
-    for msg in (plain, html, attached):
-        greenmail.send("hub-list", msg)
+    # One second apart: within one INTERNALDATE second the list order is the location key, not the arrival (§5.5).
+    now = datetime.now(UTC).replace(microsecond=0)
+    for seconds_ago, msg in ((3, plain), (2, html), (1, attached)):
+        greenmail.append("hub-list", msg, now - timedelta(seconds=seconds_ago))
     items = greenmail.ours(
         greenmail.mailbox("hub-list")
         .list_messages(ListQuery("inbox", since, True, None, 20), CallDeadline.start())
