@@ -329,7 +329,7 @@ def status_call(server: FakeImapServer, targets: list[StableRef]) -> str:
         username="u",
         password="p",
         client_factory=lambda host, port, context, timeout: server.client(),
-        own_addresses=frozenset(),
+        own_addresses=frozenset({"owner@example.test"}),  # not the hostile sender: the From item is fetched
         folder_maps=FolderMapCache(clock=clock),
     )
     statuses = box.message_status(targets, CallDeadline(clock(), 16.0, 20.0, clock))

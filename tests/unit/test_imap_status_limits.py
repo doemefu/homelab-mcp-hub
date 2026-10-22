@@ -132,8 +132,9 @@ def test_gmail_fifty_refs_thread_batches() -> None:
     )
     statuses = run(server, [StableRef("gmail", x) for x in xs])
     assert [s.thread_checked for s in statuses] == [True] * REFS
-    thread = [c for c in searches(server) if b"X-GM-THRID" in c]  # type: ignore[operator]
-    assert [c.count(b"X-GM-THRID") for c in thread] == [MAX_THRID_VALUES, MAX_THRID_VALUES, 10]  # type: ignore[attr-defined]
-    assert all(len(c) <= MAX_OR_BYTES for c in thread)  # type: ignore[arg-type]
-    assert not [c for c in searches(server) if b"In-Reply-To" in c or b"References" in c]  # type: ignore[operator]
+    sent = [c for c in searches(server) if isinstance(c, bytes)]
+    thread = [c for c in sent if b"X-GM-THRID" in c]
+    assert [c.count(b"X-GM-THRID") for c in thread] == [MAX_THRID_VALUES, MAX_THRID_VALUES, 10]
+    assert all(len(c) <= MAX_OR_BYTES for c in thread)
+    assert not [c for c in sent if b"In-Reply-To" in c or b"References" in c]
     assert examined(server) == ["[Gmail]/Trash", GMAIL_ALL]
