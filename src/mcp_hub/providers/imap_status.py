@@ -4,7 +4,10 @@ descendant headers, on Gmail by `X-GM-THRID`), inside one `ImapSession` (one con
 
 Read-only through the guard: EXAMINE, UID SEARCH and UID FETCH of FLAGS, INTERNALDATE, the Message-ID (and FROM)
 header item, the 64 KiB re-check item of the lookups and, on Gmail, X-GM-LABELS and X-GM-THRID. Nothing here is
-logged but `item_degraded`, through the session and capped per call (SR6)."""
+logged but `item_degraded`, through the session and capped per call (SR6).
+
+The Gmail reply search by In-Reply-To/References in All Mail is gated off by GMAIL_REPLY_HEADER_SEARCH (T0 P1: about
+14 s per search). It is kept on purpose, tested, as the path to switch on if Gmail answers it faster."""
 
 import imaplib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence

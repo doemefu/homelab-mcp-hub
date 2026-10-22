@@ -83,7 +83,7 @@ It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` a
 
 `scripts/imap_probe.py --host <imap host>` is run by the owner on their own machine. It is read-only (an allowlist proxy, `EXAMINE` only), asks for the credentials at a prompt and writes nothing. It prints mailbox roles, counts and LIST/EXAMINE/SEARCH timings, including the bracketed Message-ID search (O35). Paste only the part after `--- result ---`; `--show-names` adds mailbox names, which are private.
 
-`--status-rounds` runs the `get_message_status` rounds P1–P7 instead (WP13b): reply-header matching, OR width and timing, Gmail `X-GM-THRID` ORs, re-`EXAMINE` and header-`FETCH` cost. Every command goes through the hub's `GuardedImapClient` and every criteria through `imap_search`; the output is yes/no, counts and milliseconds only. Run it once per host (`uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds`, then `--host imap.gmail.com`); `--help` starts with German usage lines for the owner.
+`--status-rounds` runs the `get_message_status` rounds P1–P7 instead (WP13b): reply-header matching, OR width and timing, Gmail `X-GM-THRID` ORs, re-`EXAMINE` and header-`FETCH` cost. Every command goes through the hub's `GuardedImapClient` and every criteria through `imap_search`; the output is yes/no, counts and milliseconds only. Run it once per host (`uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds`, then `--host imap.gmail.com`); `--help` starts with the owner's usage lines.
 
 ### Provider integration tests
 

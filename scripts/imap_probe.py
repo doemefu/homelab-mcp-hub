@@ -918,11 +918,11 @@ def status_rounds(raw: Any, caps: frozenset[bytes], *, out: TextIO, today: date 
 
 
 _HELP: Final = """\
-Aufruf (durch den Besitzer, auf dem eigenen Rechner, im Repository-Verzeichnis):
+Run by the owner, on their own machine, in the repository directory:
   uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds
   uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds
-Benutzername und App-Passwort werden abgefragt; nichts wird gespeichert, nur gelesen.
-Nur den Teil ab der Zeile "--- result ---" weitergeben.
+The username and the app-specific password are asked for at a prompt; nothing is stored or changed.
+Share only the part after the line "--- result ---".
 
 Read-only IMAP folder and search probe (O35); --status-rounds runs the get_message_status rounds P1-P7 instead.
 """

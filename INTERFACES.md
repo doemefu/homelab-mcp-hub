@@ -194,7 +194,7 @@ Consumer semantics:
 - (f) About 20 iCloud refs per call fit the soft stop (A-td5).
 - (g) On IMAP, `received_at` can be the time a mail client moved the message; compare `replied_at` with `newer_incoming_at`, not with `received_at` (TD-R5).
 - (h) `thread_checked: false` after a full Graph conversation answer: `replied_at` may not be the earliest and `newer_incoming_at` may not be the newest (GR5).
-- (i) Reply detection differs per provider (T0 probe, 2026-10-22): iCloud and other IMAP servers search the sent mailbox by `In-Reply-To` and `References`; Gmail finds replies only among the `\Sent` members of the message's Gmail thread (no header search), so a reply whose subject was changed (a new Gmail thread) shows only through `\Answered`; Graph counts a `sentitems` item of the same conversation sent after receipt.
+- (i) Reply detection differs per provider (T0 probe, 2026-10-22): iCloud and other IMAP servers search the sent mailbox by `In-Reply-To` and `References`; Gmail finds replies only among the `\Sent` members of the message's Gmail thread (no header search), so a reply whose subject was changed (a new Gmail thread) shows only through `\Answered`; Graph counts a `sentitems` item of the same conversation sent after receipt. A forward counts as a reply (accepted residual): on Graph any later `sentitems` item of the conversation (`flags.answered` stays false), on IMAP a forward whose `References` or `In-Reply-To` names the message.
 
 ### `get_events` (§5.2)
 

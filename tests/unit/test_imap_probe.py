@@ -1058,12 +1058,12 @@ def test_status_rounds_login_failure_prints_class_name_only(
     assert [cmd for cmd, _ in stub.commands] == ["LOGOUT"]
 
 
-def test_help_starts_with_german_usage(capsys: pytest.CaptureFixture[str]) -> None:
+def test_help_starts_with_owner_usage(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         probe_mod.main(["--help"])
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
-    assert "Aufruf" in out
+    assert "Run by the owner" in out
     assert "uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds" in out
     assert "uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds" in out
-    assert out.index("Aufruf") < out.index("--status-rounds  ")  # the German block comes before the options
+    assert out.index("Run by the owner") < out.index("--status-rounds  ")  # the usage block comes before the options
