@@ -83,19 +83,41 @@ def sender(address: str, name: str) -> dict[str, object]:
     return {"emailAddress": {"name": name, "address": address}}
 
 
-# The facts of the owner's Graph Explorer run for the batched `get_message_status` lookups (T17, plan §4; requests
-# 14, 14b, 15 and 16, each with the same `Prefer` header). None until they are recorded: the strict xfail of
-# `test_fixture_shapes_match_t1c_facts` then turns into a failure, and the marker must go before lane G merges.
+# The facts of the owner's Graph Explorer run for the batched `get_message_status` lookups (T17, plan §4; personal
+# Outlook.com account, 2026-10-22; requests 14, 14b, 15 and 16, each with the same `Prefer` header):
 # - "status_14", "status_14b", "status_15", "status_16" -> the HTTP status of each request;
-# - "count_14", "count_14b", "count_15", "count_16" -> the item count of each answer;
+# - "count_14", "count_14b", "count_15", "count_16" -> the item count of each answer (16: 10 conversations, unordered);
 # - "next_link_14", "next_link_14b", "next_link_15", "next_link_16" -> that answer carried `@odata.nextLink` (GR3);
 # - "batch_10_at_cap_ok" -> request 14b (10 values, about 1,800 encoded characters of `$filter`) answered 200 (GR3);
 # - "filter_chars_14b" -> the encoded length of request 14b's `$filter`, as the URL builder printed it;
-# - "request14_both_found", "request14_replied_last_verb" -> request 14 returned both messages, and `Integer 0x1081`
-#   on the replied one (the `$expand` works on the batch; otherwise the C6 fallback);
+# - "request14_both_found" -> request 14 returned both messages;
+# - "request14_replied_last_verb" -> the `Integer 0x1081` value on the replied one, as a string (the `$expand` works
+#   on the batch; otherwise the C6 fallback); the other message had no `singleValueExtendedProperties`;
 # - "request15_only_c1_c2", "request15_sent_reply_after_receipt" -> request 15 returned only items of C1/C2, among
-#   them a `sentitems` item whose `sentDateTime` is after the replied message's `receivedDateTime`.
-T1C_FACTS: dict[str, bool | int | None] | None = None
+#   them a `sentitems` item whose `sentDateTime` is after the replied message's `receivedDateTime`;
+# - "sent_from_legacy_dn" -> request 16: an own sent item carried an Exchange legacy DN as `from.emailAddress.address`
+#   and the SMTP address as the name (see LEGACY_DN).
+T1C_FACTS: dict[str, bool | int | str | None] | None = {
+    "status_14": 200,
+    "status_14b": 200,
+    "status_15": 200,
+    "status_16": 200,
+    "count_14": 2,
+    "count_14b": 2,  # the 8 made-up values match nothing
+    "count_15": 5,
+    "count_16": 14,
+    "next_link_14": False,
+    "next_link_14b": False,
+    "next_link_15": False,
+    "next_link_16": False,
+    "batch_10_at_cap_ok": True,
+    "filter_chars_14b": 1795,
+    "request14_both_found": True,
+    "request14_replied_last_verb": "102",
+    "request15_only_c1_c2": True,
+    "request15_sent_reply_after_receipt": True,
+    "sent_from_legacy_dn": True,
+}
 
 
 def extended(
