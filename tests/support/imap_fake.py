@@ -22,6 +22,7 @@ _PEEK = re.compile(r"BODY\.PEEK\[([^\]]*)\]<0\.(\d+)>")
 _TOKEN = re.compile(r'\s*(\(|\)|"(?:[^"\\]|\\.)*"|[^\s()"]+)')
 _MSGID_FIELDS = frozenset({"message-id", "in-reply-to", "references"})
 _MSGID_TOKEN = re.compile(r"<[^<>]*>")
+_HEADER_FIELDS = re.compile(r"HEADER\.FIELDS\s*\(([^)]*)\)", re.IGNORECASE)
 
 
 @dataclass
@@ -165,7 +166,7 @@ class FakeImapClient:
         self._server.run("UID SEARCH", criteria)
         folder = self._selected("UID SEARCH")
         tokens = [m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))]
-        pos, node = _parse_list(tokens, 0, self._server.whole_msgid_tokens)
+        pos, node = _parse_list(tokens, 0, self._server.whole_msgid_tokens, b"X-GM-EXT-1" in self._server.capabilities)
         if pos != len(tokens):
             raise bad("UID SEARCH")
         return [uid for uid, msg in sorted(folder.messages.items()) if node(msg, self._server.honour_not_draft)]
@@ -230,37 +231,59 @@ def _fill(row: dict[bytes, object], item: str, msg: FakeMessage) -> None:
         peek = _PEEK.fullmatch(item)
         assert peek is not None
         section, limit = peek.group(1), int(peek.group(2))
-        data = msg.headers if section.upper().startswith("HEADER") else msg.text
+        data = _header_subset(msg.headers, section) if section.upper().startswith("HEADER") else msg.text
         row[f"BODY[{section}]<0>".encode()] = None if data is None else data[:limit]
+
+
+def _header_subset(headers: bytes | None, section: str) -> bytes | None:
+    """HEADER.FIELDS (…): only the requested fields with their folded lines, in message order, plus the closing CRLF."""
+    fields = _HEADER_FIELDS.fullmatch(section)
+    if headers is None or fields is None:
+        return headers
+    wanted = {name.casefold() for name in fields.group(1).split()}
+    kept: list[bytes] = []
+    keep = False
+    for line in headers.split(b"\r\n"):
+        if not line:
+            break
+        if line[:1] not in (b" ", b"\t"):
+            keep = line.partition(b":")[0].decode("latin-1").strip().casefold() in wanted
+        if keep:
+            kept.append(line + b"\r\n")
+    return b"".join(kept) + b"\r\n"
 
 
 # --- mini evaluator of the hub's UID SEARCH grammar -------------------------------------------------------------
 
 
-def _parse_list(tokens: list[str], pos: int, whole: bool) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
+def _parse_list(
+    tokens: list[str], pos: int, whole: bool, gmail: bool
+) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     parts: list[Callable[[FakeMessage, bool], bool]] = []
     while pos < len(tokens) and tokens[pos] != ")":
-        pos, node = _parse_key(tokens, pos, whole)
+        pos, node = _parse_key(tokens, pos, whole, gmail)
         parts.append(node)
     return pos, lambda msg, honour: all(p(msg, honour) for p in parts)
 
 
-def _parse_key(tokens: list[str], pos: int, whole: bool) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
+def _parse_key(
+    tokens: list[str], pos: int, whole: bool, gmail: bool
+) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     word = tokens[pos].upper()
     pos += 1
     if word == "(":
-        pos, node = _parse_list(tokens, pos, whole)
+        pos, node = _parse_list(tokens, pos, whole, gmail)
         if pos >= len(tokens):
             raise bad("UID SEARCH")
         return pos + 1, node
     if word == "NOT":
         if pos < len(tokens) and tokens[pos].upper() == "DRAFT":
             return pos + 1, lambda msg, honour: not honour or b"\\Draft" not in msg.flags
-        pos, inner = _parse_key(tokens, pos, whole)
+        pos, inner = _parse_key(tokens, pos, whole, gmail)
         return pos, lambda msg, honour: not inner(msg, honour)
     if word == "OR":
-        pos, left = _parse_key(tokens, pos, whole)
-        pos, right = _parse_key(tokens, pos, whole)
+        pos, left = _parse_key(tokens, pos, whole, gmail)
+        pos, right = _parse_key(tokens, pos, whole, gmail)
         return pos, lambda msg, honour: left(msg, honour) or right(msg, honour)
     if word == "UNSEEN":
         return pos, lambda msg, honour: b"\\Seen" not in msg.flags
@@ -288,6 +311,9 @@ def _parse_key(tokens: list[str], pos: int, whole: bool) -> tuple[int, Callable[
     if word == "X-GM-LABELS":
         label = _unquote(tokens[pos]).encode().lower()
         return pos + 1, lambda msg, honour: label in {x.lower() for x in msg.labels}
+    if word == "X-GM-THRID" and gmail:
+        wanted = int(tokens[pos])
+        return pos + 1, lambda msg, honour: msg.thrid is not None and msg.thrid == wanted
     raise bad("UID SEARCH")
 
 

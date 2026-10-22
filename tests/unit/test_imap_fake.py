@@ -159,3 +159,49 @@ def test_fake_select_honours_folder_encode() -> None:
     client.folder_encode = False
     client.select_folder("Eing&AOQ-nge", readonly=True)
     assert srv.commands == [("EXAMINE", "Eing&-AOQ-nge"), ("EXAMINE", "Eing&AOQ-nge")]
+
+
+def test_fake_header_fields_subset_in_message_order_and_cut() -> None:
+    srv = server()
+    srv.folders[0].messages[1].headers = (
+        b"Subject: Hi\r\nReferences: <a@example.org>\r\n <b@example.org>\r\nFrom: Alice <a@example.org>\r\n"
+        b"Message-ID: <m@example.org>\r\n\r\n"
+    )
+    client = srv.client()
+    client.select_folder("INBOX", readonly=True)
+    key = b"BODY[HEADER.FIELDS (MESSAGE-ID REFERENCES)]<0>"
+    rows = client.fetch("1", ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES)]<0.4096>"])
+    assert rows[1][key] == b"References: <a@example.org>\r\n <b@example.org>\r\nMessage-ID: <m@example.org>\r\n\r\n"
+    rows = client.fetch("1", ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES)]<0.20>"])
+    assert rows[1][key] == b"References: <a@examp"
+    rows = client.fetch("1", ["BODY.PEEK[HEADER.FIELDS (X-ABSENT)]<0.100>"])
+    assert rows[1][b"BODY[HEADER.FIELDS (X-ABSENT)]<0>"] == b"\r\n"
+
+
+def thrid_server(capabilities: tuple[bytes, ...] = (b"IMAP4REV1", b"X-GM-EXT-1")) -> FakeImapServer:
+    srv = server()
+    srv.capabilities = capabilities
+    srv.folders[0].messages[1].thrid = 11
+    srv.folders[0].messages[3].thrid = 22
+    return srv
+
+
+def test_fake_thrid_search() -> None:
+    client = thrid_server().client()
+    client.select_folder("INBOX", readonly=True)
+    assert client.search(b"NOT DRAFT X-GM-THRID 11") == [1]
+    assert client.search(b"X-GM-THRID 99") == []  # messages without thrid (2, 4) never match
+
+
+def test_fake_thrid_refused_without_gmail_capability() -> None:
+    client = thrid_server((b"IMAP4REV1",)).client()
+    client.select_folder("INBOX", readonly=True)
+    with pytest.raises(IMAPClientError, match="BAD"):
+        client.search(b"X-GM-THRID 11")
+
+
+def test_fake_thrid_in_or_tree() -> None:
+    client = thrid_server().client()
+    client.select_folder("INBOX", readonly=True)
+    assert client.search(b"NOT DRAFT OR X-GM-THRID 11 X-GM-THRID 22") == [1, 3]
+    assert client.search(b"OR X-GM-THRID 11 OR X-GM-THRID 22 X-GM-THRID 33") == [1, 3]
