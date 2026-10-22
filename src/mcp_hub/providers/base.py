@@ -149,7 +149,10 @@ StatusTarget = StableRef | MessageRef | GraphMessageRef  # one distinct entry of
 
 @dataclass(frozen=True, slots=True)
 class FoundMessage:
-    """The earliest found copy of a message; third-party strings are decoded, not yet sanitised."""
+    """The earliest found copy of a message; third-party strings are decoded, not yet sanitised.
+
+    `location`, `received_at` and `meta.folder` are those of the earliest copy, but `meta.direction` is `outgoing`
+    when any found copy of the Message-ID is in sent (ruling MF-R2); an `uncertain` copy still counts as found (C3)."""
 
     location: AnyMessageRef  # the copy found (-> `id`)
     message_id: str | None  # valid bare Message-ID of that copy (-> `ref`), else None
@@ -166,7 +169,7 @@ class MessageStatus:
     reply_at: datetime | None = None  # earliest reply found (IMAP INTERNALDATE / Graph sentDateTime)
     reply_message_id: str | None = None  # its valid bare Message-ID (-> `reply_ref`)
     newer_incoming_at: datetime | None = None  # newest incoming thread message (rules per provider)
-    # Every reply/thread batch covering this ref completed; None when the message was not found (ruling E-td1).
+    # Every reply/thread batch covering this ref completed: a bool when found, None otherwise (ruling E-td1).
     thread_checked: bool | None = None
 
     def __post_init__(self) -> None:
@@ -174,6 +177,10 @@ class MessageStatus:
             raise ValueError("found is set exactly when state is found")
         if (self.reason is None) != (self.state != "unknown"):
             raise ValueError("reason is set exactly when state is unknown")
+        if (self.found is not None) != (self.thread_checked is not None):
+            raise ValueError("thread_checked is a bool exactly when state is found")
+        if self.reply_message_id is not None and self.reply_at is None:
+            raise ValueError("reply_message_id needs reply_at")
         if self.found is None and (
             self.reply_at is not None
             or self.reply_message_id is not None

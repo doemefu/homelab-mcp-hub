@@ -135,19 +135,30 @@ def _found() -> FoundMessage:
         {"state": "unknown", "reason": "stale_id", "reply_message_id": "r@example.org"},
         {"state": "gone", "newer_incoming_at": T0},
         {"state": "gone", "thread_checked": True},
+        {"state": "unknown", "reason": "stale_id", "thread_checked": True},
+        {"state": "unknown", "reason": "stale_id", "thread_checked": False},
+        {"state": "unknown", "reason": "stale_id", "reply_at": T0},
+        {"state": "unknown", "reason": "stale_id", "newer_incoming_at": T0},
+        {"state": "found", "found": "copy"},  # found needs thread_checked
+        {"state": "found", "found": "copy", "thread_checked": True, "reply_message_id": "r@example.org"},
     ],
 )
 def test_message_status_invariants(kwargs: dict[str, object]) -> None:
     values = dict(kwargs)
     if values.get("found") == "copy":
         values["found"] = _found()
-    with pytest.raises(ValueError, match=r"exactly when|need a found"):
+    with pytest.raises(ValueError, match=r"exactly when|need a found|needs reply_at"):
         MessageStatus(**values)  # type: ignore[arg-type]  # deliberately invalid combinations
 
 
 def test_message_status_valid_shapes() -> None:
     found = MessageStatus("found", found=_found(), reply_at=T0, newer_incoming_at=T0, thread_checked=False)
     assert found.reason is None
+    plain = MessageStatus("found", found=_found(), thread_checked=True)
+    assert plain.reply_at is None
+    assert MessageStatus("found", found=_found(), reply_at=T0, reply_message_id="r@example.org", thread_checked=True)
+    no_id = FoundMessage(location=_found().location, message_id=None, received_at=T0, unread=False, meta=MailMeta())
+    assert MessageStatus("found", found=no_id, thread_checked=False).found is no_id
     assert MessageStatus("gone").thread_checked is None
     assert MessageStatus("unknown", "incomplete_search").found is None
 
