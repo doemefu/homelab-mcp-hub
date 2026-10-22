@@ -30,6 +30,12 @@ def _raw(parts: list[object]) -> str:
     return "v1." + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
+def _padded(parts: list[object]) -> str:
+    """A well-formed id whose JSON carries trailing blanks, so only the 512-character limit refuses it."""
+    raw = json.dumps(parts, separators=(",", ":")).encode() + b" " * 400
+    return "v1." + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
 def _invalid(fn: object, value: str) -> None:
     with pytest.raises(ToolError) as info:
         fn(value)  # type: ignore[operator]  # test helper takes any decoder
@@ -215,7 +221,8 @@ def test_location_k() -> None:
 
 
 def test_status_entry_round_trips() -> None:
-    ref = encode_ref("icloud", "abc.123@example.org") or ""
+    ref = encode_ref("icloud", "abc.123@example.org")
+    assert ref is not None
     assert decode_status_entry(ref) == StableRef(account="icloud", message_id="abc.123@example.org")
     m = encode_message_id(MessageRef(account="icloud", folder="INBOX", uidvalidity=7, uid=9))
     assert decode_status_entry(m) == MessageRef(account="icloud", folder="INBOX", uidvalidity=7, uid=9)
@@ -236,7 +243,7 @@ def test_status_entry_refuses_other_kinds() -> None:
         None,
         b"v1.abc",
         "",
-        "v1." + "a" * 510,
+        _padded(["r", "icloud", "a@example.org"]),
         (encode_ref("icloud", "a@example.org") or "") + "\n",
         "v1.!!!not-base64!!!",
         _raw(["r", "icloud", "bad id@example.org"]),
@@ -250,8 +257,19 @@ def test_status_entry_refuses_malformed(value: object) -> None:
 
 
 def test_status_entry_error_text_is_fixed() -> None:
-    secret = _raw(["r", "icloud", "it's-secret@example.org"])
-    for value in (secret, "x" * 600, 5, _raw(["t", "icloud", "gmail", 1])):
+    values: list[object] = [
+        _raw(["r", "icloud", "it's-secret@example.org"]),
+        _raw(["m", "icloud", "INBOX", 0, 1]),
+        _raw(["m", "icloud", "INBOX", 1]),
+        _raw(["m", "ICLOUD", "INBOX", 1, 1]),
+        _raw(["g", "outlook", "bad'id"]),
+        _raw(["g", "outlook"]),
+        _padded(["g", "outlook", "AAMk"]),
+        "x" * 600,
+        5,
+        _raw(["t", "icloud", "gmail", 1]),
+    ]
+    for value in values:
         with pytest.raises(ToolError) as info:
             decode_status_entry(value)
         assert info.value.code == "invalid_argument"
