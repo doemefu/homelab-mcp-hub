@@ -330,6 +330,32 @@ def test_real_client_examines_a_raw_mutf7_name_unchanged() -> None:
     assert b"UID SEARCH NOT DRAFT" in sent
 
 
+@pytest.mark.parametrize(
+    ("raw_name", "wire"),
+    [
+        ('a"b', b'"a\\"b"'),
+        ("a\\b", b'"a\\\\b"'),
+        ("x{5}", b'"x{5}"'),
+        ("a%b", b'"a%b"'),
+        ("a*b", b'"a*b"'),
+        ("a&-b", b'"a&-b"'),
+        ('&-"\\{5}%*', b'"&-\\"\\\\{5}%*"'),
+    ],
+)
+def test_examine_sends_each_raw_name_as_one_quoted_string(raw_name: str, wire: bytes) -> None:
+    """Security I2: a real IMAPClient sends every raw mailbox name as exactly one quoted string, `"` and `\\`
+    escaped, with no literal (a trailing `{5}` stays inside the quotes) and `%`, `*` and `&-` sent unchanged."""
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(wire_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.examine(raw_name)
+        guard.logout()
+        lines, literals = list(recorder.lines), list(recorder.literals)
+    examines = [line.split(b" ", 1)[1] for line in lines if _wire_command(line) == "EXAMINE"]
+    assert examines == [b"EXAMINE " + wire]
+    assert literals == []
+
+
 def _wire_command(line: bytes) -> str:
     words = line.split(b" ")
     verb = words[1].upper()
