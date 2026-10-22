@@ -7,7 +7,7 @@ message answer fills the 2 MiB message cap (non-ASCII body plus 5,000 recipients
 1 MiB list cap; `--with-calendar <scenario>` runs that calendar scenario concurrently in the same process.
 `--scenario status` drives ImapMailbox.message_status for 50 refs through an in-process IMAP fake: every location SEARCH
 and every reply or thread SEARCH answers 500 hits whose header blocks are hostile (8 KiB address header for the 500-UID
-locate chunks, 64 KiB lookup header for the 100-UID lookup chunks; one shared bytes object, so the fake holds
+locate chunks, 64 KiB lookup header for the 50-UID lookup chunks; one shared bytes object, so the fake holds
 none of it).
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 

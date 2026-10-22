@@ -75,7 +75,7 @@ GMAIL_REPLY_HEADER_SEARCH: Final = False
 # T0 P1: iCloud not measurable (no aged sample); default kept. False → `replied` from the flag only
 OTHER_REPLY_IN_REPLY_TO: Final = True
 MAX_LOOKUP_HITS: Final = 500  # hits re-checked per reply/thread SEARCH batch and folder (C9)
-LOOKUP_FETCH_UIDS: Final = 100  # UIDs per re-check FETCH: at most 6.4 MiB of 64 KiB header items per answer (C9)
+LOOKUP_FETCH_UIDS: Final = 50  # UIDs per re-check FETCH: at most 3.2 MiB of 64 KiB header items per answer (C9)
 MAX_REPLY_KEYS_PER_REF: Final = 5  # owner reply Message-IDs added to a ref's thread keys (E-mf1)
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per provider call (SR6)
 SOFT_CHECK_ROWS: Final = 10  # fetched rows parsed between two soft checks (SR2: parsing sends no command)

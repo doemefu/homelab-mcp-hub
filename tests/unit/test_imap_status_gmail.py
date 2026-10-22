@@ -299,7 +299,7 @@ def test_gmail_reply_from_sent_thread_member(header_search_on: None, monkeypatch
 
 def test_gmail_thread_search_shape_and_twenty_keys() -> None:
     """At most 20 X-GM-THRID keys per SEARCH (P5), batched by `thrid_batches`, no SINCE (Option 13); the members are
-    fetched with labels, thread id and the 64 KiB header item in chunks of at most 100."""
+    fetched with labels, thread id and the 64 KiB header item in chunks of at most 50."""
     xs = [f"x{i}@example.test" for i in range(21)]
     server = gmail(
         all_mail=[msg(i + 1, 200, "x", INBOX_L, thrid=THR + i, message_id=f"<{x}>") for i, x in enumerate(xs)]
@@ -701,7 +701,7 @@ def test_gmail_soft_checks_every_ten_rows_and_per_chunk() -> None:
     checks: list[str] = []
     [status] = run_direct(server, [g()], lambda: checks.append("check"))
     fetched = member_fetches(server)
-    assert [len(uids) for _, uids in fetched] == [100, 100, 51]
+    assert [len(uids) for _, uids in fetched] == [50, 50, 50, 50, 50, 1]
     assert len(checks) >= sum((len(uids) - 1) // SOFT_CHECK_ROWS for _, uids in fetched) + len(fetched) - 1
     assert facts(status) == (None, None, ago(100 - 251 / 10), True)
 

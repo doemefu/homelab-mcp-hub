@@ -1033,7 +1033,7 @@ def test_hit_cap_keeps_lowest_for_replies_highest_for_thread() -> None:
     server = server_with(inbox=[x_inbox(), *followers], sent=answers)
     assert facts(run(server, [r()])[0]) == (ago(600 - 0.1), None, ago(300 - count / 10 - 0.1), False)
     fetched = lookup_fetches(server)
-    assert all(len(uids) <= LOOKUP_FETCH_UIDS == 100 for _, uids in fetched)
+    assert all(len(uids) <= LOOKUP_FETCH_UIDS == 50 for _, uids in fetched)
     by_box = {box: sorted(uid for b, uids in fetched if b == box for uid in uids) for box, _ in fetched}
     assert by_box["Sent Messages"] == list(range(1, MAX_LOOKUP_HITS + 1))
     assert by_box["INBOX"] == list(range(count + 1 - MAX_LOOKUP_HITS + 1, count + 2))
