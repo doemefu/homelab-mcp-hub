@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -707,6 +708,36 @@ def test_copy_without_internaldate_is_dropped(monkeypatch: pytest.MonkeyPatch) -
         sent=[msg(3, 90, "dated", message_id=f"<{MID}>")],
     )
     assert get(server, ref()).ref == MessageRef("icloud", "Sent Messages", 7, 3)
+
+
+@pytest.mark.parametrize("field", ["To", "Cc", "From"])
+def test_hostile_address_header_parses_in_linear_time(field: str) -> None:
+    """Security I1: To, Cc and From of `get_message` go through the linear parser on text cut to 8 KiB, never the
+    quadratic policy parser (a 60,000-quote header took seconds there)."""
+    lines = {"From": "From: Sender <sender@example.test>", "To": "To: Owner <owner@example.org>", "Cc": None}
+    lines[field] = f"{field}: " + '"' * 60_000
+    headers = "\r\n".join([line for line in lines.values() if line] + ["Subject: hostile", f"Message-ID: <{MID}>"])
+    server = icloud(inbox=[FakeMessage(1, NOW - timedelta(minutes=5), headers=(headers + "\r\n\r\n").encode())])
+    start = time.perf_counter()
+    detail = get(server, MessageRef("icloud", "INBOX", 7, 1))
+    assert time.perf_counter() - start < 0.5
+    assert (detail.subject, detail.meta.message_id) == ("hostile", MID)
+    if field != "From":
+        assert detail.from_address == "sender@example.test"
+
+
+def test_address_headers_keep_names_and_addresses() -> None:
+    headers = (
+        "From: =?utf-8?q?J=C3=B6rg?= <joerg@example.test>\r\n"
+        'To: "Doe, Jane" <jane@example.test>,\r\n bob@example.test\r\n'
+        "Cc: Team: carol@example.test, dave@example.test;\r\n"
+        "Subject: s\r\n\r\n"
+    )
+    server = icloud(inbox=[FakeMessage(1, NOW - timedelta(minutes=5), headers=headers.encode())])
+    detail = get(server, MessageRef("icloud", "INBOX", 7, 1))
+    assert (detail.from_name, detail.from_address) == ("J\u00f6rg", "joerg@example.test")
+    assert detail.to_addresses == ["jane@example.test", "bob@example.test"]
+    assert detail.cc_addresses == ["carol@example.test", "dave@example.test"]
 
 
 def test_history_header_failure_keeps_sender_and_subject(monkeypatch: pytest.MonkeyPatch) -> None:

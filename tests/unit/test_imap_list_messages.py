@@ -900,15 +900,10 @@ def test_get_message_steps_pass_soft_stop_through(step: str, monkeypatch: pytest
     assert (info.value.code, info.value.cause) == ("upstream_timeout", "SoftStop")
 
 
-def test_address_fallback_passes_soft_stop_through() -> None:
-    class Header:
-        @property
-        def addresses(self) -> object:
-            raise SoftStop
-
+def test_address_parse_passes_soft_stop_through() -> None:
     class Message:
-        def get(self, name: str) -> Header:
-            return Header()
+        def raw_items(self) -> object:
+            raise SoftStop
 
     with pytest.raises(SoftStop):
         imap._addresses(Message(), "From")  # type: ignore[arg-type]

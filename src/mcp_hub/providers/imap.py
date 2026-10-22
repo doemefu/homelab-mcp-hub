@@ -12,10 +12,8 @@ import ssl
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from email.headerregistry import AddressHeader
 from email.message import Message
 from email.parser import BytesHeaderParser
-from email.utils import getaddresses
 from typing import Final, Literal, cast
 
 import imapclient
@@ -57,6 +55,7 @@ from mcp_hub.providers.folders import (
 from mcp_hub.providers.headers import (
     SUMMARY_HEADER_ITEM,
     ParsedHeaders,
+    address_pairs,
     candidate_header_item,
     header_bytes,
     imap_thread_key,
@@ -143,16 +142,14 @@ def _aware(value: object) -> datetime | None:
 
 
 def _addresses(message: Message, name: str) -> list[tuple[str, str]]:
-    """(display name, address) pairs; falls back to the lenient stdlib parser for malformed headers."""
-    header = message.get(name)
-    if header is None:
-        return []
-    try:  # policy.default yields an AddressHeader; typeshed types Message.get as str
-        return [(a.display_name, a.addr_spec) for a in cast(AddressHeader, header).addresses]
-    except PASS_THROUGH:
-        raise
-    except Exception:  # malformed header: parse the raw text leniently
-        return [(n, a) for n, a in getaddresses([str(header)]) if a or n]
+    """(display name, address) pairs of the first `name` header: its raw text through the linear parser of
+    `headers.address_pairs` (cut to 8 KiB). `Message.get` would run the policy parser, which is quadratic on a
+    hostile 64 KiB header (security I1)."""
+    wanted = name.lower()
+    for key, value in message.raw_items():
+        if key.lower() == wanted:
+            return address_pairs(str(value))
+    return []
 
 
 def _flags(row: dict[bytes, object]) -> frozenset[bytes]:

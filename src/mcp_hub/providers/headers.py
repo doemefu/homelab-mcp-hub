@@ -159,7 +159,7 @@ def _display_name(name: str) -> str:
         return name
 
 
-def _addresses(text: str) -> list[tuple[str, str]]:
+def address_pairs(text: str) -> list[tuple[str, str]]:
     """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic)."""
     try:
         return [(_display_name(n), a) for n, a in getaddresses([text[:MAX_ADDRESS_HEADER_BYTES]]) if a or n]
@@ -194,9 +194,9 @@ def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
     items: dict[str, list[str]] = {}
     for name, value in _PARSER.parsebytes(raw).raw_items():
         items.setdefault(name.lower(), []).append(_FOLD.sub("", str(value)).strip())
-    sender = (_addresses(_first(items, "from") or "") or [("", "")])[0]
-    to = tuple(a for _, a in _addresses(_first(items, "to") or "") if a)
-    cc = tuple(a for _, a in _addresses(_first(items, "cc") or "") if a)
+    sender = (address_pairs(_first(items, "from") or "") or [("", "")])[0]
+    to = tuple(a for _, a in address_pairs(_first(items, "to") or "") if a)
+    cc = tuple(a for _, a in address_pairs(_first(items, "cc") or "") if a)
     subject_raw = _first(items, "subject")
     message_id = bare_message_id(_first(items, "message-id"))
     refs_raw = _first(items, "references")
