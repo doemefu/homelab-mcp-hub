@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 
 RUNS = 7
-MAX_RATIO = 2.5  # a 2x input may take at most 2.5x the time; quadratic growth gives about 4x
+MAX_RATIO = 3.0  # a 2x input may take at most 3x the time (cache effects: 2.6x on one CPU); quadratic gives 4x
 MIN_SAMPLE_SECONDS = 0.005  # each sample repeats the call until it lasts this long, so timer jitter cannot decide
 
 
