@@ -36,6 +36,7 @@ _SUBJECT_KEPT_CHARS: Final = 1000
 _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 _FOLD: Final = re.compile(r"\r?\n(?=[ \t])")
 _SPLIT: Final = re.compile(r"[\s,]+")
+_LIST_TAIL: Final = ", \t\r\n"  # what a list cut after a comma ends with
 _WHITESPACE: Final = re.compile(r"\s+")
 _PREFIX: Final = re.compile(r"\s*(?:re|aw|antw|antwort|fwd?|wg|wtr|sv)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*:\s*", re.I)
 _TAG: Final = re.compile(r"\[[^\[\]]{1,40}\]\s*")
@@ -174,10 +175,49 @@ def _display_name(name: str) -> str:
         return name
 
 
+def _complete_list(value: str) -> str:
+    """`value` up to its last comma outside quoted strings, comments and angle brackets: the addresses that ended
+    before a cut. One linear pass, no regex."""
+    last, depth, quoted, angle, i, n = -1, 0, False, False, 0, len(value)
+    while i < n:
+        c = value[i]
+        if quoted or depth:
+            if c == "\\":
+                i += 1
+            elif quoted:
+                quoted = c != '"'
+            elif c in "()":
+                depth += 1 if c == "(" else -1
+        elif angle:
+            angle = c != ">"
+        elif c == '"':
+            quoted = True
+        elif c == "(":
+            depth = 1
+        elif c == "<":
+            angle = True
+        elif c == ",":
+            last = i
+        i += 1
+    return value[:last] if last >= 0 else ""
+
+
 def address_pairs(text: str) -> list[tuple[str, str]]:
-    """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic)."""
+    """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic).
+
+    A list cut at a byte cap keeps its complete addresses: at the 8 KiB cap here the half address after the last
+    top-level comma is dropped; trailing commas and whitespace (what `trim_cut` leaves) are stripped; and a field the
+    strict parser refuses as a whole (an unterminated quoted string or comment) is parsed once more up to its last
+    top-level comma."""
+    value = text[:MAX_ADDRESS_HEADER_BYTES]
+    if len(text) > MAX_ADDRESS_HEADER_BYTES:
+        value = _complete_list(value)
+    value = value.rstrip(_LIST_TAIL)
     try:
-        return [(_display_name(n), a) for n, a in getaddresses([text[:MAX_ADDRESS_HEADER_BYTES]]) if a or n]
+        pairs = getaddresses([value])
+        if value and pairs == [("", "")]:
+            pairs = getaddresses([_complete_list(value).rstrip(_LIST_TAIL)])
+        return [(_display_name(n), a) for n, a in pairs if a or n]
     except Exception:
         return []
 

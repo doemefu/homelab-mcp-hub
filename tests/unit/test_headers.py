@@ -1,5 +1,6 @@
 import time
 from collections.abc import Callable
+from email.utils import getaddresses
 
 import pytest
 
@@ -8,8 +9,10 @@ from mcp_hub.providers import headers as h
 from mcp_hub.providers.headers import (
     DESCENDANT_HEADER_BYTES,
     DESCENDANT_HEADER_ITEM,
+    MAX_ADDRESS_HEADER_BYTES,
     Descendant,
     ParsedHeaders,
+    address_pairs,
     bare_message_id,
     imap_thread_key,
     is_own,
@@ -18,6 +21,7 @@ from mcp_hub.providers.headers import (
     parse_descendant,
     parse_summary_headers,
     subject_digest,
+    trim_cut,
 )
 from mcp_hub.providers.imap_guard import _fetch_item_ok
 
@@ -302,6 +306,71 @@ def test_hostile_header_bytes_do_not_raise(data: bytes) -> None:
     subject_digest(parsed.subject)
     imap_thread_key("icloud", parsed)
     is_own(parsed.from_address, frozenset({"me@example.org"}))
+
+
+def addresses(value: str) -> list[str]:
+    return [address for _, address in address_pairs(value)]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("a@x.y, b@x.y,", ["a@x.y", "b@x.y"]),  # what `trim_cut` leaves of a list cut after a comma
+        ("a@x.y, b@x.y, \t", ["a@x.y", "b@x.y"]),
+        ("a@x.y,,", ["a@x.y"]),
+        ('a@x.y, "Doe, J', ["a@x.y"]),  # the strict parser refuses the field: back to the last top-level comma
+        ("a@x.y, (note, x", ["a@x.y"]),
+        ('a@x.y, "Doe \\", J', ["a@x.y"]),  # an escaped quote does not end the quoted string
+        ("a@x.y, Bob <@r1,@r2:b@x.y", ["a@x.y"]),  # a comma inside angle brackets is not a list comma
+        ('"Doe, J" <j@x.y>, Ann <a@x.y>, (n) c@x.y, "Lee, K', ["j@x.y", "a@x.y", "c@x.y"]),
+    ],
+)
+def test_address_pairs_cut_list_keeps_complete_addresses(value: str, expected: list[str]) -> None:
+    """A list cut at a byte cap keeps the addresses that ended before the cut: trailing commas and whitespace are
+    stripped, and a field the strict parser refuses is cut back to its last comma outside quoted strings, comments
+    and angle brackets."""
+    assert addresses(value) == expected
+
+
+def test_address_pairs_cut_inside_the_last_address() -> None:
+    """A cut inside the last address drops only that address. At the 8 KiB cap of `address_pairs` the cut is known,
+    so the list is cut back to its last top-level comma. In a block cut at its own cap, `trim_cut` drops the
+    shortened token; what is left of that address is kept as the parser reads it: here the display name "Bob",
+    which the parser returns as an address. No complete address is lost, and no shortened address appears."""
+    first = "a" * (MAX_ADDRESS_HEADER_BYTES - 20) + "@x.y"
+    value = first + ", bob@example.test, c@x.y"
+    assert value[:MAX_ADDRESS_HEADER_BYTES].endswith(", bob@example.te")  # the cap falls inside the second address
+    assert addresses(value) == [first]
+
+    block = trim_cut(b"To: a@x.y, Bob <b@x.y")
+    assert block == b"To: a@x.y, Bob "
+    parsed = parse_summary_headers(block)
+    assert parsed.to == ("a@x.y", "Bob")
+    block = trim_cut(b"To: a@x.y, b@x.yz")
+    assert parse_summary_headers(block).to == ("a@x.y",)
+
+
+def test_address_pairs_strip_keeps_one_parse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trailing comma `trim_cut` leaves is stripped before parsing, so the common cut needs one parse only."""
+    calls: list[list[str]] = []
+
+    def counting(values: list[str]) -> list[tuple[str, str]]:
+        calls.append(values)
+        return getaddresses(values)
+
+    monkeypatch.setattr(h, "getaddresses", counting)
+    assert addresses("a@x.y, b@x.y, ") == ["a@x.y", "b@x.y"]
+    assert calls == [["a@x.y, b@x.y"]]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["a@x.y", "Ann <a@x.y>, b@x.y", '"Doe, J" <j@x.y>', "a@x.y, Bob <b@x", "undisclosed-recipients:;", ""],
+)
+def test_address_pairs_uncut_values_unchanged(value: str) -> None:
+    """Values the strict parser accepts and that need no strip parse as before."""
+    expected = [(name, address) for name, address in getaddresses([value]) if address or name]
+    assert address_pairs(value) == expected
 
 
 def test_folded_message_id_fallback_has_no_line_break() -> None:
