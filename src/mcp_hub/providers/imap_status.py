@@ -9,7 +9,6 @@ logged but `item_degraded`, through the session and capped per call (SR6).
 The Gmail reply search by In-Reply-To/References in All Mail is gated off by GMAIL_REPLY_HEADER_SEARCH (T0 P1: about
 14 s per search). It is kept on purpose, tested, as the path to switch on if Gmail answers it faster."""
 
-import imaplib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -38,7 +37,6 @@ from mcp_hub.providers.headers import (
     header_bytes,
     parse_descendant,
 )
-from mcp_hub.providers.imap_guard import PASS_THROUGH, examine_name_ok
 from mcp_hub.providers.imap_search import (
     GMAIL_SENT_LABEL_KEY,
     LOOKUP_BATCH_VALUES,
@@ -56,7 +54,6 @@ from mcp_hub.providers.imap_session import (
     ImapSession,
     LocateResult,
     MissingInternalDate,
-    _answered_no,
     _aware,
     _bound_entry,
     _candidate_headers,
@@ -67,9 +64,20 @@ from mcp_hub.providers.imap_session import (
     _in_sent,
     _is_draft,
     _labels,
+    _open,
     _replaces,
+    _rows,
     _thread_id,
     locate_items,
+)
+from mcp_hub.providers.imap_session import (
+    LOOKUP_FETCH_UIDS as LOOKUP_FETCH_UIDS,
+)
+from mcp_hub.providers.imap_session import (
+    MAX_LOOKUP_HITS as MAX_LOOKUP_HITS,
+)
+from mcp_hub.providers.imap_session import (
+    SOFT_CHECK_ROWS as SOFT_CHECK_ROWS,
 )
 
 # Gates from the T0 probe (Option 17), used by the reply and thread lookups (T9, T10).
@@ -77,18 +85,14 @@ from mcp_hub.providers.imap_session import (
 GMAIL_REPLY_HEADER_SEARCH: Final = False
 # T0 P1: iCloud not measurable (no aged sample); default kept. False → `replied` from the flag only
 OTHER_REPLY_IN_REPLY_TO: Final = True
-MAX_LOOKUP_HITS: Final = 500  # hits re-checked per reply/thread SEARCH batch and folder (C9)
-LOOKUP_FETCH_UIDS: Final = 50  # UIDs per re-check FETCH: at most 3.2 MiB of 64 KiB header items per answer (C9)
 MAX_REPLY_KEYS_PER_REF: Final = 5  # owner reply Message-IDs added to a ref's thread keys (E-mf1)
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per provider call (SR6)
-SOFT_CHECK_ROWS: Final = 10  # fetched rows parsed between two soft checks (SR2: parsing sends no command)
 _LOOKUP_FIELDS: Final[tuple[HeaderField, ...]] = ("In-Reply-To", "References")
 _LOOKUP_ITEMS: Final = ("FLAGS", "INTERNALDATE", DESCENDANT_HEADER_ITEM)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "archive", "trash")
 _GMAIL_REPLY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", DESCENDANT_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", DESCENDANT_HEADER_ITEM)
 _GMAIL_NO_ALL_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "trash", "sent")  # Gmail without `\All` (E-im3a)
-_TOKEN_ENDS: Final = (b" ", b"\t", b"\r", b"\n", b",", b">")  # where a msg-id token can end
 _SEEN: Final = b"\\seen"
 _ANSWERED: Final = b"\\answered"
 _FLAGGED: Final = b"\\flagged"
@@ -527,64 +531,6 @@ def _count_newer(session: ImapSession, state: _Lookups, hit: _Hit, key_refs: Map
             copies[hit.message_id] = hit.received_at
 
 
-def _open(session: ImapSession, entry: FolderEntry) -> bool:
-    """EXAMINE `entry` unless it is selected already (Design A). A NO is the caller's to mark, without a map rebuild
-    (§6.5); a missing UIDVALIDITY is no failure here, since no id is built from it (M6)."""
-    if session.selected == entry.raw_name:
-        return True
-    if entry.raw_name != session.registry_inbox and not examine_name_ok(entry.raw_name):
-        return False  # over 1,000 characters: the guard would refuse the EXAMINE
-    try:
-        session.examine(entry)
-    except PASS_THROUGH:
-        raise
-    except imaplib.IMAP4.error as exc:
-        if not _answered_no(exc):
-            raise
-        return False
-    return True
-
-
-def _rows(
-    session: ImapSession,
-    search: bytes,
-    items: Sequence[str],
-    *,
-    newest: bool,
-    miss: Callable[[], None],
-    soft_check: Callable[[], None],
-) -> Iterator[dict[bytes, object]]:
-    """One lookup `UID SEARCH` in the selected mailbox, then the rows of at most MAX_LOOKUP_HITS hits (the lowest
-    UIDs, or the highest when `newest`; E-im2, C9), fetched in chunks of LOOKUP_FETCH_UIDS, each consumed before the
-    next is fetched. `miss` marks the search's refs incomplete: a SEARCH NO (B7), the hit cap or a lost row."""
-    try:
-        found = session.search(search)
-    except PASS_THROUGH:
-        raise
-    except imaplib.IMAP4.error as exc:
-        if not _answered_no(exc):
-            raise
-        miss()
-        return
-    uids = sorted(set(found))
-    if len(uids) > MAX_LOOKUP_HITS:
-        uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
-        miss()
-    chunks = session.fetch_chunks(uids, items, chunk=LOOKUP_FETCH_UIDS)
-    for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
-        part = uids[start : start + LOOKUP_FETCH_UIDS]
-        if len(rows.keys() & set(part)) < len(part):  # FETCH NO or expunged meanwhile: a hit is unchecked
-            miss()
-        for count, uid in enumerate(part):
-            if count and count % SOFT_CHECK_ROWS == 0:
-                soft_check()  # SR2: at most 10 blocks of 64 KiB parsed between two checks; parsing sends no command
-            row = rows.get(uid)
-            if row is not None:
-                yield row
-        if start + LOOKUP_FETCH_UIDS < len(uids):
-            soft_check()  # per chunk; the guard checks again before the next FETCH
-
-
 def _hits(
     session: ImapSession,
     batch: list[str],
@@ -622,10 +568,9 @@ def _recheck(
     if not block:
         miss(wanted)
         return None
+    parsed = parse_descendant(block, wanted)
     if len(block) < DESCENDANT_HEADER_BYTES:
-        parsed = parse_descendant(block, wanted)
         return _Hit(parsed.message_id, parsed.from_address, received, parsed.referenced)
-    parsed = parse_descendant(block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1], wanted)
     miss(wanted - parsed.referenced)
     if not parsed.referenced:
         return None
@@ -864,10 +809,9 @@ def _gmail_member(
         return None
     sent = _gmail_sent(entry, row)
     ids = wanted[thread_id]
+    parsed = parse_descendant(block, ids)
     if len(block) < DESCENDANT_HEADER_BYTES:
-        parsed = parse_descendant(block, ids)
         return _Member(thread_id, sent, parsed.message_id, parsed.from_address, received, parsed.referenced)
-    parsed = parse_descendant(block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1], ids)
     sender = parsed.from_address if _field_complete(block, b"from") else None
     complete_id = parsed.message_id is not None and _field_complete(block, b"message-id")
     if not complete_id or (not sent and sender is None):

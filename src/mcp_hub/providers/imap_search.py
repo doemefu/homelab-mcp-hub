@@ -22,7 +22,10 @@ MAX_OR_BYTES: Final = 4000  # bounds one header OR tree, so a UID SEARCH line st
 LOCATE_BATCH_VALUES: Final = 20  # Message-IDs per location UID SEARCH
 LOOKUP_BATCH_VALUES: Final = 10  # Message-IDs per reply/thread UID SEARCH: 20 keys (In-Reply-To + References)
 MAX_THRID_VALUES: Final = 20  # X-GM-THRID keys per UID SEARCH
+THREAD_SEED_IDS: Final = 11  # round (1) ids: 22 keys with Message-ID + References (spec 080 §6.5)
+THREAD_ROUND_KEYS: Final = 20  # keys per round (2) UID SEARCH (spec 080 §6.5)
 HeaderField = Literal["Message-ID", "In-Reply-To", "References"]
+MixedKey = tuple[HeaderField, str]
 
 _NOT_DRAFT: Final = b"NOT DRAFT"
 _HEADER_FIELDS: Final = frozenset({"Message-ID", "In-Reply-To", "References"})
@@ -161,6 +164,63 @@ def or_batches(
         batch.append(value)
         batch_bytes += value_bytes
         batch_leaves += len(leaves)
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _mixed_leaves(keys: Sequence[MixedKey]) -> list[bytes]:
+    """`HEADER <field> "<<id>>"` per (field, id) key, in order; a bad field is a `ValueError`, a bad id an
+    `UnsafeSearchValue` (`msg_id_token`)."""
+    if isinstance(keys, (str, bytes)):
+        raise ValueError("keys must be a sequence, not one string")
+    leaves: list[bytes] = []
+    for key in keys:
+        field, value = key
+        if type(field) is not str or field not in _HEADER_FIELDS:
+            raise ValueError("unknown header field")
+        leaves.append(b"HEADER " + field.encode("ascii") + b" " + msg_id_token(value))
+    return leaves
+
+
+def mixed_or(keys: Sequence[MixedKey]) -> bytes:
+    """Balanced OR tree (I10) of `HEADER <field> "<id>"` keys where each key has its own field."""
+    leaves = _mixed_leaves(keys)
+    if not leaves:
+        raise ValueError("no search keys")
+    return _or_tree(leaves)
+
+
+def mixed_batches(
+    keys: Sequence[MixedKey], *, max_keys: int = THREAD_ROUND_KEYS, max_bytes: int = MAX_OR_BYTES
+) -> list[list[MixedKey]]:
+    """Consecutive batches of the distinct keys in input order (the caller puts the downward keys first); each holds
+    at most `max_keys` keys and its `mixed_or` at most `max_bytes` bytes. A batch is closed when the next key would
+    break either cap; no key is dropped. Raises `UnsafeSearchValue` for a key that fails `msg_id_token` or whose own
+    leaf exceeds `max_bytes`."""
+    if type(max_keys) is not int or max_keys < 1:
+        raise ValueError("max_keys must be positive")
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    if isinstance(keys, (str, bytes)):
+        raise ValueError("keys must be a sequence, not one string")
+    snapshot = list(keys)  # one pass: the checked copy is what gets batched
+    leaves = _mixed_leaves(snapshot)
+    batches: list[list[MixedKey]] = []
+    batch: list[MixedKey] = []
+    batch_bytes = 0
+    seen: set[MixedKey] = set()
+    for key, leaf in zip(snapshot, leaves, strict=True):
+        if key in seen:
+            continue
+        seen.add(key)
+        if _or_tree_size(len(leaf), 1) > max_bytes:
+            raise UnsafeSearchValue("search value refused")
+        if batch and (len(batch) >= max_keys or _or_tree_size(batch_bytes + len(leaf), len(batch) + 1) > max_bytes):
+            batches.append(batch)
+            batch, batch_bytes = [], 0
+        batch.append(key)
+        batch_bytes += len(leaf)
     if batch:
         batches.append(batch)
     return batches

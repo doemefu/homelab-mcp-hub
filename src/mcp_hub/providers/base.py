@@ -194,6 +194,109 @@ def status_unknown(reason: StatusReason) -> MessageStatus:
     return MessageStatus("unknown", reason)
 
 
+LinkedBy = Literal["server", "headers", "subject"]
+BodySource = Literal["text/plain", "text/html-converted", "none"]
+QuoteRemoval = Literal["server", "heuristic", "none"]
+MIN_CHARS_PER_MESSAGE: Final = 200
+MAX_CHARS_PER_MESSAGE: Final = 5000
+MAX_THREAD_MESSAGES: Final = 50
+MAX_PARTICIPANTS: Final = 20
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadQuery:
+    """One `get_thread` call (spec 080 §5.2): a seed (`ref` or `id`) or a thread key, never both."""
+
+    seed: AnyMessageRef | StableRef | None
+    key: ThreadKey | None
+    include_trash: bool
+    max_chars: int  # max_chars_per_message
+
+    def __post_init__(self) -> None:
+        if (self.seed is None) == (self.key is None):
+            raise ValueError("exactly one of seed and key is set")
+        if not MIN_CHARS_PER_MESSAGE <= self.max_chars <= MAX_CHARS_PER_MESSAGE:
+            raise ValueError("max_chars is out of range")
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadBody:
+    """A member body after quote removal, decoded but not yet sanitised; the tool cuts it to `max_chars`."""
+
+    text: str  # at most BODY_KEEP_FACTOR * max_chars characters
+    source: BodySource
+    quote_removal: QuoteRemoval
+    original_chars: int | None  # None for a server cut ("server") and for an omitted body
+    cut: bool  # the 64 KiB fetch or the uniqueBody cap, or the BODY_KEEP_FACTOR * max_chars keep, cut the text
+    omitted: bool  # not read
+
+    def __post_init__(self) -> None:
+        if self.omitted and (self.text or self.quote_removal != "none"):
+            raise ValueError("an omitted body has no text and no quote removal")
+        if (self.original_chars is None) != (self.omitted or self.quote_removal == "server"):
+            raise ValueError("original_chars is None exactly for an omitted body or a server cut")
+        if self.original_chars is not None and self.original_chars < 0:
+            raise ValueError("original_chars is negative")
+
+
+OMITTED_BODY: Final = ThreadBody("", "none", "none", None, False, True)
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadMember:
+    summary: MailSummary  # snippet_text ""; meta carries folder, flags, direction, ids and its own thread key
+    linked_by: LinkedBy
+    body: ThreadBody
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadOverview:
+    """`summary` of a thread over every member found, before the 50-message cap (spec 080 §5.2)."""
+
+    message_count: int
+    message_count_exact: bool
+    last_direction: Direction
+    last_incoming_at: datetime | None
+    last_outgoing_at: datetime | None
+    participants: tuple[str, ...]  # at most 20, newest member first, own addresses removed, not yet sanitised
+
+    def __post_init__(self) -> None:
+        if self.message_count < 1:
+            raise ValueError("message_count is at least 1")
+        if len(self.participants) > MAX_PARTICIPANTS:
+            raise ValueError("too many participants")
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadPage:
+    """`source_mismatch`: the key's source does not fit the account (the tool answers invalid_argument).
+
+    `truncated`: members or bodies are missing (the 50-message cap, a soft stop, a body not read)."""
+
+    outcome: Literal["ok", "source_mismatch"]
+    thread: ThreadKey | None = None  # None for a seed without a derivable key (SG4)
+    members: tuple[ThreadMember, ...] = ()  # oldest first by (received_at, k)
+    overview: ThreadOverview | None = None
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.overview is not None) != (self.outcome == "ok"):
+            raise ValueError("overview is set exactly when outcome is ok")
+        if self.overview is None:
+            if self.members:
+                raise ValueError("members need outcome ok")
+            return
+        if not 1 <= len(self.members) <= MAX_THREAD_MESSAGES:
+            raise ValueError("an ok page holds 1 to 50 members")
+        if self.overview.message_count < len(self.members):
+            raise ValueError("message_count is below the number of members")
+        if self.overview.message_count > len(self.members) and not self.truncated:
+            raise ValueError("message_count above the members needs truncated")  # the cap (P11)
+        keys = [order_key(member.summary) for member in self.members]
+        if keys != sorted(keys):
+            raise ValueError("members are not oldest first")
+
+
 def read_credential(secrets_dir: Path, ref: str) -> str:
     """Read at connection time, so a rotated Secret file is picked up without a restart (spec 080 §7.1)."""
     try:

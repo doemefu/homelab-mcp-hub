@@ -31,6 +31,9 @@ class CallDeadline:
     def hard_at(self) -> float:
         return self.started + self.hard_seconds
 
+    def elapsed(self) -> float:
+        return self.clock() - self.started
+
     def remaining(self) -> float:
         return self.hard_at - self.clock()
 

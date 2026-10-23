@@ -4,7 +4,14 @@ import pytest
 
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap_guard import GuardedImapClient
-from mcp_hub.providers.imap_search import GMAIL_SENT_LABEL_KEY, UnsafeSearchValue, criteria, header_or, thrid_or
+from mcp_hub.providers.imap_search import (
+    GMAIL_SENT_LABEL_KEY,
+    UnsafeSearchValue,
+    criteria,
+    header_or,
+    mixed_or,
+    thrid_or,
+)
 from tests.support.imap_wire import WireRecorder, wire_client
 
 ATOM_SPECIALS = ["a(b)@x", "a{b@x", "%*@x", "a]b@x", "x{5}@y", "x{5}", "a+&#%=;/?@x"]
@@ -129,4 +136,13 @@ def test_unsafe_value_never_reaches_the_wire(value: str) -> None:
         literals = list(recorder.literals)
     assert b"UID SEARCH" not in [_command(line) for line in lines]
     assert not any(b"ok@x" in line for line in lines)
+    assert literals == []
+
+
+def test_mixed_or_wire_bytes() -> None:
+    search = criteria(b"NOT DRAFT", mixed_or([("In-Reply-To", "a@x"), ("Message-ID", "b@x")]))
+    lines, literals = _search_once(search)
+    assert [line.partition(b" ")[2] for line in lines if _command(line) == b"UID SEARCH"] == [
+        b'UID SEARCH NOT DRAFT OR HEADER In-Reply-To "<a@x>" HEADER Message-ID "<b@x>"'
+    ]
     assert literals == []

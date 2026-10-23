@@ -5,8 +5,9 @@ Lists cover the well-known folders by id (inbox, sentitems, archive, deleteditem
 deadline with the 16 s soft stop. `get_message` reads one message by its immutable id, bound to its parent folder
 (D75), or first locates a `ref` by `internetMessageId` over all folders. `message_status` locates refs in batched
 `internetMessageId` lookups, reads `g` ids without their body and looks up replies and newer items by `conversationId`
-(§5.2 `get_message_status`). Blocking; runs through providers.base.run_blocking. Returns decoded, unsanitised text;
-the tool layer sanitises every string (§5.3)."""
+(§5.2 `get_message_status`). `get_thread` reads one conversation by `conversationId` with the server-cut `uniqueBody`
+(§5.2 `get_thread`, §6.5). Blocking; runs through providers.base.run_blocking. Returns decoded, unsanitised text; the
+tool layer sanitises every string (§5.3)."""
 
 import logging
 import re
@@ -33,6 +34,7 @@ from mcp_hub.logging import log_event
 from mcp_hub.providers.base import (
     MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
+    OMITTED_BODY,
     PROVIDER_TIMEOUT_SECONDS,
     AttachmentMeta,
     FolderPage,
@@ -45,6 +47,10 @@ from mcp_hub.providers.base import (
     MessageStatus,
     ProviderError,
     StatusTarget,
+    ThreadBody,
+    ThreadMember,
+    ThreadPage,
+    ThreadQuery,
     direction_of,
     load_json_object,
     log_message_skipped,
@@ -75,7 +81,18 @@ from mcp_hub.providers.graph_status import (
     message_id_filter,
     thread_facts,
 )
+from mcp_hub.providers.graph_thread import MAX_UNIQUE_BODY_READS, THREAD_LIST_TOP, body_text, thread_list_params
 from mcp_hub.providers.headers import MAX_REFERENCES, bare_message_id, msg_id_tokens, valid_message_id
+from mcp_hub.providers.threads import (
+    FOLDER_RANK,
+    ThreadCopy,
+    choose_members,
+    merge_copies,
+    overview,
+    participants_of,
+    prepare_body,
+    server_body,
+)
 from mcp_hub.sanitize import html_to_text
 
 GRAPH_HOST: Final = "graph.microsoft.com"
@@ -113,16 +130,19 @@ MESSAGE_SELECT: Final = f"{_HEADER_FIELDS},body,{_HISTORY_FIELDS}"
 FALLBACK_SELECT: Final = f"{_HEADER_FIELDS},bodyPreview,{_HISTORY_FIELDS}"
 ATTACHMENT_SELECT: Final = "name,contentType,size,isInline"
 REF_LOOKUP_TOP: Final = 50  # one Message-ID over all folders (spec 080 §5.2 "Location, Graph")
-# S-e: among copies with the same Message-ID and received_at, the first of this order wins.
-_FOLDER_RANK: Final[dict[MailFolder, int]] = {"inbox": 0, "archive": 1, "sent": 2, "trash": 3, "other": 4}
+_SEED_SELECT: Final = "id,conversationId,parentFolderId,isDraft,receivedDateTime"  # a `get_thread` id seed (D75)
 # Lookup failures that keep their code; every other lookup failure is an incomplete search, never not_found (B6).
 _KEPT_CAUSES: Final = frozenset({"Throttled", "Forbidden"})
 _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anything else is "not a number"
 _LEGACY_DN: Final = re.compile(r"/O=[^/@]+(?:/OU=[^/@]+)*/CN=RECIPIENTS/CN=[^/@]+", re.IGNORECASE)  # fullmatch (T17)
 _PLAIN_ADDRESS: Final = re.compile(r"[^@\s]+@[^@\s]+")  # fullmatch: one "@", no whitespace
+_DN_ADDRESS: Final = re.compile(r"\s*/O=", re.IGNORECASE)  # match: an Exchange DN, never a participant (gr-G4)
+_UNEXPECTED_STATUS: Final = "UnexpectedStatus"  # `_get`'s cause for a status it does not map (G-R7)
+# The get_thread list falls back on these causes too: any status but 2xx, 401, 403, 404, 429 and 503 (SG1, Q7).
+_FALLBACK_CAUSES: Final = frozenset({_UNEXPECTED_STATUS, "Redirect"})
 MAX_ADDRESS_CHARS: Final = 254
-MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status provider call (SR6)
-MAX_FAILURE_LOGS: Final = 20  # provider_call_failed lines per get_message_status call, one per class (SR6, S-F2)
+MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status or get_thread provider call (SR6)
+MAX_FAILURE_LOGS: Final = 20  # provider_call_failed lines per status or thread call, one per class (SR6, S-F2, P15)
 MAX_THREAD_SPLITS: Final = 10  # one-conversation re-requests of full conversationId answers per call (C14)
 _log = logging.getLogger("mcp_hub.providers.graph")
 
@@ -203,17 +223,29 @@ def _address(value: object) -> tuple[str | None, str | None]:
     return _str(inner.get("name")), _str(inner.get("address"))
 
 
-def _sender_for_direction(raw: Mapping[str, object]) -> str | None:
-    """The `from` address that decides the direction; never an output field.
+def _legacy_dn_name(name: str | None, address: str | None) -> str | None:
+    """The stripped name when `address` is a well-formed legacy DN and the name a plain address; None otherwise.
 
     T17: an own sent item can carry an Exchange legacy DN ("/O=.../CN=RECIPIENTS/CN=...") as the address and the SMTP
-    address as the name; then the stripped name counts, but only for a well-formed DN (no "@") and a plain address
-    of at most 254 characters as the name."""
+    address as the name; only a well-formed DN (no "@") and a plain address of at most 254 characters count. One
+    predicate for the direction and the participants (G-R2)."""
+    if address is None or name is None or not _LEGACY_DN.fullmatch(address):
+        return None
+    stripped = name.strip()
+    return stripped if len(stripped) <= MAX_ADDRESS_CHARS and _PLAIN_ADDRESS.fullmatch(stripped) else None
+
+
+def _sender_for_direction(raw: Mapping[str, object]) -> str | None:
+    """The `from` address that decides the direction; never an output field. A legacy DN counts as its name."""
     name, address = _address(raw.get("from"))
-    if address is not None and name is not None and _LEGACY_DN.fullmatch(address):
-        stripped = name.strip()
-        if len(stripped) <= MAX_ADDRESS_CHARS and _PLAIN_ADDRESS.fullmatch(stripped):
-            return stripped
+    return _legacy_dn_name(name, address) or address
+
+
+def _participant(name: str | None, address: str | None) -> str | None:
+    """A participant address (§5.5): a DN ("/O=...") or any other value that is not a plain address becomes the
+    name of a strict legacy DN or is dropped (gr-G4), so a participant is always an address."""
+    if address is not None and (_DN_ADDRESS.match(address) or not _PLAIN_ADDRESS.fullmatch(address.strip())):
+        return _legacy_dn_name(name, address)
     return address
 
 
@@ -364,6 +396,28 @@ class _Hit:
     raw: Mapping[str, object]
 
 
+class _ThreadLogs:
+    """The log caps of one `get_thread` call; built outside `work`, so they hold across the 401 restart (P15)."""
+
+    def __init__(self) -> None:
+        self.degraded = 0  # item_degraded lines (SR6)
+        self.failed: set[tuple[str, str | None]] = set()  # (outcome, exception) classes of failed single reads
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadSeed:
+    """The seed of a `get_thread` call, as its lookup or read found it."""
+
+    graph_id: str
+    message_id: str | None  # the Message-ID of a `ref` seed; an `id` seed is recognised by its Graph id (G-R3)
+    conversation: str | None  # a valid conversationId, else None (SG4)
+
+
+def _conversation_id(raw: Mapping[str, object]) -> str | None:
+    value = raw.get("conversationId")
+    return value if isinstance(value, str) and GRAPH_ID.fullmatch(value) else None
+
+
 def _soft_stopped_page() -> FolderPage:
     return FolderPage(items=[], more=False, truncated=True, complete=False)
 
@@ -475,7 +529,7 @@ class GraphMailbox:
                     self._account, self._clock(), retry_after_seconds(response.headers.get("retry-after"))
                 )
                 raise ProviderError("upstream_error", "Throttled")
-            raise ProviderError("upstream_error", "UnexpectedStatus")
+            raise ProviderError("upstream_error", _UNEXPECTED_STATUS)
 
     def _folder_ids(
         self, client: httpx2.Client, token: str, deadline: CallDeadline, *, refresh: bool = False
@@ -576,6 +630,30 @@ class GraphMailbox:
             raise ProviderError("not_found", "ForeignRef")
         ref = target
         return self._run(lambda client, token, call: self._message(client, token, call, ref), deadline)
+
+    def get_thread(self, query: ThreadQuery, deadline: CallDeadline) -> ThreadPage:
+        """One conversation, oldest first (spec 080 §5.2 `get_thread`, §6.5 Graph). A soft stop before the list
+        answered is upstream_timeout (no partial result); during the body reads the rest is body_omitted."""
+        conversation: str | None = None
+        if query.key is not None:
+            if query.key.source != "graph":
+                return ThreadPage("source_mismatch")
+            if query.key.account != self._account:
+                raise ProviderError("not_found", "ForeignRef")
+            if not isinstance(query.key.value, str) or not GRAPH_ID.fullmatch(query.key.value):
+                raise ProviderError("not_found", "MalformedRef")
+            conversation = query.key.value
+        elif isinstance(query.seed, StableRef):
+            if query.seed.account != self._account:
+                raise ProviderError("not_found", "ForeignRef")
+            if not MESSAGE_ID_PATTERN.fullmatch(query.seed.message_id):  # keeps `'` out of the $filter literal
+                raise ProviderError("not_found", "MalformedRef")
+        elif not isinstance(query.seed, GraphMessageRef) or query.seed.account != self._account:
+            raise ProviderError("not_found", "ForeignRef")
+        logs = _ThreadLogs()
+        return self._run(
+            lambda client, token, call: self._thread(client, token, call, query, conversation, logs), deadline
+        )
 
     # --- list -----------------------------------------------------------------------------------------------------
     def _list_messages(self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery) -> FolderPage:
@@ -751,7 +829,15 @@ class GraphMailbox:
     def _lookup_ref(
         self, client: httpx2.Client, token: str, deadline: CallDeadline, message_id: str
     ) -> GraphMessageRef | None:
-        """The copy of `message_id` with the earliest `receivedDateTime`, ties by folder order (S-e), or None.
+        """`_lookup_copy` without the conversation (get_message)."""
+        found = self._lookup_copy(client, token, deadline, message_id)
+        return None if found is None else found[0]
+
+    def _lookup_copy(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, message_id: str
+    ) -> tuple[GraphMessageRef, str | None] | None:
+        """The copy of `message_id` with the earliest `receivedDateTime`, ties by folder order (S-e), with its valid
+        `conversationId` (gr-G1), or None.
 
         One `GET /me/messages` over all folders, the value only inside the `$filter` string literal of an httpx
         query parameter (G8; the caller checked the §5.5 pattern, which excludes `'`). Hits are kept only with a
@@ -784,26 +870,26 @@ class GraphMailbox:
                 raise
             raise ProviderError("upstream_timeout", "IncompleteSearch") from None
         full = len(values) >= top or "@odata.nextLink" in body
-        candidates: list[tuple[datetime, str, str | None]] = []
+        candidates: list[tuple[datetime, str, str | None, str | None]] = []
         for raw in values[:top]:  # entries beyond the requested $top are never inspected (L7)
             hit = self._lookup_hit(raw, message_id)
-            if hit is not None:
-                candidates.append(hit)
-        best: tuple[datetime, int, str] | None = None
+            if hit is not None and isinstance(raw, dict):
+                candidates.append((*hit, _conversation_id(raw)))
+        best: tuple[datetime, int, str, str | None] | None = None
         if candidates:
-            ids = self._bound_ids(client, token, deadline, [parent for *_, parent in candidates], before_refusal=False)
-            for received, graph_id, parent in candidates:
+            ids = self._bound_ids(client, token, deadline, [c[2] for c in candidates], before_refusal=False)
+            for received, graph_id, parent, conversation in candidates:
                 folder = ids.role_of(parent)
                 if folder == "excluded":
                     continue  # junk, drafts, outbox: never located (D75)
-                key = (received, _FOLDER_RANK[folder], graph_id)
+                key = (received, FOLDER_RANK[folder], graph_id, conversation)
                 if best is None or key[:2] < best[:2]:  # equal keys: the first hit in Graph's order stays
                     best = key
         if best is None:
             if full:
                 raise ProviderError("upstream_timeout", "IncompleteSearch")
             return None
-        return GraphMessageRef(self._account, best[2])
+        return GraphMessageRef(self._account, best[2]), best[3]
 
     def _lookup_hit(self, raw: object, message_id: str) -> tuple[datetime, str, str | None] | None:
         """(received, Graph id, parent) of an exact, non-draft hit with a valid id and time; None otherwise."""
@@ -1054,7 +1140,7 @@ class GraphMailbox:
                 if folder == "sent":
                     in_sent.add(hit.message_id)
                 current = best.get(hit.message_id)
-                key = (hit.received, _FOLDER_RANK[folder])
+                key = (hit.received, FOLDER_RANK[folder])
                 if current is None or key < current[:2]:  # equal keys: the first hit in Graph's order stays (S-e)
                     best[hit.message_id] = (*key, hit)
             for message_id, (received, _, hit) in best.items():
@@ -1262,6 +1348,312 @@ class GraphMailbox:
             newer_incoming_at=facts.newer_incoming_at,
             thread_checked=conversation in run.checked and facts.complete and not run.no_sent,
         )
+
+    # --- get_thread -----------------------------------------------------------------------------------------------
+    def _thread(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        query: ThreadQuery,
+        conversation: str | None,
+        logs: _ThreadLogs,
+    ) -> ThreadPage:
+        """Seed, list, members, bodies (Option 5a). Inside `work`: the 401 restart runs it again from the start.
+
+        A seed without a valid conversationId (SG4), or a seed input whose filtered list holds no member (G-R1, K9),
+        is returned alone and not exact. A key whose list holds no member is not_found after a complete list and
+        upstream_timeout otherwise (Q6)."""
+        seed = None if query.seed is None else self._thread_seed(client, token, deadline, query.seed)
+        if seed is not None:
+            conversation = seed.conversation
+            if conversation is None:
+                return self._seed_alone(client, token, deadline, query, seed, None, logs)
+        if conversation is None:
+            raise ProviderError("not_found", "MalformedRef")  # unreachable: get_thread checked the key
+        # The map of this call binds the members as it is: no forced re-read for an unknown parent (as C13).
+        ids = self._folder_ids(client, token, deadline)
+        values, full, unique = self._thread_list(client, token, deadline, conversation, logs)
+        exact = not full  # 51 values or a nextLink: more members may exist (gr-G2)
+        copies: list[ThreadCopy] = []
+        raws: dict[AnyMessageRef, Mapping[str, object]] = {}
+        for raw in values:
+            try:
+                copy = self._thread_copy(raw, ids, seed)
+            except Exception as exc:  # an unusable item: dropped, and the list is not exact (gr-G2)
+                self._thread_degraded(logs, exc)
+                exact = False
+                continue
+            if copy is None or not isinstance(raw, dict) or copy.summary.ref in raws:
+                continue  # a draft, an excluded folder, or a repeated Graph id (the first entry stays)
+            raws[copy.summary.ref] = raw
+            copies.append(copy)
+        merged = merge_copies(copies, include_trash=query.include_trash)  # the trash filter after the merge (G-R3)
+        counted, kept, capped = choose_members(merged, include_trash=query.include_trash)
+        thread = ThreadKey(self._account, "graph", conversation)
+        if not counted:
+            if seed is not None:
+                return self._seed_alone(client, token, deadline, query, seed, thread, logs)
+            if not exact:
+                raise ProviderError("upstream_timeout", "IncompleteSearch")
+            raise ProviderError("not_found", "NotFound")
+        members = self._thread_bodies(client, token, deadline, kept, raws if unique else {}, query.max_chars, logs)
+        return ThreadPage(
+            "ok",
+            thread=thread,
+            members=members,
+            overview=overview(counted, exact=exact),
+            truncated=full or capped or any(member.body.omitted for member in members),
+        )
+
+    def _thread_seed(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, target: AnyMessageRef | StableRef
+    ) -> _ThreadSeed:
+        """A `ref` through `_lookup_copy` (not found → not_found; incomplete → upstream_timeout, B6); an `id` by a
+        small read bound to its parent (D75): 404, a draft or an excluded parent → not_found."""
+        if isinstance(target, StableRef):
+            found = self._lookup_copy(client, token, deadline, target.message_id)
+            if found is None:
+                raise ProviderError("not_found", "RefNotFound")  # a complete search over all folders (B6)
+            ref, conversation = found
+            return _ThreadSeed(ref.graph_id, target.message_id, conversation)
+        if not isinstance(target, GraphMessageRef):
+            raise ProviderError("not_found", "ForeignRef")
+        path = f"/me/messages/{quote(target.graph_id, safe='')}"
+        body = self._get(client, token, deadline, path, {"$select": _SEED_SELECT}, MAX_LIST_RESPONSE_BYTES)
+        if body.get("isDraft") is True:
+            raise ProviderError("not_found", "Draft")
+        parent = _parent(body)
+        ids = self._bound_ids(client, token, deadline, [parent], before_refusal=True)
+        if ids.role_of(parent) == "excluded":
+            raise ProviderError("not_found", "ExcludedFolder")
+        return _ThreadSeed(target.graph_id, None, _conversation_id(body))
+
+    def _seed_alone(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        query: ThreadQuery,
+        seed: _ThreadSeed,
+        thread: ThreadKey | None,
+        logs: _ThreadLogs,
+    ) -> ThreadPage:
+        """The seed read once with its summary fields and bodies (P5, G-R1) and returned alone, not exact."""
+        path = f"/me/messages/{quote(seed.graph_id, safe='')}"
+        params = {"$select": f"{SUMMARY_SELECT},uniqueBody,body", "$expand": EXTENDED_EXPAND}
+        raw = self._get(client, token, deadline, path, params, MAX_MESSAGE_RESPONSE_BYTES)
+        if raw.get("isDraft") is True:
+            raise ProviderError("not_found", "Draft")
+        # The seed's lookup or read already bound its parent; the map is used as it is (as get_message by ref).
+        ids = self._folder_ids(client, token, deadline)
+        received = _timestamp(raw.get("receivedDateTime")) or datetime.now(UTC)  # as get_message
+        copy = self._thread_copy_of(raw, GraphMessageRef(self._account, seed.graph_id), received, ids, seed=True)
+        body = self._thread_body(raw, copy.summary.subject, query.max_chars, logs, listed=False) or OMITTED_BODY
+        return ThreadPage(
+            "ok",
+            thread=thread,
+            members=(ThreadMember(copy.summary, copy.linked_by, body),),
+            overview=overview([copy], exact=False),
+            truncated=body.omitted,
+        )
+
+    def _thread_list(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, conversation: str, logs: _ThreadLogs
+    ) -> tuple[list[object], bool, bool]:
+        """(values within `$top` 51, full, with uniqueBody) of the conversation list (§6.5).
+
+        `too_large`, or any status but 2xx, 401, 403, 404, 429 and 503, reads the list once more without
+        `uniqueBody` (SG1, Q7, Q-a); the trigger is logged once per call through `_thread_failed`, so a refused
+        `uniqueBody` list (O37) shows in the logs. A second failure is the tool error of its code. `$top` is never
+        halved and a nextLink is never followed; values beyond 51 are never inspected."""
+        try:
+            body = self._thread_list_get(client, token, deadline, conversation, unique_body=True)
+            unique = True
+        except ProviderError as exc:
+            if not (exc.code == "too_large" or (exc.code == "upstream_error" and exc.cause in _FALLBACK_CAUSES)):
+                raise
+            self._thread_failed(logs, exc)
+            body = self._thread_list_get(client, token, deadline, conversation, unique_body=False)
+            unique = False
+        values = body.get("value")
+        if not isinstance(values, list):
+            raise ProviderError("upstream_error", "MalformedList")
+        full = len(values) >= THREAD_LIST_TOP or "@odata.nextLink" in body
+        return values[:THREAD_LIST_TOP], full, unique
+
+    def _thread_list_get(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, conversation: str, *, unique_body: bool
+    ) -> dict[str, object]:
+        params = thread_list_params(
+            conversation, select=SUMMARY_SELECT, expand=EXTENDED_EXPAND, unique_body=unique_body
+        )
+        try:
+            return self._get(client, token, deadline, "/me/messages", params, MAX_MESSAGE_RESPONSE_BYTES)
+        except ProviderError as exc:
+            if exc.code == "not_found":  # the collection, not a message: never the tool's not_found (G-R4)
+                raise ProviderError("upstream_error", exc.cause) from None
+            raise
+
+    def _thread_copy(self, raw: object, ids: GraphFolderIds, seed: _ThreadSeed | None) -> ThreadCopy | None:
+        """A list item as a copy; None for a draft or an excluded folder. An unusable item (not an object, an invalid
+        id, an unparsable time, a missing or malformed parent) raises MalformedItemError."""
+        if not isinstance(raw, dict):
+            raise MalformedItemError
+        graph_id = raw.get("id")
+        if not isinstance(graph_id, str) or not GRAPH_ID.fullmatch(graph_id):
+            raise MalformedItemError  # never used in a path (Sec8)
+        if raw.get("isDraft") is True:
+            return None  # drafts never (S1)
+        received = _timestamp(raw.get("receivedDateTime"))
+        parent = _parent(raw)
+        if received is None or parent is None:
+            raise MalformedItemError
+        if ids.role_of(parent) == "excluded":
+            return None  # junk, drafts, outbox (D75)
+        ref = GraphMessageRef(self._account, graph_id)
+        copy = self._thread_copy_of(raw, ref, received, ids, seed=False)
+        if seed is not None and (
+            graph_id == seed.graph_id
+            or (seed.message_id is not None and copy.summary.meta.message_id == seed.message_id)
+        ):
+            copy = replace(copy, seed=True)  # by Graph id or by Message-ID (G-R3)
+        return copy
+
+    def _thread_copy_of(
+        self, raw: Mapping[str, object], ref: GraphMessageRef, received: datetime, ids: GraphFolderIds, *, seed: bool
+    ) -> ThreadCopy:
+        """Summary (snippet empty, the body replaces it) and participants through the DN rule (gr-G4)."""
+        meta = graph_meta(raw, ids, self._own_addresses, self._account)  # an excluded parent: not_found (D75)
+        name, address = _address(raw.get("from"))
+        summary = MailSummary(
+            ref=ref,
+            received_at=received,
+            unread=raw.get("isRead") is not True,
+            has_attachments=raw.get("hasAttachments") is True,
+            from_address=address,
+            from_name=name,
+            subject=_str(raw.get("subject")),
+            snippet_text="",
+            to_addresses=tuple(self._recipients(raw.get("toRecipients"))),
+            cc_addresses=tuple(self._recipients(raw.get("ccRecipients"))),
+            meta=meta,
+        )
+        participants = participants_of(
+            meta.direction,
+            _participant(name, address),
+            self._participants(raw.get("toRecipients")),
+            self._participants(raw.get("ccRecipients")),
+            self._own_addresses,
+        )
+        return ThreadCopy(summary, "server", participants, in_sent=meta.folder == "sent", seed=seed)
+
+    @staticmethod
+    def _participants(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [a for item in value if (a := _participant(*_address(item)))]
+
+    def _thread_bodies(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        kept: Sequence[ThreadCopy],
+        listed: Mapping[AnyMessageRef, Mapping[str, object]],
+        max_chars: int,
+        logs: _ThreadLogs,
+    ) -> tuple[ThreadMember, ...]:
+        """Bodies newest first: the list item's `uniqueBody` (`listed`, empty after the fallback), else one single
+        read, at most MAX_UNIQUE_BODY_READS per call; the rest, and every body after a soft stop, body_omitted."""
+        bodies: dict[AnyMessageRef, ThreadBody] = {}
+        reads = 0
+        try:
+            for item in reversed(kept):
+                if deadline.soft_expired():
+                    raise SoftStop  # a soft check per member body, also without a request (sec-G5)
+                raw = listed.get(item.summary.ref)
+                body = (
+                    None if raw is None else self._thread_body(raw, item.summary.subject, max_chars, logs, listed=True)
+                )
+                if body is None:
+                    if reads == MAX_UNIQUE_BODY_READS:
+                        continue  # beyond 20 single reads: body_omitted
+                    reads += 1
+                    body = self._read_thread_body(client, token, deadline, item, max_chars, logs)
+                bodies[item.summary.ref] = body
+        except SoftStop:
+            pass  # what was read is kept; the rest is body_omitted (§5.4)
+        return tuple(
+            ThreadMember(item.summary, item.linked_by, bodies.get(item.summary.ref, OMITTED_BODY)) for item in kept
+        )
+
+    def _read_thread_body(
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        item: ThreadCopy,
+        max_chars: int,
+        logs: _ThreadLogs,
+    ) -> ThreadBody:
+        """One single read of `uniqueBody,body` (SG2, 2 MiB), retried once with `uniqueBody` alone after too_large
+        (G-R6). A failed read omits only this body (SC5); account failures, a 401 and the soft stop pass (P6)."""
+        if not isinstance(item.summary.ref, GraphMessageRef):
+            return OMITTED_BODY  # every Graph member has a Graph id
+        path = f"/me/messages/{quote(item.summary.ref.graph_id, safe='')}"
+        try:
+            try:
+                raw = self._get(
+                    client, token, deadline, path, {"$select": "uniqueBody,body"}, MAX_MESSAGE_RESPONSE_BYTES
+                )
+            except ProviderError as exc:
+                if exc.code != "too_large":
+                    raise
+                raw = self._get(client, token, deadline, path, {"$select": "uniqueBody"}, MAX_MESSAGE_RESPONSE_BYTES)
+        except _STATUS_PASS_THROUGH:
+            raise
+        except ProviderError as exc:
+            if _fails_account(exc):
+                raise
+            self._thread_failed(logs, exc)
+            return OMITTED_BODY
+        return self._thread_body(raw, item.summary.subject, max_chars, logs, listed=False) or OMITTED_BODY
+
+    def _thread_body(
+        self, raw: Mapping[str, object], subject: str | None, max_chars: int, logs: _ThreadLogs, *, listed: bool
+    ) -> ThreadBody | None:
+        """`uniqueBody` → "server"; else, on a read (not `listed`), `body` with the heuristic (SG2). None: a list item
+        without a usable `uniqueBody` (it joins the single reads). Any failure omits only this body (SC1)."""
+        try:
+            unique = body_text(raw, "uniqueBody")
+            if unique is not None:
+                text, source, cut = unique
+                return server_body(text, source, max_chars=max_chars, fetch_cut=cut)
+            if listed:
+                return None
+            found = body_text(raw, "body")
+            if found is None:
+                raise MalformedItemError  # a read without either body
+            text, source, cut = found
+            return prepare_body(text, source, subject=subject, max_chars=max_chars, fetch_cut=cut)
+        except Exception as exc:
+            self._thread_degraded(logs, exc)
+            return OMITTED_BODY
+
+    def _thread_degraded(self, logs: _ThreadLogs, exc: Exception) -> None:
+        if logs.degraded < MAX_DEGRADED_LOGS:  # one counter per call (SR6)
+            logs.degraded += 1
+            self._degraded(exc)
+
+    def _thread_failed(self, logs: _ThreadLogs, exc: ProviderError) -> None:
+        """One WARNING per (outcome, exception) class and call, at most MAX_FAILURE_LOGS (P15): after a `Throttled`
+        answer the back-off fails every later read without a request, and that is logged once."""
+        key = (exc.code, exc.cause)
+        if key in logs.failed or len(logs.failed) >= MAX_FAILURE_LOGS:
+            return
+        logs.failed.add(key)
+        log_provider_failure(self._account, "mail", exc)
 
 
 def _conversation(status: MessageStatus) -> str | None:

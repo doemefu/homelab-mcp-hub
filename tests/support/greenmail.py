@@ -211,7 +211,9 @@ def flags(login: str) -> dict[int, tuple[bytes, ...]]:
         return {uid: row[b"FLAGS"] for uid, row in client.fetch(client.search(["ALL"]), ["FLAGS"]).items()}
 
 
-def mailbox(login: str, password: str | None = None, port: int = IMAPS_PORT) -> ImapMailbox:
+def mailbox(
+    login: str, password: str | None = None, port: int = IMAPS_PORT, own: frozenset[str] = frozenset()
+) -> ImapMailbox:
     return ImapMailbox(
         "icloud",
         host=HOST,
@@ -221,4 +223,5 @@ def mailbox(login: str, password: str | None = None, port: int = IMAPS_PORT) -> 
         password=password or passwords()[login],
         ssl_context=pinned_context(),
         timeout=10,
+        own_addresses=own,
     )

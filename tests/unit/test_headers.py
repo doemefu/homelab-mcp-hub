@@ -1,5 +1,6 @@
 import time
 from collections.abc import Callable
+from email.utils import getaddresses
 
 import pytest
 
@@ -8,8 +9,10 @@ from mcp_hub.providers import headers as h
 from mcp_hub.providers.headers import (
     DESCENDANT_HEADER_BYTES,
     DESCENDANT_HEADER_ITEM,
+    MAX_ADDRESS_HEADER_BYTES,
     Descendant,
     ParsedHeaders,
+    address_pairs,
     bare_message_id,
     imap_thread_key,
     is_own,
@@ -18,6 +21,7 @@ from mcp_hub.providers.headers import (
     parse_descendant,
     parse_summary_headers,
     subject_digest,
+    trim_cut,
 )
 from mcp_hub.providers.imap_guard import _fetch_item_ok
 
@@ -304,6 +308,133 @@ def test_hostile_header_bytes_do_not_raise(data: bytes) -> None:
     is_own(parsed.from_address, frozenset({"me@example.org"}))
 
 
+def addresses(value: str) -> list[str]:
+    return [address for _, address in address_pairs(value)]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("a@x.y, b@x.y,", ["a@x.y", "b@x.y"]),  # what `trim_cut` leaves of a list cut after a comma
+        ("a@x.y, b@x.y, \t", ["a@x.y", "b@x.y"]),
+        ("a@x.y,,", ["a@x.y"]),
+        ('a@x.y, "Doe, J', ["a@x.y"]),  # the strict parser refuses the field: back to the last top-level comma
+        ("a@x.y, (note, x", ["a@x.y"]),
+        ('a@x.y, "Doe \\", J', ["a@x.y"]),  # an escaped quote does not end the quoted string
+        ("a@x.y, Bob <@r1,@r2:b@x.y", ["a@x.y"]),  # a comma inside angle brackets is not a list comma
+        ('"Doe, J" <j@x.y>, Ann <a@x.y>, (n) c@x.y, "Lee, K', ["j@x.y", "a@x.y", "c@x.y"]),
+    ],
+)
+def test_address_pairs_cut_list_keeps_complete_addresses(value: str, expected: list[str]) -> None:
+    """A list cut at a byte cap keeps the addresses that ended before the cut: trailing commas and whitespace are
+    stripped, and a field the strict parser refuses is cut back to its last comma outside quoted strings, comments
+    and angle brackets."""
+    assert addresses(value) == expected
+
+
+def test_address_pairs_cut_inside_the_last_address() -> None:
+    """A cut inside the last address drops only that address. At the 8 KiB cap of `address_pairs` the cut is known,
+    so the list is cut back to its last top-level comma. In a block cut at its own cap, `trim_cut` drops the
+    shortened token; what is left of that address is kept as the parser reads it: here the display name "Bob",
+    which the parser returns as an address. No complete address is lost, and no shortened address appears."""
+    first = "a" * (MAX_ADDRESS_HEADER_BYTES - 20) + "@x.y"
+    value = first + ", bob@example.test, c@x.y"
+    assert value[:MAX_ADDRESS_HEADER_BYTES].endswith(", bob@example.te")  # the cap falls inside the second address
+    assert addresses(value) == [first]
+
+    block = trim_cut(b"To: a@x.y, Bob <b@x.y")
+    assert block == b"To: a@x.y, Bob "
+    parsed = parse_summary_headers(block)
+    assert parsed.to == ("a@x.y", "Bob")
+    block = trim_cut(b"To: a@x.y, b@x.yz")
+    assert parse_summary_headers(block).to == ("a@x.y",)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("bob@example.test" + " " * 9000, ["bob@example.test"]),  # trailing whitespace is no cut
+        ("bob@example.test," + " " * 9000, ["bob@example.test"]),
+        ("bob@example.test (" + "x" * 9000 + ")", ["bob@example.test"]),  # the cap falls inside a trailing comment
+        ("Bob <bob@example.test> (" + "x" * 9000 + ")", ["bob@example.test"]),
+        ("bob@example.test" + " " * 9000 + "(note)", ["bob@example.test"]),  # the cap falls in the whitespace
+        ("a@x.y, bob@example.test (" + "x" * 9000 + ")", ["a@x.y", "bob@example.test"]),
+        ("b" * 9000 + "@example.test", []),  # the cap falls inside the address: never a shortened one
+        ("bob@" + "e" * 9000 + ".test", []),
+        ("Bob <bob@" + "e" * 9000 + ".test>", []),
+        ('"' + "B" * 9000 + '" <bob@example.test>', []),
+        ("a@x.y, bob@" + "e" * 9000, ["a@x.y"]),
+        ("a@x.y,b@x.y," + "c" * 9000, ["a@x.y", "b@x.y"]),  # the last top-level comma, not the first
+        ("bob @ " + "e" * 9000, []),  # an obsolete `bob @ example` form: the `@` alone proves nothing
+        ("bob@example.test(" + "x" * 9000 + ")", ["bob@example.test"]),  # a comment right after the domain
+        ("a@x.y, Bob <" + "b" * 9000, ["a@x.y"]),  # a display name after a comma ends nothing
+        ("a@x.y,Bob <" + "b" * 9000, ["a@x.y"]),
+        ("bob@ " + "e" * 9000, []),  # whitespace right after the `@`: never the shortened `bob@`
+    ],
+    ids=[
+        "spaces",
+        "comma-spaces",
+        "comment",
+        "angle-comment",
+        "spaces-then-comment",
+        "list-comment",
+        "cut-local",
+        "cut-domain",
+        "cut-angle",
+        "cut-name",
+        "list-cut-domain",
+        "no-space-list",
+        "obsolete-at",
+        "comment-no-space",
+        "name-after-comma",
+        "name-after-tight-comma",
+        "space-after-at",
+    ],
+)
+def test_address_pairs_one_address_past_the_cap(value: str, expected: list[str]) -> None:
+    """Code review #54 #3: trailing whitespace is no cut; past the 8 KiB cap, the last address is kept only when its
+    addr-spec provably ended before the cut (an angle-addr closed, or whitespace or a comment after it), else it is
+    dropped as before."""
+    assert addresses(value) == expected
+
+
+def test_complete_list_needs_a_domain_character_after_the_at() -> None:
+    """An `@` alone does not prove an address ended: whitespace must follow at least one domain character. Through
+    `address_pairs` the strict parser also refuses a dangling `bob@`; this pins the scanner itself."""
+    assert h._complete_list("bob@ example") == ""
+    assert h._complete_list("bob @ example") == ""
+    assert h._complete_list("bob@e xample") == "bob@e"
+
+
+@pytest.mark.parametrize("value", ["Bob", "undisclosed-recipients:;", "Bob <bob@example.test>", "a@x.y, (n)"])
+def test_address_pairs_trailing_whitespace_is_no_cut(value: str) -> None:
+    """Whitespace padding past the 8 KiB cap is stripped before the cap decision: the value parses as without it."""
+    assert address_pairs(value + " " * 9000) == address_pairs(value)
+
+
+def test_address_pairs_strip_keeps_one_parse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trailing comma `trim_cut` leaves is stripped before parsing, so the common cut needs one parse only."""
+    calls: list[list[str]] = []
+
+    def counting(values: list[str]) -> list[tuple[str, str]]:
+        calls.append(values)
+        return getaddresses(values)
+
+    monkeypatch.setattr(h, "getaddresses", counting)
+    assert addresses("a@x.y, b@x.y, ") == ["a@x.y", "b@x.y"]
+    assert calls == [["a@x.y, b@x.y"]]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["a@x.y", "Ann <a@x.y>, b@x.y", '"Doe, J" <j@x.y>', "a@x.y, Bob <b@x", "undisclosed-recipients:;", ""],
+)
+def test_address_pairs_uncut_values_unchanged(value: str) -> None:
+    """Values the strict parser accepts and that need no strip parse as before."""
+    expected = [(name, address) for name, address in getaddresses([value]) if address or name]
+    assert address_pairs(value) == expected
+
+
 def test_folded_message_id_fallback_has_no_line_break() -> None:
     p = parse_summary_headers(raw("Message-ID: abc", " def"))
     assert p.message_id is not None
@@ -516,3 +647,48 @@ def test_parse_descendant_cpu_bound(field: str, unit: Callable[[int], str]) -> N
     large_best = _best_of(lambda: parse_descendant(large, wanted))
     assert large_best <= 16 * small_best, (large_best, small_best)
     assert large_best < 0.020, large_best
+
+
+def _cut_block(head: str, tail: str, keep: int) -> bytes:
+    """`head`, space padding and `tail`, cut after `keep` bytes of `tail` at exactly DESCENDANT_HEADER_BYTES."""
+    pad = DESCENDANT_HEADER_BYTES - len(head) - keep
+    data = (head + " " * pad + tail).encode()
+    assert data[:DESCENDANT_HEADER_BYTES].endswith(tail[:keep].encode())
+    return data[:DESCENDANT_HEADER_BYTES]
+
+
+def test_parse_descendant_trims_cut_tail() -> None:
+    wanted = frozenset({"a@x", "r1@example.org"})
+    data = _cut_block("References:", "r1@example.org a@x.y", len("r1@example.org a@x"))
+    assert len(data) == DESCENDANT_HEADER_BYTES
+    d = parse_descendant(data, wanted)
+    assert d.referenced == frozenset({"r1@example.org"})  # the shortened `a@x` is not a token
+    assert d.cut is True
+
+
+def test_parse_descendant_no_token_end_reports_cut() -> None:
+    data = b"References: <" + b"z" * (DESCENDANT_HEADER_BYTES - len("References: <"))
+    assert len(data) == DESCENDANT_HEADER_BYTES
+    d = parse_descendant(data, X)
+    assert d.referenced == frozenset()
+    assert d.cut is True
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["<a@x> <b@x>", "<a@x>, <b@x>", "a@x b@x", "<a@x>\r\n <b@x>"],
+)
+@pytest.mark.parametrize("keep", [3, 6, 7, 8])
+def test_parse_descendant_trim_matches_old_call_sites(tail: str, keep: int) -> None:
+    wanted = frozenset({"a@x", "b@x"})
+    data = _cut_block("References:", tail, min(keep, len(tail)))
+    ends = (b" ", b"\t", b"\r", b"\n", b",", b">")
+    old = parse_descendant(data[: max(data.rfind(end) for end in ends) + 1], wanted)  # short: the old call-site path
+    new = parse_descendant(data, wanted)
+    assert new.referenced == old.referenced
+    assert new.cut is True
+
+
+def test_parse_descendant_block_without_any_delimiter_trims_to_nothing() -> None:
+    d = parse_descendant(b"x" * DESCENDANT_HEADER_BYTES, X)
+    assert d == Descendant(None, None, frozenset(), True)

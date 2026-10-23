@@ -16,6 +16,8 @@ from mcp_hub.providers.base import (
     MailDetail,
     MessageStatus,
     StatusTarget,
+    ThreadPage,
+    ThreadQuery,
     read_credential,
 )
 from mcp_hub.providers.caldav import CalDavCalendarSource, CalendarPage
@@ -41,6 +43,7 @@ class Mailbox(Protocol):
     def get_message(self, target: AnyMessageRef | StableRef, deadline: CallDeadline) -> MailDetail: ...
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage: ...
     def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]: ...
+    def get_thread(self, query: ThreadQuery, deadline: CallDeadline) -> ThreadPage: ...
 
 
 MailboxFactory = Callable[[Account, Path], Mailbox]

@@ -26,6 +26,7 @@ MAX_ADDRESS_HEADER_BYTES: Final = 8192
 MAX_REFERENCES: Final = 10
 MAX_IN_REPLY_TO_TOKENS: Final = 100  # the phrase-form scan looks at no more (security M1: no quadratic scan)
 DESCENDANT_HEADER_BYTES: Final = 65536
+_TOKEN_ENDS: Final = (b" ", b"\t", b"\r", b"\n", b",", b">")  # where a msg-id token can end
 DESCENDANT_HEADER_ITEM: Final = (
     f"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES FROM)]<0.{DESCENDANT_HEADER_BYTES}>"
 )
@@ -35,6 +36,7 @@ _SUBJECT_KEPT_CHARS: Final = 1000
 _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 _FOLD: Final = re.compile(r"\r?\n(?=[ \t])")
 _SPLIT: Final = re.compile(r"[\s,]+")
+_LIST_TAIL: Final = ", \t\r\n"  # what a list cut after a comma ends with
 _WHITESPACE: Final = re.compile(r"\s+")
 _PREFIX: Final = re.compile(r"\s*(?:re|aw|antw|antwort|fwd?|wg|wtr|sv)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*:\s*", re.I)
 _TAG: Final = re.compile(r"\[[^\[\]]{1,40}\]\s*")
@@ -173,10 +175,60 @@ def _display_name(name: str) -> str:
         return name
 
 
+def _complete_list(value: str) -> str:
+    """`value` up to the end of its last address that provably ended before a cut. Outside quoted strings, comments
+    and angle brackets, a comma ends an address; so does the `>` of an angle-addr, and whitespace or a comment after
+    an `@` and at least one domain character (an addr-spec holds neither). Anything else (a cut inside an address,
+    a display name or an obsolete `bob @ example` form) is dropped, so no shortened address is ever returned. One
+    linear pass, no regex."""
+    last, depth, quoted, angle, i, n = -1, 0, False, False, 0, len(value)
+    domain = 0  # 0: no `@` in this address yet; 1: an `@`; 2: an `@` and a domain character after it
+    while i < n:
+        c = value[i]
+        if quoted or depth:
+            if c == "\\":
+                i += 1
+            elif quoted:
+                quoted = c != '"'
+            elif c in "()":
+                depth += 1 if c == "(" else -1
+        elif angle:
+            if c == ">":
+                angle, last, domain = False, i + 1, 0
+        elif c == '"':
+            quoted = True
+        elif c == "(" or c in " \t\r\n":
+            if domain == 2:
+                last, domain = i, 0
+            depth = 1 if c == "(" else 0
+        elif c == "<":
+            angle = True
+        elif c == ",":
+            last, domain = i, 0
+        elif c == "@":
+            domain = 1
+        elif domain == 1:
+            domain = 2
+        i += 1
+    return value[:last] if last >= 0 else ""
+
+
 def address_pairs(text: str) -> list[tuple[str, str]]:
-    """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic)."""
+    """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic).
+
+    A list cut at a byte cap keeps its complete addresses: trailing commas and whitespace (what `trim_cut` leaves,
+    or padding) are stripped first and are no cut; past the 8 KiB cap here, the value is cut back to its last address
+    that provably ended (`_complete_list`); and a field the strict parser refuses as a whole (an unterminated quoted
+    string or comment) is parsed once more the same way."""
+    text = text.rstrip(_LIST_TAIL)
+    value = text[:MAX_ADDRESS_HEADER_BYTES]
+    if len(text) > MAX_ADDRESS_HEADER_BYTES:
+        value = _complete_list(value)
     try:
-        return [(_display_name(n), a) for n, a in getaddresses([text[:MAX_ADDRESS_HEADER_BYTES]]) if a or n]
+        pairs = getaddresses([value])
+        if value and pairs == [("", "")]:
+            pairs = getaddresses([_complete_list(value).rstrip(_LIST_TAIL)])
+        return [(_display_name(n), a) for n, a in pairs if a or n]
     except Exception:
         return []
 
@@ -238,13 +290,23 @@ def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
     )
 
 
+def trim_cut(block: bytes) -> bytes:
+    """A header block cut at its byte cap, up to and including its last token end, so that a token the cut shortened
+    (`a@x` of `a@x.y`) is dropped before parsing; empty when no token ended."""
+    return block[: max(block.rfind(end) for end in _TOKEN_ENDS) + 1]
+
+
 def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
     """Which `wanted` Message-IDs a reply/thread hit names: whole msg-id tokens of its `In-Reply-To` (the first 100)
     and `References`, compared exactly, so `<a@x.y>` never counts for `a@x` and ids in comments or quoted strings are
     skipped. `msg_id_tokens` is one linear pass and the comparison a set lookup: no quadratic scan (security M1).
-    The first value of each field counts, as in `parse_summary_headers`."""
+    The first value of each field counts, as in `parse_summary_headers`. A block at the byte cap is cut: its last,
+    possibly shortened token is dropped before parsing and `cut` is set."""
     if not raw:
         return Descendant(None, None, frozenset(), False)
+    cut = len(raw) >= DESCENDANT_HEADER_BYTES
+    if cut:
+        raw = trim_cut(raw)
     items = _header_items(raw)
     in_reply_to = _first(items, "in-reply-to")
     references = _first(items, "references")
@@ -257,7 +319,7 @@ def parse_descendant(raw: bytes | None, wanted: frozenset[str]) -> Descendant:
                 *(msg_id_tokens(references) if references else ()),
             ]
         ),
-        cut=len(raw) >= DESCENDANT_HEADER_BYTES,
+        cut=cut,
     )
 
 

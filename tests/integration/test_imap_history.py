@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -22,9 +23,10 @@ from mcp_hub.providers import Adapters
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import NAME_FALLBACK
 from mcp_hub.registry import load_registry
-from mcp_hub.tools import HubContext, mail_status
+from mcp_hub.tools import HubContext, mail_status, mail_thread
 from mcp_hub.tools.mail import ListMessagesResult, MessageSummary, run_get_message, run_list_messages, run_list_unread
 from mcp_hub.tools.mail_status import MessageStatusResult, StatusItem, run_get_message_status
+from mcp_hub.tools.mail_thread import GetThreadResult, run_get_thread
 from tests.support import greenmail
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
@@ -38,7 +40,19 @@ PROJECTS = f"Projects-{RUN}"  # an `other` folder: listed by no folder value, st
 FOLDERS = ("INBOX", SENT, ARCHIVE, TRASH, PROJECTS)
 LIST_FOLDERS = ("inbox", "sent", "archive", "trash", "all")
 OWNER = f"owner@{greenmail.DOMAIN}"
+SENDER = f"Sender <sender@{greenmail.DOMAIN}>"
 THIRD = f"Third <third@{greenmail.DOMAIN}>"
+REQUEST_BODY = "Please send the figures by Friday."
+REPLY_BODY = (
+    "Sure, I will send them on Thursday.\n\n"
+    f"On Mon, 5 Oct 2026 at 10:00, Sender <sender@{greenmail.DOMAIN}> wrote:\n> {REQUEST_BODY}\n"
+)
+OUTLOOK_REPLY_BODY = (
+    "Sure, I will send them on Thursday.\n\n"
+    f"From: Sender <sender@{greenmail.DOMAIN}>\nSent: Monday, 5 October 2026 10:00\n"
+    f"To: Owner <{OWNER}>\nSubject: {REQUEST_BODY}\n\n{REQUEST_BODY}\n"
+)
+HAND_OVER_BODY = "Please continue with Third, who owns the figures from now on."
 
 
 @pytest.fixture
@@ -68,14 +82,25 @@ def mail(
     references: tuple[str, ...] = (),
     in_reply_to: str | None = None,
     cc: tuple[str, ...] = (),
+    body: str | None = None,
+    subject: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
 ) -> EmailMessage:
-    """`In-Reply-To` defaults to the last of `references`."""
+    """`In-Reply-To` defaults to the last of `references`; `subject` and `body` default to the tag's; `sender` and
+    `to` override the From and To header."""
     msg = EmailMessage()
-    msg["Subject"] = S(tag)
+    msg["Subject"] = subject or S(tag)
     msg["Message-ID"] = f"<{message_id(tag)}>"
     if outgoing:
         msg["From"] = f"Owner <{OWNER}>"
         msg["To"] = f"Peer <peer@{greenmail.DOMAIN}>"
+    if sender:
+        del msg["From"]
+        msg["From"] = sender
+    if to:
+        del msg["To"]
+        msg["To"] = to
     if cc:
         msg["Cc"] = ", ".join(cc)
     parent = in_reply_to or (references[-1] if references else None)
@@ -83,7 +108,7 @@ def mail(
         msg["In-Reply-To"] = f"<{parent}>"
     if references:
         msg["References"] = " ".join(f"<{r}>" for r in references)
-    msg.set_content(f"body of {tag}")
+    msg.set_content(body or f"body of {tag}")
     return msg
 
 
@@ -98,19 +123,33 @@ def seed(
     in_reply_to: str | None = None,
     cc: tuple[str, ...] = (),
     when: datetime | None = None,
+    body: str | None = None,
+    subject: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
 ) -> str:
     """APPENDs the message with INTERNALDATE `when` (default: five minutes ago) and returns its Message-ID."""
-    message = mail(tag, outgoing=outgoing, references=references, in_reply_to=in_reply_to, cc=cc)
+    message = mail(
+        tag,
+        outgoing=outgoing,
+        references=references,
+        in_reply_to=in_reply_to,
+        cc=cc,
+        body=body,
+        subject=subject,
+        sender=sender,
+        to=to,
+    )
     greenmail.append(login, message, when or datetime.now(UTC) - timedelta(minutes=5), folder=folder, flags=flags)
     return message_id(tag)
 
 
-def hub(secrets_dir: Path, login: str, password: str | None = None) -> HubContext:
+def hub(secrets_dir: Path, login: str, password: str | None = None, own: frozenset[str] = frozenset()) -> HubContext:
     return HubContext(
         load_settings({"HUB_SECRETS_DIR": str(secrets_dir), "LOG_LEVEL": "DEBUG"}),
         load_registry(secrets_dir / "accounts.json"),
         StatusStore(),
-        Adapters(mailbox=lambda a, d: greenmail.mailbox(login, password)),
+        Adapters(mailbox=lambda a, d: greenmail.mailbox(login, password, own=own)),
     )
 
 
@@ -170,7 +209,7 @@ def instant(value: str | None) -> datetime | None:
     return None if value is None else datetime.fromisoformat(value)
 
 
-def stepping_deadline(monkeypatch: pytest.MonkeyPatch, soft_ticks: int) -> None:
+def stepping_deadline(monkeypatch: pytest.MonkeyPatch, soft_ticks: int, module: ModuleType = mail_status) -> None:
     """Every read of the call clock advances one tick, so the soft stop lands after a fixed number of deadline checks
     (`soft_ticks`), at a different step of the call for each value; the hard deadline stays out of reach."""
     ticks = itertools.count()
@@ -181,7 +220,7 @@ def stepping_deadline(monkeypatch: pytest.MonkeyPatch, soft_ticks: int) -> None:
     def start() -> CallDeadline:
         return CallDeadline(clock(), float(soft_ticks), 1e9, clock)
 
-    monkeypatch.setattr(mail_status, "CallDeadline", type("SteppingDeadline", (), {"start": staticmethod(start)}))
+    monkeypatch.setattr(module, "CallDeadline", type("SteppingDeadline", (), {"start": staticmethod(start)}))
 
 
 def test_greenmail_capabilities_recorded() -> None:
@@ -380,13 +419,17 @@ async def test_get_message_ref_follows_moves(secrets_dir: Path) -> None:
 
 
 def seed_hand_over(
-    login: str, prefix: str, follow_up_references: Callable[[str, str], tuple[str, ...]]
+    login: str,
+    prefix: str,
+    follow_up_references: Callable[[str, str], tuple[str, ...]],
+    reply_body: str = REPLY_BODY,
 ) -> tuple[datetime, tuple[str, str, str]]:
-    """The request R from the sender at t0, the owner's reply A in sent at t0 + 1 min (without `\\Answered` on R),
-    and the sender's hand-over B at t0 + 2 min, copying a third person; B's `References` from
+    """The request R from the sender to the owner at t0, the owner's reply A to the sender in sent at t0 + 1 min
+    (without `\\Answered` on R), and the sender's hand-over B to the owner at t0 + 2 min, copying a third person and
+    the owner (reply-all); B's `References` from
     `follow_up_references(R, A)`, its `In-Reply-To` naming A. Returns t0 and the refs of R, A and B."""
     t0 = (datetime.now(UTC) - timedelta(minutes=30)).replace(microsecond=0)
-    request = seed(login, "INBOX", f"{prefix}-request", when=t0)
+    request = seed(login, "INBOX", f"{prefix}-request", when=t0, body=REQUEST_BODY, to=OWNER)
     reply = seed(
         login,
         SENT,
@@ -395,6 +438,8 @@ def seed_hand_over(
         outgoing=True,
         references=(request,),
         when=t0 + timedelta(minutes=1),
+        body=reply_body,
+        to=SENDER,
     )
     seed(
         login,
@@ -402,8 +447,10 @@ def seed_hand_over(
         f"{prefix}-handover",
         references=follow_up_references(request, reply),
         in_reply_to=reply,
-        cc=(THIRD,),
+        cc=(THIRD, OWNER),  # a reply-all
         when=t0 + timedelta(minutes=2),
+        body=HAND_OVER_BODY,
+        to=OWNER,
     )
     return t0, (ref_of(f"{prefix}-request"), ref_of(f"{prefix}-reply"), ref_of(f"{prefix}-handover"))
 
@@ -600,6 +647,206 @@ async def test_logs_contain_no_history_values(secrets_dir: Path, captured: Captu
         forbidden.update(v for v in (detail.id, detail.ref, detail.thread_key) if v)
     for status in [*checked, *failed.items]:
         forbidden.update(v for v in (status.input, status.ref, status.id, status.reply_ref) if v)
+    for value in sorted(forbidden):
+        assert value not in text, value
+    assert not [r for r in captured.raw if r[0].startswith("imapclient") and r[1] < logging.WARNING]
+    events = [json.loads(line) for line in captured.lines]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    assert any(e["event"] == "provider_call_failed" and e["outcome"] == "auth_expired" for e in events)
+    assert not [
+        e for e in events if e["event"] not in {"provider_call_failed", "item_degraded", "folder_map_refreshed"}
+    ]
+
+
+async def thread_of(ctx: HubContext, include_trash: bool | None = None, **target: str) -> GetThreadResult:
+    return await run_get_thread(
+        ctx,
+        ref=target.get("ref"),
+        message_id=target.get("message_id"),
+        thread_key=target.get("thread_key"),
+        account=None,
+        max_chars_per_message=None,
+        include_trash=include_trash,
+    )
+
+
+def assert_thread_hand_over(result: GetThreadResult, t0: datetime, refs: tuple[str, str, str]) -> None:
+    request, reply, follow_up = result.messages
+    assert [m.ref for m in result.messages] == list(refs)
+    assert (result.truncated, result.account_errors) == (False, [])
+    assert [m.linked_by for m in result.messages] == ["headers"] * 3  # MF-P1, TDc-6
+    assert [m.direction for m in result.messages] == ["incoming", "outgoing", "incoming"]
+    assert [instant(m.received_at) for m in result.messages] == [t0 + timedelta(minutes=n) for n in range(3)]
+    summary = result.summary
+    assert (summary.message_count, summary.message_count_exact) == (3, True)
+    assert summary.last_message_direction == "incoming"
+    assert instant(summary.last_incoming_at) == t0 + timedelta(minutes=2)
+    assert instant(summary.last_outgoing_at) == t0 + timedelta(minutes=1)
+    participants = summary.untrusted.participants
+    assert sum("sender@" in p for p in participants) == 1  # once, although R, A and B all name the sender
+    assert any("third@" in p for p in participants)
+    assert not any(OWNER in p for p in participants)
+    assert reply.untrusted.body.strip() == "Sure, I will send them on Thursday."  # the quote is gone
+    assert (reply.quote_removal, reply.body_source) == ("heuristic", "text/plain")
+    assert reply.body_original_chars is not None
+    assert reply.body_original_chars > len(reply.untrusted.body)
+    assert request.untrusted.body.strip() == REQUEST_BODY
+    assert (follow_up.direction, follow_up.body_omitted) == ("incoming", False)  # TDc-7: the newest body is present
+    assert HAND_OVER_BODY in follow_up.untrusted.body
+    assert "third@" in " ".join(follow_up.untrusted.cc_addresses)
+
+
+async def test_thread_hand_over(secrets_dir: Path) -> None:
+    """Scenario "hand-over" for get_thread (spec 080 §10.2): R, A and B are one thread from any of them and from the
+    thread key, oldest first, with the owner's reply in the middle and its quote removed."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "tho", lambda request, reply: (request, reply))
+    ctx = hub(secrets_dir, login, own=frozenset({OWNER}))
+    first = await thread_of(ctx, ref=refs[0])
+    assert_thread_hand_over(first, t0, refs)
+    assert first.thread_key is not None
+    for seed_ref in refs[1:]:
+        assert_thread_hand_over(await thread_of(ctx, ref=seed_ref), t0, refs)
+    assert_thread_hand_over(await thread_of(ctx, thread_key=first.thread_key), t0, refs)
+
+
+async def test_thread_hand_over_without_own_addresses(secrets_dir: Path) -> None:
+    """Control: without the own addresses the owner is a participant (B's Cc), so the removal in the scenarios above
+    comes from the configuration."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    _, refs = seed_hand_over(login, "thc", lambda request, reply: (request, reply))
+    result = await thread_of(hub(secrets_dir, login), ref=refs[0])
+    participants = result.summary.untrusted.participants
+    assert sum(OWNER in p for p in participants) == 1
+    assert sum("sender@" in p for p in participants) == 1
+    assert any("third@" in p for p in participants)
+
+
+async def test_thread_hand_over_outlook_style(secrets_dir: Path) -> None:
+    """E-mf4: B names only A in `References`; the request is still found from B, through A's own references."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "thoo", lambda _request, reply: (reply,), OUTLOOK_REPLY_BODY)
+    ctx = hub(secrets_dir, login, own=frozenset({OWNER}))
+    assert_thread_hand_over(await thread_of(ctx, ref=refs[2]), t0, refs)
+
+
+async def test_thread_subject_fallback(secrets_dir: Path) -> None:
+    """T9: two mails without threading headers, the same subject and a shared sender are joined by subject only."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    subject = S("tsf-shared")
+    now = datetime.now(UTC).replace(microsecond=0)
+    seed(login, "INBOX", "tsf-first", subject=f"Re: {subject}", when=now - timedelta(days=2))
+    seed(login, "INBOX", "tsf-second", subject=subject, when=now - timedelta(days=1))
+    seed(  # the same subject, but no shared address: not joined
+        login,
+        "INBOX",
+        "tsf-stranger",
+        subject=subject,
+        sender=f"Stranger <stranger@{greenmail.DOMAIN}>",
+        to=f"Other <other@{greenmail.DOMAIN}>",
+        when=now - timedelta(days=1),
+    )
+    seed(login, "INBOX", "tsf-other", subject=S("tsf-unrelated"), when=now - timedelta(days=1))
+    result = await thread_of(hub(secrets_dir, login), ref=ref_of("tsf-second"))
+    assert [m.ref for m in result.messages] == [ref_of("tsf-first"), ref_of("tsf-second")]
+    assert [m.linked_by for m in result.messages] == ["subject", "headers"]  # a `ref` seed keeps "headers" (MF-P1)
+    assert (result.summary.message_count, result.summary.message_count_exact) == (2, True)
+    assert result.truncated is False
+
+
+async def test_read_only_snapshot_around_get_thread(secrets_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec §10.2 read-only for get_thread: FLAGS and folders are identical before and after calls by `ref`, `id`
+    and `thread_key`, with and without trash, and when the call runs into the soft stop at any step."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "tro", lambda request, reply: (request, reply))
+    seed(login, TRASH, "tro-trash", references=(message_id("tro-request"),), when=t0 + timedelta(minutes=3))
+    before = greenmail.snapshot(login, FOLDERS)
+    assert any(b"\\Seen" not in flags for _, flags in before.values())  # unread mail is there to be marked read
+    ctx = hub(secrets_dir, login, own=frozenset({OWNER}))
+    full = await thread_of(ctx, ref=refs[0])
+    assert full.summary.message_count == 4
+    assert full.messages[0].id is not None
+    assert full.thread_key is not None
+    await thread_of(ctx, message_id=full.messages[0].id)
+    await thread_of(ctx, thread_key=full.thread_key)
+    without_trash = await thread_of(ctx, include_trash=False, ref=refs[0])
+    assert without_trash.summary.message_count == 3
+    partial = []
+    for soft_ticks in (2, 8, 20, 40, 80, 160, 320):
+        stepping_deadline(monkeypatch, soft_ticks, mail_thread)
+        try:
+            result = await thread_of(ctx, ref=refs[0])
+        except ToolError as exc:
+            partial.append(exc.code)
+        else:
+            partial.append((result.truncated, result.summary.message_count_exact))
+    assert {p for p in partial if isinstance(p, str)} == {"upstream_timeout"}
+    assert (True, False) in partial  # stopped in the middle: the members so far, flagged as incomplete
+    assert "upstream_timeout" in partial  # stopped before the seed was found
+    assert greenmail.snapshot(login, FOLDERS) == before
+
+
+async def test_logs_contain_no_thread_values(secrets_dir: Path, captured: Capture) -> None:
+    """Spec §9.7: no body text, subject, participant, thread key, Message-ID, ref, id or folder name in a log line of
+    get_thread, on the success paths and on the failing ones."""
+    login = "hub-logs"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    t0, refs = seed_hand_over(login, "Thl5k", lambda request, reply: (request, reply))
+    seeded = [message_id(f"Thl5k-{name}") for name in ("request", "reply", "handover")]
+    seeded.append(seed(login, TRASH, "Thl5k-trash", references=(seeded[0],), when=t0 + timedelta(minutes=3)))
+    ctx = hub(secrets_dir, login, own=frozenset({OWNER}))
+    results = [await thread_of(ctx, ref=refs[0])]
+    assert results[0].thread_key is not None
+    assert results[0].messages[0].id is not None
+    results.append(await thread_of(ctx, message_id=results[0].messages[0].id))
+    results.append(await thread_of(ctx, thread_key=results[0].thread_key))
+    absent = encode_ref("icloud", message_id("Thl5k-Absent"))
+    assert absent is not None
+    with pytest.raises(ToolError) as caught:
+        await thread_of(ctx, ref=absent)
+    assert caught.value.code == "not_found"
+    failing = hub(secrets_dir, login, password="not-the-password")
+    with pytest.raises(ToolError):
+        await thread_of(failing, ref=refs[0])
+
+    for result in results:  # the values the log must not hold are in the results
+        assert REQUEST_BODY in result.messages[0].untrusted.body
+        assert HAND_OVER_BODY in result.messages[2].untrusted.body
+        assert any("third@" in p for p in result.summary.untrusted.participants)
+    text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
+    forbidden = {
+        login,
+        greenmail.passwords()[login],
+        "not-the-password",
+        absent,
+        RUN,
+        "Thl5k",
+        REQUEST_BODY,
+        HAND_OVER_BODY,
+        "Sure, I will send",
+        "Third",
+        "third@",
+        "@",
+        *seeded,
+        *FOLDERS,
+        "Sent",
+        "Archive",
+        "Deleted",
+        "Projects",
+        "3993",
+        "127.0.0.1",
+        OWNER,
+    }
+    for result in results:
+        forbidden.update(v for v in (result.thread_key, result.summary.untrusted.participants[0]) if v)
+        for message in result.messages:
+            forbidden.update(v for v in (message.id, message.ref, message.thread_key) if v)
+            forbidden.add(message.untrusted.subject)
     for value in sorted(forbidden):
         assert value not in text, value
     assert not [r for r in captured.raw if r[0].startswith("imapclient") and r[1] < logging.WARNING]

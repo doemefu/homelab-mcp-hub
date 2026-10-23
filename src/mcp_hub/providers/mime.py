@@ -112,13 +112,17 @@ def _base64(data: bytes) -> bytes:
         return b""
 
 
+# Canonical names (codecs.lookup(...).name): punycode is quadratic on hostile input, the others are not charsets.
+DENIED_CODECS: Final = frozenset({"punycode", "idna", "unicode-escape", "raw-unicode-escape"})
+
+
 def safe_decode(raw: bytes, charset: str | None) -> str:
-    """Never raises: only real text codecs are used; rot13, base64, zlib, hex and idna fall back to UTF-8, and
-    latin-1 is the last resort."""
+    """Never raises: only real text codecs are used; rot13, base64, zlib, hex, punycode, idna and the escape codecs
+    fall back to UTF-8, and latin-1 is the last resort."""
     name = (charset or "utf-8").strip().lower() or "utf-8"
     try:
         info = codecs.lookup(name)
-        if not getattr(info, "_is_text_encoding", True) or info.name == "idna":
+        if not getattr(info, "_is_text_encoding", True) or info.name in DENIED_CODECS:
             name = "utf-8"
     except (LookupError, UnicodeError, ValueError):  # unknown, or a NUL byte or lone surrogate in the name (SC1)
         name = "utf-8"

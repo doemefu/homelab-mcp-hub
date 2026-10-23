@@ -1,0 +1,8 @@
+Ok, done.
+
+*From:* Alex Example <alex@example.org>
+Sent: Monday, October 5, 2026 10:00
+To: Sam Example <sam@example.org>
+Subject: Meeting
+
+Can we meet on Friday?

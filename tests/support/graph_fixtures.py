@@ -5,6 +5,7 @@ The list item shape follows the documented Graph v1.0 `message` resource with th
 correct it; they are recorded in `T1B_FACTS` and `test_fixture_shapes_match_t1b_facts` checks the fixtures against them.
 """
 
+from datetime import UTC, datetime, timedelta
 from typing import Final
 
 INBOX_ID = "AQMkADAwATM0MDAAMS1iNTcwLWI2NTEtMDACLTAwCgAuAAAD"
@@ -147,6 +148,31 @@ def message(n: int, **extra: object) -> dict[str, object]:
         "flag": {"flagStatus": "notFlagged"},
         "sentDateTime": f"2026-09-29T06:{n % 60:02d}:00Z",
     } | extra
+
+
+# get_thread (WP13c): one conversation; item n is received n minutes after THREAD_START.
+CONVERSATION: Final = "AAQkTHREAD0001="
+THREAD_START: Final = datetime(2026, 10, 20, 6, 0, tzinfo=UTC)
+
+
+def body_object(content: str, kind: str = "text") -> dict[str, str]:
+    """A Graph `itemBody` value (`uniqueBody` or `body`)."""
+    return {"contentType": kind, "content": content}
+
+
+def thread_item(n: int, folder_id: str = INBOX_ID, **extra: object) -> dict[str, object]:
+    """Item `n` of CONVERSATION with Message-ID `t<n>@example.test` and the `uniqueBody` "Unique <n>"."""
+    at = (THREAD_START + timedelta(minutes=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields: dict[str, object] = {
+        "receivedDateTime": at,
+        "sentDateTime": at,
+        "parentFolderId": folder_id,
+        "conversationId": CONVERSATION,
+        "internetMessageId": f"<t{n}@example.test>",
+        "from": {"emailAddress": {"name": "Peer", "address": "peer@example.test"}},
+        "uniqueBody": body_object(f"Unique {n}"),
+    }
+    return message(n, **(fields | extra))
 
 
 class FakeTokens:
