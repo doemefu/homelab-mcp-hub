@@ -9,6 +9,13 @@ message answer fills the 2 MiB message cap (non-ASCII body plus 5,000 recipients
 and every reply or thread SEARCH answers 500 hits whose header blocks are hostile (8 KiB address header for the 500-UID
 locate chunks, 64 KiB lookup header for the 50-UID lookup chunks; one shared bytes object, so the fake holds
 none of it).
+`--scenario thread` drives run_get_thread for `icloud` accounts through an in-process IMAP fake (WP13c): the calls
+alternate between a 51-message header-round thread (round (1) with 11 ids, three round-(2) iterations, 20 keys per
+search, hit blocks of 64 KiB, 51 members with 64 KiB bodies and 300-part BODYSTRUCTUREs) and a subject-fallback thread
+(500 hostile 8 KiB scan items per folder, 50 joined members); every search also answers 500 hostile hits per folder.
+`--scenario thread-graph` drives run_get_thread for `--accounts` Graph accounts through an in-process transport: the
+conversation list answers with a 2 MiB `uniqueBody` list or, alternately, a refused one and the 2 MiB fallback list, and
+20 single reads of about 2 MiB follow (every fourth refused once, then retried with `uniqueBody` alone).
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
@@ -18,12 +25,16 @@ Run inside the production image with the repository mounted read-only (see CONTR
       python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
     ... python /work/scripts/memory_probe.py --scenario graph-message --with-calendar nonascii-240k --calls 10
     ... python /work/scripts/memory_probe.py --scenario status --accounts 2 --parallel 2 --calls 10
+    ... python /work/scripts/memory_probe.py --scenario thread --accounts 2 --parallel 2 --calls 10
+    ... python /work/scripts/memory_probe.py --scenario thread-graph --accounts 2 --parallel 2 --calls 10
 """
 
 import argparse
 import asyncio
 import base64
+import functools
 import gc
+import itertools
 import json
 import resource
 import sys
@@ -31,6 +42,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,13 +50,15 @@ import anyio
 import httpx2
 from tests.support.clock import FakeClock
 from tests.support.dav_transport import RecordingTransport, collection, dav, home_set, multistatus, principal, report
-from tests.support.imap_fake import FakeFolder, FakeImapServer, FakeMessage
+from tests.support.graph_fixtures import CONVERSATION, body_object, thread_item
+from tests.support.graph_fixtures import INBOX_ID as THREAD_INBOX_ID
+from tests.support.imap_fake import FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.ms_transport import FAKE_CLIENT_ID, MsTransport, json_answer
 from tests.support.token_fakes import KEY, FakeStore
 
 from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
-from mcp_hub.ids import GraphMessageRef, StableRef, encode_message_id
+from mcp_hub.ids import GraphMessageRef, StableRef, encode_message_id, encode_ref
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.caldav import MAX_REPORT_BYTES_PER_CALL, CalDavCalendarSource, SlowObjectCache
 from mcp_hub.providers.deadline import CallDeadline
@@ -57,6 +71,7 @@ from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
 from mcp_hub.tools.mail import run_get_message
+from mcp_hub.tools.mail_thread import run_get_thread
 
 BASE = "https://dav.example.test:443"
 HEAD = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub probe//EN\r\n"
@@ -234,7 +249,7 @@ def graph_attachments_body() -> bytes:
     return body
 
 
-def graph_mailbox(account: Account) -> GraphMailbox:
+def graph_mailbox(account: Account, thread: bool = False) -> GraphMailbox:
     """Real GraphMailbox + GraphTokenSource; the refresh token lives in the in-memory fake store (no PostgreSQL).
     The seven well-known folder GETs of the D75 binding are answered: inbox with its id, the others 404 (no such
     folder); the folder ids are cached per mailbox as in the hub."""
@@ -249,12 +264,14 @@ def graph_mailbox(account: Account) -> GraphMailbox:
             200, content=graph_attachments_body()
         ),
     }
-    graph = RecordingTransport(answers).transport()
+    graph = thread_graph_transport() if thread else RecordingTransport(answers).transport()
     token = {"access_token": "AT-PROBE", "refresh_token": "RT-PROBE", "expires_in": 3600, "scope": "Mail.Read"}
     ms = MsTransport({"/consumers/oauth2/v2.0/token": [json_answer(200, token)]}).transport()
+    store = FakeStore()
+    store.sealed = store.cipher_.seal("RT-PROBE", account_id=account.id, provider=account.provider)  # bound to the id
     tokens = GraphTokenSource(
         GraphAccount(account.id, account.provider, "consumers", FAKE_CLIENT_ID, ("Mail.Read", "offline_access")),
-        FakeStore(),
+        store,
         cache=AccessTokenCache(),
         client_factory=lambda timeout: httpx2.Client(transport=ms, trust_env=False),
     )
@@ -267,28 +284,48 @@ def graph_mailbox(account: Account) -> GraphMailbox:
     )
 
 
-def context(accounts: int, scenario: str | None, calendars: int, graph: bool = False) -> HubContext:
+def context(
+    accounts: int,
+    scenario: str | None,
+    calendars: int,
+    graph: bool = False,
+    *,
+    imap: Callable[[str], ImapMailbox] | None = None,
+    thread_graph: bool = False,
+) -> HubContext:
+    """`accounts` icloud accounts (calendar scenario and/or fake IMAP mailboxes) and, with `graph`, as many Graph
+    accounts (`outlook`, `outlook1`, ...; one for graph-message)."""
     secrets = Path(tempfile.mkdtemp()) / "secrets"
     secrets.mkdir()
     example = json.loads((Path(__file__).parents[1] / "tests/fixtures/accounts.example.json").read_text())
     template = next(a for a in example["accounts"] if a["id"] == "icloud")
-    icloud = [template | {"id": f"icloud{i}" if i else "icloud"} for i in range(accounts if scenario else 0)]
-    example["accounts"] = icloud + [a for a in example["accounts"] if graph and a["id"] == "outlook"]
+    graph_template = next(a for a in example["accounts"] if a["id"] == "outlook")
+    icloud = [template | {"id": f"icloud{i}" if i else "icloud"} for i in range(accounts if scenario or imap else 0)]
+    outlook = [
+        graph_template | {"id": f"outlook{i}" if i else "outlook"}
+        for i in range(accounts if thread_graph else 1 if graph else 0)
+    ]
+    example["accounts"] = icloud + outlook
     (secrets / "accounts.json").write_text(json.dumps(example))
     for ref in ("icloud-username", "icloud-app-password", "outlook-ms-client-id", "db-username", "db-password"):
         (secrets / ref).write_text("placeholder")
     (secrets / "token-encryption-key").write_text(base64.b64encode(KEY).decode())
     sources = {a["id"]: source(a["id"], scenario, calendars) for a in icloud} if scenario else {}
     registry = load_registry(secrets / "accounts.json")
-    mailboxes = {a.id: graph_mailbox(a) for a in registry.accounts if a.id == "outlook"}
+    mailboxes = {a.id: graph_mailbox(a, thread_graph) for a in registry.accounts if a.id.startswith("outlook")}
+
+    def mailbox(account: Account, directory: Path) -> ImapMailbox | GraphMailbox:
+        if account.id in mailboxes:
+            return mailboxes[account.id]
+        if imap is None:
+            raise SystemExit("no mailbox for this account")
+        return imap(account.id)
+
     return HubContext(
         load_settings({"HUB_SECRETS_DIR": str(secrets)}),
         registry,
         StatusStore(),
-        Adapters(
-            mailbox=lambda account, directory: mailboxes[account.id],
-            calendar=lambda account, deadline: sources[account.id],
-        ),
+        Adapters(mailbox=mailbox, calendar=lambda account, deadline: sources[account.id]),
     )
 
 
@@ -337,6 +374,313 @@ def status_call(server: FakeImapServer, targets: list[StableRef]) -> str:
     statuses = box.message_status(targets, CallDeadline(clock(), 16.0, 20.0, clock))
     checked = sum(s.thread_checked for s in statuses)
     return f"refs {len(statuses)}, found {sum(s.state == 'found' for s in statuses)}, thread_checked {checked}"
+
+
+# --- get_thread (WP13c) ---------------------------------------------------------------------------------------------
+
+OWNER = "owner@example.test"
+THREAD_START = datetime(2026, 10, 21, 7, 0, tzinfo=UTC)
+BULK_HITS, MEMBERS, SUBJECT_MEMBERS = 500, 51, 50
+RECIPIENTS = ", ".join([OWNER] + [f"r{i}@example.test" for i in range(150)])
+PAIR = "ä" + EMOJI  # 6 bytes of UTF-8
+PLAIN_B64 = base64.b64encode(
+    ((PAIR + " word ") * 14_000).encode()
+)  # 64 KiB of it is fetched; the part is declared larger
+HTML_BODY = ("<p>Hello <b>" + PAIR + "</b> &amp; <i>x</i></p>\n" * 7000).encode()
+ATTACHMENT = (
+    b"application", b"pdf", (b"name", b"f.pdf"), None, None, b"base64", 1000, None,
+    (b"attachment", (b"filename", b"f.pdf")), None, None,
+)  # fmt: skip
+
+
+def hdr(*fields: tuple[str, str]) -> bytes:
+    return ("".join(f"{name}: {value}\r\n" for name, value in fields) + "\r\n").encode()
+
+
+def text_leaf(subtype: bytes, encoding: bytes, size: int) -> tuple[object, ...]:
+    return (b"text", subtype, (b"charset", b"utf-8"), None, None, encoding, size, 100, None, None, None, None)
+
+
+def mixed(first: object) -> tuple[object, ...]:
+    """multipart/mixed: the text structure and 300 attachment parts (a maximal BODYSTRUCTURE line)."""
+    return ([first, *([ATTACHMENT] * 300)], b"mixed", (b"boundary", b"b"), None, None, None)
+
+
+STRUCTURES = (  # even UIDs: plain (base64) next to HTML; odd UIDs: HTML only
+    mixed(([text_leaf(b"plain", b"base64", 200_000), text_leaf(b"html", b"7bit", 300_000)], b"alternative", None)),
+    mixed(text_leaf(b"html", b"7bit", 300_000)),
+)
+
+
+def bulk_header(ids: list[str]) -> bytes:
+    """A hit of every header and date SEARCH: a 9,000-character Subject (the 8 KiB scan item is cut inside it) and a
+    64 KiB item cut inside the References, before the ids that made it match. The addresses are short: an 8 KiB
+    address header costs about 1.5 ms of `email.utils.getaddresses` per hit (500 hits per SEARCH), which would
+    exhaust the 12 s reserve and keep the probe from reaching the body pass."""
+    named = " ".join(f"<{x}@example.test>" for x in ids)
+    return hdr(
+        ("From", "Bulk <bulk@example.test>"),
+        ("To", OWNER),
+        ("Subject", "y" * 9000),
+        ("Message-ID", "<bulk@example.test>"),
+        ("References", f"{'x' * 66000} {named}"),
+    )
+
+
+def member(
+    uid: int, ident: str, minute: int, topic: str, *, parent: str | None, refs: list[str], sent: bool
+) -> FakeMessage:
+    fields = [
+        ("From", OWNER if sent else "Peer <peer@example.test>"),
+        ("To", "Peer <peer@example.test>" if sent else RECIPIENTS),
+        ("Subject", topic),
+        ("Message-ID", f"<{ident}@example.test>"),
+    ]
+    if parent is not None:
+        fields.append(("In-Reply-To", f"<{parent}@example.test>"))
+    if refs:
+        fields.append(("References", " ".join(f"<{r}@example.test>" for r in refs)))
+    return FakeMessage(
+        uid,
+        THREAD_START + timedelta(minutes=minute),
+        headers=hdr(*fields),
+        text=HTML_BODY if uid % 2 else PLAIN_B64,
+        bodystructure=STRUCTURES[uid % 2],
+    )
+
+
+@dataclass
+class ProbeFolder(FakeFolder):
+    bulk: frozenset[int] = frozenset()  # the hostile hits: found by every header or date SEARCH without being matched
+
+
+class ProbeClient(FakeImapClient):
+    def search(self, criteria: bytes) -> list[int]:
+        """The fake's evaluator over the real messages, plus every bulk UID for a header or date search (matching 500
+        hostile blocks per SEARCH in the evaluator would cost seconds and measure the fake)."""
+        folder = self._selected("UID SEARCH")
+        bulk = folder.bulk if isinstance(folder, ProbeFolder) else frozenset()
+        every = folder.messages
+        folder.messages = {uid: m for uid, m in every.items() if uid not in bulk}
+        try:
+            hits = super().search(criteria)
+        finally:
+            folder.messages = every
+        return sorted({*hits, *bulk}) if bulk and (b"HEADER" in criteria or b"SINCE" in criteria) else hits
+
+
+class ProbeServer(FakeImapServer):
+    def client(self) -> FakeImapClient:
+        return ProbeClient(self)
+
+
+def chain(n: int) -> tuple[str | None, list[str], bool]:
+    """(In-Reply-To, References, in Sent) of member n of the header-round thread: 1-30 reach round (1) through their
+    References root; 31-40, 41-45 and 46-51 follow one round-(2) iteration each by In-Reply-To; the keys of 46-51 are
+    left after the third iteration (not exact)."""
+    if n == 1:
+        return None, [], False
+    if n < 30:
+        return "t1", ["t1"], False
+    if n == 30:  # the seed: 31 References, of which round (1) searches the root and the newest nine
+        return "t29", ["t1", *(f"x{i}" for i in range(1, 31))], False
+    if n <= 40:
+        return f"t{n - 30}", [], False
+    if n <= 45:
+        return f"t{n - 10}", [], True
+    return f"t{41 + (n - 46) % 5}", [], False
+
+
+def thread_server(kind: str) -> tuple[ProbeServer, StableRef]:
+    """`rounds`: 51 members, 31 of them with a chain through the header rounds; `subject`: a seed without References
+    and 50 other messages with its subject. Every folder also holds 500 bulk hits."""
+    ids = [f"t{n}" for n in range(1, MEMBERS + 1)] + ["b0"]
+    hostile = bulk_header(ids)  # one shared bytes object, so the fake holds none of it per hit
+    bulk = {uid: FakeMessage(uid, THREAD_START, headers=hostile) for uid in range(1, BULK_HITS + 1)}
+    inbox: dict[int, FakeMessage] = dict(bulk)
+    sent: dict[int, FakeMessage] = {}
+    if kind == "rounds":
+        for n in range(1, MEMBERS + 1):
+            parent, refs, outgoing = chain(n)
+            target = sent if outgoing else inbox
+            target[BULK_HITS + n] = member(
+                BULK_HITS + n, f"t{n}", n, "Probe thread", parent=parent, refs=refs, sent=outgoing
+            )
+        seed = "t30@example.test"
+    else:
+        inbox[BULK_HITS + 1] = member(BULK_HITS + 1, "b0", 0, "Probe topic", parent=None, refs=[], sent=False)
+        for k in range(1, SUBJECT_MEMBERS + 1):
+            uid = BULK_HITS + 1 + k
+            inbox[uid] = member(uid, f"s{k}", k, "Re: Probe topic", parent=None, refs=[], sent=False)
+        seed = "b0@example.test"
+    folders: list[FakeFolder] = [
+        ProbeFolder("INBOX", (b"\\HasNoChildren",), messages=inbox, bulk=frozenset(bulk)),
+        ProbeFolder("Sent Messages", (b"\\HasNoChildren", b"\\Sent"), messages=dict(bulk) | sent, bulk=frozenset(bulk)),
+        ProbeFolder("Archive", (b"\\HasNoChildren", b"\\Archive"), messages=dict(bulk), bulk=frozenset(bulk)),
+        ProbeFolder("Deleted Messages", (b"\\HasNoChildren", b"\\Trash"), messages=dict(bulk), bulk=frozenset(bulk)),
+    ]
+    return ProbeServer(folders, clock=FakeClock()), StableRef("icloud", seed)
+
+
+def account_id(prefix: str, index: int) -> str:
+    return f"{prefix}{index}" if index else prefix
+
+
+def imap_factory(kind: Callable[[], str]) -> Callable[[str], ImapMailbox]:
+    """A fresh fake server and mailbox per call (and a fresh folder map: the LIST is part of the call)."""
+
+    def build(account: str) -> ImapMailbox:
+        server, _ = thread_server(kind())
+        clock = server.clock
+        if clock is None:
+            raise SystemExit("thread server needs a clock")
+        return ImapMailbox(
+            account,
+            host="imap.example.test",
+            port=993,
+            folder="INBOX",
+            username="u",
+            password="p",
+            client_factory=lambda host, port, context, timeout: server.client(),
+            own_addresses=frozenset({OWNER}),
+            folder_maps=FolderMapCache(clock=clock),
+        )
+
+    return build
+
+
+GRAPH_ITEMS, GRAPH_LISTED, GRAPH_SEED = 51, 31, "AAMkMSG0051="
+CAP = MAX_MESSAGE_RESPONSE_BYTES
+
+
+@functools.cache
+def graph_list(unique: bool) -> bytes:
+    """The conversation list filled to just below the 2 MiB cap: 51 items, with `uniqueBody` for the 31 oldest (as
+    HTML above the 64 KiB cut) or, without it, a long subject on every item."""
+
+    def build(pairs: int) -> bytes:
+        items = [
+            thread_item(
+                n,
+                subject="Probe thread" + ("" if unique else PAIR * pairs),
+                **(
+                    {"uniqueBody": body_object(f"<p>{PAIR * pairs}</p>", "html")}
+                    if unique and n <= GRAPH_LISTED
+                    else {}
+                ),
+            )
+            for n in range(1, GRAPH_ITEMS + 1)
+        ]
+        return json.dumps({"value": items}, ensure_ascii=False).encode()
+
+    holders = GRAPH_LISTED if unique else GRAPH_ITEMS
+    pairs = (CAP - 4096 - len(build(0))) // (len(PAIR.encode()) * holders)
+    body = build(pairs)
+    if len(body) > CAP:
+        raise SystemExit("probe list body exceeds the 2 MiB cap")
+    return body
+
+
+@functools.cache
+def graph_single(retry: bool) -> bytes:
+    """One single read: `uniqueBody` and `body` of about 1 MiB each (the retry: `uniqueBody` alone, 2 MiB)."""
+    pairs = (CAP - 4096) // (len(PAIR.encode()) * (1 if retry else 2))
+    content = body_object(f"<p>{PAIR * pairs}</p>", "html")
+    body = {"uniqueBody": content} if retry else {"uniqueBody": content, "body": content}
+    return json.dumps(body, ensure_ascii=False).encode()
+
+
+OVER_CAP = b"x" * (CAP + 1)
+
+
+def thread_graph_transport() -> httpx2.MockTransport:
+    """Folder ids (inbox only), the seed read, the conversation list (every second `uniqueBody` list refused as too
+    large) and the single reads (every fourth `uniqueBody,body` read refused as too large)."""
+    lists = itertools.count()
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        path, select = request.url.path.removeprefix("/v1.0"), request.url.params.get("$select", "")
+        if path.startswith("/me/mailFolders/"):
+            found = path.endswith("/inbox")
+            return httpx2.Response(200, json={"id": THREAD_INBOX_ID}) if found else httpx2.Response(404)
+        if path == "/me/messages":
+            if "uniqueBody" not in select:
+                return httpx2.Response(200, content=graph_list(False))
+            return httpx2.Response(200, content=OVER_CAP if next(lists) % 2 else graph_list(True))
+        if path == f"/me/messages/{GRAPH_SEED}" and "conversationId" in select:
+            seed = {"id": GRAPH_SEED, "conversationId": CONVERSATION, "parentFolderId": THREAD_INBOX_ID}
+            return httpx2.Response(200, json=seed | {"isDraft": False, "receivedDateTime": "2026-10-20T06:51:00Z"})
+        n = int(path.removeprefix("/me/messages/AAMkMSG")[:4])
+        if select == "uniqueBody,body":
+            return httpx2.Response(200, content=OVER_CAP if n % 4 == 0 else graph_single(False))
+        if select == "uniqueBody":
+            return httpx2.Response(200, content=graph_single(True))
+        return httpx2.Response(404)
+
+    return httpx2.MockTransport(handle)
+
+
+async def thread_call(ctx: HubContext, args: argparse.Namespace, graph: bool, kind: str) -> list[str]:
+    """`--accounts` accounts times `--parallel` concurrent get_thread calls; `--with-calendar` adds get_events."""
+    notes: list[str] = []
+    seed = "t30@example.test" if kind == "rounds" else "b0@example.test"
+
+    async def thread(account: str) -> None:
+        result = await run_get_thread(
+            ctx,
+            ref=None if graph else encode_ref("icloud", seed),
+            message_id=encode_message_id(GraphMessageRef(account, GRAPH_SEED)) if graph else None,
+            thread_key=None,
+            account=None,
+            max_chars_per_message=5000,
+            include_trash=True,
+        )
+        omitted = sum(m.body_omitted for m in result.messages)
+        notes.append(
+            f"{account}: {len(result.messages)} messages, {result.summary.message_count} found "
+            f"(exact {result.summary.message_count_exact}), truncated {result.truncated}, bodies omitted {omitted}"
+        )
+
+    async def events() -> None:
+        notes.extend(await one_call(ctx, True, False))
+
+    async with anyio.create_task_group() as tg:
+        for i in range(args.accounts):
+            for _ in range(args.parallel):
+                tg.start_soon(thread, account_id("outlook" if graph else "icloud", i))
+        if args.with_calendar:
+            tg.start_soon(events)
+    return notes
+
+
+def thread_main(args: argparse.Namespace) -> None:
+    graph = args.scenario == "thread-graph"
+    kinds = itertools.cycle(("rounds", "subject"))
+    kind = {"now": "rounds"}  # read by the mailbox factory: every call of a round runs the same thread
+    ctx = context(
+        args.accounts,
+        args.with_calendar,
+        args.calendars,
+        graph=graph,
+        imap=None if graph else imap_factory(lambda: kind["now"]),
+        thread_graph=graph,
+    )
+    gc.collect()
+    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+    print(f"baseline peak RSS {base:.0f} MiB (imports and fakes)", flush=True)
+    for call in range(1, args.calls + 1):
+        kind["now"] = next(kinds)
+        cpu = time.process_time()
+        started = time.monotonic()
+        notes = asyncio.run(thread_call(ctx, args, graph, kind["now"]))
+        gc.collect()
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+        print(
+            f"call {call} ({'graph' if graph else kind['now']}): peak RSS {peak:.0f} MiB, "
+            f"CPU {time.process_time() - cpu:.1f} s, wall {time.monotonic() - started:.1f} s: {notes[0]}",
+            flush=True,
+        )
+    print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
 
 
 def cgroup(name: str) -> str:
@@ -411,17 +755,24 @@ def status_main(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status"], required=True)
     parser.add_argument(
-        "--with-calendar", choices=sorted(SCENARIOS), help="calendar scenario run next to graph-message or status"
+        "--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status", "thread", "thread-graph"], required=True
+    )
+    parser.add_argument(
+        "--with-calendar",
+        choices=sorted(SCENARIOS),
+        help="calendar scenario run next to graph-message, status, thread or thread-graph",
     )
     parser.add_argument("--accounts", type=int, default=1)
-    parser.add_argument("--parallel", type=int, default=1, help="concurrent status calls per account")
+    parser.add_argument("--parallel", type=int, default=1, help="concurrent status or thread calls per account")
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
     args = parser.parse_args()
     if args.scenario == "status":
         status_main(args)
+        return
+    if args.scenario in ("thread", "thread-graph"):
+        thread_main(args)
         return
     graph = args.scenario == "graph-message"
     if args.with_calendar and not graph:
