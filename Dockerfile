@@ -18,7 +18,7 @@ RUN groupadd --system --gid 10001 app \
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/src /app/src
 COPY --chmod=0755 bin/mcp-hub /usr/local/bin/mcp-hub
-ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH=/app/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH=/app/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 MALLOC_ARENA_MAX=2
 WORKDIR /app
 USER 10001:10001
 EXPOSE 8083 8084
