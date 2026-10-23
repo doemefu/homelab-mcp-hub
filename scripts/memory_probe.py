@@ -11,8 +11,9 @@ locate chunks, 64 KiB lookup header for the 50-UID lookup chunks; one shared byt
 none of it).
 `--scenario thread` drives run_get_thread for `icloud` accounts through an in-process IMAP fake (WP13c): the calls
 alternate between a 51-message header-round thread (round (1) with 11 ids, three round-(2) iterations, 20 keys per
-search, hit blocks of 64 KiB, 51 members with 64 KiB bodies and 300-part BODYSTRUCTUREs) and a subject-fallback thread
-(500 hostile 8 KiB scan items per folder, 50 joined members); every search also answers 500 hostile hits per folder.
+search, hit blocks of 64 KiB, 51 members with 64 KiB bodies and BODYSTRUCTUREs of 10,000 parts, `--structure-parts`)
+and a subject-fallback thread (500 hostile 8 KiB scan items per folder, 50 joined members);
+every search also answers 500 hostile hits per folder.
 `--scenario thread-graph` drives run_get_thread for `--accounts` Graph accounts through an in-process transport: the
 conversation list answers with a 2 MiB `uniqueBody` list or, alternately, a refused one and the 2 MiB fallback list, and
 20 single reads of about 2 MiB follow (every fourth refused once, then retried with `uniqueBody` alone).
@@ -41,7 +42,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -387,10 +388,6 @@ PLAIN_B64 = base64.b64encode(
     ((PAIR + " word ") * 14_000).encode()
 )  # 64 KiB of it is fetched; the part is declared larger
 HTML_BODY = ("<p>Hello <b>" + PAIR + "</b> &amp; <i>x</i></p>\n" * 7000).encode()
-ATTACHMENT = (
-    b"application", b"pdf", (b"name", b"f.pdf"), None, None, b"base64", 1000, None,
-    (b"attachment", (b"filename", b"f.pdf")), None, None,
-)  # fmt: skip
 
 
 def hdr(*fields: tuple[str, str]) -> bytes:
@@ -401,15 +398,26 @@ def text_leaf(subtype: bytes, encoding: bytes, size: int) -> tuple[object, ...]:
     return (b"text", subtype, (b"charset", b"utf-8"), None, None, encoding, size, 100, None, None, None, None)
 
 
-def mixed(first: object) -> tuple[object, ...]:
-    """multipart/mixed: the text structure and 300 attachment parts (a maximal BODYSTRUCTURE line)."""
-    return ([first, *([ATTACHMENT] * 300)], b"mixed", (b"boundary", b"b"), None, None, None)
-
-
-STRUCTURES = (  # even UIDs: plain (base64) next to HTML; odd UIDs: HTML only
-    mixed(([text_leaf(b"plain", b"base64", 200_000), text_leaf(b"html", b"7bit", 300_000)], b"alternative", None)),
-    mixed(text_leaf(b"html", b"7bit", 300_000)),
+STRUCTURE_PARTS = (
+    10_000  # parts per BODYSTRUCTURE: about 1 MiB of FETCH line, the size INTERFACES names (§5.5 residual)
 )
+
+
+def attachment(i: int) -> tuple[object, ...]:
+    name = b"f%d.pdf" % i
+    disposition = (b"attachment", (b"filename", name))
+    return (b"application", b"pdf", (b"name", name), None, None, b"base64", 1000, None, disposition, None, None)
+
+
+def structure(uid: int) -> tuple[object, ...]:
+    """A fresh multipart/mixed BODYSTRUCTURE: the text structure and STRUCTURE_PARTS attachment parts. Built per FETCH
+    answer, as IMAPClient builds the parsed tuples of every answer, so the probe holds what the adapter holds. Even
+    UIDs: plain (base64) next to HTML; odd UIDs: HTML only."""
+    first: object = text_leaf(b"html", b"7bit", 300_000)
+    if not uid % 2:
+        first = ([text_leaf(b"plain", b"base64", 200_000), first], b"alternative", None)
+    attachments = [attachment(i) for i in range(STRUCTURE_PARTS - 2)]
+    return ([first, *attachments], b"mixed", (b"boundary", b"b"), None, None, None)
 
 
 def bulk_header(ids: list[str]) -> bytes:
@@ -445,7 +453,6 @@ def member(
         THREAD_START + timedelta(minutes=minute),
         headers=hdr(*fields),
         text=HTML_BODY if uid % 2 else PLAIN_B64,
-        bodystructure=STRUCTURES[uid % 2],
     )
 
 
@@ -455,6 +462,13 @@ class ProbeFolder(FakeFolder):
 
 
 class ProbeClient(FakeImapClient):
+    def fetch(self, messages: str | Sequence[int], items: str | Sequence[str]) -> dict[int, dict[bytes, object]]:
+        rows = super().fetch(messages, items)
+        for uid, row in rows.items():
+            if b"BODYSTRUCTURE" in row:
+                row[b"BODYSTRUCTURE"] = structure(uid)
+        return rows
+
     def search(self, criteria: bytes) -> list[int]:
         """The fake's evaluator over the real messages, plus every bulk UID for a header or date search (matching 500
         hostile blocks per SEARCH in the evaluator would cost seconds and measure the fake)."""
@@ -754,6 +768,7 @@ def status_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    global STRUCTURE_PARTS
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status", "thread", "thread-graph"], required=True
@@ -767,11 +782,13 @@ def main() -> None:
     parser.add_argument("--parallel", type=int, default=1, help="concurrent status or thread calls per account")
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
+    parser.add_argument("--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread)")
     args = parser.parse_args()
     if args.scenario == "status":
         status_main(args)
         return
     if args.scenario in ("thread", "thread-graph"):
+        STRUCTURE_PARTS = args.structure_parts
         thread_main(args)
         return
     graph = args.scenario == "graph-message"
