@@ -8,6 +8,7 @@ the chosen text part as `BODY.PEEK[<section>]<0.65536>`. Subjects are compared l
 is logged but `item_degraded`, through the session and capped per call.
 """
 
+import imaplib
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -43,7 +44,7 @@ from mcp_hub.providers.headers import (
     trim_cut,
     valid_message_id,
 )
-from mcp_hub.providers.imap_guard import PASS_THROUGH
+from mcp_hub.providers.imap_guard import PASS_THROUGH, imap_error_kind
 from mcp_hub.providers.imap_search import (
     THREAD_ROUND_KEYS,
     THREAD_SEED_IDS,
@@ -1040,7 +1041,8 @@ def _body_pass(
     A body not read (a failed fetch, a soft stop, SC1) is `OMITTED_BODY`: `body_omitted`, `body_source: "none"`
     (§5.2 "Bodies", final review I-1); `has_attachments` is false until its structure was read (A-td3a, Q-c). The
     `provisional` copies (from the subject scan) get their summary completed with their structure. A SoftStop leaves
-    the rest unread; other errors propagate."""
+    the rest unread; a FETCH answer that does not parse leaves only its messages unread; a tagged BAD, a lost
+    connection and the hard deadline propagate (G4)."""
     bodies: dict[AnyMessageRef, ThreadBody] = {}
     attachments: dict[AnyMessageRef, bool] = {}
     summaries: dict[AnyMessageRef, MailSummary] = {}
@@ -1129,7 +1131,7 @@ def _slice_bodies(
     `has_attachments`; a chunk with a `provisional` copy also fetches the summary header item, which completes that
     copy's summary (Option 6a). Then one `UID FETCH BODY.PEEK[<section>]<0.65536>` per section for the slice; per
     member a soft check, then the body (`_body`). A member the FETCH did not return (NO, expunged) keeps its body
-    omitted."""
+    omitted; so do the members of a text FETCH whose answer does not parse, each with one `item_degraded` line."""
     chosen: dict[str, list[tuple[MessageRef, ThreadCopy, Part]]] = {}
     for start in range(0, len(group), STRUCTURE_CHUNK_UIDS):
         if start:
@@ -1159,7 +1161,15 @@ def _slice_bodies(
                 continue
             chosen.setdefault(part.section, []).append((ref, copy, part))
     for section, members in chosen.items():
-        data = session.fetch([ref.uid for ref, _, _ in members], [f"BODY.PEEK[{section}]<0.{THREAD_BODY_BYTES}>"])
+        try:
+            data = session.fetch([ref.uid for ref, _, _ in members], [f"BODY.PEEK[{section}]<0.{THREAD_BODY_BYTES}>"])
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:  # an answer that does not parse: these bodies stay omitted (code review #54)
+            _raise_bad(exc)
+            for ref, _, _ in members:
+                session.log_skipped(ref, exc)
+            continue
         key = f"BODY[{section}]<0>".encode()
         for ref, copy, part in members:
             soft_check()  # decoding, conversion and quote removal cost CPU without a command (sec-G5)
@@ -1181,19 +1191,33 @@ def _structures(
     session: ImapSession, refs: Sequence[MessageRef], items: Sequence[str]
 ) -> dict[int, dict[bytes, object]]:
     """The `items` of one chunk: BODYSTRUCTURE, with the summary header item when the chunk holds a provisional copy.
-    IMAPClient's recursive parser raises RecursionError on a structure nested about 1000 deep, failing the whole
-    chunk; the chunk is then fetched one UID at a time, and only a UID that fails alone is missing (P10), with one
-    `item_degraded` line."""
+    An answer that does not parse fails the whole chunk: IMAPClient's recursive parser raises RecursionError on a
+    structure nested about 1000 deep (P10), and a ProtocolError or another parse exception on other odd answers (code
+    review #54). The chunk is then fetched one UID at a time, and only a UID that fails alone is missing, with one
+    `item_degraded` line. A tagged BAD, a lost connection and the deadlines stay errors of the call (G4)."""
     try:
         return session.fetch([ref.uid for ref in refs], items)
-    except RecursionError:
-        rows: dict[int, dict[bytes, object]] = {}
-        for ref in refs:
-            try:
-                rows.update(session.fetch([ref.uid], items))
-            except RecursionError as exc:
-                session.log_skipped(ref, exc)
-        return rows
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        _raise_bad(exc)
+    rows: dict[int, dict[bytes, object]] = {}
+    for ref in refs:
+        try:
+            rows.update(session.fetch([ref.uid], items))
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:
+            _raise_bad(exc)
+            session.log_skipped(ref, exc)
+    return rows
+
+
+def _raise_bad(exc: Exception) -> None:
+    """Re-raise a tagged BAD: it fails the call (G4). Any other exception that is not `PASS_THROUGH` (a NO is answered
+    inside `session.fetch`) is a FETCH answer that did not parse, which degrades only its messages."""
+    if isinstance(exc, imaplib.IMAP4.error) and imap_error_kind(exc) == "bad":
+        raise exc
 
 
 def _completed(session: ImapSession, ref: MessageRef, summary: MailSummary, row: dict[bytes, object]) -> MailSummary:

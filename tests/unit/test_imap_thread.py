@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable, Iterator
 
 import pytest
+from imapclient.exceptions import ProtocolError
 
 import mcp_hub.providers.imap_thread as imap_thread
 import mcp_hub.providers.threads as threads
@@ -495,6 +496,75 @@ def test_body_not_read_after_its_structure_has_source_none(cause: str, monkeypat
     assert page.overview.message_count_exact is True
     assert any("BODYSTRUCTURE" in items for items in asked)
     assert any(section_fetch in items for items in asked) is (cause != "soft stop")
+
+
+def _failing_fetch(server: FakeImapServer, stage: str, error: Callable[[], Exception]) -> None:
+    """Answer the body pass FETCH with `error`: the first text FETCH, or every BODYSTRUCTURE FETCH holding UID 12."""
+    state = {"done": False}
+
+    def before(command: str, argument: object) -> None:
+        if command != "UID FETCH":
+            return
+        uids, items = argument  # type: ignore[misc]
+        if stage == "text" and not state["done"] and "BODY.PEEK[1]<0.65536>" in items:
+            state["done"] = True
+            raise error()
+        if stage == "structure" and "BODYSTRUCTURE" in items and 12 in uids:
+            raise error()
+
+    hook(server, before)
+
+
+def _twelve() -> FakeImapServer:
+    return gmail(
+        all_mail=[
+            msg(uid, 100 - uid, f"m{uid}", thrid=THREAD, message_id=f"<m{uid}@example.test>") for uid in range(1, 13)
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "error", [lambda: ProtocolError("unparsable"), lambda: ValueError("unparsable")], ids=["protocol", "value"]
+)
+@pytest.mark.parametrize("stage", ["text", "structure"])
+def test_unparsable_fetch_answer_degrades_only_its_messages(
+    stage: str, error: Callable[[], Exception], provider_log: Capture
+) -> None:
+    """Code review #54 #2: a body-pass answer IMAPClient cannot parse (ProtocolError or another parse exception; not
+    NO, BAD or a lost connection) degrades only the messages it was for: a text FETCH omits its slice's members of
+    that section, a BODYSTRUCTURE FETCH is retried one UID at a time and omits only the failing one. Each gets
+    `OMITTED_BODY` and one item_degraded line (the class name only); the result is truncated, the count exact."""
+    server = _twelve()
+    _failing_fetch(server, stage, error)
+    page = thread(server, key=gmail_key())
+    members = by_subject(page)
+    lost = [f"m{uid}" for uid in range(3, 13)] if stage == "text" else ["m12"]
+    for subject, member in members.items():
+        if subject in lost:
+            assert (member.body.text, member.body.omitted, member.body.source) == ("", True, "none"), subject
+        else:
+            assert (member.body.text, member.body.omitted) == ("Hello", False), subject
+    assert page.truncated is True
+    assert page.overview is not None
+    assert page.overview.message_count_exact is True
+    logged = [json.loads(line) for line in provider_log.lines]
+    assert [line["event"] for line in logged] == ["item_degraded"] * len(lost)
+    assert {line["exception"] for line in logged} == {type(error()).__name__}
+
+
+@pytest.mark.parametrize("error", ["bad", "abort", "oserror"])
+@pytest.mark.parametrize("stage", ["text", "structure"])
+def test_bad_or_lost_connection_in_the_body_pass_fails_the_call(stage: str, error: str) -> None:
+    """G4: a tagged BAD, a lost connection (abort) or a socket error in the body pass stays a tool error."""
+    server = _twelve()
+    errors: dict[str, Callable[[], Exception]] = {
+        "bad": lambda: server.bad("UID FETCH"),
+        "abort": server.abort,
+        "oserror": lambda: OSError("reset"),
+    }
+    _failing_fetch(server, stage, errors[error])
+    with pytest.raises(ProviderError):
+        thread(server, key=gmail_key())
 
 
 def test_uidvalidity_compared_after_real_and_skipped_examine() -> None:
