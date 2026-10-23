@@ -1,15 +1,16 @@
 """IMAP `get_thread` (spec 080 §5.2 `get_thread`, §5.5, §6.5; WP13c): the seed, the members, the merge and the body
 pass, inside one `ImapSession` (one connection, one deadline, D76). Gmail finds the members by `X-GM-THRID` (Option
-4a); other servers by the header rounds (Option 3a) and the subject fallback (T9).
+4a); other servers by the header rounds (Option 3a) and the subject fallback (3) (Option 8a).
 
-Read-only through the guard: EXAMINE, UID SEARCH and UID FETCH of FLAGS, INTERNALDATE, the summary header item,
-X-GM-LABELS and X-GM-THRID (Gmail), BODYSTRUCTURE in chunks of at most 10 UIDs (A-sec1) and the chosen text part as
-`BODY.PEEK[<section>]<0.65536>`. Nothing here is logged but `item_degraded`, through the session and capped per call.
+Read-only through the guard: EXAMINE, UID SEARCH and UID FETCH of FLAGS, INTERNALDATE, the summary header item, the
+8 KiB subject-scan item, X-GM-LABELS and X-GM-THRID (Gmail), BODYSTRUCTURE in chunks of at most 10 UIDs (A-sec1) and
+the chosen text part as `BODY.PEEK[<section>]<0.65536>`. Subjects are compared locally, never sent (D74). Nothing here
+is logged but `item_degraded`, through the session and capped per call.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Final, cast
 
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
@@ -38,6 +39,7 @@ from mcp_hub.providers.headers import (
     imap_thread_key,
     parse_descendant,
     parse_summary_headers,
+    subject_digest,
     trim_cut,
     valid_message_id,
 )
@@ -53,6 +55,7 @@ from mcp_hub.providers.imap_search import (
     or_batches,
     search_value_ok,
     thrid_or,
+    window_keys,
 )
 from mcp_hub.providers.imap_session import (
     _LABEL_SENT,
@@ -87,6 +90,13 @@ STRUCTURE_CHUNK_UIDS: Final = 10  # BODYSTRUCTURE lines per UID FETCH (A-sec1)
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per call (sec-G8)
 MAX_ROUND_ITERATIONS: Final = 3  # round (2) iterations after round (1) (§6.5, S-m)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "sent", "archive", "trash")  # trash with include_trash
+SUBJECT_WINDOW: Final = timedelta(days=30)  # subject members within 30 days of the seed (§6.5 (3))
+MAX_SUBJECT_CANDIDATES: Final = 500  # the highest UIDs read per folder and call (Q4); beyond: not exact
+SUBJECT_SCAN_BYTES: Final = 8192
+SUBJECT_SCAN_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT MESSAGE-ID)]<0.{SUBJECT_SCAN_BYTES}>"
+_SCAN_SINCE: Final = timedelta(days=31)  # SEARCH dates are the server's days: one day of margin (IR4)
+_SCAN_BEFORE: Final = timedelta(days=32)  # BEFORE is exclusive: one day of margin after the 30 days
+_SCAN_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUBJECT_SCAN_ITEM)
 _ROUND_ONE_FIELDS: Final = ("Message-ID", "References")
 _MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUMMARY_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", SUMMARY_HEADER_ITEM)
@@ -123,6 +133,17 @@ class _Rounds:
     down: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """A subject-scan row whose subject digest matched, reduced at once (A-sec1): where it lies and the copy it
+    becomes when it joins. The copy holds the scan item's fields (received_at, participants, Message-ID, sent
+    state); the body pass completes the rest (Option 6a)."""
+
+    entry: FolderEntry
+    location: Location
+    copy: ThreadCopy
+
+
 @dataclass(slots=True)
 class _Members:
     """The copies found, where they lie, and what the member passes left incomplete (P11)."""
@@ -134,6 +155,8 @@ class _Members:
     truncated: bool = False  # members may be missing: SEARCH or EXAMINE NO, the reserve, the soft stop
     seed_headers: ParsedHeaders | None = None  # the seed's headers, trimmed when cut: round (1) ids (IR2, T7-3)
     seed_cut: bool = False  # the seed's block reached its cap: References beyond the cut were not seen
+    cut_copies: set[Location] = field(default_factory=set)  # copies whose summary block reached its cap
+    provisional: set[Location] = field(default_factory=set)  # copies from the scan item, completed in the body pass
 
     def partial(self) -> None:
         self.exact, self.truncated = False, True
@@ -168,7 +191,9 @@ def get_thread(
         thread = _seed_members(session, query, state, soft_check, reserve_spent)
     merged = merge_copies(state.copies, include_trash=query.include_trash)
     counted, kept, capped = choose_members(merged, include_trash=query.include_trash)
-    members = _body_pass(session, kept, state.entries, max_chars=query.max_chars, soft_check=soft_check)
+    members = _body_pass(
+        session, kept, state.entries, provisional=state.provisional, max_chars=query.max_chars, soft_check=soft_check
+    )
     return ThreadPage(
         "ok",
         thread=thread,
@@ -194,6 +219,11 @@ def _items(session: ImapSession) -> tuple[str, ...]:
     return _GMAIL_MEMBER_ITEMS if session.gmail else _MEMBER_ITEMS
 
 
+def _utc_now() -> datetime:
+    """The wall-clock time the scan of a `subject` key counts its days from (tests pin it)."""
+    return datetime.now(UTC)
+
+
 # --- seed ------------------------------------------------------------------------------------------------------
 
 
@@ -205,16 +235,23 @@ def _key_members(
     soft_check: Callable[[], None],
     reserve_spent: Callable[[], bool],
 ) -> None:
-    """The members from the key alone. Nothing found is `not_found` after a complete search and `upstream_timeout`
-    otherwise; members found by an incomplete search are a partial answer (B6, Q6 as refined by IR3)."""
+    """The members from the key alone. A `headers` key runs the rounds from its root, then (3) from the root member
+    (Q5); a `subject` key runs (3) only (Q-d). Nothing found is `not_found` after a complete search and
+    `upstream_timeout` otherwise; members found by an incomplete search are a partial answer (B6, Q6 as refined by
+    IR3)."""
     value = key.value
     try:
         if key.source == "gmail" and isinstance(value, int):
             _gmail_members(session, value, query, state, None, soft_check, reserve_spent)
         elif key.source == "headers" and isinstance(value, str):
             _header_members(session, [value], query, state, None, soft_check, reserve_spent)  # round (1): the root
+            anchor = _anchor(state, root=value)
+            if anchor is not None:
+                _subject_members(session, query, state, *anchor, soft_check, reserve_spent)
+        elif key.source == "subject" and isinstance(value, str):
+            _subject_key_members(session, value, query, state, soft_check, reserve_spent)
         else:
-            raise ProviderError("upstream_error", "NotImplemented")  # `subject` keys: WP13c T9
+            raise ProviderError("upstream_error", "NotImplemented")  # a key value of the wrong type (ids.py)
     except SoftStop:
         state.partial()
     if not state.copies:
@@ -234,7 +271,8 @@ def _seed_members(
     X-GM-THRID fetch of its mailbox (Q-b); only a seed that no member search returned is read alone. A seed without
     a thread id is returned alone, not exact, with no key (SG4). Other servers read the seed first, then run the
     header rounds from its ids; a cut seed block still gives the ids before the cut, and the count is not exact
-    (IR2, P12)."""
+    (IR2, P12). When the rounds found no other member, (3) follows (`_anchor`); a seed with no id to search by and
+    an empty normalised subject is returned alone, not exact (P12, SG4)."""
     seed = _seed(session, query.seed, soft_check)
     if seed.row is not None:
         _add(session, seed.entry, seed.uidvalidity, seed.uid, seed.row, state, linked_by=_linked_by(session), seed=seed)
@@ -256,13 +294,16 @@ def _seed_members(
     ids = seed_round_ids(state.seed_headers) if state.seed_headers is not None else []
     if state.seed_cut:
         state.inexact()  # the References beyond the cut were not seen (IR2)
-    if not ids:
-        state.inexact()  # no id to search by; the subject fallback follows (T9)
-    else:
-        try:
+    try:
+        if ids:
             _header_members(session, ids, query, state, seed, soft_check, reserve_spent)
-        except SoftStop:
-            state.partial()
+        anchor = _anchor(state)
+        if anchor is not None:
+            _subject_members(session, query, state, *anchor, soft_check, reserve_spent)
+        elif not ids:
+            state.inexact()  # no id and no subject to search by: the seed alone (P12, SG4)
+    except SoftStop:
+        state.partial()
     return next(copy for copy in state.copies if copy.seed).summary.meta.thread
 
 
@@ -398,13 +439,32 @@ def _copy(
     seed: bool,
     known_id: str | None,
 ) -> ThreadCopy:
+    """The copy of a member row from its summary header item (`_headers`). The seed's headers are kept for round
+    (1); a block at its cap is noted, since References beyond the cut may hide (no subject fallback from it)."""
+    parsed = _headers(session, ref, row, state, known_id=known_id)
+    cut = len(header_bytes(row)) >= MAX_HEADER_BYTES
+    if cut:
+        state.cut_copies.add((ref.folder, ref.uidvalidity, ref.uid))
+    if seed:
+        state.seed_headers, state.seed_cut = parsed, cut
+    return _parsed_copy(session, entry, ref, received, row, parsed, linked_by=linked_by, seed=seed)
+
+
+def _parsed_copy(
+    session: ImapSession,
+    entry: FolderEntry,
+    ref: MessageRef,
+    received: datetime,
+    row: dict[bytes, object],
+    parsed: ParsedHeaders,
+    *,
+    linked_by: LinkedBy,
+    seed: bool,
+) -> ThreadCopy:
     """The copy's summary (snippet empty: the body replaces it), participants and sent state. `has_attachments`
     stays false until the body pass reads its structure (Q-c)."""
     flags, labels = _flags(row), _labels(row)
     folder = _detail_folder(entry, row, gmail=session.gmail)
-    parsed = _headers(session, ref, row, state, known_id=known_id)
-    if seed:
-        state.seed_headers, state.seed_cut = parsed, len(header_bytes(row)) >= MAX_HEADER_BYTES
     in_sent = folder == "sent" or _LABEL_SENT in labels
     direction = direction_of(in_sent=in_sent, from_address=parsed.from_address, own=session.own)
     if session.gmail:
@@ -697,6 +757,245 @@ def _linked(
     return False
 
 
+# --- subject fallback (other servers) --------------------------------------------------------------------------
+
+
+def _anchor(state: _Members, *, root: str | None = None) -> tuple[ThreadCopy, str] | None:
+    """The message (3) starts from and its subject digest, when the precondition of §6.5 (3) holds: every copy found
+    is a copy of one message, the seed or, with a `headers` key, the member whose Message-ID is the root (Q5); it
+    names no valid In-Reply-To or References id; no copy's block was cut, so no hidden References; and its
+    normalised subject is not empty. The merged copy: its participants are a sent copy's when there is one."""
+    merged = merge_copies(state.copies, include_trash=True)
+    if len(merged) != 1 or state.cut_copies:
+        return None
+    anchor = merged[0]
+    meta = anchor.summary.meta
+    if not (anchor.seed if root is None else valid_message_id(meta.message_id) == root):
+        return None
+    if valid_message_id(meta.in_reply_to) is not None or meta.references:
+        return None
+    digest = subject_digest(anchor.summary.subject)
+    return None if digest is None else (anchor, digest)
+
+
+def _subject_members(
+    session: ImapSession,
+    query: ThreadQuery,
+    state: _Members,
+    anchor: ThreadCopy,
+    digest: str,
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> None:
+    """(3) from `anchor`: the round folders scanned for the days of its window, `SINCE <day - 31> BEFORE <day + 32>`
+    (the exact ± 30 days are checked on INTERNALDATE), then the candidates joined (`_join`)."""
+    day = anchor.summary.received_at.astimezone(UTC).date()
+    folders = _round_folders(session, query)
+    found = _subject_scan(
+        session,
+        folders,
+        day - _SCAN_SINCE,
+        day + _SCAN_BEFORE,
+        digest=digest,
+        state=state,
+        scanned={},
+        soft_check=soft_check,
+        reserve_spent=reserve_spent,
+    )
+    _join(state, anchor, found)
+
+
+def _subject_key_members(
+    session: ImapSession,
+    digest: str,
+    query: ThreadQuery,
+    state: _Members,
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> None:
+    """A `subject` key runs (3) only (Q-d). The first scan sends `SINCE <today - 31>` without BEFORE (IR4); the newest
+    match received within SUBJECT_WINDOW before the call is the seed (`linked_by: "subject"`, MF-P1). Then only the
+    part of the seed's window the first scan did not cover, `[seed - 31, today - 31)`, is scanned, without the UIDs
+    read already (im-M11), and the candidates of both scans are joined to the seed."""
+    now = _utc_now()
+    edge = now.date() - _SCAN_SINCE
+    scanned: dict[tuple[str, int], set[int]] = {}
+    found = _subject_scan(
+        session,
+        _round_folders(session, query),
+        edge,
+        None,
+        digest=digest,
+        state=state,
+        scanned=scanned,
+        soft_check=soft_check,
+        reserve_spent=reserve_spent,
+    )
+    recent = [candidate for candidate in found if now - candidate.copy.summary.received_at <= SUBJECT_WINDOW]
+    if not recent:
+        return
+    newest = max(recent, key=lambda candidate: order_key(candidate.copy.summary))
+    seed = replace(newest.copy, seed=True)
+    _take(state, newest, seed)
+    since = seed.summary.received_at.astimezone(UTC).date() - _SCAN_SINCE
+    if since < edge:
+        found += _subject_scan(
+            session,
+            _round_folders(session, query),
+            since,
+            edge,
+            digest=digest,
+            state=state,
+            scanned=scanned,
+            soft_check=soft_check,
+            reserve_spent=reserve_spent,
+        )
+    seed_id = valid_message_id(seed.summary.meta.message_id)
+    copies = [
+        seed,
+        *(
+            candidate.copy
+            for candidate in found
+            if candidate is not newest
+            and seed_id is not None
+            and valid_message_id(candidate.copy.summary.meta.message_id) == seed_id
+        ),
+    ]
+    _join(state, merge_copies(copies, include_trash=True)[0], found)
+
+
+def _subject_scan(
+    session: ImapSession,
+    folders: Sequence[FolderEntry],
+    since: date,
+    before: date | None,
+    *,
+    digest: str,
+    state: _Members,
+    scanned: dict[tuple[str, int], set[int]],
+    soft_check: Callable[[], None],
+    reserve_spent: Callable[[], bool],
+) -> list[_Candidate]:
+    """One `UID SEARCH NOT DRAFT SINCE … [BEFORE …]` per folder (`window_keys`; a subject is never a search value,
+    D74), then the 8 KiB scan item of the highest UIDs, at most MAX_SUBJECT_CANDIDATES per folder over every scan of
+    the call (Q4; more hits: not exact), in chunks of 50, each row reduced at once (`_candidate`, A-sec1). UIDs an
+    earlier scan read (`scanned`, IR4) or that are members already (P7) are skipped. The reserve is checked before
+    every folder and every SEARCH (G2, T8-1); EXAMINE or SEARCH NO, a folder without UIDVALIDITY, a lost row, the
+    reserve and a soft stop leave the list partial (G4, P11). A SoftStop ends the scan with the candidates so far."""
+    search = criteria(window_keys(since_day=since, before_day=before, unread_only=False))
+    found: list[_Candidate] = []
+    try:
+        for entry in folders:
+            if reserve_spent():
+                state.partial()
+                break
+            if not _open(session, entry) or session.selected_uidvalidity is None:
+                state.partial()
+                continue
+            validity = session.selected_uidvalidity
+            done = scanned.setdefault((entry.raw_name, validity), set())
+            left = MAX_SUBJECT_CANDIDATES - len(done)
+            if left <= 0:
+                continue  # an earlier scan read the folder's 500: it was capped, so not exact already
+            if reserve_spent():
+                state.partial()
+                break
+            read = done | {uid for name, value, uid in state.seen if name == entry.raw_name and value == validity}
+            rows = _uid_rows(
+                session,
+                search,
+                _SCAN_ITEMS,
+                newest=True,
+                miss=state.partial,
+                soft_check=soft_check,
+                capped=state.inexact,
+                skip=read,
+                limit=left,
+            )
+            for uid, row in rows:
+                done.add(uid)
+                candidate = _candidate(session, entry, validity, uid, row, state, digest=digest)
+                if candidate is not None:
+                    found.append(candidate)
+    except SoftStop:
+        state.partial()
+    return found
+
+
+def _candidate(
+    session: ImapSession,
+    entry: FolderEntry,
+    uidvalidity: int,
+    uid: int,
+    row: dict[bytes, object],
+    state: _Members,
+    *,
+    digest: str,
+) -> _Candidate | None:
+    """One scan row, unless it is a draft (S1) or its normalised subject digest differs. A block cut at 8 KiB is
+    parsed without its last, possibly shortened token (T7-3): a cut Subject gives no digest, so that row only loses
+    the match; a matching row whose Message-ID did not end before the cut, or that shows none, is no candidate and
+    the count is not exact; a cut From gives the direction by folder. A matching row without INTERNALDATE is dropped
+    with one `item_degraded` line and the count is not exact (Q9). A block that does not parse degrades only this
+    row (SC1). The copy's thread key stays unknown until the body pass reads its References."""
+    if _is_draft(row):
+        return None
+    ref = MessageRef(session.account, entry.raw_name, uidvalidity, uid)
+    block = header_bytes(row)
+    cut = len(block) >= SUBJECT_SCAN_BYTES
+    try:
+        parsed = parse_summary_headers(trim_cut(block) if cut else block)
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        session.log_skipped(ref, exc)
+        state.inexact()
+        return None
+    if (cut and not _field_complete(block, b"subject")) or subject_digest(parsed.subject) != digest:
+        return None
+    if cut and (parsed.message_id is None or not _field_complete(block, b"message-id")):
+        state.inexact()
+        return None
+    received = _aware(row.get(b"INTERNALDATE"))
+    if received is None:
+        session.log_skipped(ref, MissingInternalDate())
+        state.inexact()
+        return None
+    if cut and not _field_complete(block, b"from"):
+        parsed = replace(parsed, from_address=None, from_name=None)
+    copy = _parsed_copy(session, entry, ref, received, row, parsed, linked_by="subject", seed=False)
+    unkeyed = replace(copy.summary, meta=replace(copy.summary.meta, thread=None))
+    return _Candidate(entry, (entry.raw_name, uidvalidity, uid), replace(copy, summary=unkeyed))
+
+
+def _join(state: _Members, anchor: ThreadCopy, candidates: Sequence[_Candidate]) -> None:
+    """(3)'s rule: a candidate received within SUBJECT_WINDOW of the anchor whose participants share an address with
+    the anchor's, compared casefolded (F-1), joins with `linked_by: "subject"`. Only the anchor's participants
+    count, never those of another subject member (Q3). A copy of the anchor (its valid Message-ID) joins as a copy,
+    with the anchor's `linked_by`, so that the merge keeps one member."""
+    anchor_id = valid_message_id(anchor.summary.meta.message_id)
+    shared = {address.casefold() for address in anchor.participants}
+    for candidate in candidates:
+        copy = candidate.copy
+        if candidate.location in state.seen:
+            continue
+        if anchor_id is not None and valid_message_id(copy.summary.meta.message_id) == anchor_id:
+            copy = replace(copy, linked_by=anchor.linked_by)
+        elif abs(copy.summary.received_at - anchor.summary.received_at) > SUBJECT_WINDOW or shared.isdisjoint(
+            address.casefold() for address in copy.participants
+        ):
+            continue
+        _take(state, candidate, copy)
+
+
+def _take(state: _Members, candidate: _Candidate, copy: ThreadCopy) -> None:
+    """A candidate becomes a copy of the thread; its summary is completed in the body pass (Option 6a)."""
+    state.seen.add(candidate.location)
+    state.provisional.add(candidate.location)
+    state.entries[candidate.entry.raw_name] = candidate.entry
+    state.copies.append(copy)
+
+
 # --- body pass -------------------------------------------------------------------------------------------------
 
 
@@ -705,6 +1004,7 @@ def _body_pass(
     kept: Sequence[ThreadCopy],
     entries: Mapping[str, FolderEntry],
     *,
+    provisional: Collection[Location] = (),
     max_chars: int,
     soft_check: Callable[[], None],
 ) -> list[ThreadMember]:
@@ -713,9 +1013,11 @@ def _body_pass(
     Per group: EXAMINE unless selected, then its UIDVALIDITY is compared with `session.selected_uidvalidity`, also
     when the EXAMINE was skipped (IR5); another one or a failed EXAMINE leaves the group's bodies unread (im-M8).
     A body not read keeps `body_omitted` and, until its structure was read, `body_source: "none"` and
-    `has_attachments: false` (A-td3a, Q-c). A SoftStop leaves the rest unread; other errors propagate."""
+    `has_attachments: false` (A-td3a, Q-c). The `provisional` copies (from the subject scan) get their summary
+    completed with their structure. A SoftStop leaves the rest unread; other errors propagate."""
     bodies: dict[AnyMessageRef, ThreadBody] = {}
     attachments: dict[AnyMessageRef, bool] = {}
+    summaries: dict[AnyMessageRef, MailSummary] = {}
     groups: dict[tuple[str, int], list[tuple[MessageRef, ThreadCopy]]] = {}
     for copy in kept:
         if isinstance(copy.summary.ref, MessageRef):
@@ -736,12 +1038,23 @@ def _body_pass(
             if entry is None or not _open(session, entry) or session.selected_uidvalidity != uidvalidity:
                 continue
             group.sort(key=lambda member: order_key(member[1].summary), reverse=True)  # newest first
-            _group_bodies(session, group, bodies, attachments, max_chars=max_chars, soft_check=soft_check)
+            _group_bodies(
+                session,
+                group,
+                bodies,
+                attachments,
+                summaries,
+                provisional=provisional,
+                max_chars=max_chars,
+                soft_check=soft_check,
+            )
     except SoftStop:
         pass  # the bodies not read stay omitted (§5.4)
     return [
         ThreadMember(
-            replace(copy.summary, has_attachments=attachments.get(copy.summary.ref, False)),
+            replace(
+                summaries.get(copy.summary.ref, copy.summary), has_attachments=attachments.get(copy.summary.ref, False)
+            ),
             copy.linked_by,
             bodies.get(copy.summary.ref, OMITTED_BODY),
         )
@@ -754,23 +1067,30 @@ def _group_bodies(
     group: Sequence[tuple[MessageRef, ThreadCopy]],
     bodies: dict[AnyMessageRef, ThreadBody],
     attachments: dict[AnyMessageRef, bool],
+    summaries: dict[AnyMessageRef, MailSummary],
     *,
+    provisional: Collection[Location],
     max_chars: int,
     soft_check: Callable[[], None],
 ) -> None:
-    """BODYSTRUCTURE per chunk of 10 UIDs, each reduced at once to the chosen text part and `has_attachments`; then
-    one `UID FETCH BODY.PEEK[<section>]<0.65536>` per section; per member a soft check, then the body (`_body`). A
-    member the FETCH did not return (NO, expunged) keeps its body omitted."""
+    """BODYSTRUCTURE per chunk of 10 UIDs, each reduced at once to the chosen text part and `has_attachments`; a chunk
+    with a `provisional` copy also fetches the summary header item, which completes that copy's summary (Option 6a).
+    Then one `UID FETCH BODY.PEEK[<section>]<0.65536>` per section; per member a soft check, then the body (`_body`).
+    A member the FETCH did not return (NO, expunged) keeps its body omitted."""
     chosen: dict[str, list[tuple[MessageRef, ThreadCopy, Part]]] = {}
     for start in range(0, len(group), STRUCTURE_CHUNK_UIDS):
         if start:
             soft_check()  # reducing a chunk costs CPU without a command (sec-G5)
         chunk = group[start : start + STRUCTURE_CHUNK_UIDS]
-        rows = _structures(session, [ref for ref, _ in chunk])
+        complete = {ref for ref, _ in chunk if (ref.folder, ref.uidvalidity, ref.uid) in provisional}
+        items = ("BODYSTRUCTURE", SUMMARY_HEADER_ITEM) if complete else ("BODYSTRUCTURE",)
+        rows = _structures(session, [ref for ref, _ in chunk], items)
         for ref, copy in chunk:
             row = rows.get(ref.uid)
             if row is None:  # FETCH NO, expunged, or a structure that cannot be parsed alone (P10)
                 continue
+            if ref in complete:
+                summaries[ref] = _completed(session, ref, copy.summary, row)
             try:  # per member: an odd structure leaves only this body unread
                 parts = walk(cast(Sequence[object], row.get(b"BODYSTRUCTURE", ())))
                 part = choose_text_part(parts)
@@ -805,20 +1125,50 @@ def _group_bodies(
             )
 
 
-def _structures(session: ImapSession, refs: Sequence[MessageRef]) -> dict[int, dict[bytes, object]]:
-    """BODYSTRUCTURE of one chunk. IMAPClient's recursive parser raises RecursionError on a structure nested about
-    1000 deep, failing the whole chunk; the chunk is then fetched one UID at a time, and only a UID that fails alone
-    is missing (P10), with one `item_degraded` line."""
+def _structures(
+    session: ImapSession, refs: Sequence[MessageRef], items: Sequence[str]
+) -> dict[int, dict[bytes, object]]:
+    """The `items` of one chunk: BODYSTRUCTURE, with the summary header item when the chunk holds a provisional copy.
+    IMAPClient's recursive parser raises RecursionError on a structure nested about 1000 deep, failing the whole
+    chunk; the chunk is then fetched one UID at a time, and only a UID that fails alone is missing (P10), with one
+    `item_degraded` line."""
     try:
-        return session.fetch([ref.uid for ref in refs], ["BODYSTRUCTURE"])
+        return session.fetch([ref.uid for ref in refs], items)
     except RecursionError:
         rows: dict[int, dict[bytes, object]] = {}
         for ref in refs:
             try:
-                rows.update(session.fetch([ref.uid], ["BODYSTRUCTURE"]))
+                rows.update(session.fetch([ref.uid], items))
             except RecursionError as exc:
                 session.log_skipped(ref, exc)
         return rows
+
+
+def _completed(session: ImapSession, ref: MessageRef, summary: MailSummary, row: dict[bytes, object]) -> MailSummary:
+    """A subject member's In-Reply-To, References and thread key from its summary header item, which the 8 KiB scan
+    item lacks (Option 6a). The other fields stay the scan item's, so the copy keeps the Message-ID and the
+    participants it joined with. A block cut at 64 KiB is parsed without its last token (T7-3); a missing block, or
+    one that does not parse (SC1), leaves the summary as it was."""
+    block = header_bytes(row)
+    if not block:
+        return summary
+    try:
+        parsed = parse_summary_headers(trim_cut(block) if len(block) >= MAX_HEADER_BYTES else block)
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        session.log_skipped(ref, exc)
+        return summary
+    own = valid_message_id(summary.meta.message_id)
+    root = parsed.root if parsed.root is not None and parsed.root != parsed.message_id else own
+    keyed = replace(parsed, message_id=summary.meta.message_id, subject=summary.subject, root=root)
+    meta = replace(
+        summary.meta,
+        in_reply_to=parsed.in_reply_to,
+        references=parsed.references,
+        thread=imap_thread_key(session.account, keyed),
+    )
+    return replace(summary, meta=meta)
 
 
 def _source(part: Part) -> BodySource:

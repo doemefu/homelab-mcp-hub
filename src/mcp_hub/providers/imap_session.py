@@ -602,10 +602,14 @@ def _uid_rows(
     soft_check: Callable[[], None],
     capped: Callable[[], None] | None = None,
     skip: Collection[int] = (),
+    limit: int = MAX_LOOKUP_HITS,
 ) -> Iterator[tuple[int, dict[bytes, object]]]:
     """`_rows` with each row's UID (a fetched row does not carry it), for callers that build ids (WP13c). `capped`
     marks the hit cap instead of `miss` when given (P11); hits in `skip` were read already: they are neither fetched
-    nor counted against the cap (P7)."""
+    nor counted against the cap (P7); `limit` (1 to MAX_LOOKUP_HITS) lowers the cap for a folder whose budget an
+    earlier search used in part (the subject scan, Q4)."""
+    if type(limit) is not int or not 1 <= limit <= MAX_LOOKUP_HITS:
+        raise ValueError("limit out of range")
     try:
         found = session.search(search)
     except PASS_THROUGH:
@@ -616,8 +620,8 @@ def _uid_rows(
         miss()
         return
     uids = sorted(set(found).difference(skip))
-    if len(uids) > MAX_LOOKUP_HITS:
-        uids = uids[-MAX_LOOKUP_HITS:] if newest else uids[:MAX_LOOKUP_HITS]
+    if len(uids) > limit:
+        uids = uids[-limit:] if newest else uids[:limit]
         (miss if capped is None else capped)()
     chunks = session.fetch_chunks(uids, items, chunk=LOOKUP_FETCH_UIDS)
     for start, rows in zip(range(0, len(uids), LOOKUP_FETCH_UIDS), chunks, strict=True):
