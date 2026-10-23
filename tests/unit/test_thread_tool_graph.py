@@ -63,7 +63,7 @@ class GraphStub:
             return graph_json({"id": FOLDER_IDS[path.rsplit("/", 1)[1]]})
         if path.startswith(PATH + "/"):
             if path.endswith("AAMkMSG0004="):
-                return graph_json({"error": {"code": "x"}}, 500)
+                return graph_json({"error": {"code": "x"}}, 404)  # moved away during the call
             return graph_json({"uniqueBody": body_object(f"READ-{path.rsplit('/', 1)[1]}")})
         text = request.url.params["$filter"]
         if text.startswith("internetMessageId eq "):
@@ -179,7 +179,8 @@ def test_graph_adapter_behind_get_thread(
     logged = [e for e in events if e["event"] in {"provider_call_failed", "tool_call"}]
     assert [(e["event"], e.get("outcome"), e.get("exception")) for e in logged] == [
         ("tool_call", "ok", None),
-        ("provider_call_failed", "upstream_error", "UnexpectedStatus"),  # the failed single read, the call goes on
+        ("provider_call_failed", "upstream_error", "UnexpectedStatus"),  # the 400 list fallback (SG1), once
+        ("provider_call_failed", "not_found", "GraphNotFound"),  # the failed single read, the call goes on
         ("tool_call", "ok", None),
         ("tool_call", "not_found", None),  # absence after a complete list: no provider failure
         ("provider_call_failed", "upstream_error", "Forbidden"),
@@ -203,7 +204,8 @@ def test_graph_adapter_behind_get_thread(
         "READ-",
         "Unique",
         ref("t2@example.test"),
-        key(FOUND),
+        ref(SLOW_MID),
+        *[key(c) for c in (FOUND, FALLBACK, EMPTY, FORBIDDEN)],
         *[m["id"] for m in messages],
         *FOLDER_IDS.values(),
         "AT-SENTINEL",

@@ -1373,7 +1373,7 @@ class GraphMailbox:
             raise ProviderError("not_found", "MalformedRef")  # unreachable: get_thread checked the key
         # The map of this call binds the members as it is: no forced re-read for an unknown parent (as C13).
         ids = self._folder_ids(client, token, deadline)
-        values, full, unique = self._thread_list(client, token, deadline, conversation)
+        values, full, unique = self._thread_list(client, token, deadline, conversation, logs)
         exact = not full  # 51 values or a nextLink: more members may exist (gr-G2)
         copies: list[ThreadCopy] = []
         raws: dict[AnyMessageRef, Mapping[str, object]] = {}
@@ -1459,19 +1459,21 @@ class GraphMailbox:
         )
 
     def _thread_list(
-        self, client: httpx2.Client, token: str, deadline: CallDeadline, conversation: str
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, conversation: str, logs: _ThreadLogs
     ) -> tuple[list[object], bool, bool]:
         """(values within `$top` 51, full, with uniqueBody) of the conversation list (§6.5).
 
         `too_large`, or any status but 2xx, 401, 403, 404, 429 and 503, reads the list once more without
-        `uniqueBody` (SG1, Q7, Q-a); a second failure is the tool error of its code. `$top` is never halved and a
-        nextLink is never followed; values beyond 51 are never inspected."""
+        `uniqueBody` (SG1, Q7, Q-a); the trigger is logged once per call through `_thread_failed`, so a refused
+        `uniqueBody` list (O37) shows in the logs. A second failure is the tool error of its code. `$top` is never
+        halved and a nextLink is never followed; values beyond 51 are never inspected."""
         try:
             body = self._thread_list_get(client, token, deadline, conversation, unique_body=True)
             unique = True
         except ProviderError as exc:
             if not (exc.code == "too_large" or (exc.code == "upstream_error" and exc.cause in _FALLBACK_CAUSES)):
                 raise
+            self._thread_failed(logs, exc)
             body = self._thread_list_get(client, token, deadline, conversation, unique_body=False)
             unique = False
         values = body.get("value")

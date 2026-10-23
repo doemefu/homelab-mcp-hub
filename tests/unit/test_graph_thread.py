@@ -539,6 +539,30 @@ def test_one_hostile_body_degrades_only_itself(path: str, monkeypatch: pytest.Mo
     assert [e["exception"] for e in logs.named("item_degraded")] == ["RecursionError"]
 
 
+@pytest.mark.parametrize(
+    ("first", "logged"),
+    [(raw(OVER_TWO_MIB), ("too_large", "ResponseTooLarge")), (status(400), ("upstream_error", "UnexpectedStatus"))],
+    ids=["too_large", "400"],
+)
+def test_list_fallback_logged_once_per_call(first: Handler, logged: tuple[str, str]) -> None:
+    # M4-2: the SG1/Q7 fallback leaves one provider_call_failed line per call, not one per single read, and not a
+    # second one when a 401 in a read restarts the call (the caps live outside `work`).
+    items = newest_first(*(without(thread_item(n), "uniqueBody") for n in range(1, 4)))
+    tokens = FakeTokens()
+    server = Server(
+        sequence(first, values(*items), first, values(*items)), reads={gid(3): sequence(status(401), read_ok)}
+    )
+    with Logs() as logs:
+        page = thread(server, tokens=tokens)
+    assert tokens.invalidated == 1
+    assert len(server.lists()) == 4  # the list, its re-read, then both again after the restart
+    assert server.read_ids() == [gid(3), gid(3), gid(2), gid(1)]
+    assert not page.truncated
+    assert logs.failures() == [logged]
+    [line] = logs.named("provider_call_failed")
+    assert set(line) <= allowed_fields("provider_call_failed")
+
+
 def test_unauthorized_in_single_read_refreshes() -> None:
     tokens = FakeTokens()
     server = Server(values(without(thread_item(1), "uniqueBody")), reads={gid(1): sequence(status(401), read_ok)})
