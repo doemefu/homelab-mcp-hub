@@ -40,6 +40,7 @@ PROJECTS = f"Projects-{RUN}"  # an `other` folder: listed by no folder value, st
 FOLDERS = ("INBOX", SENT, ARCHIVE, TRASH, PROJECTS)
 LIST_FOLDERS = ("inbox", "sent", "archive", "trash", "all")
 OWNER = f"owner@{greenmail.DOMAIN}"
+SENDER = f"Sender <sender@{greenmail.DOMAIN}>"
 THIRD = f"Third <third@{greenmail.DOMAIN}>"
 REQUEST_BODY = "Please send the figures by Friday."
 REPLY_BODY = (
@@ -83,14 +84,23 @@ def mail(
     cc: tuple[str, ...] = (),
     body: str | None = None,
     subject: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
 ) -> EmailMessage:
-    """`In-Reply-To` defaults to the last of `references`; `subject` and `body` default to the tag's."""
+    """`In-Reply-To` defaults to the last of `references`; `subject` and `body` default to the tag's; `sender` and
+    `to` override the From and To header."""
     msg = EmailMessage()
     msg["Subject"] = subject or S(tag)
     msg["Message-ID"] = f"<{message_id(tag)}>"
     if outgoing:
         msg["From"] = f"Owner <{OWNER}>"
         msg["To"] = f"Peer <peer@{greenmail.DOMAIN}>"
+    if sender:
+        del msg["From"]
+        msg["From"] = sender
+    if to:
+        del msg["To"]
+        msg["To"] = to
     if cc:
         msg["Cc"] = ", ".join(cc)
     parent = in_reply_to or (references[-1] if references else None)
@@ -115,10 +125,20 @@ def seed(
     when: datetime | None = None,
     body: str | None = None,
     subject: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
 ) -> str:
     """APPENDs the message with INTERNALDATE `when` (default: five minutes ago) and returns its Message-ID."""
     message = mail(
-        tag, outgoing=outgoing, references=references, in_reply_to=in_reply_to, cc=cc, body=body, subject=subject
+        tag,
+        outgoing=outgoing,
+        references=references,
+        in_reply_to=in_reply_to,
+        cc=cc,
+        body=body,
+        subject=subject,
+        sender=sender,
+        to=to,
     )
     greenmail.append(login, message, when or datetime.now(UTC) - timedelta(minutes=5), folder=folder, flags=flags)
     return message_id(tag)
@@ -404,11 +424,12 @@ def seed_hand_over(
     follow_up_references: Callable[[str, str], tuple[str, ...]],
     reply_body: str = REPLY_BODY,
 ) -> tuple[datetime, tuple[str, str, str]]:
-    """The request R from the sender at t0, the owner's reply A in sent at t0 + 1 min (without `\\Answered` on R),
-    and the sender's hand-over B at t0 + 2 min, copying a third person; B's `References` from
+    """The request R from the sender to the owner at t0, the owner's reply A to the sender in sent at t0 + 1 min
+    (without `\\Answered` on R), and the sender's hand-over B to the owner at t0 + 2 min, copying a third person and
+    the owner (reply-all); B's `References` from
     `follow_up_references(R, A)`, its `In-Reply-To` naming A. Returns t0 and the refs of R, A and B."""
     t0 = (datetime.now(UTC) - timedelta(minutes=30)).replace(microsecond=0)
-    request = seed(login, "INBOX", f"{prefix}-request", when=t0, body=REQUEST_BODY)
+    request = seed(login, "INBOX", f"{prefix}-request", when=t0, body=REQUEST_BODY, to=OWNER)
     reply = seed(
         login,
         SENT,
@@ -418,6 +439,7 @@ def seed_hand_over(
         references=(request,),
         when=t0 + timedelta(minutes=1),
         body=reply_body,
+        to=SENDER,
     )
     seed(
         login,
@@ -425,9 +447,10 @@ def seed_hand_over(
         f"{prefix}-handover",
         references=follow_up_references(request, reply),
         in_reply_to=reply,
-        cc=(THIRD,),
+        cc=(THIRD, OWNER),  # a reply-all
         when=t0 + timedelta(minutes=2),
         body=HAND_OVER_BODY,
+        to=OWNER,
     )
     return t0, (ref_of(f"{prefix}-request"), ref_of(f"{prefix}-reply"), ref_of(f"{prefix}-handover"))
 
@@ -635,7 +658,7 @@ async def test_logs_contain_no_history_values(secrets_dir: Path, captured: Captu
     ]
 
 
-async def thread_of(ctx: HubContext, **target: str) -> GetThreadResult:
+async def thread_of(ctx: HubContext, include_trash: bool | None = None, **target: str) -> GetThreadResult:
     return await run_get_thread(
         ctx,
         ref=target.get("ref"),
@@ -643,7 +666,7 @@ async def thread_of(ctx: HubContext, **target: str) -> GetThreadResult:
         thread_key=target.get("thread_key"),
         account=None,
         max_chars_per_message=None,
-        include_trash=None,
+        include_trash=include_trash,
     )
 
 
@@ -659,9 +682,10 @@ def assert_thread_hand_over(result: GetThreadResult, t0: datetime, refs: tuple[s
     assert summary.last_message_direction == "incoming"
     assert instant(summary.last_incoming_at) == t0 + timedelta(minutes=2)
     assert instant(summary.last_outgoing_at) == t0 + timedelta(minutes=1)
-    participants = " ".join(summary.untrusted.participants)
-    assert "third@" in participants
-    assert OWNER not in participants
+    participants = summary.untrusted.participants
+    assert sum("sender@" in p for p in participants) == 1  # once, although R, A and B all name the sender
+    assert any("third@" in p for p in participants)
+    assert not any(OWNER in p for p in participants)
     assert reply.untrusted.body.strip() == "Sure, I will send them on Thursday."  # the quote is gone
     assert (reply.quote_removal, reply.body_source) == ("heuristic", "text/plain")
     assert reply.body_original_chars is not None
@@ -687,6 +711,19 @@ async def test_thread_hand_over(secrets_dir: Path) -> None:
     assert_thread_hand_over(await thread_of(ctx, thread_key=first.thread_key), t0, refs)
 
 
+async def test_thread_hand_over_without_own_addresses(secrets_dir: Path) -> None:
+    """Control: without the own addresses the owner is a participant (B's Cc), so the removal in the scenarios above
+    comes from the configuration."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    _, refs = seed_hand_over(login, "thc", lambda request, reply: (request, reply))
+    result = await thread_of(hub(secrets_dir, login), ref=refs[0])
+    participants = result.summary.untrusted.participants
+    assert sum(OWNER in p for p in participants) == 1
+    assert sum("sender@" in p for p in participants) == 1
+    assert any("third@" in p for p in participants)
+
+
 async def test_thread_hand_over_outlook_style(secrets_dir: Path) -> None:
     """E-mf4: B names only A in `References`; the request is still found from B, through A's own references."""
     login = "hub-get"
@@ -702,13 +739,22 @@ async def test_thread_subject_fallback(secrets_dir: Path) -> None:
     greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
     subject = S("tsf-shared")
     now = datetime.now(UTC).replace(microsecond=0)
-    seed(login, "INBOX", "tsf-first", subject=subject, when=now - timedelta(days=2))
+    seed(login, "INBOX", "tsf-first", subject=f"Re: {subject}", when=now - timedelta(days=2))
     seed(login, "INBOX", "tsf-second", subject=subject, when=now - timedelta(days=1))
+    seed(  # the same subject, but no shared address: not joined
+        login,
+        "INBOX",
+        "tsf-stranger",
+        subject=subject,
+        sender=f"Stranger <stranger@{greenmail.DOMAIN}>",
+        to=f"Other <other@{greenmail.DOMAIN}>",
+        when=now - timedelta(days=1),
+    )
     seed(login, "INBOX", "tsf-other", subject=S("tsf-unrelated"), when=now - timedelta(days=1))
     result = await thread_of(hub(secrets_dir, login), ref=ref_of("tsf-second"))
     assert [m.ref for m in result.messages] == [ref_of("tsf-first"), ref_of("tsf-second")]
-    assert result.messages[0].linked_by == "subject"
-    assert result.summary.message_count == 2
+    assert [m.linked_by for m in result.messages] == ["subject", "headers"]  # a `ref` seed keeps "headers" (MF-P1)
+    assert (result.summary.message_count, result.summary.message_count_exact) == (2, True)
     assert result.truncated is False
 
 
@@ -728,6 +774,8 @@ async def test_read_only_snapshot_around_get_thread(secrets_dir: Path, monkeypat
     assert full.thread_key is not None
     await thread_of(ctx, message_id=full.messages[0].id)
     await thread_of(ctx, thread_key=full.thread_key)
+    without_trash = await thread_of(ctx, include_trash=False, ref=refs[0])
+    assert without_trash.summary.message_count == 3
     partial = []
     for soft_ticks in (2, 8, 20, 40, 80, 160, 320):
         stepping_deadline(monkeypatch, soft_ticks, mail_thread)
@@ -766,6 +814,10 @@ async def test_logs_contain_no_thread_values(secrets_dir: Path, captured: Captur
     with pytest.raises(ToolError):
         await thread_of(failing, ref=refs[0])
 
+    for result in results:  # the values the log must not hold are in the results
+        assert REQUEST_BODY in result.messages[0].untrusted.body
+        assert HAND_OVER_BODY in result.messages[2].untrusted.body
+        assert any("third@" in p for p in result.summary.untrusted.participants)
     text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
     forbidden = {
         login,
