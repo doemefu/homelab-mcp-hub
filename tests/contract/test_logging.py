@@ -296,3 +296,65 @@ def test_get_message_status_log_fields_allowed(settings: Settings, secrets_dir: 
     text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
     for value in sorted(forbidden):
         assert value not in text, value
+
+
+def test_get_thread_log_fields_allowed(settings: Settings, secrets_dir: Path, tokens: TokenFactory) -> None:
+    """Spec 080 §9.7 for get_thread (WP13c), through the MCP endpoint and the IMAP adapter: a thread read by `ref`, by
+    `id` and by `thread_key`, a not found and refused calls log only allowed fields, one `tool_call` line each
+    (`result_count` = messages returned), and no body, subject, address, thread key, Message-ID, ref, id or folder
+    name."""
+    server = _history_server()
+
+    def mailbox(account: Account, _dir: Path) -> ImapMailbox:
+        return ImapMailbox(
+            account.id,
+            host="imap.example.test",
+            port=993,
+            folder="INBOX",
+            username="u",
+            password="p",
+            client_factory=lambda host, port, context, timeout: server.client(),
+        )
+
+    absent = encode_ref("icloud", "absent-sentinel9x@x.test")
+    configure_logging(settings.log_level)
+    hub = create_app(settings, load_registry(secrets_dir / "accounts.json"), adapters=Adapters(mailbox=mailbox))
+    handler = Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        with TestClient(hub.public, base_url="https://mcp.furchert.ch") as client:
+            listed = _call(client, tokens, "list_messages", {"account": "icloud", "folder": "inbox"})
+            [item] = listed["structuredContent"]["items"]
+            by_ref = _call(client, tokens, "get_thread", {"ref": item["ref"]})
+            thread = by_ref["structuredContent"]
+            calls = {
+                "ref": by_ref,
+                "id": _call(client, tokens, "get_thread", {"id": item["id"]}),
+                "key": _call(client, tokens, "get_thread", {"thread_key": thread["thread_key"]}),
+                "absent": _call(client, tokens, "get_thread", {"ref": absent}),
+                "both": _call(client, tokens, "get_thread", {"ref": item["ref"], "id": item["id"]}),
+                "small": _call(client, tokens, "get_thread", {"ref": item["ref"], "max_chars_per_message": 5}),
+            }
+    finally:
+        logging.getLogger().removeHandler(handler)
+
+    assert thread["thread_key"]
+    assert {m["folder"] for m in thread["messages"]} == {"inbox", "sent", "archive", "trash"}
+    assert [calls[name].get("isError", False) for name in calls] == [False, False, False, True, True, True]
+    events = [json.loads(line) for line in handler.lines]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    thread_calls = [e for e in events if e["event"] == "tool_call" and e["tool"] == "get_thread"]
+    assert [(e["outcome"], e["accounts"], e["result_count"]) for e in thread_calls] == [
+        ("ok", ["icloud"], 4),
+        ("ok", ["icloud"], 4),
+        ("ok", ["icloud"], 4),
+        ("not_found", [], 0),
+        ("invalid_argument", [], 0),
+        ("invalid_argument", [], 0),
+    ]
+    forbidden = {absent, thread["thread_key"], item["ref"], item["id"], "@", "imap.example.test", *HISTORY_SENTINELS}
+    for message in thread["messages"]:
+        forbidden.update(v for v in (message["id"], message["ref"], message["thread_key"]) if v)
+    text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
+    for value in sorted(forbidden):
+        assert value not in text, value
