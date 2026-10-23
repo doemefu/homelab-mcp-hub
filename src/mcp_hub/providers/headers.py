@@ -176,9 +176,13 @@ def _display_name(name: str) -> str:
 
 
 def _complete_list(value: str) -> str:
-    """`value` up to its last comma outside quoted strings, comments and angle brackets: the addresses that ended
-    before a cut. One linear pass, no regex."""
+    """`value` up to the end of its last address that provably ended before a cut. Outside quoted strings, comments
+    and angle brackets, a comma ends an address; so does the `>` of an angle-addr, and whitespace or a comment after
+    an `@` and at least one domain character (an addr-spec holds neither). Anything else (a cut inside an address,
+    a display name or an obsolete `bob @ example` form) is dropped, so no shortened address is ever returned. One
+    linear pass, no regex."""
     last, depth, quoted, angle, i, n = -1, 0, False, False, 0, len(value)
+    domain = 0  # 0: no `@` in this address yet; 1: an `@`; 2: an `@` and a domain character after it
     while i < n:
         c = value[i]
         if quoted or depth:
@@ -189,15 +193,22 @@ def _complete_list(value: str) -> str:
             elif c in "()":
                 depth += 1 if c == "(" else -1
         elif angle:
-            angle = c != ">"
+            if c == ">":
+                angle, last, domain = False, i + 1, 0
         elif c == '"':
             quoted = True
-        elif c == "(":
-            depth = 1
+        elif c == "(" or c in " \t\r\n":
+            if domain == 2:
+                last, domain = i, 0
+            depth = 1 if c == "(" else 0
         elif c == "<":
             angle = True
         elif c == ",":
-            last = i
+            last, domain = i, 0
+        elif c == "@":
+            domain = 1
+        elif domain == 1:
+            domain = 2
         i += 1
     return value[:last] if last >= 0 else ""
 
@@ -205,14 +216,14 @@ def _complete_list(value: str) -> str:
 def address_pairs(text: str) -> list[tuple[str, str]]:
     """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic).
 
-    A list cut at a byte cap keeps its complete addresses: at the 8 KiB cap here the half address after the last
-    top-level comma is dropped; trailing commas and whitespace (what `trim_cut` leaves) are stripped; and a field the
-    strict parser refuses as a whole (an unterminated quoted string or comment) is parsed once more up to its last
-    top-level comma."""
+    A list cut at a byte cap keeps its complete addresses: trailing commas and whitespace (what `trim_cut` leaves,
+    or padding) are stripped first and are no cut; past the 8 KiB cap here, the value is cut back to its last address
+    that provably ended (`_complete_list`); and a field the strict parser refuses as a whole (an unterminated quoted
+    string or comment) is parsed once more the same way."""
+    text = text.rstrip(_LIST_TAIL)
     value = text[:MAX_ADDRESS_HEADER_BYTES]
     if len(text) > MAX_ADDRESS_HEADER_BYTES:
         value = _complete_list(value)
-    value = value.rstrip(_LIST_TAIL)
     try:
         pairs = getaddresses([value])
         if value and pairs == [("", "")]:

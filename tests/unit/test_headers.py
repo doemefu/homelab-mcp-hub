@@ -350,6 +350,68 @@ def test_address_pairs_cut_inside_the_last_address() -> None:
     assert parse_summary_headers(block).to == ("a@x.y",)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("bob@example.test" + " " * 9000, ["bob@example.test"]),  # trailing whitespace is no cut
+        ("bob@example.test," + " " * 9000, ["bob@example.test"]),
+        ("bob@example.test (" + "x" * 9000 + ")", ["bob@example.test"]),  # the cap falls inside a trailing comment
+        ("Bob <bob@example.test> (" + "x" * 9000 + ")", ["bob@example.test"]),
+        ("bob@example.test" + " " * 9000 + "(note)", ["bob@example.test"]),  # the cap falls in the whitespace
+        ("a@x.y, bob@example.test (" + "x" * 9000 + ")", ["a@x.y", "bob@example.test"]),
+        ("b" * 9000 + "@example.test", []),  # the cap falls inside the address: never a shortened one
+        ("bob@" + "e" * 9000 + ".test", []),
+        ("Bob <bob@" + "e" * 9000 + ".test>", []),
+        ('"' + "B" * 9000 + '" <bob@example.test>', []),
+        ("a@x.y, bob@" + "e" * 9000, ["a@x.y"]),
+        ("a@x.y,b@x.y," + "c" * 9000, ["a@x.y", "b@x.y"]),  # the last top-level comma, not the first
+        ("bob @ " + "e" * 9000, []),  # an obsolete `bob @ example` form: the `@` alone proves nothing
+        ("bob@example.test(" + "x" * 9000 + ")", ["bob@example.test"]),  # a comment right after the domain
+        ("a@x.y, Bob <" + "b" * 9000, ["a@x.y"]),  # a display name after a comma ends nothing
+        ("a@x.y,Bob <" + "b" * 9000, ["a@x.y"]),
+        ("bob@ " + "e" * 9000, []),  # whitespace right after the `@`: never the shortened `bob@`
+    ],
+    ids=[
+        "spaces",
+        "comma-spaces",
+        "comment",
+        "angle-comment",
+        "spaces-then-comment",
+        "list-comment",
+        "cut-local",
+        "cut-domain",
+        "cut-angle",
+        "cut-name",
+        "list-cut-domain",
+        "no-space-list",
+        "obsolete-at",
+        "comment-no-space",
+        "name-after-comma",
+        "name-after-tight-comma",
+        "space-after-at",
+    ],
+)
+def test_address_pairs_one_address_past_the_cap(value: str, expected: list[str]) -> None:
+    """Code review #54 #3: trailing whitespace is no cut; past the 8 KiB cap, the last address is kept only when its
+    addr-spec provably ended before the cut (an angle-addr closed, or whitespace or a comment after it), else it is
+    dropped as before."""
+    assert addresses(value) == expected
+
+
+def test_complete_list_needs_a_domain_character_after_the_at() -> None:
+    """An `@` alone does not prove an address ended: whitespace must follow at least one domain character. Through
+    `address_pairs` the strict parser also refuses a dangling `bob@`; this pins the scanner itself."""
+    assert h._complete_list("bob@ example") == ""
+    assert h._complete_list("bob @ example") == ""
+    assert h._complete_list("bob@e xample") == "bob@e"
+
+
+@pytest.mark.parametrize("value", ["Bob", "undisclosed-recipients:;", "Bob <bob@example.test>", "a@x.y, (n)"])
+def test_address_pairs_trailing_whitespace_is_no_cut(value: str) -> None:
+    """Whitespace padding past the 8 KiB cap is stripped before the cap decision: the value parses as without it."""
+    assert address_pairs(value + " " * 9000) == address_pairs(value)
+
+
 def test_address_pairs_strip_keeps_one_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     """The trailing comma `trim_cut` leaves is stripped before parsing, so the common cut needs one parse only."""
     calls: list[list[str]] = []
