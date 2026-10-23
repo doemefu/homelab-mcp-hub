@@ -22,6 +22,7 @@ from tests.support.imap_threads import (
     INBOX_L,
     SENT_L,
     THREAD,
+    clock_of,
     deadline,
     examined,
     fetches,
@@ -294,7 +295,7 @@ def test_body_fetch_no_omits_group_only() -> None:
     page = thread(server, key=gmail_key())
     members = by_subject(page)
     assert [members[s].body.omitted for s in ("one", "two", "three")] == [True, True, True]
-    assert [members[s].body.source for s in ("one", "two", "three")] == ["text/plain"] * 3  # structure was read
+    assert [members[s].body.source for s in ("one", "two", "three")] == ["none"] * 3  # §5.2: not read (I-1)
     assert (members["four"].body.omitted, members["four"].body.text) == (False, "Hello")
     assert page.truncated is True
     assert page.overview is not None
@@ -415,10 +416,60 @@ def test_one_hostile_member_degrades_only_itself(
         )
     page = thread(server, key=gmail_key())
     members = by_subject(page)
-    assert members["hostile"].body.omitted is True
+    assert (members["hostile"].body.omitted, members["hostile"].body.source) == (True, "none")
     assert (members["fine"].body.text.strip(), members["also fine"].body.text.strip()) == ("fine", "ok")
     assert page.truncated is True
     assert [json.loads(line)["exception"] for line in provider_log.lines] == ["ValueError"]
+
+
+@pytest.mark.parametrize("cause", ["fetch no", "soft stop", "decode"])
+def test_body_not_read_after_its_structure_has_source_none(cause: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """§5.2 "Bodies", final review I-1: once BODYSTRUCTURE was read, a body whose text was not read (the section
+    FETCH answered NO, a soft stop between the structure and the text fetch, an exception while decoding, SC1) is
+    `""`, `body_omitted`, `body_source: "none"`, `quote_removal: "none"` and `body_original_chars: null`, and the
+    result is `truncated` (P11: the count stays exact); `has_attachments` stays as the structure says."""
+    server = icloud(inbox=[msg(1, 30, "m", bodystructure=with_attachment(), message_id="<m@example.test>")])
+    section_fetch = "BODY.PEEK[1]<0.65536>"
+    asked: list[list[str]] = []
+
+    def record(command: str, argument: object) -> None:
+        if command == "UID FETCH":
+            asked.append(list(argument[1]))  # type: ignore[index]
+            if cause == "fetch no" and section_fetch in asked[-1]:
+                raise server.no("UID FETCH")
+
+    hook(server, record)
+    if cause == "soft stop":
+        original = server.run
+
+        def run(command: str, argument: object = None) -> None:
+            original(command, argument)
+            if command == "UID FETCH" and "BODYSTRUCTURE" in argument[1]:  # type: ignore[index]
+                clock_of(server).advance(17.0)
+
+        server.run = run  # type: ignore[method-assign]
+    else:
+
+        def explode(data: bytes, part: object) -> str:
+            raise ValueError("undecodable")
+
+        monkeypatch.setattr(imap_thread, "decode_part", explode)
+    page = thread(server, seed=ref("m@example.test", server))
+    member = page.members[0]
+    body = member.body
+    assert (body.text, body.omitted, body.source, body.quote_removal, body.original_chars) == (
+        "",
+        True,
+        "none",
+        "none",
+        None,
+    )
+    assert member.summary.has_attachments is True  # read from the structure
+    assert page.truncated is True
+    assert page.overview is not None
+    assert page.overview.message_count_exact is True
+    assert any("BODYSTRUCTURE" in items for items in asked)
+    assert any(section_fetch in items for items in asked) is (cause != "soft stop")
 
 
 def test_uidvalidity_compared_after_real_and_skipped_examine() -> None:
@@ -499,7 +550,7 @@ def test_soft_stop_matrix(stage: str) -> None:
         assert subjects(page) == ["one", "two", "three", "four"]
         assert page.overview.message_count_exact is True
         assert all(m.body.omitted for m in page.members)
-        assert by_subject(page)["four"].body.source == "text/plain"  # its structure was read first (newest group)
+        assert by_subject(page)["four"].body.source == "none"  # its structure was read, its text not (I-1)
 
 
 def test_hard_deadline_and_bad_are_tool_errors() -> None:

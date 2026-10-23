@@ -1035,9 +1035,10 @@ def _body_pass(
     member first and the selected mailbox first on a tie (A-td3), so that a soft stop leaves the newest bodies read.
     Per group: EXAMINE unless selected, then its UIDVALIDITY is compared with `session.selected_uidvalidity`, also
     when the EXAMINE was skipped (IR5); another one or a failed EXAMINE leaves the group's bodies unread (im-M8).
-    A body not read keeps `body_omitted` and, until its structure was read, `body_source: "none"` and
-    `has_attachments: false` (A-td3a, Q-c). The `provisional` copies (from the subject scan) get their summary
-    completed with their structure. A SoftStop leaves the rest unread; other errors propagate."""
+    A body not read (a failed fetch, a soft stop, SC1) is `OMITTED_BODY`: `body_omitted`, `body_source: "none"`
+    (§5.2 "Bodies", final review I-1); `has_attachments` is false until its structure was read (A-td3a, Q-c). The
+    `provisional` copies (from the subject scan) get their summary completed with their structure. A SoftStop leaves
+    the rest unread; other errors propagate."""
     bodies: dict[AnyMessageRef, ThreadBody] = {}
     attachments: dict[AnyMessageRef, bool] = {}
     summaries: dict[AnyMessageRef, MailSummary] = {}
@@ -1127,7 +1128,6 @@ def _group_bodies(
             if part is None:  # no text part: nothing to read
                 bodies[ref] = ThreadBody("", "none", "none", 0, False, False)
                 continue
-            bodies[ref] = _unread(part)
             chosen.setdefault(part.section, []).append((ref, copy, part))
     for section, members in chosen.items():
         data = session.fetch([ref.uid for ref, _, _ in members], [f"BODY.PEEK[{section}]<0.{THREAD_BODY_BYTES}>"])
@@ -1198,16 +1198,12 @@ def _source(part: Part) -> BodySource:
     return "text/html-converted" if part.mime_type == "text/html" else "text/plain"
 
 
-def _unread(part: Part) -> ThreadBody:
-    """A body whose structure was read but whose text was not: omitted, with its known source (Q-c)."""
-    return ThreadBody("", _source(part), "none", None, False, True)
-
-
 def _body(
     session: ImapSession, ref: MessageRef, raw: bytes, part: Part, *, subject: str | None, max_chars: int
 ) -> ThreadBody:
     """Decode, convert HTML, then `prepare_body` (§5.2 body order). `cut` when the part is larger than the fetch, or
-    has no size and the fetch came back full. Any exception for one member omits only its body (SC1)."""
+    has no size and the fetch came back full. Any exception for one member omits only its body (SC1), as a body not
+    read: `OMITTED_BODY`."""
     try:
         text = decode_part(raw, part)
         if part.mime_type == "text/html":
@@ -1218,4 +1214,4 @@ def _body(
         raise
     except Exception as exc:
         session.log_skipped(ref, exc)
-        return _unread(part)
+        return OMITTED_BODY
