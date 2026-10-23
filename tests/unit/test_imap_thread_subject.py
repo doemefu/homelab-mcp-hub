@@ -467,6 +467,42 @@ def test_subject_cut_block_without_message_id_inexact() -> None:
     assert exact(page) is True
 
 
+@pytest.mark.parametrize("field", [b"To", b"Cc"])
+def test_cut_before_subject_marks_inexact(field: bytes) -> None:
+    """MF-T9-1: a To or Cc list that fills the 8 KiB scan item pushes the Subject wholly past the cut; the block shows
+    no Subject, so it may hide a member: not joined, the count is not exact, not truncated."""
+    many = ", ".join(f"x{i}@example.test" for i in range(600)).encode()  # about 10 KiB
+    raw = b"From: " + ALICE.encode() + b"\r\nMessage-ID: <c@example.test>\r\n" + field + b": " + many
+    seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    server = icloud(inbox=[seed, msg(2, 4 * DAY, headers=raw + b"\r\nSubject: Plan\r\n\r\n")])
+    page = thread(server, seed=seed_in_inbox(server))
+    assert ids(page) == ["s@example.test"]
+    assert exact(page) is False
+    assert page.truncated is False
+
+
+def test_from_past_the_cut_gives_direction_by_folder() -> None:
+    """MF-T9-2: a From line wholly past the 8 KiB cut is unknown, like one cut inside: `from_address` null and the
+    direction from the folder (sent: outgoing, otherwise incoming)."""
+    many = ", ".join(f"x{i}@example.test" for i in range(600)).encode()  # about 10 KiB
+
+    def raw(message_id: str) -> bytes:
+        head = b"Subject: Plan\r\nMessage-ID: <" + message_id.encode() + b">\r\nCc: " + ALICE.encode()
+        return head + b"\r\nTo: " + many + b"\r\nFrom: " + OWNER.encode() + b"\r\n\r\n"
+
+    seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    server = icloud(
+        inbox=[seed],
+        archive=[msg(2, 4 * DAY, headers=raw("a@example.test"))],
+        sent=[msg(3, 3 * DAY, headers=raw("o@example.test"))],
+    )
+    page = thread(server, seed=seed_in_inbox(server))
+    assert linked(page) == [("s@example.test", "headers"), ("a@example.test", "subject"), ("o@example.test", "subject")]
+    joined = [member.summary for member in page.members[1:]]
+    assert [summary.from_address for summary in joined] == [None, None]
+    assert [summary.meta.direction for summary in joined] == ["incoming", "outgoing"]
+
+
 def test_no_subject_search_key_on_the_wire() -> None:
     """D74, D80: subjects are compared locally after decoding; no SEARCH carries a subject key or subject text."""
     subject = "=?utf-8?q?Caf=C3=A9_Pl=C3=A4n?="

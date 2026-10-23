@@ -965,7 +965,7 @@ def _candidate(
         session.log_skipped(ref, MissingInternalDate())
         state.inexact()
         return None
-    if cut and not _field_complete(block, b"from"):
+    if cut and not _field_complete(block, b"from"):  # a From wholly past the cut is None already (MF-T9-2)
         parsed = replace(parsed, from_address=None, from_name=None)
     copy = _parsed_copy(session, entry, ref, received, row, parsed, linked_by="subject", seed=False)
     unkeyed = replace(copy.summary, meta=replace(copy.summary.meta, thread=None))
