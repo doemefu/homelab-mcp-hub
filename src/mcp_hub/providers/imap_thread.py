@@ -86,7 +86,8 @@ from mcp_hub.sanitize import html_to_text
 
 BODY_RESERVE_SECONDS: Final = 12.0  # no new member search after this: the body pass's share (G2, Q-b; soft stop - 4 s)
 THREAD_BODY_BYTES: Final = 65_536  # partial fetch of a member's text part (§5.2 "Bodies")
-STRUCTURE_CHUNK_UIDS: Final = 10  # BODYSTRUCTURE lines per UID FETCH (A-sec1)
+STRUCTURE_CHUNK_UIDS: Final = 2  # BODYSTRUCTURE lines per UID FETCH (A-sec1; T14: 1 MiB lines under 230 MiB)
+BODY_SLICE_MEMBERS: Final = 10  # members per body slice: their structures, then their texts (rev 4.13, T14)
 MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per call (sec-G8)
 MAX_ROUND_ITERATIONS: Final = 3  # round (2) iterations after round (1) (§6.5, S-m)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "sent", "archive", "trash")  # trash with include_trash
@@ -1032,7 +1033,8 @@ def _body_pass(
     soft_check: Callable[[], None],
 ) -> list[ThreadMember]:
     """Option 6a: the bodies of the kept members, one group per (mailbox, UIDVALIDITY), the group with the newest
-    member first and the selected mailbox first on a tie (A-td3), so that a soft stop leaves the newest bodies read.
+    member first and the selected mailbox first on a tie (A-td3), and within a group in slices, newest first
+    (`_group_bodies`), so that a soft stop leaves the newest bodies read.
     Per group: EXAMINE unless selected, then its UIDVALIDITY is compared with `session.selected_uidvalidity`, also
     when the EXAMINE was skipped (IR5); another one or a failed EXAMINE leaves the group's bodies unread (im-M8).
     A body not read (a failed fetch, a soft stop, SC1) is `OMITTED_BODY`: `body_omitted`, `body_source: "none"`
@@ -1097,10 +1099,37 @@ def _group_bodies(
     max_chars: int,
     soft_check: Callable[[], None],
 ) -> None:
-    """BODYSTRUCTURE per chunk of 10 UIDs, each reduced at once to the chosen text part and `has_attachments`; a chunk
-    with a `provisional` copy also fetches the summary header item, which completes that copy's summary (Option 6a).
-    Then one `UID FETCH BODY.PEEK[<section>]<0.65536>` per section; per member a soft check, then the body (`_body`).
-    A member the FETCH did not return (NO, expunged) keeps its body omitted."""
+    """The group's members (newest first) in slices of at most BODY_SLICE_MEMBERS, each read whole before the next,
+    so that a soft stop loses only older slices (rev 4.13 §5.2 "Bodies", T14)."""
+    for start in range(0, len(group), BODY_SLICE_MEMBERS):
+        _slice_bodies(
+            session,
+            group[start : start + BODY_SLICE_MEMBERS],
+            bodies,
+            attachments,
+            summaries,
+            provisional=provisional,
+            max_chars=max_chars,
+            soft_check=soft_check,
+        )
+
+
+def _slice_bodies(
+    session: ImapSession,
+    group: Sequence[tuple[MessageRef, ThreadCopy]],
+    bodies: dict[AnyMessageRef, ThreadBody],
+    attachments: dict[AnyMessageRef, bool],
+    summaries: dict[AnyMessageRef, MailSummary],
+    *,
+    provisional: Collection[Location],
+    max_chars: int,
+    soft_check: Callable[[], None],
+) -> None:
+    """BODYSTRUCTURE per chunk of STRUCTURE_CHUNK_UIDS, each reduced at once to the chosen text part and
+    `has_attachments`; a chunk with a `provisional` copy also fetches the summary header item, which completes that
+    copy's summary (Option 6a). Then one `UID FETCH BODY.PEEK[<section>]<0.65536>` per section for the slice; per
+    member a soft check, then the body (`_body`). A member the FETCH did not return (NO, expunged) keeps its body
+    omitted."""
     chosen: dict[str, list[tuple[MessageRef, ThreadCopy, Part]]] = {}
     for start in range(0, len(group), STRUCTURE_CHUNK_UIDS):
         if start:

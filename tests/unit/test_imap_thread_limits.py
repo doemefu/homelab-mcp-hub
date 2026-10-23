@@ -248,7 +248,7 @@ def test_key_search_incomplete_is_upstream_timeout(source: str, case: str) -> No
 
 # --- iCloud latency ---------------------------------------------------------------------------------------------
 
-LATENCY = {"EXAMINE": 0.2, "UID SEARCH": 0.6}  # T0 probe: iCloud EXAMINE and header SEARCH
+LATENCY = {"EXAMINE": 0.2, "UID SEARCH": 0.6, "UID FETCH": 0.2}  # T0 probe: EXAMINE, SEARCH; a FETCH as an EXAMINE
 
 
 def _timed(server: FakeImapServer) -> list[tuple[str, float]]:
@@ -279,10 +279,10 @@ def _chain(length: int) -> list[FakeMessage]:
 
 
 def test_icloud_latency_soft_stop_partial() -> None:
-    """At iCloud latencies (0.2 s EXAMINE, 0.6 s SEARCH) a `ref` whose chain needs three round-(2) iterations cannot
-    search everything: the reserve stops the rounds, the result is partial (truncated, not exact) with the members
-    found so far and their bodies, never an account error; no command but LOGOUT is sent after the soft stop and the
-    call ends before the hard deadline."""
+    """At iCloud latencies (0.2 s EXAMINE and FETCH, 0.6 s SEARCH) a `ref` whose chain needs three round-(2)
+    iterations cannot search everything: the reserve stops the rounds, the result is partial (truncated, not exact)
+    with the members found so far and their bodies, never an account error; no command but LOGOUT is sent after the
+    soft stop and the call ends before the hard deadline."""
     server = icloud(inbox=_chain(5))
     log = _timed(server)
     page = thread(server, seed=ref("c0@example.test", server), call=deadline(server, soft=SOFT_STOP_SECONDS, hard=HARD))
@@ -294,6 +294,37 @@ def test_icloud_latency_soft_stop_partial() -> None:
     assert all(not member.body.omitted for member in page.members)  # the reserve left the body pass its time
     searched_until = max(at for name, at in log if name == "UID SEARCH")
     assert searched_until <= BODY_RESERVE_SECONDS  # no member search starts after the reserve (G2)
+    assert [name for name, at in log if at >= SOFT_STOP_SECONDS] in ([], ["LOGOUT"])
+    assert log[-1][1] < HARD
+
+
+def test_icloud_latency_fifty_members_newest_bodies_first() -> None:
+    """Rev 4.13 (T14): at iCloud latencies a thread of 50 members spends the 12 s reserve on its searches; the body
+    pass then reads the newest slices first, so the newest body is read and a soft stop omits only older bodies
+    (truncated), never an account error."""
+    replies = [
+        msg(
+            1 + i,
+            1000 - i,
+            f"m{i}",
+            message_id=f"<m{i}@example.test>",
+            in_reply_to="<m0@example.test>",
+            references="<m0@example.test>",
+        )
+        for i in range(1, 50)
+    ]
+    server = icloud(inbox=[msg(1, 1000, "m0", message_id="<m0@example.test>"), *replies])
+    log = _timed(server)
+    page = thread(
+        server, seed=ref("m49@example.test", server), call=deadline(server, soft=SOFT_STOP_SECONDS, hard=HARD)
+    )
+    assert page.outcome == "ok"
+    assert len(page.members) == 50
+    omitted = [member.body.omitted for member in page.members]  # oldest first
+    assert omitted[-1] is False  # the newest body is read
+    assert omitted[0] is True  # the oldest was not reached before the soft stop
+    assert omitted == sorted(omitted, reverse=True)  # only older bodies are missing
+    assert page.truncated is True
     assert [name for name, at in log if at >= SOFT_STOP_SECONDS] in ([], ["LOGOUT"])
     assert log[-1][1] < HARD
 

@@ -15,7 +15,7 @@ from mcp_hub.providers.base import MailMeta, MailSummary, ProviderError, ThreadM
 from mcp_hub.providers.headers import SUMMARY_HEADER_ITEM
 from mcp_hub.providers.imap_session import ImapSession
 from mcp_hub.providers.threads import ThreadCopy
-from tests.support.imap_fake import FakeImapClient, FakeImapServer
+from tests.support.imap_fake import PLAIN, FakeImapClient, FakeImapServer
 from tests.support.imap_threads import (
     GMAIL_ALL,
     GMAIL_TRASH,
@@ -234,20 +234,45 @@ def test_body_pass_groups_newest_first_selected_on_tie() -> None:
     assert [argument for name, argument in tie.commands[start:] if name == "EXAMINE"] == ["INBOX"]
 
 
-def test_bodystructure_in_chunks_of_ten() -> None:
+PDF = (b"application", b"pdf", (b"name", b"a.pdf"), None, None, b"base64", 4000, None, (b"attachment", None), None)
+
+
+def test_bodies_in_slices_newest_first_structures_in_chunks() -> None:
+    """Rev 4.13 §5.2 "Bodies", §5.4 (T14): within a folder group the members are read newest first in slices of at
+    most BODY_SLICE_MEMBERS; per slice their BODYSTRUCTUREs in chunks of at most STRUCTURE_CHUNK_UIDS, then one text
+    FETCH per section for the slice."""
+    assert (imap_thread.STRUCTURE_CHUNK_UIDS, imap_thread.BODY_SLICE_MEMBERS) == (2, 10)
+    second = ([PDF, PLAIN], b"mixed", None, None, None, None)  # its text is section 2
     server = gmail(
         all_mail=[
-            msg(uid, 100 - uid, f"m{uid}", thrid=THREAD, message_id=f"<m{uid}@example.test>") for uid in range(1, 24)
+            msg(
+                uid,
+                100 - uid,
+                f"m{uid}",
+                thrid=THREAD,
+                message_id=f"<m{uid}@example.test>",
+                **({"bodystructure": second} if uid == 20 else {}),  # type: ignore[arg-type]
+            )
+            for uid in range(1, 24)
         ]
     )
     page = thread(server, key=gmail_key())
     assert len(page.members) == 23
     assert all(m.body.text == "Hello" for m in page.members)
-    structure_fetches = [uids for uids, items in fetches(server) if items == ["BODYSTRUCTURE"]]
-    assert [len(uids) for uids in structure_fetches] == [10, 10, 3]
-    assert structure_fetches[0] == list(range(14, 24))  # newest first
-    body_fetches = [uids for uids, items in fetches(server) if items == ["BODY.PEEK[1]<0.65536>"]]
-    assert body_fetches == [list(range(1, 24))]  # one FETCH per folder and section
+    one, two = "BODY.PEEK[1]<0.65536>", "BODY.PEEK[2]<0.65536>"
+    newest_first = list(range(23, 0, -1))
+    expected: list[tuple[list[int], list[str]]] = []
+    for start in range(0, len(newest_first), imap_thread.BODY_SLICE_MEMBERS):
+        piece = newest_first[start : start + imap_thread.BODY_SLICE_MEMBERS]
+        for chunk in range(0, len(piece), imap_thread.STRUCTURE_CHUNK_UIDS):
+            expected.append((sorted(piece[chunk : chunk + imap_thread.STRUCTURE_CHUNK_UIDS]), ["BODYSTRUCTURE"]))
+        expected.append((sorted(uid for uid in piece if uid != 20), [one]))
+        if 20 in piece:
+            expected.append(([20], [two]))
+    body_pass = [(uids, items) for uids, items in fetches(server) if items in (["BODYSTRUCTURE"], [one], [two])]
+    assert body_pass == expected
+    assert body_pass[0] == ([22, 23], ["BODYSTRUCTURE"])  # the newest first
+    assert body_pass[5] == ([14, 15, 16, 17, 18, 19, 21, 22, 23], [one])  # the first slice's text before the next
 
 
 def test_body_fetch_items_are_partial_peeks_only() -> None:
