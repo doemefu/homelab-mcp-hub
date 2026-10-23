@@ -685,7 +685,8 @@ def test_copy_of_the_anchor_keeps_its_link() -> None:
 
 def test_subject_scan_trims_a_cut_token() -> None:
     """T7-3: a scan block cut at 8 KiB is parsed without its last token, so a shortened address
-    (`bob@example.te` of `bob@example.test`) is never a shared participant."""
+    (`bob@example.te` of `bob@example.test`) is never a shared participant; the cut Cc may hide one, so the count is
+    not exact."""
     head = b"From: " + CAROL.encode() + b"\r\nSubject: Plan\r\nMessage-ID: <cut@example.test>\r\nCc: "
     tail = b", bob@example.te"
     local = b"a" * (imap_thread.SUBJECT_SCAN_BYTES - len(head) - len(tail) - len(b"@example.org"))
@@ -694,4 +695,54 @@ def test_subject_scan_trims_a_cut_token() -> None:
     server = icloud(inbox=[seed, msg(2, 4 * DAY, headers=raw)])
     page = thread(server, seed=seed_in_inbox(server))
     assert ids(page) == ["s@example.test"]
+    assert exact(page) is False
+
+
+@pytest.mark.parametrize(("box", "sender", "field"), [("inbox", BOB, b"Cc"), ("sent", OWNER, b"To")])
+def test_cut_participants_may_hide_the_shared_address(box: str, sender: str, field: bytes) -> None:
+    """Fail safe: a cut block with the seed's subject whose visible participants share no address with the seed's,
+    while a participant field of its direction (incoming: From and Cc; outgoing: To and Cc) did not end before the
+    cut, may hide the shared address: not joined, the count is not exact. The same list uncut joins."""
+    many = ", ".join([*(f"x{i}@example.test" for i in range(600)), "alice@example.test"]).encode()  # Alice past the cut
+
+    def raw(addresses: bytes) -> bytes:
+        head = b"From: " + sender.encode() + b"\r\nSubject: Plan\r\nMessage-ID: <c@example.test>\r\n"
+        if field == b"To":  # a complete Cc: only the cut To can hide the shared address
+            head += b"Cc: " + CAROL.encode() + b"\r\n"
+        return head + field + b": " + addresses + b"\r\n\r\n"
+
+    seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    for addresses, joined in ((many, False), (b"x1@example.test, alice@example.test", True)):
+        member = msg(2, 4 * DAY, headers=raw(addresses))
+        server = icloud(inbox=[seed, member]) if box == "inbox" else icloud(inbox=[seed], sent=[member])
+        page = thread(server, seed=seed_in_inbox(server))
+        assert ids(page) == (["s@example.test", "c@example.test"] if joined else ["s@example.test"])
+        assert exact(page) is joined
+        assert page.truncated is False
+
+
+def test_cut_outside_the_direction_or_window_stays_exact() -> None:
+    """Only the participant fields of the candidate's direction count: an incoming block cut inside its To, with
+    From and Cc complete, that shares nothing is simply not joined; so is a cut candidate outside the 30 days."""
+    many = ", ".join(f"x{i}@example.test" for i in range(600)).encode()
+    head = b"From: " + BOB.encode() + b"\r\nCc: " + CAROL.encode() + b"\r\nSubject: Plan\r\n"
+    to_cut = head + b"Message-ID: <c@example.test>\r\nTo: " + many + b"\r\n\r\n"
+    cc_cut = b"From: " + BOB.encode() + b"\r\nSubject: Plan\r\nMessage-ID: <o@example.test>\r\nCc: " + many
+    seed = msg(1, 40 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    server = icloud(inbox=[seed, msg(2, 39 * DAY, headers=to_cut), msg(3, 8.5 * DAY, headers=cc_cut + b"\r\n\r\n")])
+    page = thread(server, seed=seed_in_inbox(server))
+    assert ids(page) == ["s@example.test"]
     assert exact(page) is True
+    assert sorted(uid for _, uids in scanned_in(server) for uid in uids) == [2, 3]  # both were read (31.5 d: margin)
+
+
+def test_participant_field_past_the_cut_marks_inexact() -> None:
+    """A participant field of the direction that the block does not hold may lie past the cut: an incoming block cut
+    inside its To, whose Cc (with the shared address) comes after it, is not joined and the count is not exact."""
+    many = ", ".join(f"x{i}@example.test" for i in range(600)).encode()
+    head = b"From: " + BOB.encode() + b"\r\nSubject: Plan\r\nMessage-ID: <c@example.test>\r\nTo: " + many
+    seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    server = icloud(inbox=[seed, msg(2, 4 * DAY, headers=head + b"\r\nCc: " + ALICE.encode() + b"\r\n\r\n")])
+    page = thread(server, seed=seed_in_inbox(server))
+    assert ids(page) == ["s@example.test"]
+    assert exact(page) is False

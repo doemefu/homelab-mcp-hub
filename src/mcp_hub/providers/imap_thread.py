@@ -97,6 +97,7 @@ SUBJECT_SCAN_ITEM: Final = f"BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT MESSAGE
 _SCAN_SINCE: Final = timedelta(days=31)  # SEARCH dates are the server's days: one day of margin (IR4)
 _SCAN_BEFORE: Final = timedelta(days=32)  # BEFORE is exclusive: one day of margin after the 30 days
 _SCAN_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUBJECT_SCAN_ITEM)
+_PARTICIPANT_FIELDS: Final = {"incoming": (b"from", b"cc"), "outgoing": (b"to", b"cc")}  # §5.5 participants
 _ROUND_ONE_FIELDS: Final = ("Message-ID", "References")
 _MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUMMARY_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", SUMMARY_HEADER_ITEM)
@@ -142,6 +143,7 @@ class _Candidate:
     entry: FolderEntry
     location: Location
     copy: ThreadCopy
+    hidden: bool  # cut before a participant field of its direction ended: a shared address may lie past the cut
 
 
 @dataclass(slots=True)
@@ -938,7 +940,8 @@ def _candidate(
     row whose Message-ID did not end before the cut, or that shows none; a cut From gives the direction by folder.
     A matching row without INTERNALDATE is dropped with one `item_degraded` line and the count is not exact (Q9). A
     block that does not parse degrades only this row (SC1). The copy's thread key stays unknown until the body pass
-    reads its References."""
+    reads its References. A cut block notes whether a participant field of its direction did not end before the cut
+    (`hidden`, used by `_join`)."""
     if _is_draft(row):
         return None
     ref = MessageRef(session.account, entry.raw_name, uidvalidity, uid)
@@ -969,14 +972,28 @@ def _candidate(
         parsed = replace(parsed, from_address=None, from_name=None)
     copy = _parsed_copy(session, entry, ref, received, row, parsed, linked_by="subject", seed=False)
     unkeyed = replace(copy.summary, meta=replace(copy.summary.meta, thread=None))
-    return _Candidate(entry, (entry.raw_name, uidvalidity, uid), replace(copy, summary=unkeyed))
+    fields = _PARTICIPANT_FIELDS[copy.summary.meta.direction]
+    hidden = cut and not all(_ended(block, name) for name in fields)
+    return _Candidate(entry, (entry.raw_name, uidvalidity, uid), replace(copy, summary=unkeyed), hidden)
+
+
+def _ended(block: bytes, name: bytes) -> bool:
+    """Whether a cut block holds the field `name` and it ended before the cut; a field the block does not hold may
+    lie past the cut (HEADER.FIELDS returns the fields in message order)."""
+    held = any(
+        line[:1] not in (b" ", b"\t") and line.partition(b":")[0].strip().lower() == name
+        for line in block.split(b"\r\n")
+    )
+    return held and _field_complete(block, name)
 
 
 def _join(state: _Members, anchor: ThreadCopy, candidates: Sequence[_Candidate]) -> None:
     """(3)'s rule: a candidate received within SUBJECT_WINDOW of the anchor whose participants share an address with
     the anchor's, compared casefolded (F-1), joins with `linked_by: "subject"`. Only the anchor's participants
     count, never those of another subject member (Q3). A copy of the anchor (its valid Message-ID) joins as a copy,
-    with the anchor's `linked_by`, so that the merge keeps one member."""
+    with the anchor's `linked_by`, so that the merge keeps one member. A candidate in the window that shares nothing
+    but was cut inside or before a participant field of its direction may hide the shared address: it is not
+    joined, and the count is not exact (fail safe)."""
     anchor_id = valid_message_id(anchor.summary.meta.message_id)
     shared = {address.casefold() for address in anchor.participants}
     for candidate in candidates:
@@ -985,9 +1002,11 @@ def _join(state: _Members, anchor: ThreadCopy, candidates: Sequence[_Candidate])
             continue
         if anchor_id is not None and valid_message_id(copy.summary.meta.message_id) == anchor_id:
             copy = replace(copy, linked_by=anchor.linked_by)
-        elif abs(copy.summary.received_at - anchor.summary.received_at) > SUBJECT_WINDOW or shared.isdisjoint(
-            address.casefold() for address in copy.participants
-        ):
+        elif abs(copy.summary.received_at - anchor.summary.received_at) > SUBJECT_WINDOW:
+            continue
+        elif shared.isdisjoint(address.casefold() for address in copy.participants):
+            if candidate.hidden:
+                state.inexact()
             continue
         _take(state, candidate, copy)
 
