@@ -435,14 +435,17 @@ def test_subject_members_without_body_pass_keep_scan_fields() -> None:
 
 def test_subject_cut_block_without_message_id_inexact() -> None:
     """A scan block cut at 8 KiB whose Message-ID did not end before the cut is no candidate, and the count is not
-    exact; a block cut inside its Subject only loses the subject match; a short block without a Message-ID is a
-    candidate (never merged)."""
+    exact; so is a block cut inside its Subject or before it, since it may hide a member (fail safe); a short block
+    without a Message-ID is a candidate (never merged)."""
     many = ", ".join(f"x{i}@example.test" for i in range(600)).encode()  # about 10 KiB
     cut_id = (
         b"From: " + ALICE.encode() + b"\r\nSubject: Plan\r\nCc: " + many + b"\r\nMessage-ID: <cut@example.test>\r\n\r\n"
     )
     folded = b"Subject: Plan\r\n " + b"x" * 9000  # cut inside the Subject: the visible part reads "Plan"
     cut_subject = b"From: " + ALICE.encode() + b"\r\nMessage-ID: <cs@example.test>\r\n" + folded + b"\r\n\r\n"
+    hidden_subject = (
+        b"From: " + ALICE.encode() + b"\r\nMessage-ID: <hs@example.test>\r\nCc: " + many + b"\r\nSubject: Plan\r\n\r\n"
+    )
     no_id = b"From: " + ALICE.encode() + b"\r\nSubject: Plan\r\n\r\n"
     seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
     server = icloud(inbox=[seed, msg(2, 4 * DAY, headers=cut_id)])
@@ -451,7 +454,14 @@ def test_subject_cut_block_without_message_id_inexact() -> None:
     assert exact(page) is False
     assert page.truncated is False
 
-    server = icloud(inbox=[seed, msg(3, 4 * DAY, headers=cut_subject), msg(4, 3 * DAY, headers=no_id)])
+    for headers in (cut_subject, hidden_subject):
+        server = icloud(inbox=[seed, msg(3, 4 * DAY, headers=headers)])
+        page = thread(server, seed=seed_in_inbox(server))
+        assert ids(page) == ["s@example.test"]
+        assert exact(page) is False
+        assert page.truncated is False
+
+    server = icloud(inbox=[seed, msg(4, 3 * DAY, headers=no_id)])
     page = thread(server, seed=seed_in_inbox(server))
     assert linked(page) == [("s@example.test", "headers"), (None, "subject")]
     assert exact(page) is True

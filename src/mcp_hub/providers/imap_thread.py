@@ -933,11 +933,12 @@ def _candidate(
     digest: str,
 ) -> _Candidate | None:
     """One scan row, unless it is a draft (S1) or its normalised subject digest differs. A block cut at 8 KiB is
-    parsed without its last, possibly shortened token (T7-3): a cut Subject gives no digest, so that row only loses
-    the match; a matching row whose Message-ID did not end before the cut, or that shows none, is no candidate and
-    the count is not exact; a cut From gives the direction by folder. A matching row without INTERNALDATE is dropped
-    with one `item_degraded` line and the count is not exact (Q9). A block that does not parse degrades only this
-    row (SC1). The copy's thread key stays unknown until the body pass reads its References."""
+    parsed without its last, possibly shortened token (T7-3): one whose Subject did not end before the cut, or that
+    shows none, may hide a member, so it is no candidate and the count is not exact (fail safe); so is a matching
+    row whose Message-ID did not end before the cut, or that shows none; a cut From gives the direction by folder.
+    A matching row without INTERNALDATE is dropped with one `item_degraded` line and the count is not exact (Q9). A
+    block that does not parse degrades only this row (SC1). The copy's thread key stays unknown until the body pass
+    reads its References."""
     if _is_draft(row):
         return None
     ref = MessageRef(session.account, entry.raw_name, uidvalidity, uid)
@@ -951,7 +952,10 @@ def _candidate(
         session.log_skipped(ref, exc)
         state.inexact()
         return None
-    if (cut and not _field_complete(block, b"subject")) or subject_digest(parsed.subject) != digest:
+    if cut and (parsed.subject is None or not _field_complete(block, b"subject")):
+        state.inexact()
+        return None
+    if subject_digest(parsed.subject) != digest:
         return None
     if cut and (parsed.message_id is None or not _field_complete(block, b"message-id")):
         state.inexact()
