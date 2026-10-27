@@ -12,6 +12,7 @@ from mcp_hub.errors import ToolError
 from mcp_hub.providers.base import FolderPage, ListQuery
 from mcp_hub.providers.folders import ListFolder
 from mcp_hub.search import (
+    FILTER_SIGN_REFUSED,
     GRAPH_QUERY_TOO_LONG,
     MAX_GRAPH_ENCODED_CHARS,
     OPERATOR_PREFIXES,
@@ -154,8 +155,8 @@ def test_allowed_colon_words(word: str) -> None:
 
 
 def test_operator_words_only_in_query() -> None:
-    parsed = terms(query="plain", sender="from:x OR y", subject="-x")
-    assert (parsed.sender, parsed.subject) == ("from:x OR y", "-x")
+    parsed = terms(query="plain", sender="from:x OR y", subject="x -y")
+    assert (parsed.sender, parsed.subject) == ("from:x OR y", "x -y")
 
 
 def test_word_dedup_casefold() -> None:
@@ -367,3 +368,19 @@ def test_total_of_all_values_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(ToolError) as caught:
         parse_search_terms(query=None, sender=wide, recipient=wide, subject=wide)
     assert caught.value.message == VALUE_TOO_LONG
+
+
+@pytest.mark.parametrize("field", ["sender", "recipient", "subject"])
+@pytest.mark.parametrize("value", ["-x", "+1", "\uff0dx", "-5"])
+def test_filter_value_starting_with_a_sign_and_an_alphanumeric_is_refused(field: str, value: str) -> None:
+    with pytest.raises(ToolError) as caught:
+        terms(**{field: value})
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.message == FILTER_SIGN_REFUSED
+    assert value not in caught.value.message
+
+
+@pytest.mark.parametrize("field", ["sender", "recipient", "subject"])
+@pytest.mark.parametrize("value", ["-", "- x", "a-b@x.ch", "Re: x", "x-", "--", "+", "@-x"])
+def test_filter_value_with_a_sign_elsewhere_or_alone_is_allowed(field: str, value: str) -> None:
+    assert getattr(terms(**{field: value}), field) == value

@@ -55,6 +55,7 @@ VALUE_TOO_LONG: Final = "A search value is too long once normalised"
 NO_TERMS: Final = "Pass query or at least one of sender, recipient, subject"
 TOO_MANY_WORDS: Final = "query takes at most 8 words"
 OPERATOR_REFUSED: Final = "query takes plain words; use the sender, recipient and subject arguments"
+FILTER_SIGN_REFUSED: Final = "sender, recipient and subject must not start with - or +"
 NO_SEARCHABLE_TEXT: Final = "A search value has no searchable text"
 RESERVED_TEXT: Final = "A search value must not contain X-GM-RAW"
 EMPTY_GRAPH_QUERY: Final = "query has no letters or digits that Outlook can search"
@@ -84,11 +85,17 @@ def normalise_value(value: object, name: str) -> str:
     return kept
 
 
+def _leading_sign(value: str) -> bool:
+    """`-` or `+` (after NFKC) followed by a letter or digit: negation or an operator for some providers (TDr-3)."""
+    folded = unicodedata.normalize("NFKC", value).casefold()
+    return folded[0] in "-+" and len(folded) > 1 and folded[1].isalnum()
+
+
 def _check_operators(word: str) -> None:
     folded = unicodedata.normalize("NFKC", word).casefold()
     if any(folded.startswith(prefix + ":") for prefix in OPERATOR_PREFIXES):
         raise _refuse(OPERATOR_REFUSED)
-    if word in OPERATOR_WORDS or (folded[0] in "-+" and len(folded) > 1 and folded[1].isalnum()):
+    if word in OPERATOR_WORDS or _leading_sign(word):
         raise _refuse(OPERATOR_REFUSED)
 
 
@@ -108,12 +115,14 @@ def parse_search_terms(
             raise _refuse(TOO_MANY_WORDS)
         for word in words:
             _check_operators(word)
-    terms = SearchTerms(
-        words=tuple(words),
-        sender=None if sender is None else normalise_value(sender, "sender"),
-        recipient=None if recipient is None else normalise_value(recipient, "recipient"),
-        subject=None if subject is None else normalise_value(subject, "subject"),
+    filters = (
+        None if sender is None else normalise_value(sender, "sender"),
+        None if recipient is None else normalise_value(recipient, "recipient"),
+        None if subject is None else normalise_value(subject, "subject"),
     )
+    if any(value is not None and _leading_sign(value) for value in filters):
+        raise _refuse(FILTER_SIGN_REFUSED)
+    terms = SearchTerms(words=tuple(words), sender=filters[0], recipient=filters[1], subject=filters[2])
     sizes = [
         len(value.encode("utf-8")) for value in (*terms.words, terms.sender, terms.recipient, terms.subject) if value
     ]

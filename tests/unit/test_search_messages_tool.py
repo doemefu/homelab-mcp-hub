@@ -210,6 +210,9 @@ async def test_filter_only_search_and_explicit_arguments(secrets_dir: Path) -> N
         ({"query": "foo OR bar"}, "plain words"),
         ({"query": "from:alice"}, "plain words"),
         ({"query": "-spam"}, "plain words"),
+        ({"sender": "-alice"}, "must not start with - or +"),
+        ({"recipient": "+1555"}, "must not start with - or +"),
+        ({"subject": "-invoice"}, "must not start with - or +"),
         ({"query": "a b c d e f g h i"}, "at most 8 words"),
         ({"query": "report", "since": "2026-07-28T11:59:00Z"}, "since must lie within the last 90 days"),  # -91 d
         ({"query": "report", "since": "2026-10-27T12:00:00"}, "since"),
