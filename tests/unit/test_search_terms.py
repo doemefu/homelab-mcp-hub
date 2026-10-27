@@ -14,6 +14,7 @@ from mcp_hub.search import (
     GRAPH_QUERY_TOO_LONG,
     MAX_GRAPH_ENCODED_CHARS,
     OPERATOR_PREFIXES,
+    RESERVED_TEXT,
     SearchTerms,
     graph_search_text,
     imap_value_keys,
@@ -95,6 +96,8 @@ def test_filters_are_values_not_words() -> None:
         "invoice -spam",
         "+urgent",
         "-7",
+        "\uff0dx",  # fullwidth hyphen-minus (T1-S1)
+        "\uff0bx",
     ],
 )
 def test_refused_values(query: object) -> None:
@@ -111,6 +114,12 @@ def test_refused_filter_values(field: str, value: object) -> None:
     with pytest.raises(ToolError) as caught:
         parse_search_terms(**arguments)  # type: ignore[arg-type]
     assert caught.value.code == "invalid_argument"
+
+
+def test_x_gm_raw_has_its_own_text() -> None:
+    with pytest.raises(ToolError) as caught:
+        terms(query="x-gm-raw invoice")
+    assert caught.value.message == RESERVED_TEXT
 
 
 def test_all_four_omitted() -> None:
@@ -135,7 +144,9 @@ def test_operator_prefix_table_has_27_names() -> None:
     assert len(set(OPERATOR_PREFIXES)) == 27
 
 
-@pytest.mark.parametrize("word", ["Re: Offerte", "12:30", "Rückfrage", "and or", "-", "10-20", "C-3PO", "--", "Re:"])
+@pytest.mark.parametrize(
+    "word", ["Re: Offerte", "12:30", "Rückfrage", "and or", "-", "10-20", "10\uff0d20", "C-3PO", "--", "Re:"]
+)
 def test_allowed_colon_words(word: str) -> None:
     assert terms(query=word).words == tuple(word.split())
 
@@ -167,6 +178,9 @@ def test_search_terms_invariant() -> None:
         SearchTerms(words=(), sender=None, recipient=None, subject=None)
     with pytest.raises(ValueError, match="at most 8"):
         SearchTerms(words=tuple("abcdefghi"), sender=None, recipient=None, subject=None)
+    for words, sender in ((("",), "x"), (("a b",), None), (("a",), ""), (("a\t",), None)):
+        with pytest.raises(ValueError, match="non-empty"):
+            SearchTerms(words=words, sender=sender, recipient=None, subject=None)
     with pytest.raises(ValueError, match="distinct"):
         SearchTerms(words=("a", "a"), sender=None, recipient=None, subject=None)
 
@@ -197,6 +211,11 @@ def test_imap_value_keys_order() -> None:
         (["jm@example.org"], "jm@example.org"),
         (["Grüße"], "grüße"),
         ([".x."], "x"),
+        (["1..5"], "1..5"),  # pinned: plain-word interpretation inside R37
+        (["a..b"], "a..b"),
+        (["\uff21\uff2e\uff24"], "\uff41\uff4e\uff44"),  # fullwidth letters stay letters
+        (["\uff0dx"], "x"),
+        (["x\u2212y"], "x y"),
         (["@"], None),
         (["__"], None),
         (["a_b"], "a_b"),

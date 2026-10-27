@@ -138,6 +138,9 @@ class SearchTerms:
             raise ValueError("at least one search term is required")
         if len(self.words) > MAX_SEARCH_WORDS:
             raise ValueError("at most 8 words")
+        values = (*self.words, *(v for v in (self.sender, self.recipient, self.subject) if v is not None))
+        if any(not value or any(ch.isspace() for ch in value) for value in self.words) or "" in values:
+            raise ValueError("words and filters must be non-empty, words without whitespace")
         if len({word.casefold() for word in self.words}) != len(self.words):
             raise ValueError("words must be distinct")
 

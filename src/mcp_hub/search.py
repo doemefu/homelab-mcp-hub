@@ -50,6 +50,7 @@ NO_TERMS: Final = "Pass query or at least one of sender, recipient, subject"
 TOO_MANY_WORDS: Final = "query takes at most 8 words"
 OPERATOR_REFUSED: Final = "query takes plain words; use the sender, recipient and subject arguments"
 NO_SEARCHABLE_TEXT: Final = "A search value has no searchable text"
+RESERVED_TEXT: Final = "A search value contains reserved text"
 EMPTY_GRAPH_QUERY: Final = "query has no letters or digits that Outlook can search"
 GRAPH_QUERY_TOO_LONG: Final = "query is too long for Outlook search"
 
@@ -70,8 +71,10 @@ def normalise_value(value: object, name: str) -> str:
     kept = "".join(" " if ch in "  " else ch for ch in value if unicodedata.category(ch) != "Cf")
     kept = unicodedata.normalize("NFC", kept).replace('"', "").replace("\\", "")
     kept = " ".join(kept.split())
-    if not kept or "X-GM-RAW" in kept.upper():
+    if not kept:
         raise _refuse(NO_SEARCHABLE_TEXT)
+    if "X-GM-RAW" in kept.upper():
+        raise _refuse(RESERVED_TEXT)
     return kept
 
 
@@ -79,7 +82,7 @@ def _check_operators(word: str) -> None:
     folded = unicodedata.normalize("NFKC", word).casefold()
     if any(folded.startswith(prefix + ":") for prefix in OPERATOR_PREFIXES):
         raise _refuse(OPERATOR_REFUSED)
-    if word in OPERATOR_WORDS or (word[0] in "-+" and len(word) > 1 and word[1].isalnum()):
+    if word in OPERATOR_WORDS or (folded[0] in "-+" and len(folded) > 1 and folded[1].isalnum()):
         raise _refuse(OPERATOR_REFUSED)
 
 
