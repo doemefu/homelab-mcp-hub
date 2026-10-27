@@ -39,6 +39,7 @@ from mcp_hub.providers.base import (
     AttachmentMeta,
     FolderPage,
     FoundMessage,
+    IncompleteReason,
     ListQuery,
     MailDetail,
     MailFlags,
@@ -46,6 +47,7 @@ from mcp_hub.providers.base import (
     MailSummary,
     MessageStatus,
     ProviderError,
+    SearchTerms,
     StatusTarget,
     ThreadBody,
     ThreadMember,
@@ -94,6 +96,7 @@ from mcp_hub.providers.threads import (
     server_body,
 )
 from mcp_hub.sanitize import html_to_text
+from mcp_hub.search import MATCH_NAME_CHARS, MATCH_SUBJECT_CHARS, match_fold
 
 GRAPH_HOST: Final = "graph.microsoft.com"
 API: Final = f"https://{GRAPH_HOST}/v1.0"
@@ -110,6 +113,7 @@ EXTENDED_EXPAND: Final = (
     "singleValueExtendedProperties($filter=id eq 'Integer 0x1081' or id eq 'String 0x1042' or id eq 'String 0x1039')"
 )
 GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
+FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)
 ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
 FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
 WELL_KNOWN_FOR: Final[dict[ListFolder, tuple[GraphWellKnown, ...]]] = {
@@ -418,8 +422,48 @@ def _conversation_id(raw: Mapping[str, object]) -> str | None:
     return value if isinstance(value, str) and GRAPH_ID.fullmatch(value) else None
 
 
-def _soft_stopped_page() -> FolderPage:
-    return FolderPage(items=[], more=False, truncated=True, complete=False)
+def _soft_stopped_page(query: ListQuery) -> FolderPage:
+    """Nothing read before the soft stop; the reason is reported for `search_messages` only (list pages unchanged)."""
+    incomplete: frozenset[IncompleteReason] = frozenset({"time_limit"}) if query.search is not None else frozenset()
+    return FolderPage(items=[], more=False, truncated=True, complete=False, incomplete=incomplete)
+
+
+def _folded_has(needle: str, text: str | None, cap: int) -> bool:
+    return text is not None and needle in match_fold(text[:cap])
+
+
+def _participant_matches(needle: str, entry: object) -> bool:
+    """A name or a non-DN address of one Graph recipient value contains the folded needle (MF-D2)."""
+    name, address = _address(entry)
+    if _folded_has(needle, name, MATCH_NAME_CHARS):
+        return True
+    return address is not None and not _DN_ADDRESS.match(address) and _folded_has(needle, address, MATCH_NAME_CHARS)
+
+
+def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
+    """The hub-side `sender`, `recipient` and `subject` filters of `search_messages` (spec 080 §5.2, MF-D2).
+
+    Plain substring on `match_fold` of needle and candidate, never a pattern: `sender` = `from` name or non-DN
+    address; `recipient` = any `toRecipients` entry (never Cc/Bcc); `subject` = its first 4,000 characters. The words
+    are not checked here: Graph matched them. An empty folded needle matches nothing."""
+    if terms.sender is not None:
+        needle = match_fold(terms.sender)
+        if not needle or not _participant_matches(needle, raw.get("from")):
+            return False
+    if terms.recipient is not None:
+        needle = match_fold(terms.recipient)
+        to = raw.get("toRecipients")
+        if not needle or not isinstance(to, list) or not any(_participant_matches(needle, e) for e in to):
+            return False
+    if terms.subject is not None:
+        needle = match_fold(terms.subject)
+        if not needle or not _folded_has(needle, _str(raw.get("subject")), MATCH_SUBJECT_CHARS):
+            return False
+    return True
+
+
+def _has_filters(terms: SearchTerms | None) -> bool:
+    return terms is not None and (terms.sender is not None or terms.recipient is not None or terms.subject is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,7 +644,9 @@ class GraphMailbox:
         return self._run(
             lambda client, token, call: self._list_messages(client, token, call, query),
             deadline,
-            on_soft_stop=_soft_stopped_page,  # stopped before any folder answered: nothing read, no cursor
+            on_soft_stop=lambda: _soft_stopped_page(
+                query
+            ),  # stopped before any folder answered: nothing read, no cursor
         )
 
     def message_status(self, targets: Sequence[StatusTarget], deadline: CallDeadline) -> list[MessageStatus]:
@@ -667,7 +713,7 @@ class GraphMailbox:
         try:
             ids = self._folder_ids(client, token, deadline)
         except SoftStop:
-            return _soft_stopped_page()
+            return _soft_stopped_page(query)
         bound = None if query.position is None else datetime.fromtimestamp(query.position.received_at, UTC)
         params = {
             "$filter": list_filter(query.since, bound, query.unread_only),
@@ -681,26 +727,47 @@ class GraphMailbox:
         floor: int | None = None
         more = truncated = False
         complete = True
+        incomplete: set[IncompleteReason] = set()
+        read_on = query.search is not None and not query.search.words  # filter-only search (ruling 5, GR1)
         for name in WELL_KNOWN_FOR[query.folder]:
             folder_id = ids.ids.get(name)
             if folder_id is None:
                 continue  # the account has no such folder (404 when the ids were read)
+            mine: list[MailSummary] = []
+            current, previous, requests = params, None, 0
+            answer: _FolderAnswer | None = None
             try:
-                answer = self._folder_answer(client, token, deadline, folder_id, params, query, ids)
+                while True:
+                    answer = self._folder_answer(client, token, deadline, folder_id, current, query, ids, previous)
+                    requests += 1
+                    if answer.stuck:
+                        break
+                    mine.extend(answer.items)
+                    if answer.frontier is None or not read_on or requests >= FILTER_READ_REQUESTS:
+                        break
+                    if sum(1 for summary in mine if order_key(summary)[0] > answer.frontier) >= query.limit:
+                        break
+                    previous = answer.frontier  # read on: the next request starts at the frontier second
+                    bound_at = datetime.fromtimestamp(previous, UTC)
+                    current = params | {"$filter": list_filter(query.since, bound_at, query.unread_only)}
             except SoftStop:
                 truncated, complete = True, False  # what was read is returned, without a cursor (§5.4)
+                incomplete.add("time_limit")
+                answer = None
+            for summary in mine:
+                if summary.ref not in seen:  # a repeated Graph id keeps its first entry
+                    seen.add(summary.ref)
+                    found.append(summary)
+            if answer is None:
                 break
             if answer.stuck:
                 # More than 100 messages in one second (S-f residual): the account stops, without a cursor.
                 truncated, complete = True, False
+                incomplete.add("result_cap")
                 break
             if answer.frontier is not None:
                 more = True
                 floor = answer.frontier if floor is None else max(floor, answer.frontier)
-            for summary in answer.items:
-                if summary.ref not in seen:  # a repeated Graph id keeps its first entry
-                    seen.add(summary.ref)
-                    found.append(summary)
         if floor is not None:
             found = [summary for summary in found if order_key(summary)[0] > floor]
         if query.direction is not None:
@@ -714,6 +781,7 @@ class GraphMailbox:
             truncated=truncated,
             complete=complete,
             frontier=None if floor is None else (floor, _FRONTIER_K),
+            incomplete=frozenset(incomplete) if query.search is not None else frozenset(),
         )
 
     def _folder_answer(
@@ -725,6 +793,7 @@ class GraphMailbox:
         params: dict[str, str],
         query: ListQuery,
         ids: GraphFolderIds,
+        previous: int | None = None,
     ) -> _FolderAnswer:
         path = f"/me/mailFolders/{quote(folder_id, safe='')}/messages"
         top = GRAPH_LIST_TOP
@@ -756,7 +825,9 @@ class GraphMailbox:
         # Stuck only when the frontier cannot move the cursor on: on a later page a frontier second below the
         # position's second always progresses (the next page reads `lt <second + 1 s>`); on the first page there
         # must be an item above the frontier second. Otherwise one second holds at least $top messages.
-        if query.position is not None:
+        if previous is not None:
+            stuck = second >= previous  # a read-on request must end below the frontier it started at
+        elif query.position is not None:
             stuck = second >= query.position.received_at
         else:
             stuck = not any(key[0] > second for key in after)
@@ -798,6 +869,8 @@ class GraphMailbox:
         if folder == "excluded":
             return key, None  # junk, drafts, outbox or no parent: never listed (D75)
         try:
+            if query.search is not None and not graph_filters_match(raw, query.search):
+                return key, None  # the key still feeds the frontier
             name, address = _address(raw.get("from"))
             return key, MailSummary(
                 ref=ref,
@@ -814,6 +887,8 @@ class GraphMailbox:
             )
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
+            if _has_filters(query.search):
+                return key, None  # a placeholder never matches a given filter
             listed = _listed_folder(folder)
             meta = MailMeta(folder=listed, direction="outgoing" if listed == "sent" else "incoming")
             return key, placeholder_summary(ref, received, unread, meta)
