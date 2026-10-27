@@ -5,6 +5,7 @@ import hashlib
 import logging
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -55,7 +56,7 @@ def terms(
 
 
 def squery(search: SearchTerms, folder: str = "inbox", limit: int = 20) -> ListQuery:
-    return ListQuery(folder, SINCE, False, None, limit, None, search)  # type: ignore[arg-type]
+    return ListQuery(folder, SINCE, False, None, limit, None, search)  # type: ignore[arg-type]  # folder is a plain str, the field is a Literal
 
 
 def found(box: GraphMailbox, q: ListQuery, clock: FakeClock) -> FolderPage:
@@ -271,7 +272,7 @@ def test_filter_only_keeps_immutable_ids_and_all_folders() -> None:
     mine = [item(1, NOW, SENT_ID) | {"toRecipients": [sender("z@example.org", "Zed")]}]
     server = Server({INBOX_ID: values(), ARCHIVE_ID: values(), SENT_ID: values(*mine)})
     page = found(mailbox(server, clock=clock), squery(terms(recipient="zed"), folder="all"), clock)
-    assert [i.ref.graph_id for i in page.items] == ["AAMkMSG0001="]  # type: ignore[union-attr]
+    assert [i.ref.graph_id for i in page.items] == ["AAMkMSG0001="]  # type: ignore[union-attr]  # ref is the AnyMessageRef union
     assert page.items[0].meta.direction == "outgoing"
 
 
@@ -292,7 +293,7 @@ def searching(*hits: object, **extra: object) -> Server:
 
 
 def swords(*words: str, **kw: str | None) -> SearchTerms:
-    return terms(words=words, **kw)  # type: ignore[arg-type]
+    return terms(words=words, **kw)  # type: ignore[arg-type]  # kw is str | None, the parameters are typed
 
 
 def searches(server: Server) -> list[httpx2.Request]:
@@ -342,7 +343,7 @@ def test_search_wire_value_of_hostile_words_has_no_special_escapes() -> None:
 
 
 def test_search_request_shape_function_is_the_one_builder() -> None:
-    ids = GraphFolderIds("outlook", FOLDER_IDS)  # type: ignore[arg-type]
+    ids = GraphFolderIds("outlook", FOLDER_IDS)  # type: ignore[arg-type]  # FOLDER_IDS is a plain dict, the parameter a typed mapping
     path, params, allowed = _search_requests(ids, squery(swords("x1"), "all"))
     assert path == "/me/messages"
     assert allowed == {INBOX_ID, ARCHIVE_ID, SENT_ID}
@@ -692,7 +693,7 @@ def test_filter_only_read_on_stops_at_the_budget_with_a_cursor_and_the_cursor_co
 
         def handler(
             request: httpx2.Request,
-            blocks: "iter[list[object]]" = blocks,  # type: ignore[valid-type]
+            blocks: Iterator[list[object]] = blocks,
         ) -> httpx2.Response:
             clock.advance(3)
             return js({"value": next(blocks)})(request)
@@ -786,12 +787,30 @@ def test_filter_only_a_late_too_large_answer_stops_reading_on_without_an_error()
     assert page.complete
 
 
-def test_placeholder_never_matches_a_filter() -> None:
+def test_placeholder_never_matches_a_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_hub.providers.graph as graph_module
+
+    real = graph_module.graph_meta
+
+    def failing(raw: dict[str, object], *args: object, **kwargs: object) -> object:
+        if raw.get("id") == "REGULAR00002=":
+            raise ValueError("summary build failed")
+        return real(raw, *args, **kwargs)  # type: ignore[arg-type]  # the wrapper forwards the real signature
+
+    monkeypatch.setattr(graph_module, "graph_meta", failing)
     clock = FakeClock()
-    odd = hit(2, NOW, subject=["not text"], **{"from": "garbage"})
-    server = searching(odd)
-    assert found(mailbox(server, clock=clock), squery(swords("budget", sender="x")), clock).items == []
-    kept = found(mailbox(searching(odd), clock=clock), squery(swords("budget")), clock).items
+    capture = Capture()
+    logger = logging.getLogger("mcp_hub")
+    logger.addHandler(capture)
+    logger.setLevel(logging.DEBUG)
+    odd = hit(2, NOW, **{"from": sender("o@example.org", "Mina Rare")})  # the filter matches; the build raises
+    try:
+        filtered = found(mailbox(searching(odd), clock=clock), squery(swords("budget", sender="rare")), clock)
+        kept = found(mailbox(searching(odd), clock=clock), squery(swords("budget")), clock).items
+    finally:
+        logger.removeHandler(capture)
+    assert filtered.items == []
+    assert len([line for line in capture.lines if "item_degraded" in line]) == 2
     assert len(kept) == 1
     assert location_id(kept[0].ref) is None
 
@@ -834,10 +853,22 @@ def test_graph_search_logs_no_canary_at_debug() -> None:
         logging.getLogger().addHandler(capture)
         words = ("zqxcanaryquery", "zqxcanaryübung")
         filters = {"sender": "zqxcanarysender", "recipient": "zqxcanaryrecipient", "subject": "zqxcanarysubject"}
-        found(box, squery(swords(*words, **filters)), clock)  # type: ignore[arg-type]
+        found(box, squery(swords(*words, **filters)), clock)  # type: ignore[arg-type]  # **filters unpacks a dict[str, str] into optional str parameters
         with pytest.raises(ProviderError):
             found(mailbox(rejected, clock=clock), squery(swords(*words)), clock)
-        found(mailbox(Server({INBOX_ID: values(item(1, NOW))}), clock=clock), squery(terms(**filters)), clock)  # type: ignore[arg-type]
+        found(box, squery(swords(*words)), clock)  # words only: hits 2 and 3 reach `item_degraded`
+        big = {"value": [hit(0, NOW, id=ids[0], subject="x" * 1_100_000)]}
+        tops: list[str] = []
+
+        def halved(request: httpx2.Request) -> httpx2.Response:
+            tops.append(request.url.params["$top"])
+            return js(big if len(tops) == 1 else {"value": [hit(1, NOW, id=ids[0])]})(request)
+
+        retried = Server()
+        retried.routes[SEARCH_PATH] = halved
+        found(mailbox(retried, clock=clock), squery(swords(*words, **filters)), clock)  # too_large, then halved
+        assert tops == ["100", "50"]
+        found(mailbox(Server({INBOX_ID: values(item(1, NOW))}), clock=clock), squery(terms(**filters)), clock)  # type: ignore[arg-type]  # **filters unpacks a dict[str, str] into optional str parameters
         levels = {n: logging.getLogger(n).getEffectiveLevel() for n in PINNED_WARNING}
     finally:
         logging.getLogger().removeHandler(capture)
@@ -855,10 +886,32 @@ def test_graph_search_logs_no_canary_at_debug() -> None:
             repr(needle.encode()),
         ]
     for regular in ids:  # the realistic leak forms of the id: the would-be v1. text and its item hash
-        would_be = encode_message_id(GraphMessageRef(box._account, regular))  # type: ignore[attr-defined]
+        would_be = encode_message_id(GraphMessageRef("outlook", regular))
         needles += [would_be, item_hash(would_be)]
     text = " ".join([*capture.lines, *(m for _, _, m in capture.raw)])
     for needle in needles:
         assert needle not in text, needle
     assert "zqxcanary" not in text.lower()
     assert not [line for line in capture.lines if '"item"' in line]
+
+
+def test_filter_only_never_halves_below_50() -> None:
+    clock = FakeClock()
+    server = Server()
+    tops: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        tops.append(request.url.params["$top"])
+        n = len(tops)
+        if n in (1, 3):  # too large at 101 (retried at 50), then too large again at 50
+            return js({"value": [item(0, NOW, subject="x" * 1_100_000)]})(request)
+        top = int(request.url.params["$top"])
+        start = NOW - timedelta(hours=2 * n)
+        return js({"value": [item(n * 1000 + i, start - timedelta(minutes=i)) for i in range(top)]})(request)
+
+    server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert tops == ["101", "50", "50"]  # the too_large at 50 stops reading on; no request at 25
+    assert page.more
+    assert page.complete
+    assert page.frontier is not None

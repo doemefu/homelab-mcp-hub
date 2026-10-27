@@ -848,9 +848,9 @@ class GraphMailbox:
                             client, token, deadline, folder_id, current, query, ids, previous, retry
                         )
                     except ProviderError as exc:
-                        if retry or exc.code != "too_large" or answer is None:
+                        if exc.code != "too_large" or answer is None:
                             raise
-                        break  # the last frontier stands
+                        break  # a retry is not allowed here: the last frontier stands
                     requests += answer.gets
                     if answer.stuck:
                         break
@@ -918,8 +918,8 @@ class GraphMailbox:
         try:
             body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
         except ProviderError as exc:
-            if exc.code != "too_large" or not retry:
-                raise
+            if exc.code != "too_large" or not retry or top != GRAPH_LIST_TOP:
+                raise  # only 101 is halved, once: there is no third tier
             top, gets = top // 2, 2  # once more with $top halved; a second too_large fails the account (§5.4)
             body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
         values = body.get("value")
