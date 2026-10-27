@@ -1,8 +1,6 @@
 # CLAUDE.md — homelab-mcp-hub
 
-> **Session start:** Read `.claude/memory/MEMORY.md` completely if it exists. The topmost entry shows the current state. If there is an entry with `status: in_progress`, read the linked worklog and ask the user: *"I see we were interrupted at [SLUG]. Continue?"* — before doing anything else.
-
-> **After each completed change:** Insert a new block **at the top** of `.claude/memory/MEMORY.md`.
+In-progress worklogs are listed at session start by the `homelab-workflow` plugin; start work with `/homelab-workflow:start-task`. Durable facts go to auto memory.
 
 > `.claude/memory/`, `.claude/worklogs/` and `.claude/worktrees/` are gitignored — local-only; cross-check `git log` and GitHub when they look stale.
 
@@ -16,7 +14,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 
 ## The contract
 
-**`docs/080-mcp-hub.md` in the `doemefu/homelab` repo is the single source of truth** (locally `../infrastructure/docs/080-mcp-hub.md`). Tool shapes, error codes, token validation rules, the challenge text, env vars, Secret keys, the `accounts.json` schema and the log fields are implemented from it. A deviation is a spec change first, then code.
+**`docs/080-mcp-hub.md` in the `doemefu/homelab` repo is the single source of truth** (locally `../infrastructure/docs/080-mcp-hub.md`). Tool shapes, error codes, token validation rules, the challenge text, env vars, Secret keys, the `accounts.json` schema and the log fields are implemented from it. A deviation is a spec change first, then code. At task start, also read the `README.md` status table, `INTERFACES.md` and the contract sections the task touches.
 
 ## Non-Negotiables
 
@@ -27,7 +25,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 - The hub is read-only: no tool writes to a provider.
 - This repository is public: no account identifiers, usernames, addresses or real data in code, tests, fixtures, docs or commit messages.
 - Commit, push and open PRs on feature branches without asking. Merging PRs is always the user's. Rolling out changes the user has already merged needs no extra go; force-pushes, playbook runs and other cluster mutations need an explicit go. SOPS files are never read or edited by Claude — the user edits them.
-- Before any merge, wait for the Copilot review and fix or answer every comment (see `.claude/rules/workflow.md` Phase 5).
+- Before any merge, wait for the Copilot review and fix or answer every comment (see `/homelab-workflow:review-gate`).
 - All code, comments and documentation in **English**. Minimize diff size: no drive-by refactors.
 
 ## Tech Stack (pinned)
@@ -54,8 +52,40 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 
 ## Agent Team
 
-Project agents in `.claude/agents/`: `architect` (contract first), `implementer`, `reviewer`, `plan-reviewer` (Phase 3), `doc-auditor` (Phase 6), `documenter`, `devops` (read-only cluster checks). Domain advisors for plan and final reviews of mail and tool work, run as a named team that messages each other: `imap-advisor`, `graph-advisor`, `mailformat-advisor`, `security-advisor`, `tooldesign-advisor`.
+Plugin agents `homelab-workflow:<role>` (`architect`, `implementer`, `reviewer`, `plan-reviewer`, `doc-auditor`, `documenter`, `devops`). Repo specifics (contract location, layout, checklists, read-only `devops`) are in `.claude/agent-context.md`, one section per role.
+
+Repo-only agents in `.claude/agents/`: the domain advisors `imap-advisor`, `graph-advisor`, `mailformat-advisor`, `security-advisor`, `tooldesign-advisor`. For mail, provider or tool-interface work, run the matching advisors in Phase 3 and for the final review, in parallel, as a named team that messages each other and writes to a shared notes folder.
 
 ## Process & Conventions
 
-Rules in `.claude/rules/`: `workflow.md` (6-phase workflow), `worklog-conventions.md`, `plan-structure.md`, `commands.md`, `code-style-conventions.md`, `review-guidelines.md`, `documentation-files.md`, `github-project.md` (Project #5 status transitions). Skill: `.claude/skills/start-task/`. Worklog template: `.claude/worklog-template.md`.
+Plugin skills: `/homelab-workflow:start-task`, `workflow` (6-phase workflow, worklogs, plan structure), `review-gate`, `project-board` (Project #5), `cross-repo`.
+
+Rules in `.claude/rules/` (path-scoped): `code-style-conventions.md` (Python, errors, logging, tests), `documentation-files.md` (docs purpose and owner; docs are written in parallel with the code; link to the contract, never copy it).
+
+Review: request Copilot first; CodeRabbit is not installed here. If Copilot does not review, use `homelab-workflow:reviewer` plus `/code-review` and state in a PR comment which path was used.
+
+## Commands
+
+Source `.local/env.sh` first (worktree-local venv, uv cache and TMPDIR; no global installs; see CONTRIBUTING.md "Local environment"). Python 3.13 per `.python-version`.
+
+```bash
+uv sync --locked                          # create .venv from uv.lock (fails if the lock is stale)
+uv run pytest                             # all tests (unit, contract, integration)
+uv run pytest tests/contract -v           # gate G6 contract tests only
+scripts/provider_services.sh up           # GreenMail + Radicale test containers (per-run passwords in $TMPDIR)
+HUB_PROVIDER_TESTS=1 uv run pytest -m provider -v   # provider integration tests
+scripts/provider_services.sh down         # stop and remove the test containers
+uv run pytest tests/unit/test_verifier.py::test_name -v
+uv run ruff check && uv run ruff format --check
+uv run mypy --strict src
+PYTHONPATH=src uv run python -m mcp_hub  # run locally; needs HUB_SECRETS_DIR with accounts.json + allowed-subjects
+docker build -t mcp-hub:dev .             # container image
+scripts/smoke_image.sh mcp-hub:dev        # local image check (read-only FS, uid 10001, 401/200/403/421)
+uv lock                                   # after editing pyproject.toml (exact == pins only)
+uv lock --upgrade-package <name>          # bump one package (owner approval for new packages)
+actionlint                                # GitHub workflow lint
+kubectl kustomize k8s                     # render manifests (offline)
+# Policy path relative to a clone at homelab/mcp-hub; from a worktree under .claude/worktrees/<name>/
+# use ../../../../infrastructure/policy/kubernetes/ instead.
+conftest test --rego-version v0 --policy ../infrastructure/policy/kubernetes/ --all-namespaces <(kubectl kustomize k8s)
+```
