@@ -1274,8 +1274,8 @@ def test_hard_deadline_in_location_or_lookup_fails_the_account(phase: str) -> No
 
 
 def test_lookups_log_nothing(hub_log: Capture) -> None:
-    """§9.7: the lookups add no log line (the one line is the location's LIST); no Message-ID, thread key or folder
-    name reaches a log."""
+    """§9.7: the lookups add no log line of their own (the location's LIST and the call's one refusal line, #52); no
+    Message-ID, thread key or folder name reaches a log."""
     hostile_reply = "leak-reply-0002@example.test"
     server = server_with(
         inbox=[msg(1, 180, "x", message_id=f"<{HOSTILE_MID}>"), follow(2, 30, "leak-f@example.test", to=hostile_reply)],
@@ -1285,7 +1285,7 @@ def test_lookups_log_nothing(hub_log: Capture) -> None:
     _fail_lookup(server, "UID SEARCH", "Archive", HOSTILE_MID)
     [status] = run(server, [r(HOSTILE_MID)], own=OWN)
     assert (status.reply_at, status.newer_incoming_at, status.thread_checked) == (ago(60), ago(30), False)
-    assert [json.loads(line)["event"] for line in hub_log.lines] == ["folder_map_refreshed"]
+    assert [json.loads(line)["event"] for line in hub_log.lines] == ["folder_map_refreshed", "provider_call_failed"]
     text = "\n".join(hub_log.lines) + "\n".join(message for _, _, message in hub_log.raw)
     for value in (HOSTILE_MID, hostile_reply, "leak-f", HOSTILE_FOLDER, "Leak", "owner@example.org"):
         assert value not in text
@@ -1367,3 +1367,91 @@ def test_hostile_recheck_wall_time(monkeypatch: pytest.MonkeyPatch) -> None:
     elapsed = time.perf_counter() - started
     assert (status.state, status.thread_checked) == ("found", False)
     assert elapsed <= min(3.0, soft + 1.0), elapsed
+
+
+# --- refused commands: one provider_call_failed per call (#52, spec 080 §9.7) -------------------------------------
+
+
+def failures(log: Capture) -> list[dict[str, object]]:
+    return [record for record in map(json.loads, log.lines) if record["event"] == "provider_call_failed"]
+
+
+def _refused_in_place(command: str) -> tuple[FakeImapServer, list[StableRef | MessageRef]]:
+    server = server_with(projects=[msg(2, 5, "p", message_id=f"<{MID}>")])
+    server.fail[command] = server.no(command)
+    return server, [m("Projects", 2)]
+
+
+def _refused_lookup(command: str) -> tuple[FakeImapServer, list[StableRef | MessageRef]]:
+    server = server_with(inbox=[msg(1, 200, "x", message_id=f"<{MID}>")], sent=[follow(1, 60, A_MID)])
+    if command == "EXAMINE":
+        _fail_lookup(server, "EXAMINE", "Archive")
+    else:
+        _fail_lookup(server, "UID SEARCH", "Sent Messages", MID)
+    return server, [r()]
+
+
+REFUSED: dict[str, tuple[Callable[[], tuple[FakeImapServer, list[StableRef | MessageRef]]], str]] = {
+    "location_examine_no": (lambda: (_examine_no()[0], [r()]), "ExamineRefused"),
+    "location_search_no": (lambda: (_search_no()[0], [r()]), "SearchRefused"),
+    "location_fetch_no": (lambda: (_fetch_loses_a_hit()[0], [r()]), "FetchRefused"),
+    "in_place_examine_no": (lambda: _refused_in_place("EXAMINE"), "ExamineRefused"),
+    "in_place_fetch_no": (lambda: _refused_in_place("UID FETCH"), "FetchRefused"),
+    "lookup_examine_no": (lambda: _refused_lookup("EXAMINE"), "ExamineRefused"),
+    "lookup_search_no": (lambda: _refused_lookup("UID SEARCH"), "SearchRefused"),
+}
+
+
+@pytest.mark.parametrize("case", list(REFUSED))
+def test_refused_command_logs_one_warning(case: str, hub_log: Capture) -> None:
+    factory, cause = REFUSED[case]
+    server, targets = factory()
+    run(server, targets)
+    [line] = failures(hub_log)
+    assert {key: line.get(key) for key in ("level", "account", "capability", "outcome", "exception")} == {
+        "level": "WARNING",
+        "account": ICLOUD,
+        "capability": "mail",
+        "outcome": "upstream_timeout",
+        "exception": cause,
+    }
+    assert set(line) <= allowed_fields("provider_call_failed")
+    text = "\n".join(hub_log.lines)
+    for value in (MID, A_MID, "Projects", "Archive", "Sent Messages"):
+        assert value not in text
+
+
+def test_many_refusals_in_one_call_log_one_line(hub_log: Capture) -> None:
+    """The first refusal names the cause; every later one in the same call is not logged again."""
+    server = server_with(projects=[msg(2, 5, "p", message_id=f"<{MID}>")])
+    server.fail["UID FETCH"] = server.no("UID FETCH")  # the in-place read comes first
+    original = server.run
+
+    def refuse_every_search(command: str, argument: object = None) -> None:
+        if command == "UID SEARCH":
+            server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        original(command, argument)
+
+    server.run = refuse_every_search  # type: ignore[method-assign]
+    statuses = run(server, [m("Projects", 2), r(OTHER_MID)])
+    assert states(statuses) == [INCOMPLETE, INCOMPLETE]
+    assert len(searches(server)) > 1
+    assert [line["exception"] for line in failures(hub_log)] == ["FetchRefused"]
+
+
+@pytest.mark.parametrize("case", ["clean", "lost_row_without_no", "folder_cap", "soft_stop"])
+def test_no_refusal_logs_no_warning(case: str, hub_log: Capture) -> None:
+    server = server_with(
+        inbox=[msg(1, 200, "x", message_id=f"<{MID}>")],
+        sent=[follow(1, 60, A_MID)],
+        archive=[follow(2, 30, to=MID)],
+    )
+    kwargs: dict[str, object] = {}
+    if case == "lost_row_without_no":
+        _lossy_fetch(server, "Archive", 2)  # expunged meanwhile: incomplete, but the server refused nothing
+    elif case == "folder_cap":
+        server, kwargs = _folder_cap()
+    elif case == "soft_stop":
+        server, kwargs = _soft_stop_in_core()
+    run(server, [r()], **kwargs)  # type: ignore[arg-type]
+    assert failures(hub_log) == []

@@ -766,8 +766,8 @@ def hub_log() -> Iterator[Capture]:
 
 
 def test_gmail_logs_carry_no_labels_or_thread_ids(hub_log: Capture) -> None:
-    """§9.7: the Gmail lookups log nothing, not even for a member without INTERNALDATE or a failed batch; no label,
-    thread id, Message-ID or address reaches a log."""
+    """§9.7: the Gmail lookups log nothing of their own, not even for a member without INTERNALDATE; a failed batch
+    gives only the call's one refusal line (#52); no label, thread id, Message-ID or address reaches a log."""
     thread = 1781234567890123456
     label = b"Leak-Label-Name"
     reply_id = "leak-reply@example.test"
@@ -788,7 +788,9 @@ def test_gmail_logs_carry_no_labels_or_thread_ids(hub_log: Capture) -> None:
     _fail_thread_search(server, 1)
     [status] = run(server, [g(HOSTILE_MID)], own=OWN)
     assert status.thread_checked is False
-    assert {json.loads(line)["event"] for line in hub_log.lines} == {"folder_map_refreshed"}
+    assert {json.loads(line)["event"] for line in hub_log.lines} == {"folder_map_refreshed", "provider_call_failed"}
+    [refused] = [record for record in map(json.loads, hub_log.lines) if record["event"] == "provider_call_failed"]
+    assert [refused[key] for key in ("account", "outcome", "exception")] == [GMAIL, "upstream_timeout", "SearchRefused"]
     text = "\n".join(hub_log.lines) + "\n".join(message for _, _, message in hub_log.raw)
     for value in (str(thread), "Leak", "leak", "owner@example.org"):
         assert value not in text

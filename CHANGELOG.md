@@ -53,6 +53,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 - IMAP `get_message`: an `EXAMINE` of the registry inbox answered `NO` now gives `upstream_timeout` (the read did not complete) instead of `upstream_error`.
 - `get_message` ids are bound by D75 instead of the inbox-only rule: an id may name the inbox, sent, archive, trash or another readable mailbox (Gmail: inbox, All Mail, Trash); junk, drafts and excluded mailboxes answer `not_found`, without a provider call while the folder map is cached. `folder` in the result is the normalised folder of the message read (it was the id's mailbox name). Ids of the registry inbox issued earlier keep working.
 - `gmail` account live (homelab#172): mail over the existing IMAP adapter, no code change (registry entry and credentials only, runbook in the `homelab` repository's `DEPLOYMENT.md`).
+- IMAP `get_message_status`: a call in which the server answered an `EXAMINE`, `UID SEARCH` or `UID FETCH` with `NO` now logs one `provider_call_failed` WARNING naming the first refusal (`ExamineRefused`, `SearchRefused`, `FetchRefused`), so a systematic refusal is visible; results are unchanged (#52).
 
 ### Fixed
 
