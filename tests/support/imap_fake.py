@@ -92,6 +92,10 @@ class FakeImapServer:
         self.honour_not_draft = True
         # iCloud-like (O35): HEADER on a msg-id field matches a whole bracketed `<id>` token, never a substring.
         self.whole_msgid_tokens = False
+        # Search value keys: a `CHARSET` search answers NO (server without UTF-8 search); `word_match` matches whole
+        # words only, like Gmail and iCloud do for TEXT/FROM/TO/SUBJECT.
+        self.badcharset = False
+        self.word_match = False
         self.socket_timeouts: list[float] = []
         self.no, self.bad, self.abort = no, bad, abort
 
@@ -164,12 +168,32 @@ class FakeImapClient:
 
     def search(self, criteria: bytes) -> list[int]:
         self._server.run("UID SEARCH", criteria)
+        return self._evaluate([m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))])
+
+    def _raw_command_untagged(self, command: bytes, args: Sequence[bytes], uid: bool = False) -> list[bytes]:
+        """The synchronising-literal search of the guard: `UID SEARCH CHARSET UTF-8 <prefix> <key> <value>…`. Only
+        that command exists; a non-ASCII value arrives as raw UTF-8 bytes (the literal), an ASCII one quoted."""
+        if command != b"SEARCH" or uid is not True:
+            raise AssertionError(f"raw command outside the allowlist: {command!r} uid={uid}")
+        self._server.run("UID SEARCH", list(args))
+        tokens: list[str] = []
+        for arg in args:
+            text = arg.decode("utf-8")
+            if text.upper() in ("CHARSET", "UTF-8") or arg.startswith(b'"') or b" " in arg or arg.isascii():
+                tokens.extend(m.group(1) for m in _TOKEN.finditer(text))
+            else:  # a literal: one value token whatever it contains
+                tokens.append('"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"')
+        return [b" ".join(str(uid_).encode() for uid_ in self._evaluate(tokens))]
+
+    def _evaluate(self, tokens: list[str]) -> list[int]:
         folder = self._selected("UID SEARCH")
-        tokens = [m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))]
-        pos, node = _parse_list(tokens, 0, self._server.whole_msgid_tokens, b"X-GM-EXT-1" in self._server.capabilities)
+        server = self._server
+        if tokens[:1] and tokens[0].upper() == "CHARSET" and server.badcharset:
+            raise no("UID SEARCH")
+        pos, node = _parse_list(tokens, 0, server.whole_msgid_tokens, b"X-GM-EXT-1" in server.capabilities, server)
         if pos != len(tokens):
             raise bad("UID SEARCH")
-        return [uid for uid, msg in sorted(folder.messages.items()) if node(msg, self._server.honour_not_draft)]
+        return [uid for uid, msg in sorted(folder.messages.items()) if node(msg, server.honour_not_draft)]
 
     def fetch(self, messages: str | Sequence[int], items: str | Sequence[str]) -> dict[int, dict[bytes, object]]:
         self._server.run("UID FETCH", (messages, items))
@@ -261,33 +285,33 @@ def _header_subset(headers: bytes | None, section: str) -> bytes | None:
 
 
 def _parse_list(
-    tokens: list[str], pos: int, whole: bool, gmail: bool
+    tokens: list[str], pos: int, whole: bool, gmail: bool, server: "FakeImapServer"
 ) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     parts: list[Callable[[FakeMessage, bool], bool]] = []
     while pos < len(tokens) and tokens[pos] != ")":
-        pos, node = _parse_key(tokens, pos, whole, gmail)
+        pos, node = _parse_key(tokens, pos, whole, gmail, server)
         parts.append(node)
     return pos, lambda msg, honour: all(p(msg, honour) for p in parts)
 
 
 def _parse_key(
-    tokens: list[str], pos: int, whole: bool, gmail: bool
+    tokens: list[str], pos: int, whole: bool, gmail: bool, server: "FakeImapServer"
 ) -> tuple[int, Callable[[FakeMessage, bool], bool]]:
     word = tokens[pos].upper()
     pos += 1
     if word == "(":
-        pos, node = _parse_list(tokens, pos, whole, gmail)
+        pos, node = _parse_list(tokens, pos, whole, gmail, server)
         if pos >= len(tokens):
             raise bad("UID SEARCH")
         return pos + 1, node
     if word == "NOT":
         if pos < len(tokens) and tokens[pos].upper() == "DRAFT":
             return pos + 1, lambda msg, honour: not honour or b"\\Draft" not in msg.flags
-        pos, inner = _parse_key(tokens, pos, whole, gmail)
+        pos, inner = _parse_key(tokens, pos, whole, gmail, server)
         return pos, lambda msg, honour: not inner(msg, honour)
     if word == "OR":
-        pos, left = _parse_key(tokens, pos, whole, gmail)
-        pos, right = _parse_key(tokens, pos, whole, gmail)
+        pos, left = _parse_key(tokens, pos, whole, gmail, server)
+        pos, right = _parse_key(tokens, pos, whole, gmail, server)
         return pos, lambda msg, honour: left(msg, honour) or right(msg, honour)
     if word == "UNSEEN":
         return pos, lambda msg, honour: b"\\Seen" not in msg.flags
@@ -312,6 +336,15 @@ def _parse_key(
             return needle in _MSGID_TOKEN.findall(value) if tokens_only else needle in value
 
         return pos + 2, by_header
+    if word == "CHARSET":
+        if pos >= len(tokens) or tokens[pos].upper() != "UTF-8":
+            raise bad("UID SEARCH")
+        return pos + 1, lambda msg, honour: True
+    if word in ("TEXT", "FROM", "TO", "SUBJECT"):
+        needle = _unquote(tokens[pos]).casefold()
+        if not needle:
+            raise bad("UID SEARCH")  # an empty value would match everything; the hub never sends one
+        return pos + 1, lambda msg, honour: _contains(_haystack(msg, word), needle, server.word_match)
     if word == "X-GM-LABELS":
         label = _unquote(tokens[pos]).encode().lower()
         return pos + 1, lambda msg, honour: label in {x.lower() for x in msg.labels}
@@ -321,6 +354,27 @@ def _parse_key(
         wanted = int(tokens[pos])
         return pos + 1, lambda msg, honour: msg.thrid is not None and msg.thrid == wanted
     raise bad("UID SEARCH")
+
+
+def _decoded_headers(msg: FakeMessage) -> email.message.Message:
+    return email.message_from_string((msg.headers or b"").decode("utf-8", "replace"), policy=email.policy.default)
+
+
+def _haystack(msg: FakeMessage, key: str) -> str:
+    """Decoded header values (FROM, TO, SUBJECT) or all headers plus the text (TEXT)."""
+    parsed = _decoded_headers(msg)
+    if key == "TEXT":
+        return (
+            "\n".join(f"{name}: {value}" for name, value in parsed.items()) + "\n" + msg.text.decode("utf-8", "replace")
+        )
+    return str(parsed.get(key.title(), ""))
+
+
+def _contains(haystack: str, needle: str, whole_word: bool) -> bool:
+    text = haystack.casefold()
+    if not whole_word:
+        return needle in text
+    return re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", text) is not None
 
 
 def _unquote(token: str) -> str:
