@@ -17,6 +17,9 @@ every search also answers 500 hostile hits per folder.
 `--scenario thread-graph` drives run_get_thread for `--accounts` Graph accounts through an in-process transport: the
 conversation list answers with a 2 MiB `uniqueBody` list or, alternately, a refused one and the 2 MiB fallback list, and
 20 single reads of about 2 MiB follow (every fourth refused once, then retried with `uniqueBody` alone).
+`--scenario list` drives run_list_messages (folder `all`) and run_list_unread, 50 items each, for `icloud` accounts
+through an in-process IMAP fake (T0b, #44): the inbox holds 50 unread messages with BODYSTRUCTUREs of 10,000 parts
+(`--structure-parts`), large text parts; each worker runs both tools.
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
@@ -28,6 +31,7 @@ Run inside the production image with the repository mounted read-only (see CONTR
     ... python /work/scripts/memory_probe.py --scenario status --accounts 2 --parallel 2 --calls 10
     ... python /work/scripts/memory_probe.py --scenario thread --accounts 2 --parallel 2 --calls 10
     ... python /work/scripts/memory_probe.py --scenario thread-graph --accounts 2 --parallel 2 --calls 10
+    ... python /work/scripts/memory_probe.py --scenario list --accounts 2 --parallel 2 --calls 10
 """
 
 import argparse
@@ -61,6 +65,7 @@ from mcp_hub.config import load_settings
 from mcp_hub.health import StatusStore
 from mcp_hub.ids import GraphMessageRef, StableRef, encode_message_id, encode_ref
 from mcp_hub.providers import Adapters
+from mcp_hub.providers import imap as imap_module
 from mcp_hub.providers.caldav import MAX_REPORT_BYTES_PER_CALL, CalDavCalendarSource, SlowObjectCache
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.folders import GRAPH_WELL_KNOWN, FolderMapCache
@@ -71,7 +76,7 @@ from mcp_hub.providers.msidentity import GraphAccount
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
-from mcp_hub.tools.mail import run_get_message
+from mcp_hub.tools.mail import run_get_message, run_list_messages, run_list_unread
 from mcp_hub.tools.mail_thread import run_get_thread
 
 BASE = "https://dav.example.test:443"
@@ -540,11 +545,38 @@ def account_id(prefix: str, index: int) -> str:
     return f"{prefix}{index}" if index else prefix
 
 
-def imap_factory(kind: Callable[[], str]) -> Callable[[str], ImapMailbox]:
+def list_server() -> ProbeServer:
+    """`LIST_ITEMS` unread inbox messages, each with a short header and a large text part; the
+    BODYSTRUCTURE of every FETCH answer is built by `ProbeClient`."""
+    now = datetime.now(UTC)
+    inbox = {
+        uid: FakeMessage(
+            uid,
+            now - timedelta(minutes=uid),
+            headers=hdr(
+                ("From", "Peer <peer@example.test>"),
+                ("To", OWNER),
+                ("Subject", "y" * 200),
+                ("Message-ID", f"<l{uid}@example.test>"),
+            ),
+            text=HTML_BODY if uid % 2 else PLAIN_B64,
+        )
+        for uid in range(1, LIST_ITEMS + 1)
+    }
+    folders: list[FakeFolder] = [
+        ProbeFolder("INBOX", (b"\\HasNoChildren",), messages=inbox),
+        ProbeFolder("Sent Messages", (b"\\HasNoChildren", b"\\Sent")),
+        ProbeFolder("Archive", (b"\\HasNoChildren", b"\\Archive")),
+        ProbeFolder("Deleted Messages", (b"\\HasNoChildren", b"\\Trash")),
+    ]
+    return ProbeServer(folders, clock=FakeClock())
+
+
+def imap_factory(kind: Callable[[], str] | None = None) -> Callable[[str], ImapMailbox]:
     """A fresh fake server and mailbox per call (and a fresh folder map: the LIST is part of the call)."""
 
     def build(account: str) -> ImapMailbox:
-        server, _ = thread_server(kind())
+        server = list_server() if kind is None else thread_server(kind())[0]
         clock = server.clock
         if clock is None:
             raise SystemExit("thread server needs a clock")
@@ -563,6 +595,7 @@ def imap_factory(kind: Callable[[], str]) -> Callable[[str], ImapMailbox]:
     return build
 
 
+LIST_ITEMS = 50
 GRAPH_ITEMS, GRAPH_LISTED, GRAPH_SEED = 51, 31, "AAMkMSG0051="
 CAP = MAX_MESSAGE_RESPONSE_BYTES
 
@@ -697,6 +730,67 @@ def thread_main(args: argparse.Namespace) -> None:
     print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
 
 
+async def list_call(ctx: HubContext, args: argparse.Namespace) -> list[str]:
+    """`--accounts` accounts times `--parallel` concurrent workers, each running list_messages (folder `all`) and
+    list_unread for its account; `--with-calendar` adds get_events."""
+    notes: list[str] = []
+
+    async def listing(account: str) -> None:
+        async def messages() -> None:
+            result, _, _ = await run_list_messages(
+                ctx,
+                tool="list_messages",
+                account=account,
+                folder="all",
+                since="2026-10-01T00:00:00+00:00",
+                unread_only=None,
+                direction=None,
+                limit=LIST_ITEMS,
+                cursor=None,
+            )
+            notes.append(f"{account} list_messages: {len(result.items)} items, truncated {result.truncated}")
+
+        async def unread() -> None:
+            result, _, _ = await run_list_unread(
+                ctx, account=account, since="2026-10-01T00:00:00+00:00", limit=LIST_ITEMS, cursor=None
+            )
+            notes.append(f"{account} list_unread: {len(result.items)} items, truncated {result.truncated}")
+
+        async with anyio.create_task_group() as inner:
+            inner.start_soon(messages)
+            inner.start_soon(unread)
+
+    async def events() -> None:
+        notes.extend(await one_call(ctx, True, False))
+
+    async with anyio.create_task_group() as tg:
+        for i in range(args.accounts):
+            for _ in range(args.parallel):
+                tg.start_soon(listing, account_id("icloud", i))
+        if args.with_calendar:
+            tg.start_soon(events)
+    return notes
+
+
+def list_main(args: argparse.Namespace) -> None:
+    ctx = context(args.accounts, args.with_calendar, args.calendars, imap=imap_factory())
+    gc.collect()
+    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+    print(f"baseline peak RSS {base:.0f} MiB (imports and fakes)", flush=True)
+    for call in range(1, args.calls + 1):
+        cpu = time.process_time()
+        started = time.monotonic()
+        notes = asyncio.run(list_call(ctx, args))
+        gc.collect()
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+        print(
+            f"call {call}: peak RSS {peak:.0f} MiB, CPU {time.process_time() - cpu:.1f} s, "
+            f"wall {time.monotonic() - started:.1f} s: {notes[0]}",
+            flush=True,
+        )
+    print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
+
+
 def cgroup(name: str) -> str:
     try:
         return Path("/sys/fs/cgroup", name).read_text().strip().replace("\n", ", ")
@@ -771,21 +865,36 @@ def main() -> None:
     global STRUCTURE_PARTS
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "--scenario", choices=[*sorted(SCENARIOS), "graph-message", "status", "thread", "thread-graph"], required=True
+        "--scenario",
+        choices=[*sorted(SCENARIOS), "graph-message", "status", "thread", "thread-graph", "list"],
+        required=True,
     )
     parser.add_argument(
         "--with-calendar",
         choices=sorted(SCENARIOS),
-        help="calendar scenario run next to graph-message, status, thread or thread-graph",
+        help="calendar scenario run next to graph-message, status, thread, thread-graph or list",
     )
     parser.add_argument("--accounts", type=int, default=1)
-    parser.add_argument("--parallel", type=int, default=1, help="concurrent status or thread calls per account")
+    parser.add_argument("--parallel", type=int, default=1, help="concurrent status, thread or list calls per account")
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
-    parser.add_argument("--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread)")
+    parser.add_argument(
+        "--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread, list)"
+    )
+    parser.add_argument(
+        "--summary-chunk",
+        type=int,
+        help="override SUMMARY_STRUCTURE_CHUNK_UIDS of the list scenario (to compare sizes)",
+    )
     args = parser.parse_args()
+    if args.summary_chunk is not None:
+        imap_module.SUMMARY_STRUCTURE_CHUNK_UIDS = args.summary_chunk
     if args.scenario == "status":
         status_main(args)
+        return
+    if args.scenario == "list":
+        STRUCTURE_PARTS = args.structure_parts
+        list_main(args)
         return
     if args.scenario in ("thread", "thread-graph"):
         STRUCTURE_PARTS = args.structure_parts

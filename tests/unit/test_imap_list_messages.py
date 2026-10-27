@@ -1013,6 +1013,95 @@ def test_unparsable_message_keeps_its_read_state(monkeypatch: pytest.MonkeyPatch
     assert page.complete is True
 
 
+def structure_fetches(server: FakeImapServer) -> list[list[int]]:
+    return [uids for uids, items in fetches(server) if "BODYSTRUCTURE" in items]
+
+
+def many(count: int) -> list[FakeMessage]:
+    return [msg(uid, uid, f"m{uid}") for uid in range(1, count + 1)]
+
+
+def test_pass_two_fetches_structures_in_chunks() -> None:
+    """A hostile BODYSTRUCTURE is parsed into nested lists before anything reduces it, so pass 2 never asks for more
+    than SUMMARY_STRUCTURE_CHUNK_UIDS of them in one FETCH (#44)."""
+    server = icloud(inbox=many(50))
+    page = run(server, query(limit=50))
+    chunks = structure_fetches(server)
+    assert len(page.items) == 50
+    assert page.complete is True
+    assert all(1 <= len(uids) <= imap.SUMMARY_STRUCTURE_CHUNK_UIDS for uids in chunks)
+    assert sorted(uid for uids in chunks for uid in uids) == list(range(1, 51))
+    assert len(chunks) == -(-50 // imap.SUMMARY_STRUCTURE_CHUNK_UIDS)
+    assert all(items == list(imap.LIST_SUMMARY_ITEMS) for uids, items in fetches(server) if "BODYSTRUCTURE" in items)
+
+
+def test_a_page_within_one_chunk_keeps_one_summary_fetch() -> None:
+    server = icloud(inbox=many(imap.SUMMARY_STRUCTURE_CHUNK_UIDS))
+    run(server, query())
+    assert len(structure_fetches(server)) == 1
+
+
+def test_recursion_error_degrades_only_its_uid_inside_its_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(10))
+    monkeypatch.setattr(server, "client", lambda: DeepStructureClient(server))  # UID 1 cannot be parsed
+    page = run(server, query())
+    degraded = [item for item in page.items if item.snippet_text == UNDECODABLE_NOTE]
+    assert [item.ref.uid for item in degraded] == [1]
+    assert len(page.items) == 10
+    assert page.complete is True
+    # UID 1 is the newest, so it sits in the first chunk: only that chunk falls back to single UIDs (1 itself fails
+    # alone and is never answered; its FLAGS are fetched alone)
+    chunk = imap.SUMMARY_STRUCTURE_CHUNK_UIDS
+    singles = [uids[0] for uids in structure_fetches(server) if len(uids) == 1]
+    assert sorted(singles) == list(range(2, chunk + 1))
+
+
+def test_a_reduction_error_degrades_to_the_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(3))
+    real, calls = imap.walk, []
+
+    def walk(structure: Sequence[object], section: str = "") -> object:
+        calls.append(section)
+        if len(calls) == 2:  # the second message of the page (UID 2: the newest is UID 1)
+            raise ValueError("odd structure")
+        return real(structure, section)
+
+    monkeypatch.setattr(imap, "walk", walk)
+    page = run(server, query())
+    assert [item.ref.uid for item in page.items if item.snippet_text == UNDECODABLE_NOTE] == [2]
+    assert len(page.items) == 3
+
+
+def test_soft_stop_between_structure_chunks_keeps_the_items_already_built() -> None:
+    """The soft limit passes before the second chunk of the archive: the inbox items built so far are returned."""
+
+    def second_archive_chunk(commands: Commands) -> int:
+        hits = [i for i, (name, arg) in enumerate(commands) if name == "UID FETCH" and "BODYSTRUCTURE" in arg[1]]  # type: ignore[index]
+        return hits[2]  # inbox chunk, archive chunk 1, archive chunk 2
+
+    def build() -> FakeImapServer:
+        return icloud(inbox=[msg(1, 1, "in")], archive=[msg(uid, 10 + uid, f"a{uid}") for uid in range(11, 11 + 8)])
+
+    _, page = soft_stop_before(build, query("all", limit=20), second_archive_chunk)
+    assert subjects(page) == ["in"]
+    assert (page.truncated, page.complete) == (True, False)
+
+
+@pytest.mark.parametrize("limit", [20, 50])
+@pytest.mark.parametrize("step", [0.3, 0.6])
+def test_whole_call_time_of_a_full_page(step: float, limit: int) -> None:
+    """Latency of a full page at `step` seconds per command (simulated clock); read with `pytest -s`."""
+    server = icloud(inbox=many(limit))
+    server.step_seconds = step
+    clock = clock_of(server)
+    start = clock()
+    page = box(server).list_messages(query(limit=limit), CallDeadline(start, 1000.0, 2000.0, clock))
+    chunk, count = imap.SUMMARY_STRUCTURE_CHUNK_UIDS, len(server.commands)
+    print(f"\nchunk={chunk} limit={limit} step={step}s commands={count} call={clock() - start:.1f}s")
+    assert len(page.items) == limit
+    assert page.complete is True
+
+
 def test_merged_all_logs_carry_no_message_id_folder_name_or_address(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = Capture()
     logger = logging.getLogger("mcp_hub")

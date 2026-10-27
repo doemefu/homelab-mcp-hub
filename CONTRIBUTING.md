@@ -83,6 +83,8 @@ It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` a
 
 `--scenario thread` and `--scenario thread-graph` drive `get_thread` through the IMAP fake and the in-process Graph transport: `thread` alternates a header-round thread with a subject-fallback thread (hostile 500-hit searches, 64 KiB bodies, 10,000-part BODYSTRUCTUREs; `--structure-parts` sets the part count), `thread-graph` the 2 MiB `uniqueBody` list or a refused list with a 2 MiB fallback list, then 20 single reads of about 2 MiB. `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 245 MiB, `oom_kill 0`; owner decision 2026-10-23). Re-run it after any change to the thread caps (hit, chunk and body sizes, the BODYSTRUCTURE chunk).
 
+`--scenario list` drives `list_messages` (folder `all`) and `list_unread`, 50 items each, through the IMAP fake: the inbox holds 50 unread messages with 10,000-part BODYSTRUCTUREs (`--structure-parts`). `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 230 MiB, `oom_kill` 0). `--summary-chunk <n>` overrides `SUMMARY_STRUCTURE_CHUNK_UIDS` to compare chunk sizes. Re-run it after any change to that constant or to what pass 2 of the list tools holds per message.
+
 ### IMAP probe
 
 `scripts/imap_probe.py --host <imap host>` is run by the owner on their own machine. It is read-only (an allowlist proxy, `EXAMINE` only), asks for the credentials at a prompt and writes nothing. It prints mailbox roles, counts and LIST/EXAMINE/SEARCH timings, including the bracketed Message-ID search (O35). Paste only the part after `--- result ---`; `--show-names` adds mailbox names, which are private.

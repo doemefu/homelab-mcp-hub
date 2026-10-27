@@ -98,6 +98,7 @@ from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, dec
 from mcp_hub.sanitize import html_to_text
 
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
+SUMMARY_STRUCTURE_CHUNK_UIDS: Final = 2  # BODYSTRUCTURE lines per pass-2 UID FETCH (#44; chosen at merge, see the PR)
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
 _GMAIL_SUMMARY_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: per-message folder and thread (§5.5)
 _SEEN: Final = b"\\seen"
@@ -212,34 +213,71 @@ class _Progress:
 Unparsable = dict[int, tuple[Exception, dict[bytes, object]]]
 
 
-def _fetch_summaries(
-    session: ImapSession, uids: list[int], items: Sequence[str], flag_items: Sequence[str]
-) -> tuple[dict[int, dict[bytes, object]], Unparsable]:
-    """Summary rows of `uids`. IMAPClient's recursive response parser raises RecursionError on a BODYSTRUCTURE
-    nested about 1000 deep; the batch is then fetched per UID, and a UID that fails alone is returned as unparsable,
-    with its `flag_items` (FLAGS; on Gmail also X-GM-LABELS) fetched alone, so only that message degrades (to a
-    placeholder with the right `unread` and folder). A UID whose FLAGS do not come back either is missing from both
-    results."""
-    if not uids:
-        return {}, {}
+@dataclass(frozen=True, slots=True)
+class _Structure:
+    """What the list needs of a BODYSTRUCTURE, reduced at once: the nested parse is dropped with its chunk."""
+
+    text_part: Part | None
+    has_attachments: bool
+
+
+Structures = dict[int, _Structure | Exception]  # an Exception: the reduction failed, the message degrades
+
+
+def _reduce_structure(row: dict[bytes, object]) -> _Structure | Exception:
     try:
-        return session.fetch(uids, items), {}
-    except RecursionError:
-        rows: dict[int, dict[bytes, object]] = {}
-        unparsable: Unparsable = {}
-        for uid in uids:
-            try:
-                rows.update(session.fetch([uid], items))
-            except RecursionError as exc:
-                flags = session.fetch([uid], flag_items).get(uid)
-                if flags is not None:
-                    unparsable[uid] = (exc, flags)
-        return rows, unparsable
+        parts = _structure(row)
+        text_part = choose_text_part(parts)
+        return _Structure(text_part, bool(attachment_parts(parts, text_part)))
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        return exc
+
+
+def _fetch_summaries(
+    session: ImapSession,
+    uids: list[int],
+    items: Sequence[str],
+    flag_items: Sequence[str],
+    soft_check: Callable[[], None],
+) -> tuple[dict[int, dict[bytes, object]], Structures, Unparsable]:
+    """Summary rows of `uids`, fetched SUMMARY_STRUCTURE_CHUNK_UIDS at a time, each chunk's BODYSTRUCTUREs reduced
+    at once (`_Structure`) and dropped from the rows, so a hostile structure never waits for 49 others (#44). The
+    soft limit is checked between chunks (reducing costs CPU without a command). IMAPClient's recursive response
+    parser raises RecursionError on a BODYSTRUCTURE nested about 1000 deep; that chunk is then fetched per UID, and
+    a UID that fails alone is returned as unparsable, with its `flag_items` (FLAGS; on Gmail also X-GM-LABELS)
+    fetched alone, so only that message degrades (to a placeholder with the right `unread` and folder). A UID whose
+    FLAGS do not come back either is missing from all results."""
+    rows: dict[int, dict[bytes, object]] = {}
+    structures: Structures = {}
+    unparsable: Unparsable = {}
+    for start in range(0, len(uids), SUMMARY_STRUCTURE_CHUNK_UIDS):
+        if start:
+            soft_check()
+        chunk = uids[start : start + SUMMARY_STRUCTURE_CHUNK_UIDS]
+        got: dict[int, dict[bytes, object]] = {}
+        try:
+            got = session.fetch(chunk, items)
+        except RecursionError:
+            for uid in chunk:
+                try:
+                    got.update(session.fetch([uid], items))
+                except RecursionError as exc:
+                    flags = session.fetch([uid], flag_items).get(uid)
+                    if flags is not None:
+                        unparsable[uid] = (exc, flags)
+        for uid, row in got.items():
+            structures[uid] = _reduce_structure(row)
+            row.pop(b"BODYSTRUCTURE", None)
+        rows.update(got)
+    return rows, structures, unparsable
 
 
 def _fetch_texts(
     session: ImapSession,
     rows: dict[int, dict[bytes, object]],
+    structures: Structures,
     length: int,
     refs: dict[int, MessageRef],
     soft_check: Callable[[], None],
@@ -248,15 +286,10 @@ def _fetch_texts(
     FETCH that fails without losing the connection or answering BAD leaves those snippets empty. The decode of
     each member checks the soft limit first (it costs CPU without a command)."""
     by_section: dict[str, list[tuple[int, Part]]] = {}
-    for uid, row in rows.items():
-        try:  # per UID: an empty or odd BODYSTRUCTURE leaves this snippet empty
-            part = choose_text_part(_structure(row))
-        except PASS_THROUGH:
-            raise
-        except Exception:  # noqa: S112 - the message is listed without a snippet
-            continue
-        if part is not None:
-            by_section.setdefault(part.section, []).append((uid, part))
+    for uid in rows:  # an odd or empty BODYSTRUCTURE (a failed reduction) leaves this snippet empty
+        structure = structures.get(uid)
+        if isinstance(structure, _Structure) and structure.text_part is not None:
+            by_section.setdefault(structure.text_part.section, []).append((uid, structure.text_part))
     texts: dict[int, str] = {}
     for section, members in by_section.items():
         try:
@@ -584,9 +617,9 @@ class ImapMailbox:
         gmail = session.gmail
         items = [*LIST_SUMMARY_ITEMS, *_GMAIL_SUMMARY_ITEMS] if gmail else list(LIST_SUMMARY_ITEMS)
         flag_items = ["FLAGS", _GMAIL_CANDIDATE_ITEM] if gmail else ["FLAGS"]
-        rows, unparsable = _fetch_summaries(session, uids, items, flag_items)
+        rows, structures, unparsable = _fetch_summaries(session, uids, items, flag_items, self._soft_check)
         refs = {c.candidate.uid: c.ref for c in group}
-        texts = _fetch_texts(session, rows, SNIPPET_FETCH_BYTES, refs, self._soft_check)
+        texts = _fetch_texts(session, rows, structures, SNIPPET_FETCH_BYTES, refs, self._soft_check)
         for chosen in group:
             self._soft_check()
             uid = chosen.candidate.uid
@@ -608,7 +641,9 @@ class ImapMailbox:
             if _is_draft(row) or _sent_since_pass_one(chosen, row):  # excluded now, like any draft or other direction
                 continue
             item_folder = folder or _gmail_folder(_labels(row))
-            out[chosen.ref] = self._summary(entry, item_folder, chosen, row, texts.get(uid, ""), gmail=gmail)
+            out[chosen.ref] = self._summary(
+                entry, item_folder, chosen, row, structures[uid], texts.get(uid, ""), gmail=gmail
+            )
 
     def _meta(
         self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, flags: frozenset[bytes], from_address: str | None
@@ -629,6 +664,7 @@ class ImapMailbox:
         folder: MailFolder,
         chosen: _Chosen,
         row: dict[bytes, object],
+        structure: _Structure | Exception,
         snippet: str,
         *,
         gmail: bool,
@@ -636,15 +672,15 @@ class ImapMailbox:
         flags = _flags(row)
         received = chosen.candidate.received_at
         try:  # one hostile message degrades to a placeholder, never fails the account
-            parts = _structure(row)
-            text_part = choose_text_part(parts)
+            if isinstance(structure, Exception):
+                raise structure
             parsed = parse_summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
             meta = self._meta(entry, folder, chosen, flags, parsed.from_address)
             return MailSummary(
                 ref=chosen.ref,
                 received_at=received,
                 unread=_SEEN not in flags,
-                has_attachments=bool(attachment_parts(parts, text_part)),
+                has_attachments=structure.has_attachments,
                 from_address=parsed.from_address,
                 from_name=parsed.from_name,
                 subject=parsed.subject,
