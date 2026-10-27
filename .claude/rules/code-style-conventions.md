@@ -1,3 +1,11 @@
+---
+paths:
+  - "src/**/*.py"
+  - "tests/**/*.py"
+  - "scripts/**"
+  - "pyproject.toml"
+---
+
 # Code Style & Conventions (Python)
 
 - Python 3.13, `from __future__` not needed; full type hints; `mypy --strict src` must pass; no `# type: ignore` without an error code and a reason.

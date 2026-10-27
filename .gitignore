@@ -25,8 +25,7 @@ dist/
 *.pem
 
 ### Claude Code ###
-# agents/, rules/, CLAUDE.md are tracked; memory, worklogs and worktrees are local-only.
-.claude/settings.json
+# settings.json, agent-context.md, agents/ (advisors), rules/ and CLAUDE.md are tracked; local settings, memory, worklogs and worktrees are local-only.
 .claude/settings.local.json
 .claude/**/.DS_Store
 /.claude/memory/
