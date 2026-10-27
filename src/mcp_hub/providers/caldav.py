@@ -768,7 +768,7 @@ def _with_cpu_deadline[T](func: Callable[[], T], seconds: float, cpu_clock: Call
     resume) made a 600-override series cost 0.45 s instead of 0.30 s and a normal object 0.73 ms instead of 0.54 ms
     (0.12 s / 0.31 ms without the hook); a no-match rule is still stopped at 2.0 s.
     Rejected alternative: a killable subprocess per expansion (memory in a
-    256 Mi pod, start-up cost per call)."""
+    320 Mi pod, start-up cost per call)."""
     deadline = cpu_clock() + seconds
     previous = sys.gettrace()
     events = 0
