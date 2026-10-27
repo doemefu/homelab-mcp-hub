@@ -114,12 +114,13 @@ EXTENDED_EXPAND: Final = (
     "singleValueExtendedProperties($filter=id eq 'Integer 0x1081' or id eq 'String 0x1042' or id eq 'String 0x1039')"
 )
 GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
-SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (owner decision, 2026-10-27)
+SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (D88)
 SEARCH_HALVED_TOP: Final = 50  # the one retry after a too_large answer
-# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probe P8, SEARCH_FACTS).
+# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probe P8, `SEARCH_FACTS` in
+# tests/support/graph_fixtures.py).
 SEARCH_EXPAND: Final = True
-READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (G5-3)
-FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)
+READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (D84)
+FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (D84)
 ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
 FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
 WELL_KNOWN_FOR: Final[dict[ListFolder, tuple[GraphWellKnown, ...]]] = {
@@ -444,7 +445,7 @@ def _folded_has(needle: str, text: str | None, cap: int) -> bool:
 
 
 def _participant_matches(needle: str, entry: object) -> bool:
-    """A name or a non-DN address of one Graph recipient value contains the folded needle (MF-D2)."""
+    """A name or a non-DN address of one Graph recipient value contains the folded needle (D84)."""
     name, address = _address(entry)
     if _folded_has(needle, name, _search.MATCH_NAME_CHARS):
         return True
@@ -456,7 +457,7 @@ def _participant_matches(needle: str, entry: object) -> bool:
 
 
 def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
-    """The hub-side `sender`, `recipient` and `subject` filters of `search_messages` (spec 080 §5.2, MF-D2).
+    """The hub-side `sender`, `recipient` and `subject` filters of `search_messages` (spec 080 §5.2, D84).
 
     Plain substring on `match_fold` of needle and candidate, never a pattern: `sender` = `from` name or non-DN
     address; `recipient` = any `toRecipients` entry (never Cc/Bcc); `subject` = its first 4,000 characters. The words
@@ -765,7 +766,8 @@ class GraphMailbox:
     def _search_messages(
         self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery
     ) -> FolderPage:
-        """`search_messages` with words: one mailbox-wide `$search` request, the hub applies the rest (spec 080 §6.5).
+        """`search_messages` with words: one mailbox-wide `$search` request, the hub applies the rest (spec 080 §6.5,
+        D88).
 
         Per hit: not a draft, parent in the requested folders, inside the window, after the position, the hub filters
         and the direction. Dropped hits still count toward the 100 (`result_cap`). A hit carries a `SearchHitRef`: the
@@ -793,7 +795,7 @@ class GraphMailbox:
                 continue
             if query.direction is not None and summary.meta.direction != query.direction:
                 continue
-            if summary.ref not in seen:  # a repeated returned id keeps its first entry (never by Message-ID, MF-R4)
+            if summary.ref not in seen:  # a repeated returned id keeps its first entry (never by Message-ID, D87)
                 seen.add(summary.ref)
                 found.append(summary)
         found.sort(key=order_key, reverse=True)

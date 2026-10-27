@@ -181,7 +181,7 @@ def _encoded_search_length(text: str) -> int:
 
 
 def graph_search_text(words: Sequence[str]) -> str | None:
-    """Allowlist sanitiser for Graph `$search` (O4-a): letters, marks, digits and `@ . _ - '` survive, lower-cased."""
+    """Allowlist sanitiser for Graph `$search` (D83): letters, marks, digits and `@ . _ - '` survive, lower-cased."""
     tokens = [token for word in words for token in _allowlist_tokens(word)]
     if len(tokens) > MAX_GRAPH_TOKENS:
         raise _refuse(GRAPH_QUERY_TOO_LONG)

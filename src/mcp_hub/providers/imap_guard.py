@@ -40,7 +40,7 @@ _PRINTABLE_TEXT: Final = re.compile(r"[\x20-\x7e]+")
 _STATUS_ERROR: Final = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)? command error: (NO|BAD)\b.*", re.DOTALL)
 _FAILED: Final = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)? failed: .*", re.DOTALL)
 
-# search_values: typed value tokens (D82, SEC-d1). Literal bytes are checked on the code points, the part re-check on
+# search_values: typed value tokens (D82). Literal bytes are checked on the code points, the part re-check on
 # the wire form.
 _SEARCH_KEYS: Final = frozenset(get_args(SearchKey))
 MAX_TEXT_VALUES: Final = MAX_SEARCH_WORDS  # at most 8 TEXT keys + one each of FROM, TO, SUBJECT
@@ -65,7 +65,7 @@ class ImapClientLike(Protocol):
     def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]: ...
     def search(self, criteria: bytes) -> list[int]: ...
     def has_capability(self, capability: str | bytes) -> bool: ...
-    # IMAPClient's private method: the only way to send several literals; used by `search_values` alone (T3).
+    # IMAPClient's private method: the only way to send several literals; used by `search_values` alone (D82).
     def _raw_command_untagged(
         self, command: bytes, args: list[bytes], *, uid: bool = True
     ) -> list[bytes | tuple[bytes, bytes]]: ...

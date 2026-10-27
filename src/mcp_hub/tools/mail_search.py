@@ -1,4 +1,4 @@
-"""search_messages (spec 080 §5.2, §5.5, §5.7 rev 4.14): the list pipeline of `list_messages` with search terms.
+"""search_messages (spec 080 §5.2, §5.5, §5.7 rev 4.15): the list pipeline of `list_messages` with search terms.
 
 Every argument is validated before any provider call; a refused value is never echoed and never logged."""
 
@@ -150,7 +150,7 @@ async def run_search_messages(
         position=position,
         search=terms,
     )
-    # A `$search` hit's id is not an immutable id (owner decision A): the `ref` is the handle. The filter-only path
+    # A `$search` hit's id is not an immutable id (D87): the `ref` is the handle. The filter-only path
     # reads the list request and keeps its ids.
     hide_ids = graph_ids if terms.words else set()
 

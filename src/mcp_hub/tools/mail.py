@@ -330,8 +330,8 @@ def window_start(
     max_age: timedelta = SINCE_MAX_AGE,
 ) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
-    the same on every page); by default now - 24 h; at most 30 days back, at most 60 s ahead (search_messages passes
-    its own default and age limit; the error text names the limit).
+    the same on every page); by default now - 24 h; at most `max_age` back (30 days by default), at most 60 s ahead
+    (search_messages passes its own default and age limit; the error text names the limit).
 
     Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
     but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the

@@ -1,4 +1,4 @@
-"""search_messages (spec 080 §5.2, §5.5, §5.7 rev 4.14): validation before any provider call, cursor binding,
+"""search_messages (spec 080 §5.2, §5.5, §5.7 rev 4.15): validation before any provider call, cursor binding,
 `incomplete_accounts`, Graph hits without an `id`, and the cursor rules."""
 
 import base64

@@ -49,7 +49,7 @@ class GraphMessageRef:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class SearchHitRef(GraphMessageRef):
-    """The regular (not immutable) id a Graph `$search` returned: an internal order key only (owner decision A).
+    """The regular (not immutable) id a Graph `$search` returned: an internal order key only (D87).
 
     Never exposable: `location_id` gives None, so it is no `id` and no log `item`; it is never used for a request."""
 

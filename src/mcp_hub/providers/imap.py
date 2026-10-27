@@ -231,7 +231,7 @@ class _Progress:
 
     def refuse(self) -> None:
         """The folder could not be searched (NO, no UIDVALIDITY, name too long): it counts as searched for the cursor
-        (ruling 4)."""
+        (D85)."""
         self.complete = False
         self.incomplete.add("search_refused")
         self.truncated = self.truncated or self.searching
@@ -331,7 +331,7 @@ def _fetch_texts(
 
 
 def _soft_stopped_page(progress: _Progress | None = None) -> FolderPage:
-    """Nothing read past the stop; the reasons collected before it stay (ruling 3)."""
+    """Nothing read past the stop; the reasons collected before it stay (D85)."""
     reasons: set[IncompleteReason] = {"time_limit"} if progress is None else {*progress.incomplete, "time_limit"}
     return FolderPage(items=[], more=False, truncated=True, complete=False, incomplete=frozenset(reasons))
 
@@ -518,7 +518,7 @@ class ImapMailbox:
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
-            progress.refuse()  # no cursor (S-p); for a search the cursor rule of ruling 4 applies
+            progress.refuse()  # a refused folder counts as searched for the cursor of a search (D85)
             return []
         newest = sorted(set(found), reverse=True)
         if len(newest) > MAX_SEARCH_CANDIDATES:

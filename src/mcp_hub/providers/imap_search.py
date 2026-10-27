@@ -3,10 +3,11 @@
 Every ASCII value goes out as a hub-built quoted string; the whole criteria is one printable-ASCII `bytes` value for
 `GuardedImapClient.search`, which IMAPClient 4.1.0 sends unchanged. IMAPClient's per-item quoting is not used: it
 leaves atom-special values such as `a(b)@x` unquoted. ASCII values that cannot be a quoted string (`"`, `\\`, control
-characters) are refused, never escaped. The search words of `search_messages` are the one exception for non-ASCII
-text: `GuardedImapClient.search_values` sends such a value as one synchronising literal with `CHARSET UTF-8`, never
-refused and never as `{N+}`; the normaliser removed `"` and `\\` from every value beforehand, and still nothing is
-escaped. Every other builder here stays ASCII-only.
+characters) are refused, never escaped. The search values of `search_messages` (the query words and the `sender`,
+`recipient` and `subject` filters) are the one exception for non-ASCII text: `GuardedImapClient.search_values` sends
+such a value as one synchronising literal with `CHARSET UTF-8`, never refused and never as `{N+}`; the normaliser
+removed `"` and `\\` from every value beforehand, and still nothing is escaped. Every other builder here stays
+ASCII-only.
 
 Header searches on the msg-id fields send the bracketed token `"<id>"` (O35): iCloud matches them against whole
 `<...>` tokens only, so a bare id finds nothing there, while RFC 3501 substring servers match `"<id>"` as well.
