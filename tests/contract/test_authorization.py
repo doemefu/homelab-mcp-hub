@@ -49,6 +49,7 @@ def test_valid_token_modern_protocol_list_and_call(client: TestClient, tokens: T
         "list_accounts",
         "list_messages",
         "list_unread",
+        "search_messages",
     ]
     get_message = next(t for t in body(listed)["result"]["tools"] if t["name"] == "get_message")
     assert {"id", "ref", "max_chars"} <= set(get_message["inputSchema"]["properties"])  # rev. 4.9: id or ref
@@ -84,6 +85,7 @@ def test_valid_token_handshake_protocol_initialize_then_list(client: TestClient,
         "list_accounts",
         "list_messages",
         "list_unread",
+        "search_messages",
     ]
 
 

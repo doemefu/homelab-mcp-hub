@@ -1,6 +1,8 @@
+import base64
 import json
 import logging
 import time
+import urllib.parse
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,9 +13,12 @@ from starlette.testclient import TestClient
 
 from mcp_hub.app import create_app
 from mcp_hub.config import Settings
+from mcp_hub.cursors import argument_digest
 from mcp_hub.ids import GraphMessageRef, MessageRef, encode_ref, location_id
 from mcp_hub.logging import JsonFormatter, configure_logging
 from mcp_hub.providers import Adapters
+from mcp_hub.providers.base import FolderPage, ListQuery, MailMeta, MailSummary, ProviderError, order_key
+from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap import ImapMailbox
 from mcp_hub.registry import Account, load_registry
 from tests.support.imap_fake import FakeFolder, FakeImapServer, FakeMessage
@@ -358,3 +363,131 @@ def test_get_thread_log_fields_allowed(settings: Settings, secrets_dir: Path, to
     text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
     for value in sorted(forbidden):
         assert value not in text, value
+
+
+class _SearchMailbox:
+    """Adapter stand-in for search_messages: two matches, one page at a time; records nothing it is given."""
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+
+    def check(self, deadline: CallDeadline) -> None: ...
+
+    def get_message(self, ref: object, deadline: CallDeadline) -> Any:
+        raise ProviderError("not_found")
+
+    def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
+        now = datetime.now(UTC)
+        found = [
+            MailSummary(
+                ref=MessageRef(self.account, "INBOX", 7, uid),
+                received_at=now - timedelta(minutes=uid),
+                unread=True,
+                has_attachments=False,
+                from_address="sentinel-from@example.test",
+                from_name="Sentinel",
+                subject="sentinel-subject-9x",
+                snippet_text="sentinel-snippet-9x",
+                meta=MailMeta(message_id=f"sentinel{uid}-9x@example.test"),
+            )
+            for uid in (1, 2)
+        ]
+        found = sorted(found, key=order_key, reverse=True)
+        found = [m for m in found if query.position is None or query.position.precedes(*order_key(m))]
+        page = found[: query.limit]
+        return FolderPage(page, more=len(found) > query.limit, truncated=False, complete=True)
+
+
+def _search_hub(settings: Settings, secrets_dir: Path) -> Any:
+    for ref in ("gmail-username", "gmail-app-password"):
+        (secrets_dir / ref).write_text("placeholder")
+    configure_logging(settings.log_level)
+    return create_app(
+        settings,
+        load_registry(secrets_dir / "accounts.json"),
+        adapters=Adapters(mailbox=lambda account, _dir: _SearchMailbox(account.id)),
+    )
+
+
+def test_search_messages_log_fields_allowed(settings: Settings, secrets_dir: Path, tokens: TokenFactory) -> None:
+    """Spec 080 §9.7 for search_messages through the MCP endpoint: a search, a cursor page, a non-ASCII sender and a
+    refused query log only allowed fields, one `tool_call` line each, and no query, filter value, cursor, address,
+    subject or Message-ID."""
+    hub = _search_hub(settings, secrets_dir)
+    handler = Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        with TestClient(hub.public, base_url="https://mcp.furchert.ch") as client:
+            first = _call(client, tokens, "search_messages", {"query": "zqxvwordone", "account": "icloud", "limit": 1})
+            cursor = first["structuredContent"]["next_cursor"]
+            args = {"query": "zqxvwordone", "account": "icloud", "limit": 1, "cursor": cursor}
+            calls = {
+                "first": first,
+                "second": _call(client, tokens, "search_messages", args),
+                "sender": _call(client, tokens, "search_messages", {"sender": "zqxmüllerfilter", "account": "gmail"}),
+                "refused": _call(client, tokens, "search_messages", {"query": "zqxrefused OR other"}),
+            }
+    finally:
+        logging.getLogger().removeHandler(handler)
+    assert cursor
+    assert [calls[name].get("isError", False) for name in calls] == [False, False, False, True]
+    events = [json.loads(line) for line in handler.lines]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    search_calls = [e for e in events if e["event"] == "tool_call" and e["tool"] == "search_messages"]
+    assert [(e["outcome"], e["accounts"], e["result_count"]) for e in search_calls] == [
+        ("ok", ["icloud"], 1),
+        ("ok", ["icloud"], 1),
+        ("ok", ["gmail"], 2),
+        ("invalid_argument", [], 0),
+    ]
+    forbidden = {cursor, "zqxvwordone", "zqxmüllerfilter", "zqxrefused", "sentinel", "example.test"}
+    text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
+    for value in sorted(forbidden):
+        assert value not in text, value
+
+
+def test_search_logs_no_canary_at_debug(settings: Settings, secrets_dir: Path, tokens: TokenFactory) -> None:
+    """SEC-d8 at the tool layer with `LOG_LEVEL=DEBUG` and the production logger configuration: canaries in query,
+    sender, recipient, subject and cursor (ASCII and one non-ASCII word) appear in no record, in any encoding,
+    neither does an argument digest; the IMAP client loggers stay at WARNING or above (V7)."""
+    assert settings.log_level == "DEBUG"
+    hub = _search_hub(settings, secrets_dir)
+    for name in ("imapclient", "imapclient.imapclient", "imapclient.imaplib"):
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, name
+    canaries = ["zqxcanaryquery", "zqxcanarysender", "zqxcanaryrecipient", "zqxcanarysubject", "zqxcanarymüller"]
+    arguments = {
+        "query": f"{canaries[0]} {canaries[4]}",
+        "sender": canaries[1],
+        "recipient": canaries[2],
+        "subject": canaries[3],
+        "account": "icloud",
+        "limit": 1,
+    }
+    handler = Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        with TestClient(hub.public, base_url="https://mcp.furchert.ch") as client:
+            first = _call(client, tokens, "search_messages", arguments)
+            cursor = first["structuredContent"]["next_cursor"]
+            _call(client, tokens, "search_messages", arguments | {"cursor": cursor})
+            _call(client, tokens, "search_messages", arguments | {"query": "zqx:canaryoperator"})
+            _call(client, tokens, "search_messages", arguments | {"cursor": "c1.zqxcanarycursor.zqx"})
+            _call(client, tokens, "search_messages", arguments | {"sender": "zqxcanary\u0000"})
+    finally:
+        logging.getLogger().removeHandler(handler)
+    digest = argument_digest(
+        {n: arguments.get(n) for n in ("account", "query", "sender", "recipient", "subject", "folder", "since")}
+    )
+    needles = set(canaries) | {"zqxcanaryoperator", "zqxcanarycursor", digest, cursor}
+    for canary in list(needles):
+        needles.update(
+            {
+                repr(canary.encode()),
+                urllib.parse.quote(canary),
+                base64.urlsafe_b64encode(canary.encode()).decode().rstrip("="),
+            }
+        )
+    text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
+    assert handler.raw
+    for needle in sorted(needles):
+        assert needle not in text, needle

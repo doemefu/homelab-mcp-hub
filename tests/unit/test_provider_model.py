@@ -72,7 +72,8 @@ def test_order_key_of_is_the_order_key_from_its_parts() -> None:
 def test_folder_page_frontier_defaults_to_none() -> None:
     page = FolderPage(items=[], more=False, truncated=False, complete=True)
     assert page.frontier is None
-    assert list(FolderPage.__dataclass_fields__)[-2:] == ["frontier", "incomplete"]
+    assert list(FolderPage.__dataclass_fields__)[-3:] == ["frontier", "incomplete", "refused_only"]
+    assert page.refused_only is False
 
 
 @pytest.mark.parametrize(
