@@ -153,7 +153,8 @@ EXPECTED_SEARCH_DESCRIPTION = (
     "items, even none: if `next_cursor` is set, repeat the call with identical arguments plus `cursor` (valid 1 h). "
     "`incomplete_accounts` names accounts whose matches may be missing even after every page (`result_cap`: more "
     "matches than the provider returns; Outlook returns at most 100 hits per account and call for a `query`: use "
-    "other or more specific `query` words, since `since` and the filters do not change that request; on iCloud and "
+    "only other or more specific `query` words help, since `since` and the filters do not change that request; on "
+    "iCloud and "
     "Gmail narrow `since` or add filters; `search_refused`: a folder could not be searched; `time_limit`; "
     "`changed_during_call`: mail changed while it was read, repeat the call); never conclude absence. "
     "Store `ref` as the stable key and open a message with get_message(`ref`); `id` can be null (always for "
@@ -185,9 +186,9 @@ def test_search_messages_schema(wired: TestClient, tokens: TokenFactory) -> None
     assert output["properties"]["incomplete_accounts"]["description"] == INCOMPLETE_ACCOUNTS_DESCRIPTION
     assert INCOMPLETE_ACCOUNTS_DESCRIPTION == (
         "Accounts whose matches may be missing even after every page. For `result_cap` on iCloud or Gmail narrow "
-        "`since` or add filters for that account; on Outlook use other or more specific `query` words (`since` and "
-        "the filters do not change the Outlook request); for `changed_during_call` repeat the call; never conclude "
-        "absence."
+        "`since` or add filters for that account; for an Outlook account only other or more specific `query` "
+        "words help (`since` and the filters do not change the Outlook request); for `changed_during_call` repeat "
+        "the call; never conclude absence."
     )
     description = tool["description"]
     assert description == SEARCH_MESSAGES_DESCRIPTION == EXPECTED_SEARCH_DESCRIPTION

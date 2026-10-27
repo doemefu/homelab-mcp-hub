@@ -613,6 +613,19 @@ def test_search_values_refusals_send_nothing(case: str) -> None:
         assert recorder.literals == []
 
 
+def test_literal_of_exactly_800_bytes_and_a_total_of_exactly_4096_are_accepted() -> None:
+    """G7: the accepting side of both caps (`"\U0001f600" * 200` is 800 UTF-8 bytes)."""
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(hub_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.search_values(_NOT_DRAFT, [("TEXT", "\U0001f600" * 200)])
+        assert recorder.literals == [("\U0001f600" * 200).encode()]
+        ascii_values = [("TEXT", "a" * 512)] * 8  # 8 x 512 = 4,096 value bytes, quoted strings
+        guard.search_values(_NOT_DRAFT, ascii_values)
+        with pytest.raises(ImapCommandRefused):
+            guard.search_values(_NOT_DRAFT, [*ascii_values[:7], ("TEXT", "a" * 512), ("FROM", "b")])  # 4,097
+
+
 @pytest.mark.parametrize("values", [["ü"], ["word", "ü"]], ids=["non-ascii", "mixed"])
 def test_literal_path_is_refused_for_a_client_that_answers_literal_plus(values: list[str]) -> None:
     """F3 (D82): the guard does not trust its factory. A plain IMAPClient would send `{N+}` to this server."""
