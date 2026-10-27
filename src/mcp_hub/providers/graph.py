@@ -22,7 +22,6 @@ from urllib.parse import quote, urlsplit
 import httpx2
 
 from mcp_hub import search as _search  # the module: `search` imports providers.base, so names would cycle
-from mcp_hub.errors import ToolError
 from mcp_hub.ids import (
     GRAPH_ID,
     MESSAGE_ID_PATTERN,
@@ -148,7 +147,11 @@ _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anythin
 _LEGACY_DN: Final = re.compile(r"/O=[^/@]+(?:/OU=[^/@]+)*/CN=RECIPIENTS/CN=[^/@]+", re.IGNORECASE)  # fullmatch (T17)
 _PLAIN_ADDRESS: Final = re.compile(r"[^@\s]+@[^@\s]+")  # fullmatch: one "@", no whitespace
 _DN_ADDRESS: Final = re.compile(r"\s*/O=", re.IGNORECASE)  # match: an Exchange DN, never a participant (gr-G4)
-_SEARCH_REJECTED: Final = "SearchRejected"  # log cause of a 404 or unmapped status on the search request (GR5)
+# Log causes of the `$search` request: a 400 (the syntax was refused), a 404, and any other unmapped status (5xx) as
+# `_UNEXPECTED_STATUS`, so that an operator can tell a sanitiser gap from an outage (spec 080 §6.5, D88).
+_SEARCH_REJECTED: Final = "SearchRejected"
+_SEARCH_NOT_FOUND: Final = "SearchNotFound"
+_EMPTY_SEARCH_TEXT: Final = "EmptySearchText"  # the tool layer refuses words with no searchable text first
 _UNEXPECTED_STATUS: Final = "UnexpectedStatus"  # `_get`'s cause for a status it does not map (G-R7)
 # The get_thread list falls back on these causes too: any status but 2xx, 401, 403, 404, 429 and 503 (SG1, Q7).
 _FALLBACK_CAUSES: Final = frozenset({_UNEXPECTED_STATUS, "Redirect"})
@@ -482,8 +485,8 @@ def _search_requests(ids: GraphFolderIds, query: ListQuery) -> tuple[str, dict[s
     do not combine with `$search`, so window, order and folders are applied per hit."""
     terms = query.search
     text = None if terms is None else _search.graph_search_text(terms.words)
-    if text is None:
-        raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
+    if text is None:  # the tool refuses this first (`invalid_argument`); reaching here is a hub defect
+        raise ProviderError("upstream_error", _EMPTY_SEARCH_TEXT)
     params = {"$search": f'"{text}"', "$top": str(SEARCH_TOP), "$select": SUMMARY_SELECT}
     if SEARCH_EXPAND:
         params["$expand"] = EXTENDED_EXPAND
@@ -494,10 +497,6 @@ def _search_requests(ids: GraphFolderIds, query: ListQuery) -> tuple[str, dict[s
 def _by_id(ref: object) -> TypeGuard[GraphMessageRef]:
     """A Graph reference a by-id read may use: never a `SearchHitRef` (its id is a regular id, D87: never a GET)."""
     return isinstance(ref, GraphMessageRef) and not isinstance(ref, SearchHitRef)
-
-
-def _has_filters(terms: SearchTerms | None) -> bool:
-    return terms is not None and (terms.sender is not None or terms.recipient is not None or terms.subject is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,7 +561,15 @@ class GraphMailbox:
             raise _provider_error(exc) from None
 
     def _get(
-        self, client: httpx2.Client, token: str, deadline: CallDeadline, path: str, params: dict[str, str], cap: int
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        path: str,
+        params: dict[str, str],
+        cap: int,
+        *,
+        bad_request_cause: str | None = None,
     ) -> dict[str, object]:
         deadline.before_command()  # hard limit: upstream_timeout; soft stop: SoftStop (§5.4)
         now = self._clock()
@@ -608,6 +615,8 @@ class GraphMailbox:
                     self._account, self._clock(), retry_after_seconds(response.headers.get("retry-after"))
                 )
                 raise ProviderError("upstream_error", "Throttled")
+            if status == 400 and bad_request_cause is not None:
+                raise ProviderError("upstream_error", bad_request_cause)
             raise ProviderError("upstream_error", _UNEXPECTED_STATUS)
 
     def _folder_ids(
@@ -677,8 +686,10 @@ class GraphMailbox:
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         if query.search is not None and query.search.words:
-            if _search.graph_search_text(query.search.words) is None:  # refused here, not wrapped as a provider error
-                raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
+            if (
+                _search.graph_search_text(query.search.words) is None
+            ):  # the tool refuses this first (`invalid_argument`)
+                raise ProviderError("upstream_error", _EMPTY_SEARCH_TEXT)
             search = self._search_messages
         else:
             search = self._list_messages
@@ -761,8 +772,8 @@ class GraphMailbox:
         except SoftStop:
             return _soft_stopped_page(query)
         except ProviderError as exc:
-            if exc.code == "not_found" or (exc.code == "upstream_error" and exc.cause == _UNEXPECTED_STATUS):
-                raise ProviderError("upstream_error", _SEARCH_REJECTED) from None
+            if exc.code == "not_found":
+                raise ProviderError("upstream_error", _SEARCH_NOT_FOUND) from None
             raise
         found: list[MailSummary] = []
         seen: set[AnyMessageRef] = set()
@@ -793,12 +804,22 @@ class GraphMailbox:
         never followed. A too_large answer is repeated once with `$top` halved; a second one fails the account."""
         top = SEARCH_TOP
         try:
-            body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
+            body = self._get(
+                client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES, bad_request_cause=_SEARCH_REJECTED
+            )
         except ProviderError as exc:
             if exc.code != "too_large":
                 raise
             top = SEARCH_HALVED_TOP
-            body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
+            body = self._get(
+                client,
+                token,
+                deadline,
+                path,
+                params | {"$top": str(top)},
+                MAX_LIST_RESPONSE_BYTES,
+                bad_request_cause=_SEARCH_REJECTED,
+            )
         values = body.get("value")
         if not isinstance(values, list):
             raise ProviderError("upstream_error", "MalformedList")
@@ -831,11 +852,10 @@ class GraphMailbox:
         more = truncated = False
         complete = True
         incomplete: set[IncompleteReason] = set()
-        read_on = query.search is not None and not query.search.words  # filter-only search (ruling 5, GR1)
-        for name in WELL_KNOWN_FOR[query.folder]:
-            folder_id = ids.ids.get(name)
-            if folder_id is None:
-                continue  # the account has no such folder (404 when the ids were read)
+        read_on = query.search is not None and not query.search.words  # filter-only search (D84)
+        plan = [(name, folder_id) for name in WELL_KNOWN_FOR[query.folder] if (folder_id := ids.ids.get(name))]
+        for position, (_, folder_id) in enumerate(plan):  # a folder the account lacks (404 on the ids) is not planned
+            throttled = False
             mine: dict[AnyMessageRef, MailSummary] = {}  # the re-read frontier second is counted once
             current, base, previous, requests = params, params, None, 0
             answer: _FolderAnswer | None = None
@@ -848,9 +868,12 @@ class GraphMailbox:
                             client, token, deadline, folder_id, current, query, ids, previous, retry
                         )
                     except ProviderError as exc:
-                        if exc.code != "too_large" or answer is None:
+                        # Past the first answer a read-on request may fail without losing what was read: too_large
+                        # (no retry allowed here) and a throttled answer (the back-off keeps the next call away).
+                        throttled = exc.code == "upstream_error" and exc.cause == "Throttled"
+                        if answer is None or not (exc.code == "too_large" or throttled):
                             raise
-                        break  # a retry is not allowed here: the last frontier stands
+                        break  # the last frontier stands
                     requests += answer.gets
                     if answer.stuck:
                         break
@@ -885,6 +908,11 @@ class GraphMailbox:
             if answer.frontier is not None:
                 more = True
                 floor = answer.frontier if floor is None else max(floor, answer.frontier)
+            if throttled and position + 1 < len(plan):
+                # The later folders were never read: a cursor at this frontier would skip their newer items.
+                truncated, complete = True, False
+                incomplete.add("time_limit")
+                break
         if floor is not None:
             found = [summary for summary in found if order_key(summary)[0] > floor]
         if query.direction is not None:
@@ -989,6 +1017,10 @@ class GraphMailbox:
         try:
             if query.search is not None and not graph_filters_match(raw, query.search):
                 return key, None  # the key still feeds the frontier
+        except Exception as exc:  # the filter could not be evaluated: a hit that may not match is not listed
+            log_message_skipped(ref, "mail", exc)
+            return key, None
+        try:  # past the filters the hit is confirmed: a failing summary becomes a placeholder, never a dropped match
             name, address = _address(raw.get("from"))
             return key, MailSummary(
                 ref=ref,
@@ -1005,8 +1037,6 @@ class GraphMailbox:
             )
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
-            if _has_filters(query.search):
-                return key, None  # a placeholder never matches a given filter
             listed = _listed_folder(folder)
             meta = MailMeta(folder=listed, direction="outgoing" if listed == "sent" else "incoming")
             return key, placeholder_summary(ref, received, unread, meta)

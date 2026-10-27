@@ -27,7 +27,7 @@ from mcp_hub.providers.base import (
 )
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.registry import TOKEN_STORE_REFS, Account, load_registry
-from mcp_hub.search import EMPTY_GRAPH_QUERY
+from mcp_hub.search import EMPTY_GRAPH_QUERY, GRAPH_QUERY_TOO_LONG, VALUE_TOO_LONG
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE
 from mcp_hub.tools.mail import run_get_message, run_list_messages
@@ -255,6 +255,25 @@ async def test_empty_graph_query_does_not_apply_without_a_graph_account(secrets_
     with pytest.raises(ToolError) as unknown:
         await run(context(secrets_dir, fake), query="a", account="nobody")
     assert unknown.value.code == "unknown_account"
+
+
+async def test_graph_query_too_long_is_refused_at_the_tool_layer(secrets_dir: Path) -> None:
+    """G2: 35 distinct tokens exceed Graph's 32; the tool refuses before any adapter call, so the call is not a partial
+    result with an `outlook` `upstream_error`."""
+    fake = Fake()
+    with pytest.raises(ToolError) as caught:
+        await run(context(secrets_dir, fake), query=" ".join(f"w{n}/b/c/d/e" for n in range(7)))
+    assert (caught.value.code, caught.value.message) == ("invalid_argument", GRAPH_QUERY_TOO_LONG)
+    assert fake.queries == []
+
+
+async def test_value_over_the_guard_bytes_after_nfc_is_refused_before_any_provider_call(secrets_dir: Path) -> None:
+    """The guard would refuse the 1,600 bytes mid-call and the account would show as unhealthy."""
+    fake = Fake()
+    with pytest.raises(ToolError) as caught:
+        await run(context(secrets_dir, fake), subject="\U0001d15e" * 200)
+    assert (caught.value.code, caught.value.message) == ("invalid_argument", VALUE_TOO_LONG)
+    assert fake.queries == []
 
 
 async def test_empty_graph_check_only_applies_to_words(secrets_dir: Path) -> None:

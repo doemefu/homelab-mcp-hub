@@ -16,9 +16,11 @@ from mcp_hub.providers.base import (
     SearchKey,
     SearchTerms,
 )
+from mcp_hub.providers.imap_guard import MAX_LITERAL_BYTES, MAX_VALUE_BYTES
 from mcp_hub.sanitize import without_surrogates
 
 __all__ = [
+    "VALUE_TOO_LONG",
     "IncompleteReason",
     "SearchKey",
     "SearchTerms",
@@ -30,6 +32,9 @@ __all__ = [
 ]
 
 MAX_VALUE_CHARS: Final = 200
+# The IMAP guard's limits on the normalised values (D82): refused here so that user input is never an account error.
+MAX_VALUE_BYTES_EACH: Final = MAX_LITERAL_BYTES
+MAX_TOTAL_BYTES: Final = MAX_VALUE_BYTES
 MAX_QUERY_WORDS: Final = MAX_SEARCH_WORDS
 # Names of the search operators of Gmail, Graph and Outlook; a query word starting with one plus ":" is refused.
 OPERATOR_PREFIXES: Final = (
@@ -46,6 +51,7 @@ MATCH_SUBJECT_CHARS: Final = 4000
 MATCH_NAME_CHARS: Final = 1000
 
 VALUE_RULES: Final = "query, sender, recipient and subject must be 1 to 200 characters without control characters"
+VALUE_TOO_LONG: Final = "A search value is too long once normalised"
 NO_TERMS: Final = "Pass query or at least one of sender, recipient, subject"
 TOO_MANY_WORDS: Final = "query takes at most 8 words"
 OPERATOR_REFUSED: Final = "query takes plain words; use the sender, recipient and subject arguments"
@@ -102,12 +108,18 @@ def parse_search_terms(
             raise _refuse(TOO_MANY_WORDS)
         for word in words:
             _check_operators(word)
-    return SearchTerms(
+    terms = SearchTerms(
         words=tuple(words),
         sender=None if sender is None else normalise_value(sender, "sender"),
         recipient=None if recipient is None else normalise_value(recipient, "recipient"),
         subject=None if subject is None else normalise_value(subject, "subject"),
     )
+    sizes = [
+        len(value.encode("utf-8")) for value in (*terms.words, terms.sender, terms.recipient, terms.subject) if value
+    ]
+    if any(size > MAX_VALUE_BYTES_EACH for size in sizes) or sum(sizes) > MAX_TOTAL_BYTES:
+        raise _refuse(VALUE_TOO_LONG)
+    return terms
 
 
 def _allowlist_tokens(word: str) -> list[str]:

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import httpx2
 import pytest
 
+from mcp_hub import search
 from mcp_hub.errors import ToolError
 from mcp_hub.providers.base import FolderPage, ListQuery
 from mcp_hub.providers.folders import ListFolder
@@ -15,6 +16,7 @@ from mcp_hub.search import (
     MAX_GRAPH_ENCODED_CHARS,
     OPERATOR_PREFIXES,
     RESERVED_TEXT,
+    VALUE_TOO_LONG,
     SearchTerms,
     graph_search_text,
     imap_value_keys,
@@ -337,3 +339,31 @@ def test_gmail_text_value_has_no_dash_after_a_space_or_at_the_start() -> None:
         [(_, value)] = imap_value_keys(SearchTerms((word,), None, None, None), gmail=True) or [("TEXT", "")]
         assert not value.startswith("-")
         assert " -" not in value
+
+
+# --- post-normalisation byte bounds (the guard's limits, refused at the tool layer) ---------------------------------
+
+
+@pytest.mark.parametrize("field", ["query", "sender", "recipient", "subject"])
+def test_value_over_800_bytes_after_nfc_is_refused(field: str) -> None:
+    value = "\U0001d15e" * 200  # 200 code points, 400 after NFC, 1,600 UTF-8 bytes
+    arguments: dict[str, object] = {"query": None, "sender": None, "recipient": None, "subject": None}
+    arguments[field] = value
+    with pytest.raises(ToolError) as caught:
+        parse_search_terms(**arguments)  # type: ignore[arg-type]
+    assert (caught.value.code, caught.value.message) == ("invalid_argument", VALUE_TOO_LONG)
+
+
+def test_value_of_exactly_800_bytes_is_accepted() -> None:
+    assert parse_search_terms(query=None, sender="\U0001f600" * 200, recipient=None, subject=None).sender
+
+
+def test_total_of_all_values_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Four values of at most 800 bytes cannot reach the guard's 4,096, so the sum is checked as a guard against
+    the constants drifting apart: lower the limit and the same input is refused."""
+    wide = "\U0001f600" * 200
+    assert parse_search_terms(query=None, sender=wide, recipient=wide, subject=wide)
+    monkeypatch.setattr(search, "MAX_TOTAL_BYTES", 2000)
+    with pytest.raises(ToolError) as caught:
+        parse_search_terms(query=None, sender=wide, recipient=wide, subject=wide)
+    assert caught.value.message == VALUE_TOO_LONG

@@ -543,7 +543,11 @@ class ImapMailbox:
             if count and count % SOFT_CHECK_EVERY == 0:
                 self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
             row = rows.get(uid)
-            if row is None or _is_draft(row):  # FETCH NO, expunged meanwhile, or a draft (S1)
+            if row is None:  # FETCH NO or expunged meanwhile: a search hit would vanish with no signal (D85)
+                if progress.searching:
+                    progress.lose("changed_during_call")
+                continue
+            if _is_draft(row):  # S1
                 continue
             if sent_mailbox and _LABEL_INBOX in _labels(row):
                 continue

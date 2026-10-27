@@ -382,11 +382,14 @@ def test_search_filter_values_never_reach_a_url() -> None:
         assert canary not in urls
 
 
-def test_search_empty_graph_text_is_invalid_argument_before_any_request() -> None:
+def test_search_empty_graph_text_reaching_the_adapter_is_an_honest_provider_error() -> None:
+    """The tool refuses this up front (`invalid_argument`); if it ever got here, the account fails with its own cause
+    and nothing is requested."""
     clock = FakeClock()
     server = searching()
-    with pytest.raises(ToolError):
+    with pytest.raises(ProviderError) as caught:
         found(mailbox(server, clock=clock), squery(swords("--", "***")), clock)
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", "EmptySearchText")
     assert server.requests == []
 
 
@@ -494,14 +497,17 @@ def test_search_pages_within_the_hits_with_identical_requests() -> None:
     assert len({tuple(sorted(r.url.params.items())) for r in searches(server)}) == 1
 
 
-@pytest.mark.parametrize("status", [404, 400])
-def test_search_rejected_is_an_account_error_without_retry(status: int) -> None:
+@pytest.mark.parametrize(
+    ("status", "cause"),
+    [(400, "SearchRejected"), (404, "SearchNotFound"), (500, "UnexpectedStatus"), (502, "UnexpectedStatus")],
+)
+def test_search_failure_causes_are_distinct_and_never_retried(status: int, cause: str) -> None:
     clock = FakeClock()
     server = Server()
     server.routes[SEARCH_PATH] = lambda request: httpx2.Response(status)
     with pytest.raises(ProviderError) as caught:
         found(mailbox(server, clock=clock), squery(swords("secretword")), clock)
-    assert (caught.value.code, caught.value.cause) == ("upstream_error", "SearchRejected")
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", cause)
     assert len(searches(server)) == 1  # the log line is pinned by the DEBUG canary test (the adapter logs nothing)
 
 
@@ -788,7 +794,63 @@ def test_filter_only_a_late_too_large_answer_stops_reading_on_without_an_error()
     assert page.complete
 
 
-def test_placeholder_never_matches_a_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+def throttled_after(requests: int, folder_blocks: dict[str, list[list[object]]]) -> tuple[Server, FakeClock]:
+    """Folder list routes answering their blocks in turn; the `requests`-th list GET overall is a 429."""
+    clock = FakeClock()
+    server = Server()
+    count = {"n": 0}
+    answers = {folder_id: iter(blocks) for folder_id, blocks in folder_blocks.items()}
+
+    def route(folder_id: str):  # type: ignore[no-untyped-def]  # a request handler
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            count["n"] += 1
+            if count["n"] == requests:
+                return httpx2.Response(429, headers={"retry-after": "30"})
+            return js({"value": next(answers[folder_id])})(request)
+
+        return handler
+
+    for folder_id in folder_blocks:
+        server.routes[f"/v1.0/me/mailFolders/{folder_id}/messages"] = route(folder_id)
+    return server, clock
+
+
+def test_filter_only_throttled_read_on_keeps_what_was_read_with_the_last_frontier() -> None:
+    """M3: a 429 on the third request keeps the two answers already read and the cursor of the last one."""
+    server, clock = throttled_after(3, {INBOX_ID: [block(NOW - timedelta(hours=2 * k), 3, k) for k in range(4)]})
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert len(server.lists()) == 3
+    assert len(page.items) == 2
+    assert page.more
+    assert page.frontier is not None
+    assert page.frontier[0] == int((NOW - timedelta(hours=2) - timedelta(minutes=100)).timestamp())
+    assert page.complete
+    assert not page.incomplete
+
+
+def test_filter_only_throttled_with_unread_folders_left_gets_no_cursor() -> None:
+    """The other folders were never read: a cursor from this folder's frontier would skip their newer items."""
+    server, clock = throttled_after(
+        2,
+        {
+            INBOX_ID: [block(NOW - timedelta(hours=2 * k), 3, k) for k in range(4)],
+            SENT_ID: [block(NOW - timedelta(hours=2 * k), 3, k + 10) for k in range(4)],
+        },
+    )
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person"), "all"), clock)
+    assert len(page.items) == 1
+    assert (page.truncated, page.complete) == (True, False)
+    assert page.incomplete == {"time_limit"}
+
+
+def test_filter_only_throttled_on_the_first_request_fails_the_account() -> None:
+    server, clock = throttled_after(1, {INBOX_ID: [block(NOW, 3, 1)]})
+    with pytest.raises(ProviderError) as caught:
+        found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", "Throttled")
+
+
+def failing_meta(monkeypatch: pytest.MonkeyPatch) -> None:
     import mcp_hub.providers.graph as graph_module
 
     real = graph_module.graph_meta
@@ -799,6 +861,13 @@ def test_placeholder_never_matches_a_filter(monkeypatch: pytest.MonkeyPatch) -> 
         return real(raw, *args, **kwargs)  # type: ignore[arg-type]  # the wrapper forwards the real signature
 
     monkeypatch.setattr(graph_module, "graph_meta", failing)
+
+
+def test_hit_that_matched_the_filter_becomes_a_placeholder_when_its_summary_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M2: the filter matched, so the server-confirmed hit is listed (as `list_messages` does), never dropped."""
+    failing_meta(monkeypatch)
     clock = FakeClock()
     capture = Capture()
     logger = logging.getLogger("mcp_hub")
@@ -810,10 +879,22 @@ def test_placeholder_never_matches_a_filter(monkeypatch: pytest.MonkeyPatch) -> 
         kept = found(mailbox(searching(odd), clock=clock), squery(swords("budget")), clock).items
     finally:
         logger.removeHandler(capture)
-    assert filtered.items == []
+    assert len(filtered.items) == len(kept) == 1
     assert len([line for line in capture.lines if "item_degraded" in line]) == 2
-    assert len(kept) == 1
     assert location_id(kept[0].ref) is None
+
+
+def test_hit_whose_filter_cannot_be_evaluated_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_hub.providers.graph as graph_module
+
+    def failing(raw: dict[str, object], terms: SearchTerms) -> bool:
+        raise ValueError("filter failed")
+
+    monkeypatch.setattr(graph_module, "graph_filters_match", failing)
+    clock = FakeClock()
+    odd = hit(2, NOW, **{"from": sender("o@example.org", "Mina Rare")})
+    page = found(mailbox(searching(odd), clock=clock), squery(swords("budget", sender="rare")), clock)
+    assert page.items == []
 
 
 def test_by_id_paths_refuse_a_search_hit_reference() -> None:
