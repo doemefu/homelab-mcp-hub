@@ -489,5 +489,6 @@ def test_search_logs_no_canary_at_debug(settings: Settings, secrets_dir: Path, t
         )
     text = "\n".join(handler.lines) + "\n".join(message for _, _, message in handler.raw)
     assert handler.raw
+    assert "zqxcanary" not in text  # the shared prefix: a truncated or escaped print of any canary
     for needle in sorted(needles):
         assert needle not in text, needle
