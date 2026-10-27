@@ -1256,17 +1256,78 @@ def search_rounds(
                 emit(f"s5_upper: same_hits_as_s4={'yes' if upper_hits == hits else 'no'}")
 
 
+_FETCH_SAMPLE: Final = 50
+_FETCH_CHUNKS: Final = (50, 10, 5, 2)
+_FETCH_SINGLE_UIDS: Final = 10  # chunk size 1 runs for the first 10 UIDs only
+
+
+def _fetch_chunks(raw: Any, emit: Callable[[str], None], uids: Sequence[int], size: int, item: str, label: str) -> None:
+    """`UID FETCH <chunk> (item)` over `uids` in chunks of `size`, each command on its own guard and deadline. Prints
+    the chunk size, the number of commands, the total and the slowest command in ms and the status; a failure ends
+    the round with the class name only. A refusal of the guard comes before anything is sent."""
+    times: list[int] = []
+    status = "ok"
+    try:
+        for start in range(0, len(uids), size):
+            started = time.perf_counter()
+            _round_guard(raw).fetch(uids[start : start + size], [item])
+            times.append(_ms(started))
+    except ImapCommandRefused:
+        if times:
+            raise
+        emit(f"{label}: skipped=not_allowed_by_guard")
+        return
+    except Exception as exc:
+        status = f"error_{type(exc).__name__}"
+    scope = f" uids={len(uids)}" if size == 1 else ""
+    emit(
+        f"{label}: chunk={size}{scope} commands={len(times) + (status != 'ok')} total_ms={sum(times)} "
+        f"max_ms={max(times, default=0)} status={status}"
+    )
+
+
+def fetch_rounds(raw: Any, *, out: TextIO, today: date | None = None) -> None:
+    """Chunk-size timing of `UID FETCH (BODYSTRUCTURE)` over the newest <= 50 inbox UIDs of the last 30 days, and one
+    `(RFC822.SIZE)` fetch of all of them when the guard allows that item. Numbers only: no UID, size or name."""
+
+    def emit(line: str) -> None:
+        print(line, file=out)
+
+    emit("--- result ---")
+    day = today or datetime.now(UTC).date()
+    window = imap_search.window_keys(
+        since_day=day - timedelta(days=_SEARCH_SINCE_DAYS), before_day=None, unread_only=False
+    )
+    uids: list[int] = []
+
+    def sample() -> None:
+        _round_guard(raw).examine(_INBOX)
+        uids.extend(_newest(_round_guard(raw).search(window), _FETCH_SAMPLE))
+
+    if not _guarded("fetch_sample", emit, sample):
+        return
+    emit(f"fetch_sample: uids={len(uids)}")
+    if not uids:
+        return
+    for size in _FETCH_CHUNKS:
+        _fetch_chunks(raw, emit, uids, size, "BODYSTRUCTURE", "fetch_bodystructure")
+    _fetch_chunks(raw, emit, uids[:_FETCH_SINGLE_UIDS], 1, "BODYSTRUCTURE", "fetch_bodystructure")
+    _fetch_chunks(raw, emit, uids, len(uids), "RFC822.SIZE", "fetch_rfc822_size")
+
+
 _HELP: Final = """\
 Run by the owner, on their own machine, in the repository directory:
   uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds
   uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds
   uv run python scripts/imap_probe.py --host imap.mail.me.com --search-rounds
   uv run python scripts/imap_probe.py --host imap.gmail.com --search-rounds
+  uv run python scripts/imap_probe.py --host imap.mail.me.com --fetch-rounds
+  uv run python scripts/imap_probe.py --host imap.gmail.com --fetch-rounds
 The username and the app-specific password are asked for at a prompt (--search-rounds also asks for words at hidden
 prompts); nothing is stored or changed. Share only the part after the line "--- result ---".
 
 Read-only IMAP folder and search probe (O35); --status-rounds runs the get_message_status rounds P1-P7 instead,
---search-rounds the search_messages rounds S1-S8 (WP13d).
+--search-rounds the search_messages rounds S1-S8 (WP13d), --fetch-rounds the FETCH chunk-size timing.
 """
 
 
@@ -1346,6 +1407,9 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument(
         "--search-rounds", action="store_true", help="run S1-S8 (search_messages) through the hub's guard and client"
     )
+    modes.add_argument(
+        "--fetch-rounds", action="store_true", help="time UID FETCH (BODYSTRUCTURE) in chunks of 50/10/5/2/1"
+    )
     args = parser.parse_args(argv)
     if args.host not in ALLOWED_HOSTS:
         print("host not allowed; use one of: " + ", ".join(sorted(ALLOWED_HOSTS)), file=sys.stderr)
@@ -1358,6 +1422,16 @@ def main(argv: list[str] | None = None) -> int:
         raw = IMAPClient(
             args.host, port=PORT, ssl=True, ssl_context=ssl.create_default_context(), timeout=SOCKET_TIMEOUT
         )
+        if args.fetch_rounds:
+            session = _round_guard(raw)
+            try:
+                session.login(username, password)
+                session.capabilities()
+                fetch_rounds(raw, out=sys.stdout)
+            finally:
+                with contextlib.suppress(Exception):  # best-effort logout
+                    session.logout()
+            return 0
         if args.status_rounds:
             session = _round_guard(raw)
             try:

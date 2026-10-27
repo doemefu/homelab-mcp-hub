@@ -1626,3 +1626,102 @@ def test_prompts_tell_the_owner_where_the_words_must_occur(monkeypatch: pytest.M
     assert "inbox mail" in prompts[1]
     assert "not next to each other" in prompts[1]
     assert "subject of an inbox mail" in prompts[4]
+
+
+# --- fetch rounds (chunk size timing) ------------------------------------------------------------------------
+
+
+def _fetch_stub(count: int = 70) -> SearchStub:
+    stub = _icloud_search_stub()
+    stub.mailboxes["INBOX"] = [SMsg(uid, f"{_W1} s{uid}", f"{_SENDER}@example.test") for uid in range(1, count + 1)]
+    return stub
+
+
+def _fetch_run(stub: SearchStub) -> str:
+    out = io.StringIO()
+    probe_mod.fetch_rounds(stub, out=out, today=_SEARCH_TODAY)
+    return out.getvalue()
+
+
+def test_fetch_rounds_time_the_chunk_sizes_over_the_newest_50_uids() -> None:
+    stub = _fetch_stub()
+    out = _fetch_run(stub)
+    assert out.startswith("--- result ---\nfetch_sample: uids=50\n")
+    for size, commands in ((50, 1), (10, 5), (5, 10), (2, 25)):
+        assert re.search(
+            rf"^fetch_bodystructure: chunk={size} commands={commands} total_ms=\d+ max_ms=\d+ status=ok$", out, re.M
+        ), size
+    assert re.search(r"^fetch_bodystructure: chunk=1 uids=10 commands=10 total_ms=\d+ max_ms=\d+ status=ok$", out, re.M)
+    fetches = [argument for command, argument in stub.commands if command == "FETCH"]
+    assert set(fetches) == {"BODYSTRUCTURE"}
+    assert len(fetches) == 1 + 5 + 10 + 25 + 10 + 0  # RFC822.SIZE is refused by the guard before it is sent
+    assert [c for c, a in stub.commands if c == "EXAMINE"] == ["EXAMINE"]
+    assert ("EXAMINE", "INBOX") in stub.commands
+
+
+def test_fetch_rounds_skip_rfc822_size_when_the_guard_does_not_allow_it() -> None:
+    out = _fetch_run(_fetch_stub())
+    assert "fetch_rfc822_size: skipped=not_allowed_by_guard\n" in out
+
+
+def test_fetch_rounds_search_the_window_and_fetch_only_the_newest_uids() -> None:
+    stub = _fetch_stub()
+    _fetch_run(stub)
+    assert [a for c, a in stub.commands if c == "SEARCH"] == [f"NOT DRAFT SINCE {_SEARCH_SINCE}"]
+    assert {c for c, _ in stub.commands} <= {"EXAMINE", "SEARCH", "FETCH"}
+
+
+def test_fetch_rounds_with_few_messages_use_what_exists() -> None:
+    out = _fetch_run(_fetch_stub(3))
+    assert out.startswith("--- result ---\nfetch_sample: uids=3\n")
+    assert re.search(r"^fetch_bodystructure: chunk=1 uids=3 commands=3 ", out, re.M)
+    assert "fetch_sample: uids=0" in _fetch_run(_fetch_stub(0))
+
+
+def test_fetch_rounds_print_nothing_sensitive() -> None:
+    out = _fetch_run(_fetch_stub())
+    for secret in (*_SECRETS, "example.test", "INBOX", "BODYSTRUCTURE", "=?"):
+        assert secret.lower() not in out.lower().replace("fetch_bodystructure", ""), secret
+    for line in out.splitlines()[1:]:
+        assert re.fullmatch(r"[a-z0-9_]+: [a-z0-9_= ]+", line), line
+
+
+def test_a_failing_fetch_round_is_reported_by_class_and_the_next_round_runs() -> None:
+    stub = _fetch_stub()
+    original = stub.fetch
+    calls = {"n": 0}
+
+    def flaky(messages: Any, data: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("secret text")
+        return original(messages, data)
+
+    stub.fetch = flaky  # type: ignore[method-assign]  # test double
+    out = _fetch_run(stub)
+    assert re.search(
+        r"^fetch_bodystructure: chunk=50 commands=1 total_ms=\d+ max_ms=\d+ status=error_TimeoutError$", out, re.M
+    )
+    assert "secret text" not in out
+    assert re.search(r"^fetch_bodystructure: chunk=10 commands=5 .* status=ok$", out, re.M)
+
+
+def test_fetch_rounds_main_asks_only_for_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub = _fetch_stub()
+    prompts: list[str] = []
+    monkeypatch.setattr(probe_mod, "IMAPClient", lambda *a, **k: stub)
+    monkeypatch.setattr(probe_mod.getpass, "getpass", lambda prompt="": (prompts.append(prompt), "x")[1])
+    assert probe_mod.main(["--host", "imap.mail.me.com", "--fetch-rounds"]) == 0
+    assert len(prompts) == 2
+    commands = [command for command, _ in stub.commands]
+    assert commands[:2] == ["LOGIN", "CAPABILITY"]
+    assert commands[-1] == "LOGOUT"
+    assert capsys.readouterr().out.startswith("--- result ---\nfetch_sample: ")
+
+
+def test_fetch_rounds_exclude_the_other_modes(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        probe_mod.main(["--host", "imap.mail.me.com", "--fetch-rounds", "--search-rounds"])
+    assert "not allowed with argument" in capsys.readouterr().err
