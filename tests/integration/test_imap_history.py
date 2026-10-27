@@ -25,6 +25,7 @@ from mcp_hub.providers.folders import NAME_FALLBACK
 from mcp_hub.registry import load_registry
 from mcp_hub.tools import HubContext, mail_status, mail_thread
 from mcp_hub.tools.mail import ListMessagesResult, MessageSummary, run_get_message, run_list_messages, run_list_unread
+from mcp_hub.tools.mail_search import SearchMessagesResult, run_search_messages
 from mcp_hub.tools.mail_status import MessageStatusResult, StatusItem, run_get_message_status
 from mcp_hub.tools.mail_thread import GetThreadResult, run_get_thread
 from tests.support import greenmail
@@ -856,3 +857,195 @@ async def test_logs_contain_no_thread_values(secrets_dir: Path, captured: Captur
     assert not [
         e for e in events if e["event"] not in {"provider_call_failed", "item_degraded", "folder_map_refreshed"}
     ]
+
+
+# ---- search_messages (WP13d T7) -------------------------------------------------------------------------------
+# O38, GreenMail 2.1.15 vs. iCloud (owner probe facts: TEXT matches whole words, SUBJECT/FROM substrings, decoded
+# headers, `CHARSET UTF-8` with a synchronising literal accepted): see the recorded facts in the worklog.
+GRUESSE = "Grüße"
+
+
+def raw_mail(tag: str, *, headers: dict[str, str], body: bytes, qp: bool = False) -> bytes:
+    """A hand-written message: header values are written as given (so an RFC 2047 encoded word stays one), the body
+    is 7-bit ASCII or quoted-printable UTF-8 with the soft line breaks already in `body`."""
+    lines = {
+        "Message-ID": f"<{message_id(tag)}>",
+        "From": f"Sender <sender@{greenmail.DOMAIN}>",
+        "To": "hub-get@" + greenmail.DOMAIN,
+        "Subject": S(tag),
+        "MIME-Version": "1.0",
+        "Content-Type": 'text/plain; charset="utf-8"',
+        "Content-Transfer-Encoding": "quoted-printable" if qp else "7bit",
+        **headers,
+    }
+    head = "".join(f"{name}: {value}\r\n" for name, value in lines.items())
+    return head.encode("ascii") + b"\r\n" + body
+
+
+async def searching(ctx: HubContext, *, folder: str | None = None, **terms: str | None) -> SearchMessagesResult:
+    result, _, _ = await run_search_messages(
+        ctx,
+        query=terms.get("query"),
+        account=None,
+        sender=terms.get("sender"),
+        recipient=terms.get("recipient"),
+        subject=terms.get("subject"),
+        folder=folder,
+        since=None,
+        limit=50,
+        cursor=None,
+    )
+    return result
+
+
+def found_tags(result: SearchMessagesResult, prefix: str, *, cut_ok: bool = False) -> list[str]:
+    """The subjects of this run starting with `prefix`, sorted; a complete answer (no cut unless `cut_ok`, no error)."""
+    assert result.account_errors == []
+    assert cut_ok or (result.truncated, result.next_cursor) == (False, None)
+    subjects = [i.untrusted.subject for i in result.items if i.untrusted.subject.startswith(S(prefix))]
+    assert len(subjects) == len(set(subjects)), "listed twice"
+    return sorted(subjects)
+
+
+async def test_search_each_folder(secrets_dir: Path) -> None:
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    seed(login, "INBOX", "sf-inbox", body="zqxfolderword inbox")
+    seed(login, SENT, "sf-sent", flags=(b"\\Seen",), outgoing=True, body="zqxfolderword sent")
+    seed(login, ARCHIVE, "sf-archive", flags=(b"\\Seen",), body="zqxfolderword archive")
+    seed(login, TRASH, "sf-trash", flags=(b"\\Seen",), body="zqxfolderword trash")
+    seed(login, PROJECTS, "sf-other", body="zqxfolderword other")
+    copied = seed(login, "INBOX", "sf-copied", body="zqxfolderword copied")
+    greenmail.copy(login, "INBOX", copied, ARCHIVE)
+    ctx = hub(secrets_dir, login)
+    got = {f: found_tags(await searching(ctx, query="zqxfolderword", folder=f), "sf-") for f in LIST_FOLDERS}
+    assert got == {
+        "inbox": sorted([S("sf-inbox"), S("sf-copied")]),
+        "sent": [S("sf-sent")],
+        "archive": sorted([S("sf-archive"), S("sf-copied")]),
+        "trash": [S("sf-trash")],
+        "all": sorted([S("sf-inbox"), S("sf-sent"), S("sf-archive"), S("sf-copied")]),  # once; never trash or other
+    }
+    only_filter = await searching(ctx, subject=S("sf-sent"), folder="all")  # filter-only: the list request
+    assert found_tags(only_filter, "sf-") == [S("sf-sent")]
+    [item] = [i for i in only_filter.items if i.untrusted.subject.startswith(S("sf-"))]
+    assert (item.folder, item.direction, item.id is not None, item.ref is not None) == ("sent", "outgoing", True, True)
+
+
+async def test_search_utf8_three_messages(secrets_dir: Path) -> None:
+    """MF-R5 (ruling 7): which decoding matches is visible in which message answers. (a) the word only in an RFC 2047
+    Subject, (b) only in a quoted-printable UTF-8 body with a soft line break inside the word, (c) only in an encoded
+    From name; (d) D-n1: a multi-word non-ASCII subject matches as a whole. The words carry the run token, so reruns
+    against one container stay exact."""
+    login = "hub-get"
+    when = datetime.now(UTC) - timedelta(minutes=5)
+    word, other = f"Gr\u00fc\u00dfe{RUN}", f"Gr\u00fcsse{RUN}"
+    parts = {
+        "su-a": ({"Subject": f"{S('su-a')} =?UTF-8?Q?Gr=C3=BC=C3=9Fe{RUN}?="}, b"plain ascii body\r\n", False),
+        "su-b": ({}, f"Gr=C3=BC=\r\n=C3=9Fe{RUN} aus dem Norden\r\n".encode(), True),
+        "su-c": ({"From": "=?UTF-8?Q?J=C3=BCrg_M=C3=BCller?= <jm@example.org>"}, b"plain ascii body\r\n", False),
+        "su-d": ({"Subject": f"{S('su-d')} =?UTF-8?Q?Gr=C3=BCsse{RUN}_aus_Bern?="}, b"plain ascii body\r\n", False),
+    }
+    for tag, (headers, body, qp) in parts.items():
+        greenmail.append_raw(login, raw_mail(tag, headers=headers, body=body, qp=qp), when)
+    ctx = hub(secrets_dir, login)
+    a, b, c, d = S("su-a") + f" {word}", S("su-b"), S("su-c"), S("su-d") + f" {other} aus Bern"  # decoded subjects
+    refused = (await searching(ctx, query=word)).incomplete_accounts
+    assert refused == [], "GreenMail refused CHARSET UTF-8: record in O38 and assert search_refused instead"
+    assert found_tags(await searching(ctx, query=word), "su-") == sorted([a, b])
+    assert found_tags(await searching(ctx, subject=word), "su-") == [a]
+    assert found_tags(await searching(ctx, subject=f"{other} aus"), "su-") == [d]  # the whole value, not a word
+    # O38: GreenMail's FROM/TO match a complete address only (no name, no fragment, no decoding), unlike iCloud's
+    # decoded substring match. The literal path is still accepted (a clean empty answer); the full address finds (c).
+    sender_literal = await searching(ctx, sender="J\u00fcrg")
+    assert (found_tags(sender_literal, "su-"), sender_literal.incomplete_accounts) == ([], [])
+    assert found_tags(await searching(ctx, sender="jm@example.org"), "su-") == [c]  # ASCII path, whole address
+    assert found_tags(await searching(ctx, sender="jm@example"), "su-") == []
+
+
+async def test_search_ascii_sender_whole_address(secrets_dir: Path) -> None:
+    """O38: GreenMail's FROM is a whole-address match (iCloud: substring), so only the full address finds."""
+    login = "hub-get"
+    seed(login, "INBOX", "ss-one", sender=f"Ulrike Zqxbrandt <ulrike.zqxbrandt@{greenmail.DOMAIN}>")
+    seed(login, "INBOX", "ss-two", sender=f"Other <other@{greenmail.DOMAIN}>")
+    ctx = hub(secrets_dir, login)
+    for value in (f"ulrike.zqxbrandt@{greenmail.DOMAIN}", f"ULRIKE.ZQXBRANDT@{greenmail.DOMAIN.upper()}"):
+        assert found_tags(await searching(ctx, sender=value), "ss-") == [S("ss-one")], value
+    for value in ("zqxbrandt", "ulrike.zqxb"):  # name, fragment: GreenMail finds nothing, and says so cleanly
+        assert found_tags(await searching(ctx, sender=value), "ss-") == [], value
+
+
+async def test_search_quotes_removed(secrets_dir: Path) -> None:
+    login = "hub-get"
+    seed(login, "INBOX", "sq-hit", body="Our Zqxoffer for you")
+    seed(login, "INBOX", "sq-miss", body="nothing here")
+    ctx = hub(secrets_dir, login)
+    assert found_tags(await searching(ctx, query='"Zqxoffer"'), "sq-") == [S("sq-hit")]
+
+
+async def test_read_only_snapshot_around_search_messages(secrets_dir: Path) -> None:
+    """SR-3: FLAGS and folder of every message are identical before and after search_messages on the literal path
+    (non-ASCII query), the ASCII path and the filter-only path, each for `all` and `trash`."""
+    login = "hub-get"
+    greenmail.ensure_folders(login, SENT, ARCHIVE, TRASH, PROJECTS)
+    combos: tuple[tuple[bytes, ...], ...] = ((), (b"\\Seen",), (b"\\Answered",), (b"\\Flagged",))
+    for index, folder in enumerate(FOLDERS):
+        for n, flags in enumerate(combos):
+            seed(login, folder, f"sro-{index}-{n}", flags=flags, outgoing=folder == SENT, body="zqxsnapword Grüße")
+    before = greenmail.snapshot(login, FOLDERS)
+    for folder in FOLDERS:  # meaningful: unread mail exists in every folder
+        assert any(key[0] == folder and b"\\Seen" not in flags for key, (_, flags) in before.items())
+    ctx = hub(secrets_dir, login)
+    calls: tuple[dict[str, str], ...] = (
+        {"query": GRUESSE},
+        {"query": "zqxsnapword"},
+        {"sender": f"sender@{greenmail.DOMAIN}"},
+    )
+    for folder in ("all", "trash"):
+        for terms in calls:
+            result = await searching(ctx, folder=folder, **terms)
+            assert found_tags(result, "sro-", cut_ok=True) or result.items, (
+                folder,
+                terms,
+            )  # the search ran and found mail
+    assert greenmail.snapshot(login, FOLDERS) == before
+
+
+async def test_logs_contain_no_search_values(secrets_dir: Path, captured: Capture) -> None:
+    """Spec §9.7: no query, sender, recipient or subject value (also a refused one) and no message value in a log
+    line; the canary values prove the check can fail."""
+    login = "hub-logs"
+    canaries = ("zqxcanaryquery", "zqxcanarysender", "zqxcanaryrcpt", "zqxcanarysubject")
+    seed(
+        login,
+        "INBOX",
+        "sl-hit",
+        body=f"{canaries[0]} body",
+        subject=f"{S('sl-hit')} {canaries[3]}",
+        sender=f"{canaries[1]} <{canaries[1]}@{greenmail.DOMAIN}>",
+        to=f"{canaries[2]}@{greenmail.DOMAIN}",
+    )
+    ctx = hub(secrets_dir, login)
+    ok = await searching(
+        ctx,
+        query=canaries[0],
+        sender=f"{canaries[1]}@{greenmail.DOMAIN}",
+        recipient=f"{canaries[2]}@{greenmail.DOMAIN}",
+        subject=canaries[3],
+    )
+    assert found_tags(ok, "sl-") == [S("sl-hit") + f" {canaries[3]}"]
+    assert found_tags(await searching(ctx, query=GRUESSE + "zqxcanaryutf"), "sl-") == []
+    with pytest.raises(ToolError):
+        await searching(ctx, query="zqxcanaryrefused OR -x")  # refused before any provider call
+    failing = hub(secrets_dir, login, password="not-the-password")
+    await searching(failing, query=canaries[0])
+    assert captured.raw  # positive control: the capture works, so the checks below can fail
+    text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
+    forbidden = {*canaries, "zqxcanaryutf", "zqxcanaryrefused", GRUESSE, RUN, login, "@", "not-the-password"}
+    forbidden.update(i.ref or "" for i in ok.items)
+    for value in sorted(forbidden - {""}):
+        assert value not in text, value
+    assert not [r for r in captured.raw if r[0].startswith("imapclient") and r[1] < logging.WARNING]
+    events = [json.loads(line) for line in captured.lines]
+    assert all(set(e) <= allowed_fields(e["event"]) for e in events)
+    assert any(e["event"] == "provider_call_failed" for e in events)  # the wrong-password call wrote a hub event

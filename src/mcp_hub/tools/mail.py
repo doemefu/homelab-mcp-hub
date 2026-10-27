@@ -48,6 +48,7 @@ from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import (
     UNTRUSTED_CONTENT_NOTICE,
     AccountErrorItem,
+    Gathered,
     gather_accounts,
     int_argument,
     log_tool_call,
@@ -64,6 +65,8 @@ MAX_SUMMARY_REFERENCES: Final = 3  # spec 4.9 amendment S-i (was 10)
 MAX_MESSAGE_REFERENCES: Final = 10  # references of get_message (spec 080 §5.5)
 SINCE_DEFAULT: Final = timedelta(hours=24)
 SINCE_MAX_AGE: Final = timedelta(days=30)
+SEARCH_SINCE_DEFAULT: Final = timedelta(days=30)
+SEARCH_SINCE_MAX_AGE: Final = timedelta(days=90)
 CLOCK_SKEW: Final = timedelta(seconds=60)
 LIST_FOLDERS: Final[tuple[ListFolder, ...]] = ("inbox", "sent", "archive", "trash", "all")
 DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
@@ -72,10 +75,13 @@ DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
 FolderArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*LIST_FOLDERS, None]})]
 DirectionArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*DIRECTIONS, None]})]
 ListTool = Literal["list_messages", "list_unread"]
+# Tools that issue cursors; kept apart from ListTool so run_list_messages(tool="search_messages") does not type-check.
+CursorTool = Literal["list_messages", "list_unread", "search_messages"]
 # The arguments each tool's cursor is bound to (§5.5 "Cursors": every argument except `cursor` and `limit`).
-DIGEST_ARGUMENTS: Final[dict[ListTool, tuple[str, ...]]] = {
+DIGEST_ARGUMENTS: Final[dict[CursorTool, tuple[str, ...]]] = {
     "list_messages": ("account", "folder", "since", "unread_only", "direction"),
     "list_unread": ("account", "since"),
+    "search_messages": ("account", "query", "sender", "recipient", "subject", "folder", "since"),
 }
 ThreadKeySource = Literal["server", "headers", "subject"]
 _THREAD_KEY_SOURCE: Final[dict[ThreadSource, ThreadKeySource]] = {
@@ -316,16 +322,23 @@ def _choice[T: str](value: str | None, name: str, allowed: tuple[T, ...]) -> T |
     raise ToolError("invalid_argument", f"{name} must be one of: {', '.join(allowed)}")
 
 
-def _window_start(since: datetime | None, current: datetime) -> int:
+def window_start(
+    since: datetime | None,
+    current: datetime,
+    *,
+    default: timedelta = SINCE_DEFAULT,
+    max_age: timedelta = SINCE_MAX_AGE,
+) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
-    the same on every page); default now - 24 h; at most 30 days back, at most 60 s ahead.
+    the same on every page); by default now - 24 h; at most `max_age` back (30 days by default), at most 60 s ahead
+    (search_messages passes its own default and age limit; the error text names the limit).
 
     Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
     but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the
     hub's whole-second positions agree on that, so no page shows it and no page repeats it."""
-    start = current - SINCE_DEFAULT if since is None else since
-    if start < current - SINCE_MAX_AGE or start > current + CLOCK_SKEW:
-        raise ToolError("invalid_argument", "since must lie within the last 30 days")
+    start = current - default if since is None else since
+    if start < current - max_age or start > current + CLOCK_SKEW:
+        raise ToolError("invalid_argument", f"since must lie within the last {max_age.days} days")
     return math.ceil(start.timestamp())
 
 
@@ -364,7 +377,7 @@ async def run_list_messages(
     digest = argument_digest({name: given[name] for name in DIGEST_ARGUMENTS[tool]})
     position: Position | None = None
     if cursor is None:
-        window = _window_start(parsed_since, current)
+        window = window_start(parsed_since, current)
     else:
         state = ctx.cursors.open(cursor, tool=tool, args_digest=digest)
         window, position = state.window_start, state.position
@@ -376,6 +389,35 @@ async def run_list_messages(
         limit=count,
         position=position,
     )
+    result, gathered = await run_list_query(
+        ctx,
+        tool=tool,
+        digest=digest,
+        window=window,
+        position=position,
+        accounts=accounts,
+        query=query,
+        envelope=lambda result, _pages: result,
+    )
+    return result, [a.id for a in accounts], tool_outcome(gathered)
+
+
+async def run_list_query[R: BaseModel](
+    ctx: HubContext,
+    *,
+    tool: CursorTool,
+    digest: str,
+    window: int,
+    position: Position | None,
+    accounts: list[Account],
+    query: ListQuery,
+    envelope: Callable[[ListMessagesResult, list[tuple[Account, FolderPage]]], R],
+    cursor_complete: Callable[[FolderPage], bool] = lambda page: page.complete,
+) -> tuple[R, Gathered[FolderPage]]:
+    """The shared list pipeline: one query per account, keyset merge, output budget and cursor. `envelope` wraps the
+    list result into the tool's own result before the budget measures it; `cursor_complete` says whether a page
+    still allows a cursor (search_messages lets a page that was only refused go on)."""
+    count = query.limit
 
     async def call(target: Account) -> FolderPage:
         opened = partial(ctx.adapters.mailbox, target, ctx.settings.secrets_dir)
@@ -397,17 +439,21 @@ async def run_list_messages(
     cutoff = max(frontiers) if frontiers else None
     eligible = merged if cutoff is None else [m for m in merged if order_key(m) >= cutoff]
     more = any(page.more for page in pages) or len(eligible) > count
-    complete = all(page.complete for page in pages)  # a failed account has no page and never blocks the cursor
-    stopped = any(page.truncated for page in pages) or not complete
+    complete = all(cursor_complete(page) for page in pages)  # a failed account has no page and never blocks the cursor
+    stopped = any(page.truncated for page in pages) or not all(page.complete for page in pages)
     selected = eligible[:count]
     positions = [Position(*order_key(m)) for m in selected]
     zone = ZoneInfo(ctx.settings.default_timezone)
     items = [_summary_or_placeholder(m, zone) for m in selected]
 
-    def build(chosen: list[MessageSummary], _cut: bool) -> ListMessagesResult:
+    def build(chosen: list[MessageSummary], _cut: bool) -> R:
         # `chosen` is a prefix of `items`. Only dropped items count as "more" (B8): a single item shortened to fit
         # leaves nothing to fetch, so it sets neither `truncated` nor a cursor.
         remaining = more or len(chosen) < len(items)
+        if items and not chosen:
+            # Not even one shortened summary fits: the page would be `truncated` with no cursor and no reason to give
+            # (unreachable within the accepted budget range, like the get_message case below).
+            raise ToolError("too_large", "Result exceeds the output budget")
         last: Position | None = None
         if chosen:
             last = positions[len(chosen) - 1]
@@ -416,16 +462,17 @@ async def run_list_messages(
         next_cursor = None
         if remaining and complete and last is not None:
             next_cursor = ctx.cursors.issue(tool=tool, args_digest=digest, window_start=window, position=last)
-        return ListMessagesResult(
+        listed = ListMessagesResult(
             untrusted_content_notice=UNTRUSTED_CONTENT_NOTICE,
             items=chosen,
             next_cursor=next_cursor,
             truncated=remaining or stopped,
             account_errors=gathered.errors,
         )
+        return envelope(listed, gathered.results)
 
     result = fit_items(items, build, ctx.settings.response_budget_chars, shrink=shrink_summary)
-    return result, [a.id for a in accounts], tool_outcome(gathered)
+    return result, gathered
 
 
 async def run_list_unread(

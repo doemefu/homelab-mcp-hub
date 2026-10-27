@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Final, Literal
 
 from mcp_hub.ids import MessageRef
-from mcp_hub.providers.base import ProviderError, log_message_skipped
+from mcp_hub.providers.base import ProviderError, SearchKey, log_message_skipped
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import (
     MAX_LOCATE_FOLDERS,
@@ -272,6 +272,9 @@ class ImapSession:
     def search(self, criteria: bytes) -> list[int]:
         return self._client.search(criteria)
 
+    def search_values(self, prefix: bytes, values: Sequence[tuple[SearchKey, str]]) -> list[int]:
+        return self._client.search_values(prefix, values)
+
     def fetch(
         self, uids: Sequence[int], items: Sequence[str], *, on_no: Literal["drop", "fail"] = "drop"
     ) -> dict[int, dict[bytes, object]]:
@@ -293,15 +296,19 @@ class ImapSession:
         return rows
 
     def fetch_chunks(
-        self, uids: Sequence[int], items: Sequence[str], *, chunk: int
+        self, uids: Sequence[int], items: Sequence[str], *, chunk: int, soft_check: Callable[[], None] | None = None
     ) -> Iterator[dict[int, dict[bytes, object]]]:
         """UID FETCH in ascending chunks of at most `chunk` (≤ 500) UIDs, one answer per chunk, fetched only when the
         caller asks for it, so that rows are reduced per chunk and never accumulated. A chunk answered NO yields `{}`:
-        the caller sees its UIDs as lost (S-p). Every other error propagates."""
+        the caller sees its UIDs as lost (S-p). `soft_check` runs before each chunk after the first (a SoftStop ends
+        the iteration). The generator drops its reference to a chunk once the caller asks for the next one. Every
+        other error propagates."""
         if type(chunk) is not int or not 1 <= chunk <= FETCH_CHUNK_UIDS:
             raise ValueError("chunk out of range")
         ordered = sorted(set(uids))
         for start in range(0, len(ordered), chunk):
+            if start and soft_check is not None:
+                soft_check()
             try:
                 rows = self._client.fetch(ordered[start : start + chunk], items)
             except PASS_THROUGH:
@@ -311,6 +318,7 @@ class ImapSession:
                     raise
                 rows = {}
             yield rows
+            rows = {}  # the caller has reduced the chunk: do not hold it while the next one is fetched
 
     def locate(
         self,

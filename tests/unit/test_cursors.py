@@ -286,3 +286,24 @@ def test_issue_validates_inputs(kwargs: dict[str, object]) -> None:
     args.update(kwargs)
     with pytest.raises(ValueError, match="cursor"):
         codec.issue(**args)  # type: ignore[arg-type]  # deliberately ill-typed inputs
+
+
+def test_cursor_tools_include_search() -> None:
+    codec = CursorCodec(KEY, Clock())
+    assert {"list_messages", "list_unread", "search_messages"} == cursors.CURSOR_TOOLS
+    search = _issue(codec, "search_messages")
+    assert _open(codec, search, "search_messages").tool == "search_messages"
+    _assert_invalid(codec, search, "list_messages")  # a search cursor does not open a list call
+    _assert_invalid(codec, _issue(codec, "list_messages"), "search_messages")  # and vice versa
+    _assert_invalid(codec, _issue(codec, "list_unread"), "search_messages")
+
+
+def test_search_digest_binds_renamed_inputs_and_omitted_as_null() -> None:
+    base = {"account": None, "query": "invoice", "sender": None, "recipient": None, "subject": None}
+    base |= {"folder": None, "since": None}
+    digests = {argument_digest(base)}
+    for name in ("sender", "recipient", "subject"):  # each filter binds on its own name, not just its value
+        digests.add(argument_digest({**base, name: "x"}))
+    assert len(digests) == 4
+    assert argument_digest({**base, "cursor": "c", "limit": 5}) == argument_digest(base)  # cursor, limit excluded
+    assert argument_digest({**base, "query": None}) != argument_digest({**base, "query": ""})  # omitted != empty

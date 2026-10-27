@@ -143,6 +143,12 @@ def append_many(
             client.append(folder, bytes(message), flags=tuple(flags), msg_time=when)
 
 
+def append_raw(login: str, raw: bytes, when: datetime, *, folder: str = "INBOX") -> None:
+    """APPEND of the message bytes exactly as given (hand-written MIME: encoded words, quoted-printable soft breaks)."""
+    with connected(login) as client:
+        client.append(folder, raw, msg_time=when)
+
+
 def ensure_folders(login: str, *names: str) -> None:
     with connected(login) as client:
         for name in names:
