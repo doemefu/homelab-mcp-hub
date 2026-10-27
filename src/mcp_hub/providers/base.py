@@ -119,6 +119,29 @@ class MailDetail:
     meta: MailMeta = MailMeta()
 
 
+SearchKey = Literal["TEXT", "FROM", "TO", "SUBJECT"]
+IncompleteReason = Literal["result_cap", "search_refused", "time_limit", "changed_during_call"]
+MAX_SEARCH_WORDS: Final = 8
+
+
+@dataclass(frozen=True, slots=True)
+class SearchTerms:
+    """Normalised wire form of a search (spec 080 §5.2 "Query handling"); built by `search.parse_search_terms`."""
+
+    words: tuple[str, ...]
+    sender: str | None
+    recipient: str | None
+    subject: str | None
+
+    def __post_init__(self) -> None:
+        if not (self.words or self.sender or self.recipient or self.subject):
+            raise ValueError("at least one search term is required")
+        if len(self.words) > MAX_SEARCH_WORDS:
+            raise ValueError("at most 8 words")
+        if len({word.casefold() for word in self.words}) != len(self.words):
+            raise ValueError("words must be distinct")
+
+
 @dataclass(frozen=True, slots=True)
 class ListQuery:
     folder: ListFolder
@@ -127,6 +150,7 @@ class ListQuery:
     direction: Direction | None
     limit: int
     position: Position | None = None  # last item of the previous page; None on the first page
+    search: SearchTerms | None = None  # search_messages only
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +164,7 @@ class FolderPage:
     # Graph gives the frontier second as (second, "f" * 16), so that whole second is read again on the next page.
     # None with `more`: a full page, whose last item is the frontier.
     frontier: tuple[int, str] | None = None
+    incomplete: frozenset[IncompleteReason] = frozenset()  # why the page may miss matches (search_messages)
 
 
 StatusState = Literal["found", "gone", "unknown"]
