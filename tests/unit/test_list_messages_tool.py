@@ -823,7 +823,6 @@ def test_tool_call_log_line(wired: tuple[TestClient, Fake], tokens: TokenFactory
 SEARCH_WINDOW: dict[str, Any] = {
     "default": timedelta(days=30),
     "max_age": timedelta(days=90),
-    "message": "since must lie within the last 90 days",
 }
 
 
@@ -832,7 +831,7 @@ def test_search_window_bounds() -> None:
     with pytest.raises(ToolError) as caught:
         window_start(now - timedelta(days=91), now, **SEARCH_WINDOW)
     assert caught.value.code == "invalid_argument"
-    assert "90 days" in caught.value.message
+    assert caught.value.message == "since must lie within the last 90 days"
     assert window_start(now - timedelta(days=89), now, **SEARCH_WINDOW) == int((now - timedelta(days=89)).timestamp())
     assert window_start(None, now, **SEARCH_WINDOW) == int((now - timedelta(days=30)).timestamp())
     with pytest.raises(ToolError, match="since"):  # the future bound is unchanged
@@ -841,7 +840,7 @@ def test_search_window_bounds() -> None:
     assert window_start(None, now) == int((now - timedelta(hours=24)).timestamp())
     with pytest.raises(ToolError) as listed:
         window_start(now - timedelta(days=31), now)
-    assert "30 days" in listed.value.message
+    assert listed.value.message == "since must lie within the last 30 days"
 
 
 def test_search_window_constants() -> None:

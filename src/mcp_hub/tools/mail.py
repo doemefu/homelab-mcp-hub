@@ -327,18 +327,17 @@ def window_start(
     *,
     default: timedelta = SINCE_DEFAULT,
     max_age: timedelta = SINCE_MAX_AGE,
-    message: str = "since must lie within the last 30 days",
 ) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
     the same on every page); by default now - 24 h; at most 30 days back, at most 60 s ahead (search_messages passes
-    its own default, age limit and message).
+    its own default and age limit; the error text names the limit).
 
     Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
     but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the
     hub's whole-second positions agree on that, so no page shows it and no page repeats it."""
     start = current - default if since is None else since
     if start < current - max_age or start > current + CLOCK_SKEW:
-        raise ToolError("invalid_argument", message)
+        raise ToolError("invalid_argument", f"since must lie within the last {max_age.days} days")
     return math.ceil(start.timestamp())
 
 
