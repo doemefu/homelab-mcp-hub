@@ -122,14 +122,35 @@ def _allowlist_tokens(word: str) -> list[str]:
     return tokens
 
 
-def imap_value_keys(terms: SearchTerms, *, gmail: bool = False) -> list[tuple[SearchKey, str]] | None:
+def _gmail_tokens(word: str) -> list[str]:
+    """The allowlist tokens of `word`, then, inside each: a `-` survives only between two letters or digits (any
+    other `-` splits the token) and each piece starts at its first letter or digit. No piece of a Gmail TEXT value
+    can then begin with `-`, whatever precedes it (Q-a)."""
+    pieces: list[str] = []
+    for token in _allowlist_tokens(word):
+        kept = "".join(
+            " " if ch == "-" and not (_alnum(token[i - 1 : i]) and _alnum(token[i + 1 : i + 2])) else ch
+            for i, ch in enumerate(token)
+        )
+        for piece in kept.split():
+            start = next((i for i, ch in enumerate(piece) if _alnum(ch)), None)
+            if start is not None:
+                pieces.append(piece[start:])
+    return pieces
+
+
+def _alnum(ch: str) -> bool:
+    return len(ch) == 1 and unicodedata.category(ch)[0] in "LN"
+
+
+def imap_value_keys(terms: SearchTerms, *, gmail: bool) -> list[tuple[SearchKey, str]] | None:
     """The `key value` pairs of an IMAP search. On Gmail a `-` at the start of a quoted TEXT value negates it (Q-a),
     so each TEXT word goes through the allowlist above and its tokens form that word's one TEXT value; a word with no
     token is dropped. None when nothing is left to search for (no TEXT word and no filter): the folders are then
     refused. FROM, TO and SUBJECT stay as given."""
     keys: list[tuple[SearchKey, str]] = [("TEXT", word) for word in terms.words]
     if gmail:
-        sanitised = (" ".join(_allowlist_tokens(word)) for word in terms.words)
+        sanitised = (" ".join(_gmail_tokens(word)) for word in terms.words)
         keys = [("TEXT", value) for value in sanitised if value]
     for key, value in (("FROM", terms.sender), ("TO", terms.recipient), ("SUBJECT", terms.subject)):
         if value is not None:

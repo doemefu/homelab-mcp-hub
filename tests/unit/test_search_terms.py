@@ -187,8 +187,8 @@ def test_search_terms_invariant() -> None:
 
 def test_imap_value_keys_order() -> None:
     parsed = SearchTerms(words=("a", "b"), sender="x", recipient=None, subject="y")
-    assert imap_value_keys(parsed) == [("TEXT", "a"), ("TEXT", "b"), ("FROM", "x"), ("SUBJECT", "y")]
-    assert imap_value_keys(terms(sender="x", recipient="z")) == [("FROM", "x"), ("TO", "z")]
+    assert imap_value_keys(parsed, gmail=False) == [("TEXT", "a"), ("TEXT", "b"), ("FROM", "x"), ("SUBJECT", "y")]
+    assert imap_value_keys(terms(sender="x", recipient="z"), gmail=False) == [("FROM", "x"), ("TO", "z")]
 
 
 @pytest.mark.parametrize(
@@ -311,3 +311,29 @@ def test_list_query_defaults() -> None:
         search=terms(query="x"),
     )
     assert searching.search is not None
+
+
+@pytest.mark.parametrize(
+    ("word", "value"),
+    [
+        ("@-x", "x"),
+        ("foo@-bar", "foo@ bar"),
+        ("a--b", "a b"),
+        ("e\u0301-x", "e\u0301 x"),
+        ("foo-bar", "foo-bar"),
+        ("-foo-bar-", "foo-bar"),
+        ("_-x", "x"),
+        ("a-1", "a-1"),
+        ("x@y.org", "x@y.org"),
+    ],
+)
+def test_gmail_text_value_keeps_a_dash_only_between_letters_or_digits(word: str, value: str) -> None:
+    """No quoted TEXT value of a Gmail search may contain a `-` that starts a value or follows a space (Q-a)."""
+    assert imap_value_keys(SearchTerms((word,), None, None, None), gmail=True) == [("TEXT", value)]
+
+
+def test_gmail_text_value_has_no_dash_after_a_space_or_at_the_start() -> None:
+    for word in ("@-x", "foo@-bar", "a--b", "e\u0301-x", "'-x", ".-x", "x.-y", "x'-y"):
+        [(_, value)] = imap_value_keys(SearchTerms((word,), None, None, None), gmail=True) or [("TEXT", "")]
+        assert not value.startswith("-")
+        assert " -" not in value
