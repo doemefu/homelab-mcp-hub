@@ -477,3 +477,119 @@ def test_gmail_joined_value_is_one_quoted_string_or_one_literal() -> None:
     assert search_args(server) == [GMAIL_INBOX + b' TEXT "c code"']
     server, _ = gmail_inbox(terms("Müller/Köln"))
     assert search_args(server) == [[b"CHARSET", b"UTF-8", GMAIL_INBOX, b"TEXT", "müller köln".encode()]]
+
+
+# --- pass 2 of search_messages: the chunked summary pass of #66 (T4 step 4b) -------------------------------------
+
+
+def many_hits(count: int) -> list[FakeMessage]:
+    return [hit(uid, uid, f"Rechnung {uid}") for uid in range(1, count + 1)]
+
+
+def structure_chunks(server: FakeImapServer) -> list[list[int]]:
+    return [uids for uids, items in lm.fetches(server) if "BODYSTRUCTURE" in items]
+
+
+def test_search_summary_pass_uses_structure_chunks() -> None:
+    server = three(inbox=many_hits(50))
+    page = lm.run(server, squery(limit=50))
+    chunks = structure_chunks(server)
+    assert len(page.items) == 50
+    assert all(1 <= len(uids) <= imap.SUMMARY_STRUCTURE_CHUNK_UIDS for uids in chunks)
+    assert sorted(uid for uids in chunks for uid in uids) == list(range(1, 51))
+    assert (page.complete, page.incomplete) == (True, frozenset())
+
+
+@pytest.mark.parametrize("step", [0.6, 0.9])
+def test_search_slow_server_gives_a_partial_page_with_time_limit(step: float) -> None:
+    """No new chunk after the reserve: the newest items read are the page, no cursor, `time_limit`."""
+    server = three(inbox=many_hits(50))
+    server.step_seconds = step
+    clock = lm.clock_of(server)
+    page = lm.box(server).list_messages(squery(limit=50), lm.CallDeadline(clock(), 16.0, 20.0, clock))
+    assert 0 < len(page.items) < 50
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+    assert (page.incomplete, page.refused_only) == ({"time_limit"}, False)
+
+
+@pytest.mark.parametrize("step", [0.6, 1.0])
+def test_search_three_folders_slow_commands_stay_under_the_soft_limit(step: float) -> None:
+    server = three(
+        inbox=many_hits(10),
+        archive=[hit(u, 20 + u) for u in range(11, 21)],
+        sent=[hit(u, 40 + u) for u in range(21, 31)],
+    )
+    server.step_seconds = step
+    clock = lm.clock_of(server)
+    start = clock()
+    page = lm.box(server).list_messages(squery(folder="all", limit=30), lm.CallDeadline(start, 16.0, 20.0, clock))
+    assert clock() - start <= 16.0 + step
+    assert page.items
+    if not page.complete:
+        assert page.incomplete == {"time_limit"}
+        assert page.truncated is True
+
+
+def test_search_stop_between_structure_chunks_is_time_limit_only() -> None:
+    """The rows of chunks never asked for after the stop are not `changed_during_call` (no double count)."""
+
+    def second_chunk(commands: lm.Commands) -> int:
+        return lm.nth(commands, lambda n, a: n == "UID FETCH" and "BODYSTRUCTURE" in a[1], 2)  # type: ignore[index]
+
+    imap_reserve = imap.BODY_RESERVE_SECONDS
+    imap.BODY_RESERVE_SECONDS = 1000.0
+    try:
+        _, page = lm.soft_stop_before(lambda: three(inbox=many_hits(8)), squery(limit=8), second_chunk)
+    finally:
+        imap.BODY_RESERVE_SECONDS = imap_reserve
+    assert 0 < len(page.items) < 8
+    assert (page.truncated, page.complete) == (True, False)
+    assert (page.incomplete, page.refused_only) == ({"time_limit"}, False)
+
+
+def test_search_vanished_uid_in_a_read_chunk_plus_a_later_stop_gives_both_reasons() -> None:
+    server = three(inbox=many_hits(8))
+    server.step_seconds = 1.0
+    original = server.run
+    seen = {"n": 0}
+
+    def run_command(command: str, argument: object = None) -> None:
+        if command == "UID FETCH" and "BODYSTRUCTURE" in argument[1]:  # type: ignore[index]
+            seen["n"] += 1
+            if seen["n"] == 1:
+                del server.folders[0].messages[1]  # expunged between the passes (UID 1 is the newest)
+        original(command, argument)
+
+    server.run = run_command  # type: ignore[method-assign]
+    clock = lm.clock_of(server)
+    saved = imap.BODY_RESERVE_SECONDS
+    imap.BODY_RESERVE_SECONDS = 5.5  # the reserve is spent after the first chunk
+    try:
+        page = lm.box(server).list_messages(squery(limit=8), lm.CallDeadline(clock(), 16.0, 20.0, clock))
+    finally:
+        imap.BODY_RESERVE_SECONDS = saved
+    assert page.incomplete == {"changed_during_call", "time_limit"}
+    assert page.truncated is True
+
+
+@pytest.mark.parametrize("kind", ["slow", "examine_no", "validity", "fetch_no", "search_no", "badcharset", "cap"])
+def test_search_page_without_a_cursor_is_always_explained(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """(d): a truncated or incomplete page, which gets no cursor from the tool, names a reason (or is refused-only)."""
+    if kind == "cap":
+        monkeypatch.setattr(imap, "MAX_SEARCH_CANDIDATES", 2)
+    if kind in ("examine_no", "validity", "fetch_no"):
+        page = pass_two_loss(kind)
+    else:
+        server = three(inbox=many_hits(50 if kind == "slow" else 5), sent=[hit(21, 90)])
+        if kind == "slow":
+            server.step_seconds = 0.9
+        if kind == "search_no":
+            server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        if kind == "badcharset":
+            server.badcharset = True
+        clock = lm.clock_of(server)
+        q = squery(terms("Müller") if kind == "badcharset" else None, folder="all", limit=50 if kind == "slow" else 3)
+        page = lm.box(server).list_messages(q, lm.CallDeadline(clock(), 16.0, 20.0, clock))
+    assert page.truncated or not page.complete
+    assert page.incomplete
+    assert page.complete or page.refused_only or page.incomplete - {"search_refused"}
