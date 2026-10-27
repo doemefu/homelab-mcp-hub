@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + calendar enabled, 2026-10-02).
+Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + calendar enabled, 2026-10-02; `outlook` mail enabled 2026-10-06 (#171); `gmail` mail enabled 2026-10-07 (#172)).
 
 ### Added
 
