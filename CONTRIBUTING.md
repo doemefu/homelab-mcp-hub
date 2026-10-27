@@ -89,6 +89,23 @@ It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` a
 
 `--status-rounds` runs the `get_message_status` rounds P1–P7 instead (WP13b): reply-header matching, OR width and timing, Gmail `X-GM-THRID` ORs, re-`EXAMINE` and header-`FETCH` cost. Every command goes through the hub's `GuardedImapClient` and every criteria through `imap_search`; the output is yes/no, counts and milliseconds only. Run it once per host (`uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds`, then `--host imap.gmail.com`); `--help` starts with the owner's usage lines.
 
+`--search-rounds` runs the `search_messages` rounds S1-S8 instead (WP13d). It connects with the hub's own `HubImapClient`, so a non-ASCII value goes out as a synchronising literal (`{N}`, never `{N+}`) exactly as in production, and every command goes through `GuardedImapClient`: only `EXAMINE`, `UID SEARCH` and one `UID FETCH` of `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>` (a count of encoded words, nothing printed) reach the server. Run it from your own checkout or from the work-package worktree, once per host:
+
+```bash
+uv sync --locked
+uv run python scripts/imap_probe.py --host imap.mail.me.com --search-rounds
+uv run python scripts/imap_probe.py --host imap.gmail.com --search-rounds
+```
+
+Credentials are never passed on the command line. The username and the app-specific password are typed at hidden prompts (the same as the other modes), followed by hidden prompts for the words; none of them is echoed, printed or stored:
+
+1. Three words (ASCII letters only, at least 7 letters each) that occur in mail of the last 30 days: ideally words that appear in some subjects and in some bodies, so the hit counts differ. Prefer words that are not substrings of each other.
+2. Optional (Enter skips): a sender local part of at least 7 characters (the part before the `@` of someone who wrote to you in the last 30 days).
+3. Optional: a word with a non-ASCII letter (for example `Überraschung`) that occurs in a subject in the last 30 days. Without it S4/S5 are skipped.
+4. Optional, Gmail only: a fragment of an address that appears only in the Cc of some mail in the last 30 days (S8). A word that is refused is asked again (three attempts) with a fixed message.
+
+Paste back only the part after the `--- result ---` line. It holds capability flags, hit counts, `status=ok|no|bad` and milliseconds, with folders named by role (`inbox`, `sent`, `archive`, `all_mail`); it contains no word, address, header or mailbox name. A full run on Gmail can take a few minutes (`TEXT` searches are slow). Rounds: S1 capabilities; S2 `TEXT` with one word, three keys, prefix and middle fragment, `SUBJECT` and `FROM`; S3 (Gmail) Gmail operators inside a quoted value (`in:anywhere`, `-word`, `OR`, `w1 OR w2`) with the window size and a `neg_complement`/`or_union` hint (the counts decide); S6 `FROM "utf-8"` and `SUBJECT "=?utf"` plus the `encoded_from`/`encoded_subject` control over the newest 500 window rows; S7 phrase against two keys; S8 (Gmail) `TO` against Cc; S4/S5 (last, because a refused literal can leave the connection unusable) `SUBJECT <non-ASCII word>` and its upper-cased form. Every search carries `NOT DRAFT SINCE <today - 30 days>`.
+
 ### Provider integration tests
 
 The IMAP adapter is tested against a local GreenMail container, the CalDAV adapter against a local Radicale container and the token store against PostgreSQL 17 (the cluster's image, port 5433; the tests run as a non-superuser role that owns database `mcp_hub`, as production does) — all pinned by digest. `scripts/provider_services.sh up` starts all three on `127.0.0.1` with neutral `example.test` users and passwords generated per run (written to `$HUB_PROVIDER_STATE_DIR` or `$TMPDIR`, never committed; Radicale reads a per-run copy of `tests/fixtures/radicale/config`); `down` stops and removes them. The calendar fixtures in `tests/fixtures/ics/` (DST change, overrides, `EXDATE`, `RDATE`, cancellations, all-day, floating, cross-zone, window edge, hostile text) are checked in unit tests and again through Radicale; `tests/support/ics.py` loads them with CRLF line endings and turns the `{ZWSP}` placeholder into a zero-width space, so no invisible character is committed.
