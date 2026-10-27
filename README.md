@@ -8,7 +8,7 @@ The hub is a pure OAuth resource server: the homelab's auth-service issues the a
 
 ## Status
 
-Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` mail live since 2026-10-06 (#171), `gmail` mail live since 2026-10-07 (#172, configuration only). Calendars of other accounts are served through iCloud. Mail history part a (`list_messages`, cursors, `get_message` by ref) live since 2026-10-22 (WP13a, #44). `get_message_status` merged 2026-10-22 (WP13b, #44), `get_thread` 2026-10-23 (WP13c) and `search_messages` 2026-10-27 (WP13d, PR #74); story #44 is done.
+Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` mail live since 2026-10-06 (#171), `gmail` mail live since 2026-10-07 (#172, configuration only). Calendars of other accounts are served through iCloud. Mail history part a (`list_messages`, cursors, `get_message` by ref) live since 2026-10-22 (WP13a, #44). `get_message_status` merged 2026-10-22 (WP13b, #44), `get_thread` live since 2026-10-23 (WP13c) and `search_messages` live since 2026-10-27 (WP13d, PR #74); story #44 is done.
 
 | Work package | Scope | Status |
 |--------------|-------|--------|
@@ -18,8 +18,8 @@ Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` 
 | WP5d | Metrics and alerts on the internal port (`search_messages` is WP13d) | Planned |
 | WP13a | Mail history part a: `list_messages`, extended summaries, cursors, `get_message` by ref (story #44) | Done (merged and live 2026-10-22) |
 | WP13b | Mail history part b: `get_message_status` (story #44) | Done (merged 2026-10-22, live) |
-| WP13c | Mail history part c: `get_thread` with quote removal and the subject fallback (story #44) | Done (merged 2026-10-23) |
-| WP13d | Mail history part d: `search_messages` by words, sender, recipient and subject (story #44) | Done (merged 2026-10-27) |
+| WP13c | Mail history part c: `get_thread` with quote removal and the subject fallback (story #44) | Done (merged and live 2026-10-23) |
+| WP13d | Mail history part d: `search_messages` by words, sender, recipient and subject (story #44) | Done (merged and live 2026-10-27) |
 | WP9 | Microsoft Graph for `outlook`: token store, `mcp-hub login`, mail adapter, `mcp-hub check-registry` | Done (live) |
 | WP8 | `gmail` mail over the existing IMAP adapter (registry entry and credentials only) | Done (live) |
 | WP10 | Further accounts (calendar feed) | Planned |
