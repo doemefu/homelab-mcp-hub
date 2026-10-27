@@ -5,7 +5,7 @@
 # $STATE/credentials.json; the state directory lives in $TMPDIR (worktree-local for agents, ephemeral in CI).
 set -euo pipefail
 LABEL="org.furchert.homelab.workpackage=mcp-hub-provider-tests"
-GREENMAIL_IMAGE="greenmail/standalone:2.1.14@sha256:1ef95a966418cd09b7ea91d504d8c0826bbe7a2f6e679a75c601a831587c1626"
+GREENMAIL_IMAGE="greenmail/standalone:2.1.15@sha256:309ba544ea482e5d4265d09921cdab07c8dad2cc4481d715c9b8ff5d3f0a149f"
 RADICALE_IMAGE="tomsquest/docker-radicale:3.8.1.1@sha256:e6d8c17bc4d75f3fd40e52b20421ba244c17ca08fb01cd7dc90d5d78ba51b58d"
 # the cluster's PostgreSQL image (infrastructure 50_apps_infra.yml), approved for tests (spec 080 §9.3, Q-O1)
 POSTGRES_IMAGE="pgvector/pgvector:0.8.6-pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f"
