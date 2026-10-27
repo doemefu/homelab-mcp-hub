@@ -435,8 +435,9 @@ def direction_of(*, in_sent: bool, from_address: str | None, own: frozenset[str]
     return "outgoing" if in_sent or is_own(from_address, own) else "incoming"
 
 
-def log_message_skipped(ref: AnyMessageRef, capability: Capability, exc: Exception) -> None:
-    """`item` is logged only when the message has a MessageId (a refused folder name or an overlong id has none)."""
+def log_message_skipped(ref: AnyMessageRef, capability: Capability, exc: Exception | str) -> None:
+    """`item` is logged only when the message has a MessageId (a refused folder name or an overlong id has none).
+    `exc` may be just the class name of the cause."""
     fields: dict[str, str] = {}
     encoded = location_id(ref)
     if encoded is not None:
@@ -447,7 +448,7 @@ def log_message_skipped(ref: AnyMessageRef, capability: Capability, exc: Excepti
         "item_degraded",
         account=ref.account,
         capability=capability,
-        exception=type(exc).__name__,
+        exception=exc if isinstance(exc, str) else type(exc).__name__,
         **fields,
     )
 
