@@ -635,7 +635,8 @@ def test_soft_stop_in_pass_two_gives_no_cursor() -> None:
 
     server, page = soft_stop_before(lambda: icloud(inbox=[msg(1, 5, "a")]), query(), snippet_fetch)
     assert "UID SEARCH" in names(server)
-    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    assert [(item.subject, item.snippet_text) for item in page.items] == [("a", "")]  # read, but without its snippet
+    assert (page.truncated, page.complete) == (True, False)
 
 
 @pytest.mark.parametrize("command", ["LOGIN", "CAPABILITY"])
@@ -698,7 +699,8 @@ def test_summary_parse_checks_the_soft_limit_per_item(monkeypatch: pytest.Monkey
 
 
 def test_snippet_decode_checks_the_soft_limit_per_member(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The snippet decode of each member checks the soft limit too; the folders built before the stop are kept."""
+    """The snippet decode of each member checks the soft limit too; a stop there keeps every message read: the
+    snippets decoded so far stay, the others are empty."""
     server = icloud(inbox=[msg(1, 5, "a")], archive=[msg(11, 10, "b1"), msg(12, 11, "b2")])
     clock = clock_of(server)
     original = imap.decode_part
@@ -712,7 +714,8 @@ def test_snippet_decode_checks_the_soft_limit_per_member(monkeypatch: pytest.Mon
     monkeypatch.setattr(imap, "decode_part", slow_decode)
     page = box(server).list_messages(query("all"), CallDeadline(clock(), 15.0, 100.0, clock))
     assert decoded["n"] == 2  # a, then b1; stopped before b2
-    assert subjects(page) == ["a"]
+    assert sorted(str(s) for s in subjects(page)) == ["a", "b1", "b2"]
+    assert {item.subject: bool(item.snippet_text) for item in page.items} == {"a": True, "b1": True, "b2": False}
     assert (page.truncated, page.complete) == (True, False)
 
 
@@ -886,7 +889,9 @@ def test_broad_handlers_pass_soft_stop_through(
     LIST_HANDLERS[handler](monkeypatch)
     server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b")])
     page = run(server, query(direction="incoming"), own=OWN)  # with a candidate header, so the parse runs
-    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    # a stop in the snippet pass keeps the messages already reduced; a stop anywhere earlier leaves nothing
+    assert len(page.items) == (2 if handler.startswith("snippet") else 0)
+    assert (page.truncated, page.complete) == (True, False)
     assert provider_log.lines == []  # nothing degraded: the stop was not taken for a broken message
 
 
@@ -1075,9 +1080,11 @@ def test_a_reduction_error_degrades_to_the_placeholder(monkeypatch: pytest.Monke
     assert len(page.items) == 3
 
 
-def test_soft_stop_between_structure_chunks_keeps_the_items_already_built() -> None:
+def test_soft_stop_between_structure_chunks_keeps_the_items_already_built(monkeypatch: pytest.MonkeyPatch) -> None:
     """The soft limit passes before the second chunk of the archive: the items of the chunks already read, inbox and
     first archive chunk, are returned; the archive items come without snippets (no command is sent after the stop)."""
+
+    monkeypatch.setattr(imap, "BODY_RESERVE_SECONDS", 1000.0)  # the one-second steps would spend the reserve first
 
     def second_archive_chunk(commands: Commands) -> int:
         hits = [i for i, (name, arg) in enumerate(commands) if name == "UID FETCH" and "BODYSTRUCTURE" in arg[1]]  # type: ignore[index]
@@ -1102,6 +1109,40 @@ def test_slow_server_returns_a_truncated_page_not_an_empty_one(step: float) -> N
     assert 0 < len(page.items) < 50
     assert (page.truncated, page.complete, page.frontier) == (True, False, None)
     assert [item.ref.uid for item in page.items] == sorted(item.ref.uid for item in page.items)  # the newest first
+
+
+def test_soft_stop_in_the_text_pass_of_the_first_group_keeps_its_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(3))
+    clock = clock_of(server)
+    original = imap.decode_part
+
+    def slow_decode(raw: bytes, part: object) -> str:
+        clock.advance(10.0)
+        return original(raw, part)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(imap, "decode_part", slow_decode)
+    page = box(server).list_messages(query(), CallDeadline(clock(), 15.0, 100.0, clock))
+    assert len(page.items) == 3
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+
+
+def test_no_later_folder_is_read_after_the_reserve() -> None:
+    """`folder: all`: once 12 s have passed, the folders still to read are skipped; the items built are returned and
+    the call ends before the soft limit."""
+    server = icloud(
+        inbox=[msg(1, 5, "i1"), msg(2, 6, "i2")],
+        archive=[msg(11, 10, "a1"), msg(12, 11, "a2")],
+        sent=[msg(21, 20, "s1"), msg(22, 21, "s2")],
+    )
+    server.step_seconds = 1.0
+    clock = clock_of(server)
+    start = clock()
+    page = box(server).list_messages(query("all", limit=20), CallDeadline(start, 16.0, 20.0, clock))
+    assert 0 < len(page.items) < 6
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+    assert clock() - start <= 16.0
+    examined = [arg for name, arg in server.commands if name == "EXAMINE"]
+    assert len(examined) < 6  # pass 1 examines the four folders, pass 2 not all three again
 
 
 class Marker(list[object]):

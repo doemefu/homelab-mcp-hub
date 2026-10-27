@@ -338,16 +338,17 @@ def _fetch_texts(
     length: int,
     refs: dict[int, MessageRef],
     soft_check: Callable[[], None],
-) -> dict[int, str]:
-    """Partial fetch of each message's chosen text part, one FETCH per section number. Snippets are optional: a
-    FETCH that fails without losing the connection or answering BAD leaves those snippets empty. The decode of
-    each member checks the soft limit first (it costs CPU without a command)."""
+    texts: dict[int, str],
+) -> None:
+    """Partial fetch of each message's chosen text part, one FETCH per section number, into `texts` (what was
+    decoded stays when a SoftStop ends the pass). Snippets are optional: a FETCH that fails without losing the
+    connection or answering BAD leaves those snippets empty. The decode of each member checks the soft limit first
+    (it costs CPU without a command)."""
     by_section: dict[str, list[tuple[int, Part]]] = {}
     for uid in rows:  # an odd or empty BODYSTRUCTURE (a failed reduction) leaves this snippet empty
         structure = reduced[uid].structure
         if isinstance(structure, _Structure) and structure.text_part is not None:
             by_section.setdefault(structure.text_part.section, []).append((uid, structure.text_part))
-    texts: dict[int, str] = {}
     for section, members in by_section.items():
         try:
             data = session.fetch([uid for uid, _ in members], [f"BODY.PEEK[{section}]<0.{length}>"])
@@ -370,7 +371,6 @@ def _fetch_texts(
                 raise
             except Exception:
                 texts[uid] = ""
-    return texts
 
 
 def _soft_stopped_page() -> FolderPage:
@@ -514,6 +514,10 @@ class ImapMailbox:
         built: dict[MessageRef, MailSummary] = {}
         try:
             for entry, group in _by_folder(plans, chosen):
+                self._soft_check()  # EXAMINE and FETCH of a further folder
+                if built and self._reserve_spent():  # the folders read so far are the page (no cursor)
+                    progress.truncated, progress.complete = True, False
+                    break
                 self._summaries(session, entry, folder_of[entry.raw_name], group, progress, built)
                 if progress.stopped:
                     break
@@ -659,8 +663,8 @@ class ImapMailbox:
         after the items returned would skip it for good. `folder` None (Gmail All Mail): each item's folder follows
         its X-GM-LABELS; on any other server that fails closed. Under a `direction: incoming` filter, a Gmail item
         whose `\\Sent` label appeared after pass 1 is dropped like a new draft: it no longer matches the filter.
-        Each item checks the soft limit first (its header parse costs CPU without a command); a SoftStop leaves the
-        items already in `out`."""
+        The reductions are CPU-bounded and checked between BODYSTRUCTURE chunks and per snippet decode; a SoftStop
+        or the reserve ends the pass with the messages read so far (`progress.stopped`)."""
         if folder is None and not session.gmail:  # only Gmail All Mail decides the folder per message
             raise ProviderError("upstream_error", "UnmappedFolder")
         if session.selected != entry.raw_name:
@@ -688,11 +692,9 @@ class ImapMailbox:
         texts: dict[int, str] = {}
         if two.stop != "soft":  # after a soft stop no command may follow: the items come without snippets
             try:
-                texts = _fetch_texts(session, rows, reduced, SNIPPET_FETCH_BYTES, refs, self._soft_check)
-            except SoftStop:
-                if two.stop is None:  # an ordinary soft stop: the folders built before are the page (SA13)
-                    raise
-                # already truncated by the reserve: keep the messages read, without snippets
+                _fetch_texts(session, rows, reduced, SNIPPET_FETCH_BYTES, refs, self._soft_check, texts)
+            except SoftStop:  # the messages read are the page: snippets decoded so far stay, the rest is empty
+                progress.truncated, progress.complete, progress.stopped = True, False, True
         for chosen in group:
             uid = chosen.candidate.uid
             if uid in unparsable:
