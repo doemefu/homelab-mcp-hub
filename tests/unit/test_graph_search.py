@@ -301,8 +301,9 @@ def searches(server: Server) -> list[httpx2.Request]:
 
 def test_search_fixture_shapes_match_facts() -> None:
     assert SEARCH_FACTS is not None
-    assert (SEARCH_FACTS["p1_status"] == 200 and SEARCH_FACTS["p1_extended_present"] is True) == SEARCH_EXPAND
-    assert SEARCH_FACTS["p1_ids_immutable"] is False  # decision A: hits carry no id
+    assert (SEARCH_FACTS["p8_status"] == 200 and SEARCH_FACTS["p8_extended_present"] is True) == SEARCH_EXPAND
+    assert SEARCH_FACTS["p8_mailbox_wide"] is True  # the probed request is the shipped shape
+    assert SEARCH_FACTS["p8_ids_immutable"] is False  # decision A: hits carry no id
 
 
 @pytest.mark.parametrize("folder", ["all", "inbox", "sent", "archive", "trash"])

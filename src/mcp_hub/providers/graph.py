@@ -117,7 +117,7 @@ EXTENDED_EXPAND: Final = (
 GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
 SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (owner decision, 2026-10-27)
 SEARCH_HALVED_TOP: Final = 50  # the one retry after a too_large answer
-# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probes P1/P2, SEARCH_FACTS).
+# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probe P8, SEARCH_FACTS).
 SEARCH_EXPAND: Final = True
 READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (G5-3)
 FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)

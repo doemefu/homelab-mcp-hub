@@ -121,14 +121,16 @@ T1C_FACTS: dict[str, bool | int | str | None] | None = {
 }
 
 
-# The facts of the owner's Graph Explorer probes P1/P2 for `$search` (2026-10-27, personal Outlook.com account, same
-# `Prefer` header): "p1_status" -> HTTP status of `GET /me/mailFolders/inbox/messages?$search&$select&$expand`;
-# "p1_extended_present" -> the answer carried `singleValueExtendedProperties`; "p1_ids_immutable" -> the returned ids
-# equal the immutable ids of the list (False: `$search` returns regular ids, owner decision A: hits carry `id: null`).
+# The facts of the owner's Graph Explorer probe P8 (2026-10-27, personal Outlook.com account, same `Prefer` header): the
+# shipped request, `GET /me/messages?$search&$top&$select=SUMMARY_SELECT&$expand=EXTENDED_EXPAND` (mailbox-wide).
+# "p8_status" -> HTTP status; "p8_extended_present" -> every item carried `singleValueExtendedProperties`;
+# "p8_ids_immutable" -> the returned ids equal the immutable ids of the list (False: `$search` returns regular ids,
+# owner decision A: hits carry `id: null`); "p8_mailbox_wide" -> the probed shape is the shipped one.
 SEARCH_FACTS: dict[str, bool | int | None] | None = {
-    "p1_status": 200,
-    "p1_extended_present": True,
-    "p1_ids_immutable": False,
+    "p8_status": 200,
+    "p8_extended_present": True,
+    "p8_ids_immutable": False,
+    "p8_mailbox_wide": True,
 }
 
 
