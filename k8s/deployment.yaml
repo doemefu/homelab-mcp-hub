@@ -31,7 +31,7 @@ spec:
         - name: mcp-hub
           # Image tag is managed by Flux image automation. The initial tag is a placeholder that was never
           # built (data-service bootstrap pattern): Flux replaces it once doemefu/homelab#177 wires cluster/apps/mcp-hub/.
-          image: ghcr.io/doemefu/homelab-mcp-hub:main-20261027T173253 # {"$imagepolicy": "flux-system:mcp-hub"}
+          image: ghcr.io/doemefu/homelab-mcp-hub:main-20261027T192549 # {"$imagepolicy": "flux-system:mcp-hub"}
           ports:
             - name: mcp
               containerPort: 8083
@@ -80,7 +80,7 @@ spec:
               # Calendar expansion is single-threaded and CPU-bound; at 500m one busy worker runs at half speed in wall
               # time and eats the 5 s expansion budget and the 20 s call timeout.
               cpu: "1"
-              memory: 256Mi
+              memory: 320Mi
           startupProbe:
             httpGet:
               path: /healthz
