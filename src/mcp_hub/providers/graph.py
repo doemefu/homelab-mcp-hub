@@ -499,6 +499,14 @@ def _by_id(ref: object) -> TypeGuard[GraphMessageRef]:
     return isinstance(ref, GraphMessageRef) and not isinstance(ref, SearchHitRef)
 
 
+def _message_path(ref: GraphMessageRef) -> str:
+    """The by-id request path of a message: the one place that builds it, so that a `SearchHitRef` (a `$search`
+    result's regular id, D87) can never reach a GET, whatever the caller checked."""
+    if isinstance(ref, SearchHitRef):
+        raise ProviderError("not_found", "ForeignRef")
+    return f"/me/messages/{quote(ref.graph_id, safe='')}"
+
+
 @dataclass(frozen=True, slots=True)
 class _FolderAnswer:
     items: list[MailSummary]  # after the draft, window, unread, folder and position filters
@@ -1142,7 +1150,7 @@ class GraphMailbox:
         may_rebuild: bool = True,
     ) -> MailDetail:
         """The immutable id follows moves (O37); 404, a draft or an excluded parent folder is not_found (D75, S1)."""
-        path = f"/me/messages/{quote(ref.graph_id, safe='')}"
+        path = _message_path(ref)
         preview_only = False
         try:
             body = self._get(
@@ -1420,7 +1428,7 @@ class GraphMailbox:
 
     def _read_status(self, run: _StatusRun, ref: GraphMessageRef) -> MessageStatus:
         """A `g` entry (Graph G6): the immutable id follows moves; no body and no attachment read, 1 MiB cap."""
-        path = f"/me/messages/{quote(ref.graph_id, safe='')}"
+        path = _message_path(ref)
         params = {"$select": SUMMARY_SELECT, "$expand": EXTENDED_EXPAND}
         try:
             body = self._get(run.client, run.token, run.deadline, path, params, MAX_LIST_RESPONSE_BYTES)
@@ -1638,7 +1646,7 @@ class GraphMailbox:
             return _ThreadSeed(ref.graph_id, target.message_id, conversation)
         if not _by_id(target):
             raise ProviderError("not_found", "ForeignRef")
-        path = f"/me/messages/{quote(target.graph_id, safe='')}"
+        path = _message_path(target)
         body = self._get(client, token, deadline, path, {"$select": _SEED_SELECT}, MAX_LIST_RESPONSE_BYTES)
         if body.get("isDraft") is True:
             raise ProviderError("not_found", "Draft")
@@ -1659,7 +1667,7 @@ class GraphMailbox:
         logs: _ThreadLogs,
     ) -> ThreadPage:
         """The seed read once with its summary fields and bodies (P5, G-R1) and returned alone, not exact."""
-        path = f"/me/messages/{quote(seed.graph_id, safe='')}"
+        path = _message_path(GraphMessageRef(self._account, seed.graph_id))  # the seed id passed `_by_id` or a lookup
         params = {"$select": f"{SUMMARY_SELECT},uniqueBody,body", "$expand": EXTENDED_EXPAND}
         raw = self._get(client, token, deadline, path, params, MAX_MESSAGE_RESPONSE_BYTES)
         if raw.get("isDraft") is True:
@@ -1818,9 +1826,9 @@ class GraphMailbox:
     ) -> ThreadBody:
         """One single read of `uniqueBody,body` (SG2, 2 MiB), retried once with `uniqueBody` alone after too_large
         (G-R6). A failed read omits only this body (SC5); account failures, a 401 and the soft stop pass (P6)."""
-        if not isinstance(item.summary.ref, GraphMessageRef):
-            return OMITTED_BODY  # every Graph member has a Graph id
-        path = f"/me/messages/{quote(item.summary.ref.graph_id, safe='')}"
+        if not _by_id(item.summary.ref):
+            return OMITTED_BODY  # every Graph member has a Graph id; a `$search` hit's regular id is never read (D87)
+        path = _message_path(item.summary.ref)
         try:
             try:
                 raw = self._get(

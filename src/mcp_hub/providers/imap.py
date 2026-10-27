@@ -228,18 +228,16 @@ class _Progress:
     complete: bool = True
     searching: bool = False
     incomplete: set[IncompleteReason] = field(default_factory=set)
-    refused: bool = False  # a folder could not be searched
-    lost: bool = False  # incomplete for a reason other than a refusal
 
     def refuse(self) -> None:
         """The folder could not be searched (NO, no UIDVALIDITY, name too long): it counts as searched for the cursor
         (ruling 4)."""
-        self.complete, self.refused = False, True
+        self.complete = False
         self.incomplete.add("search_refused")
         self.truncated = self.truncated or self.searching
 
     def lose(self, reason: IncompleteReason, *, truncated: bool = False) -> None:
-        self.complete, self.lost = False, True
+        self.complete = False
         self.incomplete.add(reason)
         self.truncated = self.truncated or truncated or self.searching
 
@@ -255,7 +253,6 @@ class _Progress:
             complete=self.complete,
             frontier=frontier,
             incomplete=frozenset(self.incomplete),
-            refused_only=self.refused and not self.lost and not self.complete,
         )
 
 

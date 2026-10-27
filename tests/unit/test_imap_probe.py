@@ -1155,6 +1155,9 @@ class SearchStub:
             raise self.search_error[1]
         return self._match(self.mailboxes.get(self.selected, []), _Q.findall(text))
 
+    def has_capability(self, capability: str | bytes) -> bool:
+        return False  # the production client class never announces LITERAL+ to its literal sender (D82)
+
     def _raw_command_untagged(self, command: bytes, args: list[bytes], uid: bool = False) -> list[Any]:
         self.commands.append(("SEARCH", "literal"))
         self.literal_args.append(list(args))

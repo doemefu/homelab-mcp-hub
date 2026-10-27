@@ -72,7 +72,7 @@ def test_order_key_of_is_the_order_key_from_its_parts() -> None:
 def test_folder_page_frontier_defaults_to_none() -> None:
     page = FolderPage(items=[], more=False, truncated=False, complete=True)
     assert page.frontier is None
-    assert list(FolderPage.__dataclass_fields__)[-3:] == ["frontier", "incomplete", "refused_only"]
+    assert list(FolderPage.__dataclass_fields__)[-2:] == ["frontier", "incomplete"]
     assert page.refused_only is False
 
 
@@ -299,3 +299,20 @@ def test_thread_overview_invariants(kwargs: dict[str, object]) -> None:
     } | kwargs
     with pytest.raises(ValueError, match=r"message_count|participants"):
         ThreadOverview(**values)  # type: ignore[arg-type]  # deliberately invalid combinations
+
+
+@pytest.mark.parametrize(
+    ("complete", "reasons", "expected"),
+    [
+        (False, {"search_refused"}, True),
+        (False, {"search_refused", "result_cap"}, True),
+        (False, {"search_refused", "time_limit"}, False),
+        (False, {"search_refused", "changed_during_call"}, False),
+        (False, {"result_cap"}, False),
+        (False, set(), False),
+        (True, {"search_refused"}, False),
+    ],
+)
+def test_folder_page_refused_only_is_derived(complete: bool, reasons: set[str], expected: bool) -> None:
+    page = FolderPage([], False, truncated=not complete, complete=complete, incomplete=frozenset(reasons))  # type: ignore[arg-type]  # reason strings
+    assert page.refused_only is expected

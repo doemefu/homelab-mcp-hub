@@ -10,13 +10,13 @@ import imaplib
 import re
 import socket
 from collections.abc import Sequence
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, get_args
 
 from imapclient import response_parser
 from imapclient.exceptions import InvalidCriteriaError, LoginError
 
 from mcp_hub.ids import mailbox_name_shape_ok
-from mcp_hub.providers.base import ProviderError, SearchKey
+from mcp_hub.providers.base import MAX_SEARCH_WORDS, ProviderError, SearchKey
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 
 SECTION: Final = re.compile(r"[0-9.]+|TEXT|HEADER\.FIELDS \([A-Z -]+\)")
@@ -42,9 +42,9 @@ _FAILED: Final = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)? failed: .*", re.DOTALL)
 
 # search_values: typed value tokens (D82, SEC-d1). Literal bytes are checked on the code points, the part re-check on
 # the wire form.
-_SEARCH_KEYS: Final = frozenset({"TEXT", "FROM", "TO", "SUBJECT"})
-MAX_TEXT_VALUES: Final = 8  # at most 8 TEXT keys + one each of FROM, TO, SUBJECT
-MAX_SEARCH_VALUES: Final = 11
+_SEARCH_KEYS: Final = frozenset(get_args(SearchKey))
+MAX_TEXT_VALUES: Final = MAX_SEARCH_WORDS  # at most 8 TEXT keys + one each of FROM, TO, SUBJECT
+MAX_SEARCH_VALUES: Final = MAX_TEXT_VALUES + 3
 MAX_LITERAL_BYTES: Final = 800
 MAX_VALUE_BYTES: Final = 4096  # all values of one command together
 _QUOTED_PART: Final = re.compile(rb'"[\x20\x21\x23-\x5b\x5d-\x7e]+"')
@@ -64,6 +64,7 @@ class ImapClientLike(Protocol):
     ) -> list[tuple[tuple[bytes, ...], bytes | None, bytes | str | int]]: ...
     def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]: ...
     def search(self, criteria: bytes) -> list[int]: ...
+    def has_capability(self, capability: str | bytes) -> bool: ...
     # IMAPClient's private method: the only way to send several literals; used by `search_values` alone (T3).
     def _raw_command_untagged(
         self, command: bytes, args: list[bytes], *, uid: bool = True
@@ -207,8 +208,9 @@ class GuardedImapClient:
     def search_values(self, prefix: bytes, values: Sequence[tuple[SearchKey, str]]) -> list[int]:
         """UID SEARCH with `prefix` (the `NOT DRAFT` window and label keys) followed by `key value` pairs. An ASCII
         value goes out as a hub-quoted string through `search`. A non-ASCII value is one synchronising literal
-        with `CHARSET UTF-8` (never `{N+}`: the client class answers False for LITERAL+). Everything is checked
-        before the first byte is sent; after an abort the session only attempts LOGOUT."""
+        with `CHARSET UTF-8` (never `{N+}`: the client class answers False for LITERAL+, and a client that answers
+        True is refused). Everything is checked before the first byte is sent; after an abort the session only
+        attempts LOGOUT."""
         # Local import: imap_search imports `search_criteria_ok` from this module (a cycle at module level), and the
         # attribute is looked up per call so that a test can replace `value_part`.
         from mcp_hub.providers import imap_search
@@ -262,6 +264,10 @@ class GuardedImapClient:
                 + b" "
                 + b" ".join(key.encode("ascii") + b" " + part for key, part in zip(keys, parts, strict=True))
             )
+        # D82: IMAPClient sends `{N+}` when this answers True, and a server that rejects the line early would then read
+        # the value as a command. The hub's client class answers False; any other client is refused, nothing is sent.
+        if self._client.has_capability("LITERAL+"):
+            raise ImapCommandRefused("search value refused")
         args = [b"CHARSET", b"UTF-8", prefix]
         for key, part in zip(keys, parts, strict=True):
             args += [key.encode("ascii"), part]

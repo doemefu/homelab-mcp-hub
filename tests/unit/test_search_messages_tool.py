@@ -116,7 +116,6 @@ REFUSED: dict[str, Any] = {
     "truncated": True,
     "complete": False,
     "incomplete": frozenset({"search_refused"}),
-    "refused_only": True,
 }
 
 
@@ -474,6 +473,17 @@ async def test_truncated_without_cursor_always_explained(secrets_dir: Path) -> N
         result, _, _ = await run(context(secrets_dir, fake), query="a")
         if result.truncated and result.next_cursor is None:
             assert result.incomplete_accounts or result.account_errors, fake
+
+
+async def test_an_item_that_cannot_fit_the_budget_never_leaves_truncated_unexplained(secrets_dir: Path) -> None:
+    """F8: when not even one shortened summary fits, the call fails loudly (`too_large`), because the page would be
+    `truncated` with no cursor and no `incomplete_accounts` or `account_errors` entry."""
+    fake = Fake(items={"icloud": [summary("icloud", 1, 10), summary("icloud", 2, 20)]})
+    ctx = context(secrets_dir, fake)
+    ctx = replace(ctx, settings=replace(ctx.settings, response_budget_chars=300))
+    with pytest.raises(ToolError) as caught:
+        await run(ctx, query="a", account="icloud")
+    assert caught.value.code == "too_large"
 
 
 async def test_refused_folder_does_not_block_the_cursor(secrets_dir: Path) -> None:

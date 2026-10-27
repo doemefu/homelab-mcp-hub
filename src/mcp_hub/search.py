@@ -164,9 +164,14 @@ def imap_value_keys(terms: SearchTerms, *, gmail: bool) -> list[tuple[SearchKey,
     if gmail:
         sanitised = (" ".join(_gmail_tokens(word)) for word in terms.words)
         keys = [("TEXT", value) for value in sanitised if value]
-    for key, value in (("FROM", terms.sender), ("TO", terms.recipient), ("SUBJECT", terms.subject)):
+    filters: tuple[tuple[SearchKey, str | None], ...] = (
+        ("FROM", terms.sender),
+        ("TO", terms.recipient),
+        ("SUBJECT", terms.subject),
+    )
+    for key, value in filters:
         if value is not None:
-            keys.append((key, value))  # type: ignore[arg-type]  # reason: key is one of the three literals above
+            keys.append((key, value))
     return keys or None
 
 

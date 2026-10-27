@@ -450,6 +450,10 @@ async def run_list_query[R: BaseModel](
         # `chosen` is a prefix of `items`. Only dropped items count as "more" (B8): a single item shortened to fit
         # leaves nothing to fetch, so it sets neither `truncated` nor a cursor.
         remaining = more or len(chosen) < len(items)
+        if items and not chosen:
+            # Not even one shortened summary fits: the page would be `truncated` with no cursor and no reason to give
+            # (unreachable within the accepted budget range, like the get_message case below).
+            raise ToolError("too_large", "Result exceeds the output budget")
         last: Position | None = None
         if chosen:
             last = positions[len(chosen) - 1]

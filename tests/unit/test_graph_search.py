@@ -913,6 +913,27 @@ def test_by_id_paths_refuse_a_search_hit_reference() -> None:
     assert not any("REGULAR" in r.url.path for r in server.requests)
 
 
+def test_message_path_is_the_one_by_id_sink_and_refuses_a_search_hit() -> None:
+    """F1: the rule is enforced where the path is built, not only by the callers (D87)."""
+    from types import SimpleNamespace
+
+    from mcp_hub.providers.graph import _message_path, _ThreadLogs
+
+    assert _message_path(GraphMessageRef("outlook", "AAMk/id=")) == "/me/messages/AAMk%2Fid%3D"
+    with pytest.raises(ProviderError) as caught:
+        _message_path(SearchHitRef("outlook", "REGULAR00001="))
+    assert (caught.value.code, caught.value.cause) == ("not_found", "ForeignRef")
+    clock = FakeClock()
+    server = Server()
+    box = mailbox(server, clock=clock)
+    item = SimpleNamespace(summary=SimpleNamespace(ref=SearchHitRef("outlook", "REGULAR00001=")))
+    body = box._read_thread_body(  # type: ignore[call-arg,arg-type]  # a bare item: only its ref is read
+        server.client(5), "token", CallDeadline.start(clock), item, 100, _ThreadLogs()
+    )
+    assert body.omitted
+    assert not any("REGULAR" in r.url.path for r in server.requests)
+
+
 def test_graph_search_logs_no_canary_at_debug() -> None:
     from mcp_hub.logging import HUB_LOGGER, PINNED_WARNING, configure_logging
     from mcp_hub.providers.base import item_hash

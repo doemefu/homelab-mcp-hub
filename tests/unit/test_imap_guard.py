@@ -613,6 +613,29 @@ def test_search_values_refusals_send_nothing(case: str) -> None:
         assert recorder.literals == []
 
 
+@pytest.mark.parametrize("values", [["ü"], ["word", "ü"]], ids=["non-ascii", "mixed"])
+def test_literal_path_is_refused_for_a_client_that_answers_literal_plus(values: list[str]) -> None:
+    """F3 (D82): the guard does not trust its factory. A plain IMAPClient would send `{N+}` to this server."""
+    with WireRecorder() as recorder:
+        client = wire_client(recorder)
+        guard = GuardedImapClient(client, CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        assert client.has_capability("LITERAL+") is True
+        sent = list(recorder.lines)
+        with pytest.raises(ImapCommandRefused):
+            guard.search_values(_NOT_DRAFT, [("TEXT", v) for v in values])
+        assert recorder.lines == sent
+        assert recorder.literals == []
+
+
+def test_ascii_values_do_not_need_the_capability_check() -> None:
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(wire_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.search_values(_NOT_DRAFT, [("TEXT", "word")])
+        assert any(b"TEXT" in line for line in recorder.lines)
+
+
 @pytest.mark.parametrize("values", [["word"], ["word", "ü"], ["ü"]], ids=["ascii", "mixed", "non-ascii"])
 @pytest.mark.parametrize("part", [b"abc", b"x OR ALL", b'"a"b"', b'"ab', b'"x{5}', b'""', b'"a" "b"'])
 def test_unquoted_ascii_part_is_refused_at_the_send_step(
