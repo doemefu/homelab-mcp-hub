@@ -595,6 +595,8 @@ _REFUSALS: dict[str, tuple[Any, Any]] = {
     "empty-value": (_NOT_DRAFT, [("TEXT", "")]),
     "bytes-value": (_NOT_DRAFT, [("TEXT", b"abc")]),
     "no-values": (_NOT_DRAFT, []),
+    "three-tuple": (_NOT_DRAFT, [("TEXT", "a", "b")]),
+    "bare-string-pair": (_NOT_DRAFT, ["ab"]),
 }
 
 
@@ -611,8 +613,11 @@ def test_search_values_refusals_send_nothing(case: str) -> None:
         assert recorder.literals == []
 
 
-@pytest.mark.parametrize("part", [b"abc", b'"a"b"', b'"ab', b'"x{5}', b'""', b'"a" "b"'])
-def test_unquoted_ascii_part_is_refused_at_the_send_step(monkeypatch: pytest.MonkeyPatch, part: bytes) -> None:
+@pytest.mark.parametrize("values", [["word"], ["word", "ü"], ["ü"]], ids=["ascii", "mixed", "non-ascii"])
+@pytest.mark.parametrize("part", [b"abc", b"x OR ALL", b'"a"b"', b'"ab', b'"x{5}', b'""', b'"a" "b"'])
+def test_unquoted_ascii_part_is_refused_at_the_send_step(
+    monkeypatch: pytest.MonkeyPatch, part: bytes, values: list[str]
+) -> None:
     # The builder is bypassed: IMAPClient would send an all-ASCII part as an atom, so the guard re-checks every part.
     monkeypatch.setattr(imap_search, "value_part", lambda value: part)
     with WireRecorder() as recorder:
@@ -620,6 +625,6 @@ def test_unquoted_ascii_part_is_refused_at_the_send_step(monkeypatch: pytest.Mon
         guard.login("user", "secret")
         sent = list(recorder.lines)
         with pytest.raises(ImapCommandRefused):
-            guard.search_values(_NOT_DRAFT, [("TEXT", "ü")])
+            guard.search_values(_NOT_DRAFT, [("TEXT", v) for v in values])
         assert recorder.lines == sent
         assert recorder.literals == []

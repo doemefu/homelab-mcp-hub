@@ -57,6 +57,19 @@ def test_message_id_with_atom_specials_is_one_quoted_string(value: str) -> None:
     assert literals == []
 
 
+def test_exact_ascii_bytes_through_the_hub_client() -> None:
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(hub_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        guard.examine("INBOX")
+        guard.search(criteria(b"NOT DRAFT", header_or(("Message-ID",), ["m1@example.test"])))
+        guard.logout()
+        assert [line.partition(b" ")[2] for line in recorder.lines if _command(line) == b"UID SEARCH"] == [
+            b'UID SEARCH NOT DRAFT HEADER Message-ID "<m1@example.test>"'
+        ]
+        assert recorder.literals == []
+
+
 def test_or_tree_goes_out_unchanged() -> None:
     search = criteria(b"NOT DRAFT", header_or(("In-Reply-To", "References"), ATOM_SPECIALS))
     lines, literals = _search_once(search)

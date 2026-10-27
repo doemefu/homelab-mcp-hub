@@ -209,12 +209,16 @@ class GuardedImapClient:
         value goes out as a hub-quoted string through `search`. A non-ASCII value is one synchronising literal
         with `CHARSET UTF-8` (never `{N+}`: the client class answers False for LITERAL+). Everything is checked
         before the first byte is sent; after an abort the session only attempts LOGOUT."""
-        from mcp_hub.providers import imap_search  # imap_search imports this module's criteria rule
+        # Local import: imap_search imports `search_criteria_ok` from this module (a cycle at module level), and the
+        # attribute is looked up per call so that a test can replace `value_part`.
+        from mcp_hub.providers import imap_search
 
         if not search_criteria_ok(prefix) or not (prefix == b"NOT DRAFT" or prefix.startswith(b"NOT DRAFT ")):
             raise ImapCommandRefused("search criteria refused")
         pairs = list(values)  # one snapshot: the checked copy is what gets sent
         if not 0 < len(pairs) <= MAX_SEARCH_VALUES:
+            raise ImapCommandRefused("search values refused")
+        if not all(type(pair) is tuple and len(pair) == 2 for pair in pairs):
             raise ImapCommandRefused("search values refused")
         keys = [key for key, _ in pairs]
         if not all(type(key) is str and key in _SEARCH_KEYS for key in keys):
@@ -243,19 +247,21 @@ class GuardedImapClient:
             parts.append(imap_search.value_part(value))
         if total > MAX_VALUE_BYTES:
             raise ImapCommandRefused("search values refused")
+        # Right before the send, on both paths: IMAPClient sends a part without an 8-bit byte as an atom, so every
+        # part must be exactly the value's quoted string (ASCII) or its UTF-8 bytes (non-ASCII), whatever built it.
+        for (_, value), part in zip(pairs, parts, strict=True):
+            if type(part) is not bytes or (
+                part != value.encode("utf-8")
+                if not value.isascii()
+                else _QUOTED_PART.fullmatch(part) is None or part != b'"' + value.encode("ascii") + b'"'
+            ):
+                raise ImapCommandRefused("search value refused")
         if not literal:
             return self.search(
                 prefix
                 + b" "
                 + b" ".join(key.encode("ascii") + b" " + part for key, part in zip(keys, parts, strict=True))
             )
-        # Right before the send: IMAPClient sends a part without an 8-bit byte as an atom, so every such part must be
-        # a well-formed quoted string, whatever built it.
-        for part in parts:
-            if type(part) is not bytes or (
-                part.isascii() and (_QUOTED_PART.fullmatch(part) is None or b"X-GM-RAW" in part.upper())
-            ):
-                raise ImapCommandRefused("search value refused")
         args = [b"CHARSET", b"UTF-8", prefix]
         for key, part in zip(keys, parts, strict=True):
             args += [key.encode("ascii"), part]
