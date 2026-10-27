@@ -18,8 +18,9 @@ every search also answers 500 hostile hits per folder.
 conversation list answers with a 2 MiB `uniqueBody` list or, alternately, a refused one and the 2 MiB fallback list, and
 20 single reads of about 2 MiB follow (every fourth refused once, then retried with `uniqueBody` alone).
 `--scenario list` drives run_list_messages (folder `all`) and run_list_unread, 50 items each, for `icloud` accounts
-through an in-process IMAP fake (T0b, #44): the inbox holds 50 unread messages with BODYSTRUCTUREs of 10,000 parts
-(`--structure-parts`), large text parts; each worker runs both tools.
+through an in-process IMAP fake (T0b, #44): the inbox holds 50 unread messages with 64 KiB summary headers,
+BODYSTRUCTUREs of 10,000 parts (`--structure-parts`) and large text parts, among 5,000 candidates; every
+`--failing-every`-th structure (default 5) fails its reduction; each worker runs both tools.
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
@@ -414,6 +415,14 @@ def attachment(i: int) -> tuple[object, ...]:
     return (b"application", b"pdf", (b"name", name), None, None, b"base64", 1000, None, disposition, None, None)
 
 
+def broken_attachment() -> tuple[object, ...]:
+    """A part that fails the reduction (an undecodable RFC 2231 parameter), after every other part was walked."""
+    return (b"application", b"pdf", (b"name*", b"utf-8''%ZZ"), None, None, b"base64", 1000, None, None, None, None)
+
+
+FAILING_EVERY = 0  # list scenario: every n-th UID answers a structure whose reduction fails (0: none)
+
+
 def structure(uid: int) -> tuple[object, ...]:
     """A fresh multipart/mixed BODYSTRUCTURE: the text structure and STRUCTURE_PARTS attachment parts. Built per FETCH
     answer, as IMAPClient builds the parsed tuples of every answer, so the probe holds what the adapter holds. Even
@@ -422,6 +431,8 @@ def structure(uid: int) -> tuple[object, ...]:
     if not uid % 2:
         first = ([text_leaf(b"plain", b"base64", 200_000), first], b"alternative", None)
     attachments = [attachment(i) for i in range(STRUCTURE_PARTS - 2)]
+    if FAILING_EVERY and uid % FAILING_EVERY == 0:
+        attachments[-1] = broken_attachment()
     return ([first, *attachments], b"mixed", (b"boundary", b"b"), None, None, None)
 
 
@@ -546,8 +557,9 @@ def account_id(prefix: str, index: int) -> str:
 
 
 def list_server() -> ProbeServer:
-    """`LIST_ITEMS` unread inbox messages, each with a short header and a large text part; the
-    BODYSTRUCTURE of every FETCH answer is built by `ProbeClient`."""
+    """`LIST_ITEMS` unread inbox messages with a 64 KiB summary header (a 9,000-character Subject, a References cut by
+    the item) and a large text part, among `LIST_CANDIDATES` older ones that pass 1 has to read; the BODYSTRUCTURE of
+    every FETCH answer is built by `ProbeClient` (every `FAILING_EVERY`-th fails its reduction)."""
     now = datetime.now(UTC)
     inbox = {
         uid: FakeMessage(
@@ -556,13 +568,19 @@ def list_server() -> ProbeServer:
             headers=hdr(
                 ("From", "Peer <peer@example.test>"),
                 ("To", OWNER),
-                ("Subject", "y" * 200),
+                ("Subject", "y" * 9000),
                 ("Message-ID", f"<l{uid}@example.test>"),
+                ("References", f"{'x' * 66000} <l0@example.test>"),
             ),
             text=HTML_BODY if uid % 2 else PLAIN_B64,
         )
         for uid in range(1, LIST_ITEMS + 1)
     }
+    older = hdr(
+        ("From", "Bulk <bulk@example.test>"), ("To", OWNER), ("Subject", "y" * 9000), ("Message-ID", "<b@x.test>")
+    )
+    for uid in range(LIST_ITEMS + 1, LIST_CANDIDATES + 1):  # one shared bytes object: the fake holds none of it per hit
+        inbox[uid] = FakeMessage(uid, now - timedelta(hours=1, seconds=uid), headers=older)
     folders: list[FakeFolder] = [
         ProbeFolder("INBOX", (b"\\HasNoChildren",), messages=inbox),
         ProbeFolder("Sent Messages", (b"\\HasNoChildren", b"\\Sent")),
@@ -595,7 +613,7 @@ def imap_factory(kind: Callable[[], str] | None = None) -> Callable[[str], ImapM
     return build
 
 
-LIST_ITEMS = 50
+LIST_ITEMS, LIST_CANDIDATES = 50, 5000
 GRAPH_ITEMS, GRAPH_LISTED, GRAPH_SEED = 51, 31, "AAMkMSG0051="
 CAP = MAX_MESSAGE_RESPONSE_BYTES
 
@@ -862,7 +880,7 @@ def status_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global STRUCTURE_PARTS
+    global STRUCTURE_PARTS, FAILING_EVERY
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--scenario",
@@ -882,6 +900,12 @@ def main() -> None:
         "--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread, list)"
     )
     parser.add_argument(
+        "--failing-every",
+        type=int,
+        default=5,
+        help="list: every n-th message answers a structure that fails its reduction (0: none)",
+    )
+    parser.add_argument(
         "--summary-chunk",
         type=int,
         help="override SUMMARY_STRUCTURE_CHUNK_UIDS of the list scenario (to compare sizes)",
@@ -894,6 +918,7 @@ def main() -> None:
         return
     if args.scenario == "list":
         STRUCTURE_PARTS = args.structure_parts
+        FAILING_EVERY = args.failing_every
         list_main(args)
         return
     if args.scenario in ("thread", "thread-graph"):

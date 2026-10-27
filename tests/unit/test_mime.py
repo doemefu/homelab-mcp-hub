@@ -218,3 +218,9 @@ def test_denied_codec_timing_each(charset: str) -> None:
         _assert_linear(charset, payload)
     punycode_like = _HOSTILE["punycode_like"](_SIZE)
     assert safe_decode(punycode_like, charset) == punycode_like.decode("utf-8", "replace")
+
+
+def test_malformed_encoded_word_in_a_part_parameter_keeps_the_raw_value() -> None:
+    odd = (b"application", b"pdf", (b"name", b"=?utf-8?b?abcde?="), None, None, b"base64", 10, None, None, None, None)
+    [part] = walk(odd)
+    assert part.params["name"] == "=?utf-8?b?abcde?="

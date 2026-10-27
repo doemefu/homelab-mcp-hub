@@ -93,7 +93,7 @@ from mcp_hub.providers.imap_session import (
     _is_draft,
     _labels,
 )
-from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS
+from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS, _raise_bad
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
@@ -208,9 +208,15 @@ def _sent_since_pass_one(chosen: _Chosen, row: dict[bytes, object]) -> bool:
 class _Progress:
     truncated: bool = False
     complete: bool = True
+    stopped: bool = False  # pass 2 fetched no further chunks: the folders after it are not read
 
 
-Unparsable = dict[int, tuple[Exception, dict[bytes, object]]]
+@dataclass(frozen=True, slots=True)
+class Failed:
+    """A structure or header block that could not be reduced. Only the class name of the cause is kept: an exception
+    would pin its traceback, and with it the frames that hold the parsed nesting (#44)."""
+
+    kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,18 +227,77 @@ class _Structure:
     has_attachments: bool
 
 
-Structures = dict[int, _Structure | Exception]  # an Exception: the reduction failed, the message degrades
+@dataclass(frozen=True, slots=True)
+class Reduced:
+    """What pass 2 keeps of a message's BODYSTRUCTURE and summary header block (64 KiB) once its chunk is read."""
+
+    structure: _Structure | Failed
+    headers: ParsedHeaders | Failed
 
 
-def _reduce_structure(row: dict[bytes, object]) -> _Structure | Exception:
+Unparsable = dict[int, tuple[Failed, dict[bytes, object]]]
+
+
+@dataclass(slots=True)
+class PassTwo:
+    rows: dict[int, dict[bytes, object]]  # without the bulky items
+    reduced: dict[int, Reduced]
+    unparsable: Unparsable
+    stop: Literal["reserve", "soft"] | None = None  # no further chunk was fetched: the page is truncated
+
+
+def _reduce(row: dict[bytes, object]) -> Reduced:
+    structure: _Structure | Failed
+    headers: ParsedHeaders | Failed
     try:
         parts = _structure(row)
         text_part = choose_text_part(parts)
-        return _Structure(text_part, bool(attachment_parts(parts, text_part)))
+        structure = _Structure(text_part, bool(attachment_parts(parts, text_part)))
     except PASS_THROUGH:
         raise
     except Exception as exc:
-        return exc
+        structure = Failed(type(exc).__name__)
+    try:
+        headers = parse_summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        headers = Failed(type(exc).__name__)
+    for key in [k for k in row if k == b"BODYSTRUCTURE" or k.upper().startswith(b"BODY[HEADER.FIELDS")]:
+        del row[key]
+    return Reduced(structure, headers)
+
+
+def _fetch_chunk(
+    session: ImapSession, chunk: list[int], items: Sequence[str], flag_items: Sequence[str], unparsable: Unparsable
+) -> dict[int, dict[bytes, object]]:
+    """One chunk's rows. An answer that does not parse (RecursionError on a BODYSTRUCTURE nested about 1000 deep, a
+    ProtocolError or another parse exception) fails the whole chunk; it is then fetched one UID at a time, and a UID
+    that fails alone is returned as unparsable, with its `flag_items` (FLAGS; on Gmail also X-GM-LABELS) fetched
+    alone, so only that message degrades (to a placeholder with the right `unread` and folder). A tagged BAD, a lost
+    connection and the deadlines stay errors of the call. The fallback runs after the handler has left, so no
+    exception (and no parse it pins) is alive while it works."""
+    try:
+        return session.fetch(chunk, items)
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:
+        _raise_bad(exc)
+    got: dict[int, dict[bytes, object]] = {}
+    for uid in chunk:
+        kind: str | None = None
+        try:
+            got.update(session.fetch([uid], items))
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:
+            _raise_bad(exc)
+            kind = type(exc).__name__
+        if kind is not None:
+            flags = session.fetch([uid], flag_items).get(uid)
+            if flags is not None:
+                unparsable[uid] = (Failed(kind), flags)
+    return got
 
 
 def _fetch_summaries(
@@ -241,43 +306,35 @@ def _fetch_summaries(
     items: Sequence[str],
     flag_items: Sequence[str],
     soft_check: Callable[[], None],
-) -> tuple[dict[int, dict[bytes, object]], Structures, Unparsable]:
-    """Summary rows of `uids`, fetched SUMMARY_STRUCTURE_CHUNK_UIDS at a time, each chunk's BODYSTRUCTUREs reduced
-    at once (`_Structure`) and dropped from the rows, so a hostile structure never waits for 49 others (#44). The
-    soft limit is checked between chunks (reducing costs CPU without a command). IMAPClient's recursive response
-    parser raises RecursionError on a BODYSTRUCTURE nested about 1000 deep; that chunk is then fetched per UID, and
-    a UID that fails alone is returned as unparsable, with its `flag_items` (FLAGS; on Gmail also X-GM-LABELS)
-    fetched alone, so only that message degrades (to a placeholder with the right `unread` and folder). A UID whose
-    FLAGS do not come back either is missing from all results."""
-    rows: dict[int, dict[bytes, object]] = {}
-    structures: Structures = {}
-    unparsable: Unparsable = {}
-    for start in range(0, len(uids), SUMMARY_STRUCTURE_CHUNK_UIDS):
-        if start:
-            soft_check()
-        chunk = uids[start : start + SUMMARY_STRUCTURE_CHUNK_UIDS]
-        got: dict[int, dict[bytes, object]] = {}
-        try:
-            got = session.fetch(chunk, items)
-        except RecursionError:
-            for uid in chunk:
-                try:
-                    got.update(session.fetch([uid], items))
-                except RecursionError as exc:
-                    flags = session.fetch([uid], flag_items).get(uid)
-                    if flags is not None:
-                        unparsable[uid] = (exc, flags)
-        for uid, row in got.items():
-            structures[uid] = _reduce_structure(row)
-            row.pop(b"BODYSTRUCTURE", None)
-        rows.update(got)
-    return rows, structures, unparsable
+    reserve_spent: Callable[[], bool],
+) -> PassTwo:
+    """Summary rows of `uids`, fetched SUMMARY_STRUCTURE_CHUNK_UIDS at a time, each chunk's BODYSTRUCTUREs and header
+    blocks reduced at once (`Reduced`) and dropped from the rows, so a hostile structure never waits for 49 others
+    (#44). No new chunk is fetched once the reserve is spent or the soft limit has passed (checked between
+    chunks: a chunk's reductions are CPU-bounded, Sec M1): the result then holds the chunks already read, with
+    `stop` set."""
+    result = PassTwo({}, {}, {})
+    try:
+        for start in range(0, len(uids), SUMMARY_STRUCTURE_CHUNK_UIDS):
+            if start:
+                if reserve_spent():
+                    result.stop = "reserve"
+                    break
+                soft_check()
+            chunk = uids[start : start + SUMMARY_STRUCTURE_CHUNK_UIDS]
+            got = _fetch_chunk(session, chunk, items, flag_items, result.unparsable)
+            for uid, row in got.items():
+                result.reduced[uid] = _reduce(row)
+                result.rows[uid] = row
+    except SoftStop:
+        result.stop = "soft"
+    return result
 
 
 def _fetch_texts(
     session: ImapSession,
     rows: dict[int, dict[bytes, object]],
-    structures: Structures,
+    reduced: dict[int, Reduced],
     length: int,
     refs: dict[int, MessageRef],
     soft_check: Callable[[], None],
@@ -287,7 +344,7 @@ def _fetch_texts(
     each member checks the soft limit first (it costs CPU without a command)."""
     by_section: dict[str, list[tuple[int, Part]]] = {}
     for uid in rows:  # an odd or empty BODYSTRUCTURE (a failed reduction) leaves this snippet empty
-        structure = structures.get(uid)
+        structure = reduced[uid].structure
         if isinstance(structure, _Structure) and structure.text_part is not None:
             by_section.setdefault(structure.text_part.section, []).append((uid, structure.text_part))
     texts: dict[int, str] = {}
@@ -390,6 +447,10 @@ class ImapMailbox:
         if self._deadline is not None and self._deadline.soft_expired():
             raise SoftStop
 
+    def _reserve_spent(self) -> bool:
+        """No new pass-2 chunk after the body pass's share of the call (as for `get_thread`)."""
+        return self._deadline is not None and self._deadline.elapsed() > BODY_RESERVE_SECONDS
+
     def check(self, deadline: CallDeadline) -> None:
         """Status check (spec 080 §7.4): login + NOOP."""
         self._run(lambda session: session.noop(), deadline)
@@ -454,6 +515,8 @@ class ImapMailbox:
         try:
             for entry, group in _by_folder(plans, chosen):
                 self._summaries(session, entry, folder_of[entry.raw_name], group, progress, built)
+                if progress.stopped:
+                    break
         except SoftStop:  # SA13: pass 2 incomplete, so the page gets no cursor; the items built so far are kept
             progress.truncated, progress.complete = True, False
         returned = [c for c in chosen if c.ref in built]
@@ -617,17 +680,26 @@ class ImapMailbox:
         gmail = session.gmail
         items = [*LIST_SUMMARY_ITEMS, *_GMAIL_SUMMARY_ITEMS] if gmail else list(LIST_SUMMARY_ITEMS)
         flag_items = ["FLAGS", _GMAIL_CANDIDATE_ITEM] if gmail else ["FLAGS"]
-        rows, structures, unparsable = _fetch_summaries(session, uids, items, flag_items, self._soft_check)
+        two = _fetch_summaries(session, uids, items, flag_items, self._soft_check, self._reserve_spent)
+        rows, reduced, unparsable = two.rows, two.reduced, two.unparsable
+        if two.stop is not None:  # the chunks read are built, the rest is not read: no cursor (SA13)
+            progress.truncated, progress.complete, progress.stopped = True, False, True
         refs = {c.candidate.uid: c.ref for c in group}
-        texts = _fetch_texts(session, rows, structures, SNIPPET_FETCH_BYTES, refs, self._soft_check)
+        texts: dict[int, str] = {}
+        if two.stop != "soft":  # after a soft stop no command may follow: the items come without snippets
+            try:
+                texts = _fetch_texts(session, rows, reduced, SNIPPET_FETCH_BYTES, refs, self._soft_check)
+            except SoftStop:
+                if two.stop is None:  # an ordinary soft stop: the folders built before are the page (SA13)
+                    raise
+                # already truncated by the reserve: keep the messages read, without snippets
         for chosen in group:
-            self._soft_check()
             uid = chosen.candidate.uid
             if uid in unparsable:
                 failure, flag_row = unparsable[uid]
                 if _is_draft(flag_row) or _sent_since_pass_one(chosen, flag_row):
                     continue
-                log_message_skipped(chosen.ref, "mail", failure)
+                log_message_skipped(chosen.ref, "mail", failure.kind)
                 flags = _flags(flag_row)
                 meta = self._meta(entry, folder or _gmail_folder(_labels(flag_row)), chosen, flags, None)
                 out[chosen.ref] = placeholder_summary(
@@ -635,14 +707,14 @@ class ImapMailbox:
                 )
                 continue
             row = rows.get(uid)
-            if row is None:  # FETCH NO (S-p) or expunged meanwhile
+            if row is None:  # FETCH NO (S-p), expunged meanwhile, or not read after a stop
                 progress.complete = False
                 continue
             if _is_draft(row) or _sent_since_pass_one(chosen, row):  # excluded now, like any draft or other direction
                 continue
             item_folder = folder or _gmail_folder(_labels(row))
             out[chosen.ref] = self._summary(
-                entry, item_folder, chosen, row, structures[uid], texts.get(uid, ""), gmail=gmail
+                entry, item_folder, chosen, row, reduced[uid], texts.get(uid, ""), gmail=gmail
             )
 
     def _meta(
@@ -664,17 +736,19 @@ class ImapMailbox:
         folder: MailFolder,
         chosen: _Chosen,
         row: dict[bytes, object],
-        structure: _Structure | Exception,
+        reduced: Reduced,
         snippet: str,
         *,
         gmail: bool,
     ) -> MailSummary:
         flags = _flags(row)
         received = chosen.candidate.received_at
-        try:  # one hostile message degrades to a placeholder, never fails the account
-            if isinstance(structure, Exception):
-                raise structure
-            parsed = parse_summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
+        structure, parsed = reduced.structure, reduced.headers
+        if isinstance(structure, Failed):  # one hostile message degrades to a placeholder, never fails the account
+            return self._degraded(entry, folder, chosen, flags, structure.kind)
+        if isinstance(parsed, Failed):
+            return self._degraded(entry, folder, chosen, flags, parsed.kind)
+        try:  # and so does one whose summary cannot be built
             meta = self._meta(entry, folder, chosen, flags, parsed.from_address)
             return MailSummary(
                 ref=chosen.ref,
@@ -698,9 +772,14 @@ class ImapMailbox:
         except PASS_THROUGH:
             raise
         except Exception as exc:
-            log_message_skipped(chosen.ref, "mail", exc)
-            meta = self._meta(entry, folder, chosen, flags, None)
-            return placeholder_summary(chosen.ref, received, _SEEN not in flags, meta)
+            return self._degraded(entry, folder, chosen, flags, type(exc).__name__)
+
+    def _degraded(
+        self, entry: FolderEntry, folder: MailFolder, chosen: _Chosen, flags: frozenset[bytes], kind: str
+    ) -> MailSummary:
+        log_message_skipped(chosen.ref, "mail", kind)
+        meta = self._meta(entry, folder, chosen, flags, None)
+        return placeholder_summary(chosen.ref, chosen.candidate.received_at, _SEEN not in flags, meta)
 
     # --- get_message -------------------------------------------------------------------------------------------
 
