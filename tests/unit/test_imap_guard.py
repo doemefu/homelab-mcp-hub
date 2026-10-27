@@ -12,6 +12,7 @@ import pytest
 from imapclient import IMAPClient
 from imapclient.exceptions import IMAPClientError, InvalidCriteriaError, LoginError
 
+from mcp_hub.providers import imap_search
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.imap_guard import (
@@ -27,7 +28,7 @@ from mcp_hub.providers.imap_guard import (
 )
 from tests.support.clock import FakeClock
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapServer, FakeMessage, bad, no
-from tests.support.imap_wire import WireRecorder, wire_client
+from tests.support.imap_wire import WireRecorder, hub_client, wire_client
 
 ROOT = Path(__file__).resolve().parents[2]
 D = datetime(2026, 10, 19, 8, 0, tzinfo=UTC)
@@ -448,7 +449,17 @@ def test_no_write_method_reachable() -> None:
     with pytest.raises(AttributeError):
         guard.client = None  # type: ignore[attr-defined]  # no __dict__: nothing can be attached
     public = {name for name in dir(guard) if not name.startswith("_")}
-    assert public == {"login", "capabilities", "list_folders", "examine", "search", "fetch", "noop", "logout"}
+    assert public == {
+        "login",
+        "capabilities",
+        "list_folders",
+        "examine",
+        "search",
+        "search_values",
+        "fetch",
+        "noop",
+        "logout",
+    }
 
 
 def test_refusals_are_raises_not_asserts() -> None:
@@ -556,3 +567,59 @@ def test_pass_through_covers_stop_refusal_provider_and_connection_errors() -> No
     for exc in (SoftStop(), ImapCommandRefused("x"), ProviderError("upstream_timeout"), imaplib.IMAP4.abort("x")):
         assert isinstance(exc, PASS_THROUGH)
     assert isinstance(TimeoutError(), PASS_THROUGH)
+
+
+# --- search_values refusals (T3): nothing is sent --------------------------------------------------------------
+
+_NOT_DRAFT = b"NOT DRAFT SINCE 26-Sep-2026"
+_REFUSALS: dict[str, tuple[Any, Any]] = {
+    "literal-801-bytes": (_NOT_DRAFT, [("TEXT", "ü" * 400 + "a")]),
+    "6x700-bytes": (_NOT_DRAFT, [("TEXT", "ü" * 350)] * 6),
+    "lone-surrogate": (_NOT_DRAFT, [("TEXT", "\ud800ü")]),
+    "crlf": (_NOT_DRAFT, [("TEXT", "a\r\nü")]),
+    "nul": (_NOT_DRAFT, [("TEXT", "ü\x00")]),
+    "c1": (_NOT_DRAFT, [("TEXT", "ü\x85")]),
+    "12-values": (_NOT_DRAFT, [("TEXT", "a")] * 8 + [("FROM", "a"), ("TO", "a"), ("SUBJECT", "a"), ("TEXT", "a")]),
+    "9-text": (_NOT_DRAFT, [("TEXT", "a")] * 9),
+    "two-from": (_NOT_DRAFT, [("FROM", "a"), ("FROM", "b")]),
+    "key-body": (_NOT_DRAFT, [("BODY", "a")]),
+    "key-bytes": (_NOT_DRAFT, [(b"TEXT", "a")]),
+    "prefix-no-not-draft": (b"TEXT x", [("TEXT", "a")]),
+    "prefix-literal-marker": (b"NOT DRAFT x {5}", [("TEXT", "a")]),
+    "prefix-x-gm-raw": (b"NOT DRAFT x-gm-raw", [("TEXT", "a")]),
+    "prefix-str": ("NOT DRAFT", [("TEXT", "a")]),
+    "value-x-gm-raw-literal": (_NOT_DRAFT, [("TEXT", "ü x-gm-raw")]),
+    "value-x-gm-raw-quoted": (_NOT_DRAFT, [("TEXT", "x-gm-raw")]),
+    "ascii-quote": (_NOT_DRAFT, [("TEXT", 'a"b')]),
+    "ascii-backslash": (_NOT_DRAFT, [("TEXT", "a\\b")]),
+    "empty-value": (_NOT_DRAFT, [("TEXT", "")]),
+    "bytes-value": (_NOT_DRAFT, [("TEXT", b"abc")]),
+    "no-values": (_NOT_DRAFT, []),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REFUSALS))
+def test_search_values_refusals_send_nothing(case: str) -> None:
+    prefix, values = _REFUSALS[case]
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(hub_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        sent = list(recorder.lines)
+        with pytest.raises(ImapCommandRefused):
+            guard.search_values(prefix, values)
+        assert recorder.lines == sent
+        assert recorder.literals == []
+
+
+@pytest.mark.parametrize("part", [b"abc", b'"a"b"', b'"ab', b'"x{5}', b'""', b'"a" "b"'])
+def test_unquoted_ascii_part_is_refused_at_the_send_step(monkeypatch: pytest.MonkeyPatch, part: bytes) -> None:
+    # The builder is bypassed: IMAPClient would send an all-ASCII part as an atom, so the guard re-checks every part.
+    monkeypatch.setattr(imap_search, "value_part", lambda value: part)
+    with WireRecorder() as recorder:
+        guard = GuardedImapClient(hub_client(recorder), CallDeadline.start(), registry_inbox_raw="INBOX")
+        guard.login("user", "secret")
+        sent = list(recorder.lines)
+        with pytest.raises(ImapCommandRefused):
+            guard.search_values(_NOT_DRAFT, [("TEXT", "ü")])
+        assert recorder.lines == sent
+        assert recorder.literals == []

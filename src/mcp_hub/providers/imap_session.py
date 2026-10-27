@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Final, Literal
 
 from mcp_hub.ids import MessageRef
-from mcp_hub.providers.base import ProviderError, log_message_skipped
+from mcp_hub.providers.base import ProviderError, SearchKey, log_message_skipped
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import (
     MAX_LOCATE_FOLDERS,
@@ -271,6 +271,9 @@ class ImapSession:
 
     def search(self, criteria: bytes) -> list[int]:
         return self._client.search(criteria)
+
+    def search_values(self, prefix: bytes, values: Sequence[tuple[SearchKey, str]]) -> list[int]:
+        return self._client.search_values(prefix, values)
 
     def fetch(
         self, uids: Sequence[int], items: Sequence[str], *, on_no: Literal["drop", "fail"] = "drop"

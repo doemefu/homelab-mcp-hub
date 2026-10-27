@@ -1,9 +1,12 @@
 """IMAP SEARCH criteria built by the hub (D74): the only path by which third-party values reach an IMAP command.
 
-Every value goes out as a hub-built quoted string; the whole criteria is one printable-ASCII `bytes` value for
+Every ASCII value goes out as a hub-built quoted string; the whole criteria is one printable-ASCII `bytes` value for
 `GuardedImapClient.search`, which IMAPClient 4.1.0 sends unchanged. IMAPClient's per-item quoting is not used: it
-leaves atom-special values such as `a(b)@x` unquoted. Values that cannot be a quoted string (`"`, `\\`, control
-characters, non-ASCII) are refused, never escaped or sent as literals.
+leaves atom-special values such as `a(b)@x` unquoted. ASCII values that cannot be a quoted string (`"`, `\\`, control
+characters) are refused, never escaped. The search words of `search_messages` are the one exception for non-ASCII
+text: `GuardedImapClient.search_values` sends such a value as one synchronising literal with `CHARSET UTF-8`, never
+refused and never as `{N+}`; the normaliser removed `"` and `\\` from every value beforehand, and still nothing is
+escaped. Every other builder here stays ASCII-only.
 
 Header searches on the msg-id fields send the bracketed token `"<id>"` (O35): iCloud matches them against whole
 `<...>` tokens only, so a bare id finds nothing there, while RFC 3501 substring servers match `"<id>"` as well.
@@ -58,6 +61,15 @@ def quoted(value: str) -> bytes:
     if not search_value_ok(value):
         raise UnsafeSearchValue("search value refused")
     return b'"' + value.encode("ascii") + b'"'
+
+
+def value_part(value: str) -> bytes:
+    """One search value as the guard sends it: the hub-quoted string for an ASCII value, the raw UTF-8 bytes for a
+    non-ASCII one (IMAPClient sends a part with an 8-bit byte as a literal, by content). The guard re-checks the
+    result before it goes out."""
+    if type(value) is str and not value.isascii():
+        return value.encode("utf-8")
+    return quoted(value)
 
 
 def msg_id_token(value: str) -> bytes:

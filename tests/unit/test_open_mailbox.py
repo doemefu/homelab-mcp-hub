@@ -43,7 +43,7 @@ class RecordingClient:
 @pytest.fixture
 def recording(monkeypatch: pytest.MonkeyPatch) -> type[RecordingClient]:
     RecordingClient.instances = []
-    monkeypatch.setattr("mcp_hub.providers.imap.imapclient.IMAPClient", RecordingClient)
+    monkeypatch.setattr("mcp_hub.providers.imap.HubImapClient", RecordingClient)
     return RecordingClient
 
 

@@ -109,8 +109,21 @@ _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 ClientFactory = Callable[[str, int, ssl.SSLContext, float], ImapClientLike]
 
 
+class HubImapClient(imapclient.IMAPClient):  # type: ignore[misc]  # IMAPClient ships no type information
+    """IMAPClient that never announces `LITERAL+` to its own literal sender: the library asks `has_capability`
+    to choose between `{N+}` and `{N}` + wait for `+`, and a search value is third-party text. With `{N}` the
+    server must accept the command line before a single value byte is sent, so a server that rejects the line
+    early cannot read the value as a new command (D82). Every other capability answers as the library does."""
+
+    def has_capability(self, capability: str | bytes) -> bool:
+        name = capability.decode("ascii", "replace") if isinstance(capability, bytes) else capability
+        if name.upper() == "LITERAL+":
+            return False
+        return bool(super().has_capability(capability))
+
+
 def default_client(host: str, port: int, context: ssl.SSLContext, timeout: float) -> ImapClientLike:
-    return cast(ImapClientLike, imapclient.IMAPClient(host, port=port, ssl=True, ssl_context=context, timeout=timeout))
+    return cast(ImapClientLike, HubImapClient(host, port=port, ssl=True, ssl_context=context, timeout=timeout))
 
 
 def _provider_error(exc: Exception) -> ProviderError:
