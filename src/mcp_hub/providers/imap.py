@@ -81,6 +81,7 @@ from mcp_hub.providers.imap_session import (
     _GMAIL_CANDIDATE_ITEM,
     _LABEL_INBOX,
     _LABEL_SENT,
+    FETCH_CHUNK_UIDS,
     MAX_SEARCH_CANDIDATES,
     SOFT_CHECK_EVERY,
     ImapSession,
@@ -100,6 +101,7 @@ from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
+MAX_CANDIDATE_FROM_CHARS: Final = 320  # the From address kept per candidate (dedup key and direction)
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
 _GMAIL_SUMMARY_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: per-message folder and thread (§5.5)
@@ -534,30 +536,36 @@ class ImapMailbox:
             fields = ["FROM"]  # I13
         base = [*CANDIDATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if session.gmail else list(CANDIDATE_ITEMS)
         items = [*base, candidate_header_item(fields)] if fields else base
-        rows = session.fetch(newest, items)
         # Gmail without `\All`: the `\Sent` mailbox also holds self-sent mail, which is `inbox` (§5.5); its labels
         # (fetched above) drop it here, as the label key `NOT X-GM-LABELS "\Inbox"` does in All Mail.
         sent_mailbox = session.gmail and plan.fixed_folder == "sent" and plan.gmail_labels is None
         out: list[Candidate] = []
-        for count, uid in enumerate(newest):
-            if count and count % SOFT_CHECK_EVERY == 0:
-                self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
-            row = rows.get(uid)
-            if row is None or _is_draft(row):  # FETCH NO, expunged meanwhile, or a draft (S1)
-                continue
-            if sent_mailbox and _LABEL_INBOX in _labels(row):
-                continue
-            received = _aware(row.get(b"INTERNALDATE"))
-            if received is None:
-                log_message_skipped(
-                    MessageRef(self._account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
-                )
-                continue
-            if received < query.since:
-                continue
-            message_id, sender = _candidate_headers(row) if fields else (None, None)
-            sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
-            out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
+        count = 0
+        # One chunk of rows at a time, each reduced to `Candidate`s before the next FETCH: pass 1 never holds the rows
+        # of all 5,000 candidates (header blocks of up to 2 KiB each).
+        for rows in session.fetch_chunks(newest, items, chunk=FETCH_CHUNK_UIDS):
+            for uid, row in sorted(rows.items(), reverse=True):
+                if count and count % SOFT_CHECK_EVERY == 0:
+                    self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
+                count += 1
+                if _is_draft(row):  # a draft (S1); a FETCH NO or expunged UID has no row at all
+                    continue
+                if sent_mailbox and _LABEL_INBOX in _labels(row):
+                    continue
+                received = _aware(row.get(b"INTERNALDATE"))
+                if received is None:
+                    log_message_skipped(
+                        MessageRef(self._account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
+                    )
+                    continue
+                if received < query.since:
+                    continue
+                message_id, sender = _candidate_headers(row) if fields else (None, None)
+                if sender is not None:
+                    sender = sender[:MAX_CANDIDATE_FROM_CHARS]  # a hostile From must not cost memory per candidate
+                sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
+                out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
+        out.sort(key=lambda candidate: candidate.uid, reverse=True)  # newest UID first, as one FETCH would have
         return out
 
     def _choose(self, candidates: list[Candidate], query: ListQuery, merge: bool) -> tuple[list[_Chosen], bool]:
