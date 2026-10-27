@@ -21,12 +21,14 @@ from urllib.parse import quote, urlsplit
 
 import httpx2
 
+from mcp_hub.errors import ToolError
 from mcp_hub.ids import (
     GRAPH_ID,
     MESSAGE_ID_PATTERN,
     AnyMessageRef,
     GraphMessageRef,
     MessageRef,
+    SearchHitRef,
     StableRef,
     ThreadKey,
 )
@@ -96,7 +98,7 @@ from mcp_hub.providers.threads import (
     server_body,
 )
 from mcp_hub.sanitize import html_to_text
-from mcp_hub.search import MATCH_NAME_CHARS, MATCH_SUBJECT_CHARS, match_fold
+from mcp_hub.search import EMPTY_GRAPH_QUERY, MATCH_NAME_CHARS, MATCH_SUBJECT_CHARS, graph_search_text, match_fold
 
 GRAPH_HOST: Final = "graph.microsoft.com"
 API: Final = f"https://{GRAPH_HOST}/v1.0"
@@ -113,6 +115,10 @@ EXTENDED_EXPAND: Final = (
     "singleValueExtendedProperties($filter=id eq 'Integer 0x1081' or id eq 'String 0x1042' or id eq 'String 0x1039')"
 )
 GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
+SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (owner decision, 2026-10-27)
+SEARCH_HALVED_TOP: Final = 50  # the one retry after a too_large answer
+# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probes P1/P2, SEARCH_FACTS).
+SEARCH_EXPAND: Final = True
 FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)
 ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
 FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
@@ -141,6 +147,7 @@ _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anythin
 _LEGACY_DN: Final = re.compile(r"/O=[^/@]+(?:/OU=[^/@]+)*/CN=RECIPIENTS/CN=[^/@]+", re.IGNORECASE)  # fullmatch (T17)
 _PLAIN_ADDRESS: Final = re.compile(r"[^@\s]+@[^@\s]+")  # fullmatch: one "@", no whitespace
 _DN_ADDRESS: Final = re.compile(r"\s*/O=", re.IGNORECASE)  # match: an Exchange DN, never a participant (gr-G4)
+_SEARCH_REJECTED: Final = "SearchRejected"  # log cause of a 404 or unmapped status on the search request (GR5)
 _UNEXPECTED_STATUS: Final = "UnexpectedStatus"  # `_get`'s cause for a status it does not map (G-R7)
 # The get_thread list falls back on these causes too: any status but 2xx, 401, 403, 404, 429 and 503 (SG1, Q7).
 _FALLBACK_CAUSES: Final = frozenset({_UNEXPECTED_STATUS, "Redirect"})
@@ -462,6 +469,23 @@ def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
     return True
 
 
+def _search_requests(ids: GraphFolderIds, query: ListQuery) -> tuple[str, dict[str, str], frozenset[str]]:
+    """The one `$search` request of a call: (path, params, allowed parent folder ids). The only place that builds it.
+
+    Mailbox-wide, never per folder: a per-folder `$search` lost hits (probe P1b). The value is the allowlist-sanitised
+    word text inside two double quotes, sent as an httpx query parameter; `$filter`, `$orderby` and `ConsistencyLevel`
+    do not combine with `$search`, so window, order and folders are applied per hit."""
+    terms = query.search
+    text = None if terms is None else graph_search_text(terms.words)
+    if text is None:
+        raise ToolError("invalid_argument", EMPTY_GRAPH_QUERY)
+    params = {"$search": f'"{text}"', "$top": str(SEARCH_TOP), "$select": SUMMARY_SELECT}
+    if SEARCH_EXPAND:
+        params["$expand"] = EXTENDED_EXPAND
+    allowed = frozenset(i for name in WELL_KNOWN_FOR[query.folder] if (i := ids.ids.get(name)) is not None)
+    return "/me/messages", params, allowed
+
+
 def _has_filters(terms: SearchTerms | None) -> bool:
     return terms is not None and (terms.sender is not None or terms.recipient is not None or terms.subject is not None)
 
@@ -641,8 +665,14 @@ class GraphMailbox:
         self._run(self._check_inbox, deadline)
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
+        if query.search is not None and query.search.words:
+            if graph_search_text(query.search.words) is None:  # refused here, not wrapped as a provider error
+                raise ToolError("invalid_argument", EMPTY_GRAPH_QUERY)
+            search = self._search_messages
+        else:
+            search = self._list_messages
         return self._run(
-            lambda client, token, call: self._list_messages(client, token, call, query),
+            lambda client, token, call: search(client, token, call, query),
             deadline,
             on_soft_stop=lambda: _soft_stopped_page(
                 query
@@ -700,6 +730,65 @@ class GraphMailbox:
         return self._run(
             lambda client, token, call: self._thread(client, token, call, query, conversation, logs), deadline
         )
+
+    # --- search ---------------------------------------------------------------------------------------------------
+    def _search_messages(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery
+    ) -> FolderPage:
+        """`search_messages` with words: one mailbox-wide `$search` request, the hub applies the rest (spec 080 §6.5).
+
+        Per hit: not a draft, parent in the requested folders, inside the window, after the position, the hub filters
+        and the direction. Dropped hits still count toward the 100 (`result_cap`). A hit carries a `SearchHitRef`: the
+        id `$search` returns is not the immutable id, so it is only an order key and the handle is the Message-ID."""
+        try:
+            ids = self._folder_ids(client, token, deadline)
+            path, params, allowed = _search_requests(ids, query)
+            values, full = self._search_answer(client, token, deadline, path, params)
+        except SoftStop:
+            return _soft_stopped_page(query)
+        except ProviderError as exc:
+            if exc.code == "not_found" or (exc.code == "upstream_error" and exc.cause == _UNEXPECTED_STATUS):
+                raise ProviderError("upstream_error", _SEARCH_REJECTED) from None
+            raise
+        found: list[MailSummary] = []
+        seen: set[AnyMessageRef] = set()
+        for raw in values:
+            key, summary = self._list_item(raw, ids, query, searched=True)
+            if key is None or summary is None or _parent(raw if isinstance(raw, dict) else {}) not in allowed:
+                continue
+            if query.position is not None and not query.position.precedes(*key):
+                continue
+            if query.direction is not None and summary.meta.direction != query.direction:
+                continue
+            if summary.ref not in seen:  # a repeated returned id keeps its first entry (never by Message-ID, MF-R4)
+                seen.add(summary.ref)
+                found.append(summary)
+        found.sort(key=order_key, reverse=True)
+        return FolderPage(
+            items=found[: query.limit],
+            more=len(found) > query.limit,
+            truncated=full,
+            complete=True,
+            incomplete=frozenset({"result_cap"}) if full else frozenset(),
+        )
+
+    def _search_answer(
+        self, client: httpx2.Client, token: str, deadline: CallDeadline, path: str, params: dict[str, str]
+    ) -> tuple[list[object], bool]:
+        """The raw hits and whether the answer was full: the effective `$top` reached or an `@odata.nextLink`, which is
+        never followed. A too_large answer is repeated once with `$top` halved; a second one fails the account."""
+        top = SEARCH_TOP
+        try:
+            body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
+        except ProviderError as exc:
+            if exc.code != "too_large":
+                raise
+            top = SEARCH_HALVED_TOP
+            body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
+        values = body.get("value")
+        if not isinstance(values, list):
+            raise ProviderError("upstream_error", "MalformedList")
+        return values[:top], len(values) >= top or "@odata.nextLink" in body
 
     # --- list -----------------------------------------------------------------------------------------------------
     def _list_messages(self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery) -> FolderPage:
@@ -845,7 +934,7 @@ class GraphMailbox:
         )
 
     def _list_item(
-        self, raw: object, ids: GraphFolderIds, query: ListQuery
+        self, raw: object, ids: GraphFolderIds, query: ListQuery, *, searched: bool = False
     ) -> tuple[tuple[int, str] | None, MailSummary | None]:
         """(order key, summary): the key when the item has a valid id and timestamp, the summary when it is kept."""
         if not isinstance(raw, dict):
@@ -855,7 +944,7 @@ class GraphMailbox:
         if not isinstance(graph_id, str) or not GRAPH_ID.fullmatch(graph_id):
             self._degraded(MalformedItemError())
             return None, None
-        ref = GraphMessageRef(self._account, graph_id)
+        ref = (SearchHitRef if searched else GraphMessageRef)(self._account, graph_id)
         received = _timestamp(raw.get("receivedDateTime"))
         if received is None:
             log_message_skipped(ref, "mail", MalformedItemError())
