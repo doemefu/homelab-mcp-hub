@@ -206,8 +206,8 @@ async def test_filter_only_search_and_explicit_arguments(secrets_dir: Path) -> N
         ({"sender": "a" * 201}, "1 to 200 characters"),
         ({"subject": "a\nb"}, "control characters"),  # Cc category
         ({"query": ""}, "1 to 200 characters"),
-        ({"query": "X-GM-RAW foo"}, "reserved text"),
-        ({"query": "x", "sender": "a X-GM-RAW b"}, "reserved text"),
+        ({"query": "X-GM-RAW foo"}, "must not contain X-GM-RAW"),
+        ({"query": "x", "sender": "a X-GM-RAW b"}, "must not contain X-GM-RAW"),
         ({"query": "foo OR bar"}, "plain words"),
         ({"query": "from:alice"}, "plain words"),
         ({"query": "-spam"}, "plain words"),

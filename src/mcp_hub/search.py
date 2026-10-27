@@ -50,7 +50,7 @@ NO_TERMS: Final = "Pass query or at least one of sender, recipient, subject"
 TOO_MANY_WORDS: Final = "query takes at most 8 words"
 OPERATOR_REFUSED: Final = "query takes plain words; use the sender, recipient and subject arguments"
 NO_SEARCHABLE_TEXT: Final = "A search value has no searchable text"
-RESERVED_TEXT: Final = "A search value contains reserved text"
+RESERVED_TEXT: Final = "A search value must not contain X-GM-RAW"
 EMPTY_GRAPH_QUERY: Final = "query has no letters or digits that Outlook can search"
 GRAPH_QUERY_TOO_LONG: Final = "query is too long for Outlook search"
 

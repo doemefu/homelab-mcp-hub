@@ -180,6 +180,10 @@ def test_search_messages_schema(wired: TestClient, tokens: TokenFactory) -> None
         "untrusted_content_notice", "items", "next_cursor", "truncated", "incomplete_accounts", "account_errors",
     ]  # fmt: skip
     assert output["properties"]["incomplete_accounts"]["description"] == INCOMPLETE_ACCOUNTS_DESCRIPTION
+    assert INCOMPLETE_ACCOUNTS_DESCRIPTION == (
+        "Accounts whose matches may be missing even after every page; narrow `since` or add filters for that account "
+        "(for `changed_during_call`, repeat the call); never conclude absence."
+    )
     description = tool["description"]
     assert description == SEARCH_MESSAGES_DESCRIPTION == EXPECTED_SEARCH_DESCRIPTION
     assert "Read-only: never marks mail as read." in description

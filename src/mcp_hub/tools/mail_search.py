@@ -47,8 +47,8 @@ from mcp_hub.tools.mail import (
 
 REASON_ORDER: Final[tuple[IncompleteReason, ...]] = get_args(IncompleteReason)
 INCOMPLETE_ACCOUNTS_DESCRIPTION: Final = (
-    "Accounts whose matches may be missing even after every page; narrow `since` or add filters for that account; "
-    "never conclude absence."
+    "Accounts whose matches may be missing even after every page; narrow `since` or add filters for that account "
+    "(for `changed_during_call`, repeat the call); never conclude absence."
 )
 SEARCH_MESSAGES_DESCRIPTION: Final = (
     "Find mail received at or after `since` (default: last 30 days, at most 90 days back), newest first, not ranked "
