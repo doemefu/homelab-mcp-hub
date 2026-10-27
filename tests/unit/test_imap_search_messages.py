@@ -341,7 +341,8 @@ def test_reason_soft_stop_in_pass_two() -> None:
         return lm.nth(commands, lambda n, a: n == "UID FETCH" and "BODY.PEEK[1]<0.4096>" in a[1])  # type: ignore[index]
 
     _, page = lm.soft_stop_before(lambda: three(inbox=[hit(1)]), squery(), snippet_fetch)
-    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    assert [(item.subject, item.snippet_text) for item in page.items] == [("Rechnung", "")]  # read, no snippet
+    assert (page.truncated, page.complete) == (True, False)
     assert (page.incomplete, page.refused_only) == ({"time_limit"}, False)
 
 

@@ -7,6 +7,7 @@ import quopri
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from email.errors import HeaderParseError
 from email.header import decode_header, make_header
 from email.utils import collapse_rfc2231_value, decode_rfc2231
 from typing import Final
@@ -35,7 +36,7 @@ def _decoded_param(value: str) -> str:
     if "=?" in value:
         try:
             return str(make_header(decode_header(value)))
-        except (ValueError, LookupError, UnicodeError):
+        except (ValueError, LookupError, UnicodeError, HeaderParseError):
             return value
     return value
 

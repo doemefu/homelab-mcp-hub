@@ -1,11 +1,14 @@
 """IMAP `list_messages` on servers other than Gmail (spec 080 §5.2, §5.4, §5.5, §6.5; WP13a T12)."""
 
+import gc
 import json
 import logging
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from imapclient.exceptions import ProtocolError
 
 import mcp_hub.providers.imap as imap
 import mcp_hub.providers.imap_session as imap_session
@@ -632,7 +635,8 @@ def test_soft_stop_in_pass_two_gives_no_cursor() -> None:
 
     server, page = soft_stop_before(lambda: icloud(inbox=[msg(1, 5, "a")]), query(), snippet_fetch)
     assert "UID SEARCH" in names(server)
-    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    assert [(item.subject, item.snippet_text) for item in page.items] == [("a", "")]  # read, but without its snippet
+    assert (page.truncated, page.complete) == (True, False)
 
 
 @pytest.mark.parametrize("command", ["LOGIN", "CAPABILITY"])
@@ -695,7 +699,8 @@ def test_summary_parse_checks_the_soft_limit_per_item(monkeypatch: pytest.Monkey
 
 
 def test_snippet_decode_checks_the_soft_limit_per_member(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The snippet decode of each member checks the soft limit too; the folders built before the stop are kept."""
+    """The snippet decode of each member checks the soft limit too; a stop there keeps every message read: the
+    snippets decoded so far stay, the others are empty."""
     server = icloud(inbox=[msg(1, 5, "a")], archive=[msg(11, 10, "b1"), msg(12, 11, "b2")])
     clock = clock_of(server)
     original = imap.decode_part
@@ -709,7 +714,8 @@ def test_snippet_decode_checks_the_soft_limit_per_member(monkeypatch: pytest.Mon
     monkeypatch.setattr(imap, "decode_part", slow_decode)
     page = box(server).list_messages(query("all"), CallDeadline(clock(), 15.0, 100.0, clock))
     assert decoded["n"] == 2  # a, then b1; stopped before b2
-    assert subjects(page) == ["a"]
+    assert sorted(str(s) for s in subjects(page)) == ["a", "b1", "b2"]
+    assert {item.subject: bool(item.snippet_text) for item in page.items} == {"a": True, "b1": True, "b2": False}
     assert (page.truncated, page.complete) == (True, False)
 
 
@@ -883,7 +889,9 @@ def test_broad_handlers_pass_soft_stop_through(
     LIST_HANDLERS[handler](monkeypatch)
     server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b")])
     page = run(server, query(direction="incoming"), own=OWN)  # with a candidate header, so the parse runs
-    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    # a stop in the snippet pass keeps the messages already reduced; a stop anywhere earlier leaves nothing
+    assert len(page.items) == (2 if handler.startswith("snippet") else 0)
+    assert (page.truncated, page.complete) == (True, False)
     assert provider_log.lines == []  # nothing degraded: the stop was not taken for a broken message
 
 
@@ -1011,6 +1019,229 @@ def test_unparsable_message_keeps_its_read_state(monkeypatch: pytest.MonkeyPatch
     assert (fine.subject, fine.unread) == ("fine", True)
     assert ([1], ["FLAGS"]) in fetches(server)  # the FLAGS of the unparsable UID, fetched alone
     assert page.complete is True
+
+
+def structure_fetches(server: FakeImapServer) -> list[list[int]]:
+    return [uids for uids, items in fetches(server) if "BODYSTRUCTURE" in items]
+
+
+def many(count: int) -> list[FakeMessage]:
+    return [msg(uid, uid, f"m{uid}") for uid in range(1, count + 1)]
+
+
+def test_pass_two_fetches_structures_in_chunks() -> None:
+    """A hostile BODYSTRUCTURE is parsed into nested lists before anything reduces it, so pass 2 never asks for more
+    than SUMMARY_STRUCTURE_CHUNK_UIDS of them in one FETCH (#44)."""
+    server = icloud(inbox=many(50))
+    page = run(server, query(limit=50))
+    chunks = structure_fetches(server)
+    assert len(page.items) == 50
+    assert page.complete is True
+    assert all(1 <= len(uids) <= imap.SUMMARY_STRUCTURE_CHUNK_UIDS for uids in chunks)
+    assert sorted(uid for uids in chunks for uid in uids) == list(range(1, 51))
+    assert len(chunks) == -(-50 // imap.SUMMARY_STRUCTURE_CHUNK_UIDS)
+    assert all(items == list(imap.LIST_SUMMARY_ITEMS) for uids, items in fetches(server) if "BODYSTRUCTURE" in items)
+
+
+def test_a_page_within_one_chunk_keeps_one_summary_fetch() -> None:
+    server = icloud(inbox=many(imap.SUMMARY_STRUCTURE_CHUNK_UIDS))
+    run(server, query())
+    assert len(structure_fetches(server)) == 1
+
+
+def test_recursion_error_degrades_only_its_uid_inside_its_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(10))
+    monkeypatch.setattr(server, "client", lambda: DeepStructureClient(server))  # UID 1 cannot be parsed
+    page = run(server, query())
+    degraded = [item for item in page.items if item.snippet_text == UNDECODABLE_NOTE]
+    assert [item.ref.uid for item in degraded] == [1]
+    assert len(page.items) == 10
+    assert page.complete is True
+    # UID 1 is the newest, so it sits in the first chunk: only that chunk falls back to single UIDs (1 itself fails
+    # alone and is never answered; its FLAGS are fetched alone)
+    chunk = imap.SUMMARY_STRUCTURE_CHUNK_UIDS
+    singles = [uids[0] for uids in structure_fetches(server) if len(uids) == 1]
+    assert sorted(singles) == list(range(2, chunk + 1))
+
+
+def test_a_reduction_error_degrades_to_the_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(3))
+    real, calls = imap.walk, []
+
+    def walk(structure: Sequence[object], section: str = "") -> object:
+        calls.append(section)
+        if len(calls) == 2:  # the second message of the page (UID 2: the newest is UID 1)
+            raise ValueError("odd structure")
+        return real(structure, section)
+
+    monkeypatch.setattr(imap, "walk", walk)
+    page = run(server, query())
+    assert [item.ref.uid for item in page.items if item.snippet_text == UNDECODABLE_NOTE] == [2]
+    assert len(page.items) == 3
+
+
+def test_soft_stop_between_structure_chunks_keeps_the_items_already_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The soft limit passes before the second chunk of the archive: the items of the chunks already read, inbox and
+    first archive chunk, are returned; the archive items come without snippets (no command is sent after the stop)."""
+
+    monkeypatch.setattr(imap, "BODY_RESERVE_SECONDS", 1000.0)  # the one-second steps would spend the reserve first
+
+    def second_archive_chunk(commands: Commands) -> int:
+        hits = [i for i, (name, arg) in enumerate(commands) if name == "UID FETCH" and "BODYSTRUCTURE" in arg[1]]  # type: ignore[index]
+        return hits[2]  # inbox chunk, archive chunk 1, archive chunk 2
+
+    def build() -> FakeImapServer:
+        return icloud(inbox=[msg(1, 1, "in")], archive=[msg(uid, 10 + uid, f"a{uid}") for uid in range(11, 11 + 8)])
+
+    _, page = soft_stop_before(build, query("all", limit=20), second_archive_chunk)
+    assert sorted(str(s) for s in subjects(page)) == ["a11", "a12", "in"]
+    assert {item.subject: bool(item.snippet_text) for item in page.items} == {"in": True, "a11": False, "a12": False}
+    assert (page.truncated, page.complete) == (True, False)
+
+
+@pytest.mark.parametrize("step", [0.6, 0.9])
+def test_slow_server_returns_a_truncated_page_not_an_empty_one(step: float) -> None:
+    """No new BODYSTRUCTURE chunk after BODY_RESERVE_SECONDS: the newest items read so far are the page."""
+    server = icloud(inbox=many(50))
+    server.step_seconds = step
+    clock = clock_of(server)
+    page = box(server).list_messages(query(limit=50), CallDeadline(clock(), 16.0, 20.0, clock))
+    assert 0 < len(page.items) < 50
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+    assert [item.ref.uid for item in page.items] == sorted(item.ref.uid for item in page.items)  # the newest first
+
+
+def test_soft_stop_in_the_text_pass_of_the_first_group_keeps_its_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(3))
+    clock = clock_of(server)
+    original = imap.decode_part
+
+    def slow_decode(raw: bytes, part: object) -> str:
+        clock.advance(10.0)
+        return original(raw, part)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(imap, "decode_part", slow_decode)
+    page = box(server).list_messages(query(), CallDeadline(clock(), 15.0, 100.0, clock))
+    assert len(page.items) == 3
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+
+
+def test_no_later_folder_is_read_after_the_reserve() -> None:
+    """`folder: all`: once 12 s have passed, the folders still to read are skipped; the items built are returned and
+    the call ends before the soft limit."""
+    server = icloud(
+        inbox=[msg(1, 5, "i1"), msg(2, 6, "i2")],
+        archive=[msg(11, 10, "a1"), msg(12, 11, "a2")],
+        sent=[msg(21, 20, "s1"), msg(22, 21, "s2")],
+    )
+    server.step_seconds = 1.0
+    clock = clock_of(server)
+    start = clock()
+    page = box(server).list_messages(query("all", limit=20), CallDeadline(start, 16.0, 20.0, clock))
+    assert 0 < len(page.items) < 6
+    assert (page.truncated, page.complete, page.frontier) == (True, False, None)
+    assert clock() - start <= 16.0
+    examined = [arg for name, arg in server.commands if name == "EXAMINE"]
+    assert len(examined) < 6  # pass 1 examines the four folders, pass 2 not all three again
+
+
+class Marker(list[object]):
+    """Stands for a parsed BODYSTRUCTURE: weak-referenceable, so a test can see whether anything keeps it alive."""
+
+
+class StubSession:
+    def __init__(self, fetch: Callable[[list[int], Sequence[str]], dict[int, dict[bytes, object]]]) -> None:
+        self.fetch = fetch
+
+
+HEADER_KEY = b"BODY[HEADER.FIELDS (FROM TO)]<0>"
+
+
+def stub_rows(uids: list[int]) -> dict[int, dict[bytes, object]]:
+    return {u: {b"BODYSTRUCTURE": (), b"FLAGS": (), HEADER_KEY: b"Subject: hi\r\n\r\n"} for u in uids}
+
+
+def stub_summaries(session: StubSession, uids: list[int]) -> imap.PassTwo:
+    return imap._fetch_summaries(session, uids, list(imap.LIST_SUMMARY_ITEMS), ["FLAGS"], lambda: None, lambda: False)  # type: ignore[arg-type]
+
+
+def test_failed_reduction_keeps_no_parse_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stored exception would pin its traceback, and with it the frames that hold the parsed nesting (#44)."""
+    alive: list[weakref.ref[Marker]] = []
+
+    def odd(row: dict[bytes, object]) -> list[object]:
+        parsed = Marker()
+        alive.append(weakref.ref(parsed))
+        raise ValueError("odd structure")
+
+    monkeypatch.setattr(imap, "_structure", odd)
+    result = stub_summaries(StubSession(lambda uids, items: stub_rows(uids)), [1, 2, 3])
+    gc.collect()
+    assert len(alive) == 3
+    assert [ref() for ref in alive] == [None, None, None]
+    assert all(isinstance(r.structure, imap.Failed) for r in result.reduced.values())
+
+
+def test_unparsable_uid_keeps_no_parse_alive() -> None:
+    alive: list[weakref.ref[Marker]] = []
+
+    def fetch(uids: list[int], items: Sequence[str]) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" not in items:
+            return {u: {b"FLAGS": ()} for u in uids}
+        if 1 in uids:
+            parsed = Marker()
+            alive.append(weakref.ref(parsed))
+            raise RecursionError("maximum recursion depth exceeded")
+        return stub_rows(uids)
+
+    result = stub_summaries(StubSession(fetch), [1, 2])
+    gc.collect()
+    assert list(result.unparsable) == [1]
+    assert len(alive) == 2  # the chunk, then UID 1 alone
+    assert [ref() for ref in alive] == [None, None]
+
+
+def test_chunk_rows_carry_neither_structure_nor_header_bytes_after_reduction() -> None:
+    result = stub_summaries(StubSession(lambda uids, items: stub_rows(uids)), [1, 2, 3])
+    assert set(result.rows) == {1, 2, 3}
+    assert all(set(row) == {b"FLAGS"} for row in result.rows.values())
+    assert all(isinstance(r.headers, imap.ParsedHeaders) for r in result.reduced.values())
+
+
+class OddAnswerClient(FakeImapClient):
+    """An answer IMAPClient cannot parse (ProtocolError), not a RecursionError."""
+
+    def fetch(self, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        if "BODYSTRUCTURE" in items and 1 in messages:  # type: ignore[operator]
+            raise ProtocolError("odd literal")
+        return super().fetch(messages, items)  # type: ignore[arg-type]
+
+
+def test_parse_error_in_one_chunk_degrades_only_that_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = icloud(inbox=many(6))
+    monkeypatch.setattr(server, "client", lambda: OddAnswerClient(server))
+    page = run(server, query())
+    assert [item.ref.uid for item in page.items if item.snippet_text == UNDECODABLE_NOTE] == [1]
+    assert len(page.items) == 6
+    assert page.complete is True
+
+
+@pytest.mark.parametrize("limit", [20, 50])
+@pytest.mark.parametrize("step", [0.3, 0.6])
+def test_whole_call_time_of_a_full_page(step: float, limit: int) -> None:
+    """Whole-call time and items of a page at `step` seconds per command (simulated clock, the real 16/20 s limits);
+    read with `pytest -s`."""
+    server = icloud(inbox=many(limit))
+    server.step_seconds = step
+    clock = clock_of(server)
+    start = clock()
+    page = box(server).list_messages(query(limit=limit), CallDeadline(start, 16.0, 20.0, clock))
+    chunk, count = imap.SUMMARY_STRUCTURE_CHUNK_UIDS, len(server.commands)
+    print(
+        f"\nchunk={chunk} limit={limit} step={step}s commands={count} call={clock() - start:.1f}s n={len(page.items)}"
+    )
+    assert page.items
+    assert page.complete is (len(page.items) == limit)
 
 
 def test_merged_all_logs_carry_no_message_id_folder_name_or_address(monkeypatch: pytest.MonkeyPatch) -> None:
