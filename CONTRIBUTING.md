@@ -70,7 +70,7 @@ uv run pytest tests/integration -v   # starts python -m mcp_hub as a subprocess
 
 ```bash
 docker build -t mcp-hub:dev .
-docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /tmp \
+docker run --rm --memory=320m --memory-swap=320m --cpus=1 --read-only --tmpfs /tmp \
   -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \
   python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
 ```
@@ -81,7 +81,7 @@ It prints peak RSS and CPU per call, then the container's cgroup `memory.peak` a
 
 `--scenario status` drives the IMAP `get_message_status` path for 50 refs through an in-process IMAP fake: every location, reply and thread SEARCH answers 500 hits with hostile header blocks (8 KiB in the 500-UID location chunks, 64 KiB in the 50-UID lookup chunks). `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 230 MiB, `oom_kill 0`). Re-run it after any change to the status caps (`MAX_LOOKUP_HITS`, `LOOKUP_FETCH_UIDS`, the header item sizes).
 
-`--scenario thread` and `--scenario thread-graph` drive `get_thread` through the IMAP fake and the in-process Graph transport: `thread` alternates a header-round thread with a subject-fallback thread (hostile 500-hit searches, 64 KiB bodies, 10,000-part BODYSTRUCTUREs; `--structure-parts` sets the part count), `thread-graph` the 2 MiB `uniqueBody` list or a refused list with a 2 MiB fallback list, then 20 single reads of about 2 MiB. `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 245 MiB, `oom_kill 0`; owner decision 2026-10-23). Re-run it after any change to the thread caps (hit, chunk and body sizes, the BODYSTRUCTURE chunk).
+`--scenario thread` and `--scenario thread-graph` drive `get_thread` through the IMAP fake and the in-process Graph transport: `thread` alternates a header-round thread with a subject-fallback thread (hostile 500-hit searches, 64 KiB bodies, 10,000-part BODYSTRUCTUREs; `--structure-parts` sets the part count), `thread-graph` the 2 MiB `uniqueBody` list or a refused list with a 2 MiB fallback list, then 20 single reads of about 2 MiB. `--accounts 2 --parallel 2 --calls 10`, alone and with `--with-calendar nonascii-240k`, is the gate (cgroup `memory.peak` at most 290 MiB, `oom_kill 0`, under the 320 Mi limit; owner decision 2026-10-27, the 245 MiB ceiling of 2026-10-23 was relative to 256 Mi). Re-run it after any change to the thread caps (hit, chunk and body sizes, the BODYSTRUCTURE chunk).
 
 ### IMAP probe
 

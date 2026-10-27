@@ -21,7 +21,7 @@ Prints peak RSS and CPU per call, then the cgroup's memory peak and events when 
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
 
-    docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /tmp \\
+    docker run --rm --memory=320m --memory-swap=320m --cpus=1 --read-only --tmpfs /tmp \\
       -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \\
       python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
     ... python /work/scripts/memory_probe.py --scenario graph-message --with-calendar nonascii-240k --calls 10
