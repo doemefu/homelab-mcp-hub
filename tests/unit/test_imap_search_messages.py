@@ -469,3 +469,10 @@ def test_non_gmail_text_words_are_unchanged() -> None:
     server = three(inbox=[hit(1)])
     lm.run(server, squery(terms("-M\u00fcller")))
     assert search_args(server) == [[b"CHARSET", b"UTF-8", BASE, b"TEXT", "-M\u00fcller".encode()]]
+
+
+def test_gmail_joined_value_is_one_quoted_string_or_one_literal() -> None:
+    server, _ = gmail_inbox(terms("C++/Code"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "c code"']
+    server, _ = gmail_inbox(terms("Müller/Köln"))
+    assert search_args(server) == [[b"CHARSET", b"UTF-8", GMAIL_INBOX, b"TEXT", "müller köln".encode()]]
