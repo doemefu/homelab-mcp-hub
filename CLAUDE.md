@@ -35,7 +35,7 @@ A read-only remote MCP server for the owner's mail and calendars. It is a pure O
 | Component | Version |
 |-----------|---------|
 | Python | 3.13 (`python:3.13-slim@sha256:…` runtime image) |
-| MCP SDK | `mcp` 2.2.0 (`MCPServer`, Streamable HTTP) |
+| MCP SDK | `mcp` 2.3.0 (`MCPServer`, Streamable HTTP) |
 | HTTP | uvicorn 0.54.0, starlette 1.7.0, httpx2 2.13.1, anyio 4.15.1 |
 | Validation / tokens | pydantic 2.13.5, PyJWT 2.15.1 (`[crypto]`) |
 | Mail | IMAPClient 4.1.0 |
