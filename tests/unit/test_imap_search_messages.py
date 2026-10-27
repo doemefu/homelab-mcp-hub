@@ -94,6 +94,25 @@ def test_search_non_ascii_uses_literal_path() -> None:
     assert [item.ref.uid for item in page.items] == [1]
 
 
+def test_search_non_ascii_value_with_spaces_stays_one_literal() -> None:
+    """T4-I1: a literal with a space is one value, not two tokens."""
+    server = three(
+        inbox=[lm.msg(1, 5, "Gr\u00fcsse aus Bern", sender=SENDER), lm.msg(2, 6, "Gr\u00fcsse", sender=SENDER)]
+    )
+    page = lm.run(server, squery(terms("rechnung", subject="Gr\u00fcsse aus")))
+    assert search_args(server) == [
+        [b"CHARSET", b"UTF-8", BASE, b"TEXT", b'"rechnung"', b"SUBJECT", "Gr\u00fcsse aus".encode()]
+    ]
+    assert page.complete is True
+
+
+def test_search_soft_stop_on_the_literal_path() -> None:
+    """T4-m3: a stop before the second folder's literal SEARCH keeps the page empty and `time_limit`."""
+    _, page = lm.soft_stop_before(three_search, squery(terms("M\u00fcller"), folder="all"), second_search)
+    assert (page.items, page.truncated, page.complete) == ([], True, False)
+    assert (page.incomplete, page.refused_only) == ({"time_limit"}, False)
+
+
 def test_search_without_terms_sends_the_list_criteria() -> None:
     server = three(inbox=[hit(1)])
     lm.run(server, lm.query())

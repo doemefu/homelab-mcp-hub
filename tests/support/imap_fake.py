@@ -170,18 +170,21 @@ class FakeImapClient:
         self._server.run("UID SEARCH", criteria)
         return self._evaluate([m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))])
 
-    def _raw_command_untagged(self, command: bytes, args: Sequence[bytes], uid: bool = False) -> list[bytes]:
-        """The synchronising-literal search of the guard: `UID SEARCH CHARSET UTF-8 <prefix> <key> <value>…`. Only
-        that command exists; a non-ASCII value arrives as raw UTF-8 bytes (the literal), an ASCII one quoted."""
+    def _raw_command_untagged(self, command: bytes, args: Sequence[bytes], *, uid: bool = False) -> list[bytes]:
+        """The synchronising-literal search of the guard: `UID SEARCH CHARSET UTF-8 <prefix> <key> <value>...`. Only
+        that command exists; a non-ASCII value arrives as raw UTF-8 bytes (the literal, one token whatever it
+        contains), every ASCII argument is tokenised like the criteria of `search`."""
         if command != b"SEARCH" or uid is not True:
             raise AssertionError(f"raw command outside the allowlist: {command!r} uid={uid}")
+        if list(args[:2]) != [b"CHARSET", b"UTF-8"]:
+            raise AssertionError("the raw search starts with CHARSET UTF-8")
         self._server.run("UID SEARCH", list(args))
         tokens: list[str] = []
         for arg in args:
-            text = arg.decode("utf-8")
-            if text.upper() in ("CHARSET", "UTF-8") or arg.startswith(b'"') or b" " in arg or arg.isascii():
-                tokens.extend(m.group(1) for m in _TOKEN.finditer(text))
-            else:  # a literal: one value token whatever it contains
+            if arg.isascii():
+                tokens.extend(m.group(1) for m in _TOKEN.finditer(arg.decode("ascii")))
+            else:
+                text = arg.decode("utf-8")
                 tokens.append('"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"')
         return [b" ".join(str(uid_).encode() for uid_ in self._evaluate(tokens))]
 
@@ -337,7 +340,7 @@ def _parse_key(
 
         return pos + 2, by_header
     if word == "CHARSET":
-        if pos >= len(tokens) or tokens[pos].upper() != "UTF-8":
+        if pos != 1 or pos >= len(tokens) or tokens[pos].upper() != "UTF-8":
             raise bad("UID SEARCH")
         return pos + 1, lambda msg, honour: True
     if word in ("TEXT", "FROM", "TO", "SUBJECT"):

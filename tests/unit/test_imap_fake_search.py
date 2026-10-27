@@ -24,6 +24,7 @@ def server() -> FakeImapServer:
             2: _message(2, "Bob <b@example.net>", "Carol <c@example.org>", "Hello", b"The Rechnung is attached"),
             3: _message(3, "Müller <m@example.org>", "Owner <o@example.org>", "Grüsse", b"Hallo"),
             4: _message(4, "Dan <d@example.org>", "Owner <o@example.org>", "=?utf-8?q?Gr=C3=BCsse?=", b"Hi"),
+            5: _message(5, "Eve <e@example.org>", "Owner <o@example.org>", "Gr\u00fcsse aus Bern", b"Hi"),
         },
     )
     return FakeImapServer([inbox])
@@ -46,14 +47,16 @@ def test_fake_text_from_to_subject() -> None:
     assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"FROM", b'"example.net"') == [2]
     assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"TO", b'"carol"') == [2]
     assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"SUBJECT", b'"oktober"') == [1]
-    assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"SUBJECT", "Grüsse".encode()) == [3, 4]
+    assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"SUBJECT", "Grüsse".encode()) == [3, 4, 5]
     assert raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"TEXT", b'"rechnung"', b"FROM", b'"alice"') == [1]
 
 
 def test_fake_ascii_path_value_keys() -> None:
     client = opened(server())
-    assert client.search(b'NOT DRAFT TO "owner"') == [1, 3, 4]
-    assert client.search(b'NOT DRAFT SUBJECT "hello" CHARSET UTF-8') == [2]
+    assert client.search(b'NOT DRAFT TO "owner"') == [1, 3, 4, 5]
+    assert client.search(b'CHARSET UTF-8 NOT DRAFT SUBJECT "hello"') == [2]
+    with pytest.raises(IMAPClientError, match="UID SEARCH command error: BAD"):
+        client.search(b'NOT DRAFT SUBJECT "hello" CHARSET UTF-8')  # CHARSET only leads the criteria
     assert client.search(b'NOT DRAFT SINCE 19-Oct-2026 TEXT "rechnung" FROM "example.org"') == [1]
 
 
@@ -75,6 +78,19 @@ def test_fake_word_mode() -> None:
     assert client.search(b'NOT DRAFT SUBJECT "okt"') == []
     plain = opened(server())
     assert plain.search(b'NOT DRAFT TEXT "rechn"') == [1, 2]
+
+
+def test_fake_charset_only_leads_the_raw_command() -> None:
+    client = opened(server())
+    with pytest.raises(AssertionError):
+        raw(client, DRAFT_FREE, b"TEXT", b'"x"')  # no CHARSET UTF-8 lead
+    with pytest.raises(IMAPClientError, match="BAD"):
+        raw(client, b"CHARSET", b"UTF-8", DRAFT_FREE, b"CHARSET", b"UTF-8")
+
+
+def test_fake_raw_uid_is_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        opened(server())._raw_command_untagged(b"SEARCH", [b"CHARSET", b"UTF-8", DRAFT_FREE], True)  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
