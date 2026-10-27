@@ -871,8 +871,16 @@ class GraphMailbox:
             answer: _FolderAnswer | None = None
             try:
                 while True:
-                    # A retry could pass the cap: then the read stops early with the last frontier (read-on only).
-                    retry = not read_on or previous is None or requests + 2 <= FILTER_READ_REQUESTS
+                    # A halving retry that could pass the request cap, or would start after the read-on deadline (§5.2,
+                    # judged when the too_large answer arrives), is not made: the read stops with the last frontier
+                    # (read-on requests only; the first request of a folder always may halve).
+                    def retry(requests: int = requests, previous: int | None = previous) -> bool:
+                        return (
+                            not read_on
+                            or previous is None
+                            or (requests + 2 <= FILTER_READ_REQUESTS and deadline.elapsed() < READ_ON_SECONDS)
+                        )
+
                     try:
                         answer = self._folder_answer(
                             client, token, deadline, folder_id, current, query, ids, previous, retry
@@ -949,14 +957,14 @@ class GraphMailbox:
         query: ListQuery,
         ids: GraphFolderIds,
         previous: int | None = None,
-        retry: bool = True,
+        retry: Callable[[], bool] = lambda: True,
     ) -> _FolderAnswer:
         path = f"/me/mailFolders/{quote(folder_id, safe='')}/messages"
         top, gets = int(params["$top"]), 1
         try:
             body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
         except ProviderError as exc:
-            if exc.code != "too_large" or not retry or top != GRAPH_LIST_TOP:
+            if exc.code != "too_large" or top != GRAPH_LIST_TOP or not retry():
                 raise  # only 101 is halved, once: there is no third tier
             top, gets = top // 2, 2  # once more with $top halved; a second too_large fails the account (§5.4)
             body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)

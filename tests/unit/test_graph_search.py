@@ -794,6 +794,46 @@ def test_filter_only_a_late_too_large_answer_stops_reading_on_without_an_error()
     assert page.complete
 
 
+def test_filter_only_read_on_halving_is_not_retried_after_the_read_on_deadline() -> None:
+    """A read-on request started at 7.9 s that answers too large at 8.1 s: no halved GET after 8 s (§5.2); the items
+    and the frontier of the first answer stand, no error."""
+    clock = FakeClock()
+    server = Server()
+    tops: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        tops.append(request.url.params["$top"])
+        if len(tops) == 1:
+            clock.advance(7.9)
+            return js({"value": block(NOW - timedelta(hours=2), None, 1)})(request)
+        clock.advance(0.2)  # 8.1 s: the read-on request answers too large
+        return js({"value": [item(0, NOW, subject="x" * 1_100_000)]})(request)
+
+    server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert tops == ["101", "101"]  # no `$top=50` retry
+    assert page.more
+    assert page.frontier is not None
+    assert page.complete
+
+
+def test_filter_only_first_request_halving_ignores_the_read_on_deadline() -> None:
+    clock = FakeClock()
+    server = Server()
+    tops: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        tops.append(request.url.params["$top"])
+        if request.url.params["$top"] == "101":
+            clock.advance(8.1)
+            return js({"value": [item(0, NOW, subject="x" * 1_100_000)]})(request)
+        return js({"value": []})(request)
+
+    server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
+    found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert tops[:2] == ["101", "50"]
+
+
 def throttled_after(requests: int, folder_blocks: dict[str, list[list[object]]]) -> tuple[Server, FakeClock]:
     """Folder list routes answering their blocks in turn; the `requests`-th list GET overall is a 429."""
     clock = FakeClock()
