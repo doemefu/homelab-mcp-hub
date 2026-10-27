@@ -650,7 +650,7 @@ class ImapMailbox:
         count = 0
         # One chunk of rows at a time, each reduced to `Candidate`s before the next FETCH: pass 1 never holds the rows
         # of all 5,000 candidates (header blocks of up to 2 KiB each).
-        for rows in session.fetch_chunks(newest, items, chunk=FETCH_CHUNK_UIDS):
+        for rows in session.fetch_chunks(newest, items, chunk=FETCH_CHUNK_UIDS, soft_check=self._soft_check):
             for uid, row in sorted(rows.items(), reverse=True):
                 if count and count % SOFT_CHECK_EVERY == 0:
                     self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
@@ -672,6 +672,7 @@ class ImapMailbox:
                     sender = sender[:MAX_CANDIDATE_FROM_CHARS]  # a hostile From must not cost memory per candidate
                 sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
                 out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
+            del rows  # the chunk is reduced; only `out` lives on
         out.sort(key=lambda candidate: candidate.uid, reverse=True)  # newest UID first, as one FETCH would have
         return out
 

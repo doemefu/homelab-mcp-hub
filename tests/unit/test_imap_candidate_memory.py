@@ -1,5 +1,7 @@
 """Pass 1 holds no full row list and keeps a bounded From per candidate (WP13d T8 reductions)."""
 
+import gc
+import weakref
 from collections.abc import Iterator
 from datetime import timedelta
 
@@ -10,6 +12,7 @@ from mcp_hub.providers.imap import Candidate
 from mcp_hub.providers.imap_session import ImapSession
 from tests.support.imap_fake import FakeMessage
 from tests.unit import test_imap_list_messages as lm
+from tests.unit.test_imap_locate import _session, icloud, msg
 from tests.unit.test_imap_search_messages import hit, squery, three
 
 
@@ -19,9 +22,9 @@ def test_candidates_are_reduced_chunk_by_chunk(monkeypatch: pytest.MonkeyPatch) 
     original = ImapSession.fetch_chunks
 
     def fetch_chunks(
-        self: ImapSession, uids: object, items: object, *, chunk: int
+        self: ImapSession, uids: object, items: object, **kw: object
     ) -> Iterator[dict[int, dict[bytes, object]]]:
-        for number, rows in enumerate(original(self, uids, items, chunk=chunk)):  # type: ignore[arg-type]
+        for number, rows in enumerate(original(self, uids, items, **kw)):  # type: ignore[arg-type]
             events.append(f"chunk{number}")
             yield rows
 
@@ -84,3 +87,51 @@ def test_candidate_from_under_the_cap_is_kept_whole_and_still_dedups() -> None:
     )
     page = lm.run(server, squery(folder="all"))
     assert [(i.ref.uid, i.meta.folder) for i in page.items] == [(21, "sent")]  # the sent copy replaces (M3)
+
+
+def test_fetch_chunks_checks_the_soft_limit_before_each_chunk_after_the_first() -> None:
+    server = icloud(inbox=[msg(uid, 5, "m") for uid in range(1, 6)])
+    calls: list[int] = []
+    session = _session(server)
+    fetched = 0
+    chunks = session.fetch_chunks([1, 2, 3, 4, 5], ["FLAGS"], chunk=2, soft_check=lambda: calls.append(fetched))
+    for _ in chunks:
+        fetched += 1
+    assert calls == [1, 2]  # before chunk 2 and chunk 3, not before the first
+
+    stopping = session.fetch_chunks(
+        [1, 2, 3], ["FLAGS"], chunk=1, soft_check=lambda: (_ for _ in ()).throw(imap.SoftStop())
+    )
+    next(stopping)
+    before = len([c for c in server.commands if c[0] == "UID FETCH"])
+    with pytest.raises(imap.SoftStop):
+        next(stopping)
+    assert len([c for c in server.commands if c[0] == "UID FETCH"]) == before  # no command after the stop
+
+
+class _Tracked(dict[int, dict[bytes, object]]):
+    """A rows dict that can be weakly referenced."""
+
+
+def test_pass_one_keeps_at_most_one_chunk_of_rows_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    alive: list[int] = []
+    refs: list[weakref.ref[_Tracked]] = []
+    original = ImapSession.fetch_chunks
+
+    def fetch_chunks(
+        self: ImapSession, uids: object, items: object, **kw: object
+    ) -> Iterator[dict[int, dict[bytes, object]]]:
+        for plain in original(self, uids, items, **kw):  # type: ignore[arg-type]
+            gc.collect()
+            alive.append(sum(1 for ref in refs if ref() is not None))  # earlier chunks still referenced
+            tracked = _Tracked(plain)
+            refs.append(weakref.ref(tracked))
+            del plain
+            yield tracked
+            del tracked
+
+    monkeypatch.setattr(ImapSession, "fetch_chunks", fetch_chunks)
+    inbox = [FakeMessage(u, lm.NOW - timedelta(seconds=2000 - u), headers=lm.hdr(f"m{u}")) for u in range(1, 1202)]
+    lm.run(lm.icloud(inbox=inbox), lm.query(limit=1))
+    assert len(alive) == 3
+    assert alive == [0, 0, 0]

@@ -548,6 +548,8 @@ def test_search_stop_between_structure_chunks_is_time_limit_only() -> None:
 
 
 def test_search_vanished_uid_in_a_read_chunk_plus_a_later_stop_gives_both_reasons() -> None:
+    # `incomplete` is a set: this test shows both reasons arise, not that nothing is counted twice; the double-count
+    # guard is test_search_stop_between_structure_chunks_is_time_limit_only.
     server = three(inbox=many_hits(8))
     server.step_seconds = 1.0
     original = server.run
