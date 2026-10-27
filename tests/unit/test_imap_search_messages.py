@@ -423,9 +423,20 @@ def test_gmail_text_word_is_sanitised_like_graph() -> None:
     assert search_args(server) == [GMAIL_INBOX + b' TEXT "c" TEXT "foo.bar@example.org"']
 
 
-def test_gmail_text_word_splitting_in_two_tokens_and_duplicates() -> None:
+def test_gmail_word_with_two_tokens_is_one_text_value() -> None:
     server, _ = gmail_inbox(terms("foo/bar", "BAR"))
-    assert search_args(server) == [GMAIL_INBOX + b' TEXT "foo" TEXT "bar"']
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "foo bar" TEXT "bar"']
+
+
+def test_gmail_word_without_a_token_is_dropped() -> None:
+    server, _ = gmail_inbox(terms("+++", "rechnung", "-.-"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "rechnung"']
+
+
+def test_gmail_dropped_words_with_a_filter_search_by_the_filter() -> None:
+    server, page = gmail_inbox(SearchTerms(words=("+++",), sender="Alice", recipient=None, subject=None))
+    assert search_args(server) == [GMAIL_INBOX + b' FROM "Alice"']
+    assert page.complete is True
 
 
 def test_gmail_umlaut_word_stays_a_literal_after_sanitising() -> None:
@@ -438,17 +449,11 @@ def test_gmail_sender_recipient_subject_values_stay_as_given() -> None:
     assert search_args(server) == [GMAIL_INBOX + b' TEXT "x" FROM "-Alice" TO "Bob-" SUBJECT "-C++"']
 
 
-@pytest.mark.parametrize("words", [("+++",), ("rechnung", "-.-"), ("\u2603",)])
-def test_gmail_word_without_a_token_refuses_the_folders(words: tuple[str, ...]) -> None:
+@pytest.mark.parametrize("words", [("+++",), ("-.-", "\u2603")])
+def test_gmail_no_token_and_no_filter_refuses_the_folders(words: tuple[str, ...]) -> None:
     server, page = gmail_inbox(terms(*words))
     assert lm.names(server) == ["LOGIN", "CAPABILITY", "LOGOUT"]  # nothing examined or searched
     assert (page.items, page.complete, page.truncated) == ([], False, True)
-    assert (page.incomplete, page.refused_only) == ({"search_refused"}, True)
-
-
-def test_gmail_more_than_eight_text_tokens_refuses_the_folders() -> None:
-    server, page = gmail_inbox(terms("a/b", "c/d", "e/f", "g/h", "i/j"))
-    assert "UID SEARCH" not in lm.names(server)
     assert (page.incomplete, page.refused_only) == ({"search_refused"}, True)
 
 

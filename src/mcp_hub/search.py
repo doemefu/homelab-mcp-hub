@@ -124,23 +124,17 @@ def _allowlist_tokens(word: str) -> list[str]:
 
 def imap_value_keys(terms: SearchTerms, *, gmail: bool = False) -> list[tuple[SearchKey, str]] | None:
     """The `key value` pairs of an IMAP search. On Gmail a `-` at the start of a quoted TEXT value negates it (Q-a),
-    so every TEXT word goes through the allowlist above, one TEXT key per distinct token; None when a word has no
-    token or the tokens exceed `MAX_SEARCH_WORDS` (the folders are then refused). FROM, TO and SUBJECT stay as given."""
+    so each TEXT word goes through the allowlist above and its tokens form that word's one TEXT value; a word with no
+    token is dropped. None when nothing is left to search for (no TEXT word and no filter): the folders are then
+    refused. FROM, TO and SUBJECT stay as given."""
     keys: list[tuple[SearchKey, str]] = [("TEXT", word) for word in terms.words]
     if gmail:
-        tokens: dict[str, None] = {}
-        for word in terms.words:
-            found = _allowlist_tokens(word)
-            if not found:
-                return None
-            tokens.update(dict.fromkeys(found))
-        if len(tokens) > MAX_SEARCH_WORDS:
-            return None
-        keys = [("TEXT", token) for token in tokens]
+        sanitised = (" ".join(_allowlist_tokens(word)) for word in terms.words)
+        keys = [("TEXT", value) for value in sanitised if value]
     for key, value in (("FROM", terms.sender), ("TO", terms.recipient), ("SUBJECT", terms.subject)):
         if value is not None:
             keys.append((key, value))  # type: ignore[arg-type]  # reason: key is one of the three literals above
-    return keys
+    return keys or None
 
 
 def _encoded_search_length(text: str) -> int:
