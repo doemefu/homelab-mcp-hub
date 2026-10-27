@@ -20,6 +20,7 @@ from typing import Final, Literal, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
+from mcp_hub import search as _search  # the module: `search` imports providers.base, so a name import would cycle
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
 from mcp_hub.providers import imap_status, imap_thread
 from mcp_hub.providers.base import (
@@ -98,7 +99,6 @@ from mcp_hub.providers.imap_session import (
 from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
-from mcp_hub.search import imap_value_keys
 
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
@@ -855,7 +855,7 @@ class ImapMailbox:
 
 def _search_values(query: ListQuery) -> list[tuple[SearchKey, str]]:
     """The value keys of a `search_messages` query, after the window and label keys (none for the list tools)."""
-    return [] if query.search is None else imap_value_keys(query.search)
+    return [] if query.search is None else _search.imap_value_keys(query.search)
 
 
 def _criteria(plan: FolderPlan, query: ListQuery, merge: bool) -> bytes:

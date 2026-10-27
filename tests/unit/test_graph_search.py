@@ -676,7 +676,8 @@ def test_search_hit_whose_id_changes_between_pages_appears_once() -> None:
 
 
 @pytest.mark.parametrize(
-    "module", ["mcp_hub.search", "mcp_hub.providers.graph", "mcp_hub.ids", "mcp_hub.tools.mail_search"]
+    "module",
+    ["mcp_hub.search", "mcp_hub.providers.graph", "mcp_hub.providers.imap", "mcp_hub.ids", "mcp_hub.tools.mail_search"],
 )
 def test_module_imports_first_in_a_fresh_interpreter(module: str) -> None:
     src = Path(mcp_hub.__file__).resolve().parent.parent
