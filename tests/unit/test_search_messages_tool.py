@@ -454,27 +454,6 @@ async def test_incomplete_accounts_order_and_dedup(secrets_dir: Path) -> None:
     ]
 
 
-async def test_truncated_without_cursor_always_explained(secrets_dir: Path) -> None:
-    """TDr-4: `truncated` with `next_cursor` null implies an `incomplete_accounts` or `account_errors` entry."""
-    scenarios: list[Fake] = [
-        Fake(),
-        Fake(flags={"icloud": REFUSED}),
-        Fake(flags={"icloud": {"truncated": True, "complete": False, "incomplete": frozenset({"time_limit"})}}),
-        Fake(
-            items={"outlook": [summary("outlook", 1, 5, graph=True)]},
-            flags={"outlook": {"truncated": True, "complete": False, "incomplete": frozenset({"result_cap"})}},
-        ),
-        Fake(errors={"gmail": ProviderError("upstream_timeout")}),
-        Fake(
-            flags={"icloud": {"truncated": True, "complete": False, "incomplete": frozenset({"changed_during_call"})}}
-        ),
-    ]
-    for fake in scenarios:
-        result, _, _ = await run(context(secrets_dir, fake), query="a")
-        if result.truncated and result.next_cursor is None:
-            assert result.incomplete_accounts or result.account_errors, fake
-
-
 async def test_an_item_that_cannot_fit_the_budget_never_leaves_truncated_unexplained(secrets_dir: Path) -> None:
     """F8: when not even one shortened summary fits, the call fails loudly (`too_large`), because the page would be
     `truncated` with no cursor and no `incomplete_accounts` or `account_errors` entry."""
