@@ -97,6 +97,18 @@ kubectl -n apps logs -l app=mcp-hub --since=15m | grep provider_call_failed
 
 No line means Graph accepts `uniqueBody` on list requests (spec 080 assumption O37). A line is expected behaviour (the list is read again without `uniqueBody`): record its `outcome` and `exception` on story #44.
 
+### Acceptance after the WP13d rollout
+
+Read-only tool calls in claude.ai by the owner, once per account (`icloud`, `gmail`, `outlook`); no cluster mutation. For each account:
+
+1. `search_messages` with one word known to be in recent mail (30 days).
+2. The same with a word containing a non-ASCII letter.
+3. `sender` only (a full address or full name).
+4. `folder: sent` with a known word.
+5. A paging call (`limit: 5`), then one `next_cursor` followed with identical arguments.
+
+Expected: hits, no `account_errors`, `incomplete_accounts` plausible (empty for a small mailbox), `duration_ms` under 10 s per call on iCloud and Outlook (Gmail can take longer, hub#64), and no WARNING or ERROR in the logs besides expected `item_degraded` lines. Outlook items have `id: null`; open one with `get_message(ref)`.
+
 ## Rollback
 
 Revert the Flux image-update commit on `main` (or the offending code commit) through a pull request; Flux applies the previous tag. The hub keeps no state apart from in-memory status, so a rollback needs no data migration. Before rolling back to an image older than WP13a, remove `mail.own_addresses_ref` from the registry (SOPS, playbook 59), because the older hub rejects the field and does not start. Ids of folders other than the inbox and all cursors stop working after the rollback. Rolling back below WP13b removes `get_message_status`; a routine that calls it fails with an unknown tool. Rolling back below WP13c removes `get_thread`.
@@ -116,6 +128,7 @@ Revert the Flux image-update commit on `main` (or the offending code commit) thr
 | `get_message` by `ref` answers `upstream_timeout` | The search over all folders did not complete (soft stop, folder cap, failed batch); the message may still exist. Retry or use the `id` from a list result |
 | `get_message_status` answers `incomplete_search` or `thread_checked: false` for some refs while the account stays `ok` | A cap, the 16 s soft stop or a failed batch left those refs unchecked; ask again for only those refs. On a Graph account a failed lookup batch logs a `provider_call_failed` WARNING (`exception` = cause class, for example `Throttled`), also when the call still answers; only the first failed batch of each `outcome`/`exception` class is logged per call (at most 20 lines), so 50 failing reads write one line, and after a `Throttled` answer the later batches of that call fail without a request. IMAP batches answered `NO` are not logged |
 | `get_thread` for an `outlook` thread returns `body_omitted: true` on older messages, with one `provider_call_failed` WARNING | Graph refused or could not serve the list with `uniqueBody` (`outcome`/`exception` name the cause), so the list was read again without it and at most 20 bodies were read one by one, newest first; the others stay omitted. Read them with `get_message` by `ref` |
+| `search_messages` lists an account in `incomplete_accounts` | `time_limit`: the 16 s soft stop (Gmail searches take seconds each); `result_cap`: too many matches, narrow `since` or add filters; `search_refused`: a folder could not be searched (check `provider_call_failed`); `changed_during_call`: repeat the call. Narrow `since` or add filters for that account; never read an empty result as absence |
 | `get_thread` answers `upstream_timeout` | The seed lookup did not finish, or a key search found nothing and did not finish (on Graph also a soft stop after the seed lookup, before the list answered); the thread state is unknown. Retry. A search that found members returns them with `truncated: true` instead |
 | `/readyz` 503 | The process has not finished start-up; check the log for `startup_failed` |
 | An account shows `auth_expired` | `status_check_failed` line with `outcome=auth_expired` for that `account` and `capability`: the provider rejected the credential (for iCloud: create a new app-specific password, update the credential in SOPS, run playbook 59, delete the pod) |
