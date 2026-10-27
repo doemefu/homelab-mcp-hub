@@ -49,7 +49,7 @@ def test_search_candidate_rows_are_hostile_and_the_chosen_items_heavy(probe: Mod
     inbox = probe.search_messages_of(True)
     bulk = probe.search_messages_of(False)
     assert len(inbox) == len(bulk) == probe.SEARCH_HITS
-    assert max(len(m.headers or b"") for m in bulk.values()) > 8192  # cut by the candidate FETCH
+    assert max(len(m.headers or b"") for m in bulk.values()) > 8000  # about 8 KiB, cut by the candidate FETCH
     heavy = [m for m in inbox.values() if len(m.headers or b"") > 64 * 1024]
     assert len(heavy) == probe.SEARCH_CHOSEN
     assert all(len(m.text) >= 4096 for m in heavy)

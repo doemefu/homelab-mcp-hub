@@ -728,6 +728,7 @@ def thread_main(args: argparse.Namespace) -> None:
 
 SEARCH_QUERY = "alpha bravo gr" + chr(0xF6) + chr(0xDF) + "e"  # three words, one non-ASCII (a synchronising literal)
 SEARCH_HITS, SEARCH_CHOSEN, SEARCH_LIMIT = 5001, 50, 50  # one hit above the 5,000 cap
+SEARCH_LONG_FROM = False  # `--long-from`: bulk hits with an 8 KiB From
 SEARCH_FILTER = "nomatch@example.test"  # a filter-only search that matches no hit: the read-on runs to its cap
 
 
@@ -749,10 +750,11 @@ def search_messages_of(chosen: bool) -> dict[int, FakeMessage]:
     FETCH; one shared header block) and, `chosen`, the 50 newest, which carry a 64 KiB References, a unique Message-ID
     and a body for the snippet. Built once: the messages are read-only and shared by every fake server."""
     now = datetime.now(UTC)
-    hostile = hdr(
-        ("From", f"{'a' * 8000} <bulk@example.test>"),
-        ("Message-ID", f"<{'m' * 8000}@example.test>"),
-    )
+    # The From stays short unless `--long-from`: a hostile 8 KiB From costs about 0.7 ms of `getaddresses` per hit
+    # (15,000 hits per call), which exhausts the soft time limit and keeps the probe from measuring memory, and
+    # every candidate keeps its From address (up to 2 KiB).
+    sender = f"{'a' * 8000} <bulk@example.test>" if SEARCH_LONG_FROM else "Bulk <bulk@example.test>"
+    hostile = hdr(("From", sender), ("Message-ID", f"<{'m' * 8000}@example.test>"))
     first_real = SEARCH_HITS - SEARCH_CHOSEN + 1 if chosen else SEARCH_HITS + 1
     bulk = {
         uid: FakeMessage(uid, now - timedelta(days=2, seconds=uid), headers=hostile) for uid in range(1, first_real)
@@ -1001,7 +1003,7 @@ def status_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global STRUCTURE_PARTS
+    global STRUCTURE_PARTS, SEARCH_LONG_FROM
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--scenario",
@@ -1020,6 +1022,7 @@ def main() -> None:
     parser.add_argument(
         "--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread, search)"
     )
+    parser.add_argument("--long-from", action="store_true", help="search: bulk hits with an 8 KiB From (CPU heavy)")
     args = parser.parse_args()
     if args.scenario == "status":
         status_main(args)
@@ -1030,6 +1033,7 @@ def main() -> None:
         return
     if args.scenario in ("search", "search-graph"):
         STRUCTURE_PARTS = args.structure_parts
+        SEARCH_LONG_FROM = args.long_from
         search_main(args)
         return
     graph = args.scenario == "graph-message"
