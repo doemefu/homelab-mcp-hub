@@ -76,8 +76,9 @@ S1 capability flags. S2 per folder: `TEXT` with one word, with three keys, with 
 S3 (Gmail): `TEXT` and `SUBJECT` with Gmail operators inside the value (`in:anywhere`, `-word`, `OR`, `w1 OR w2`),
 the window size and a hint whether the counts look like a complement (`neg_complement`) or a union (`or_union`);
 the counts decide, the hint does not. S6: `FROM "utf-8"` and `SUBJECT "=?utf"` hit counts plus the control
-`encoded_from`/`encoded_subject` over the newest 500 window rows (control above zero and hits near zero = decoded
-matching; hits near the control = raw matching). S7: phrase against two keys. S8 (Gmail, optional): `TO <fragment>`
+`encoded_from`/`encoded_subject` (utf-8 encoded words only) over the newest 500 window rows, with
+`*_hits_in_scanned` (control above zero and hits_in_scanned near zero = decoded matching; near the control = raw
+matching). S7: phrase against two keys. S8 (Gmail, optional): `TO <fragment>`
 for an address that appears only in Cc. S4 and S5 run last, because a refused literal can leave the connection
 unusable: `SUBJECT <non-ASCII word>` and its upper-cased form. Every search carries `NOT DRAFT SINCE <today - 30 days>`.
 """
@@ -104,6 +105,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # the hub 
 from mcp_hub.providers import imap_search
 from mcp_hub.providers.base import SearchKey
 from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import NAME_FALLBACK
 from mcp_hub.providers.headers import (
     DESCENDANT_HEADER_BYTES,
     DESCENDANT_HEADER_ITEM,
@@ -948,7 +950,8 @@ _FRAGMENT_PREFIX: Final = slice(0, 4)
 _FRAGMENT_MIDDLE: Final = slice(2, 6)  # letters 3-6
 _CONTROL_UIDS: Final = 500
 _CONTROL_ITEM: Final = "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>"
-_ENCODED_WORD: Final = re.compile(r"=\?[^?\s]+\?[bq]\?[^?\s]*\?=", re.IGNORECASE)
+_ENCODED_WORD: Final = re.compile(r"=\?utf-8\?[bq]\?[^?\s]*\?=", re.IGNORECASE)  # the charset S6 searches for
+_BADCHARSET: Final = re.compile(r"\[BADCHARSET")
 _MAX_FOREIGN_BYTES: Final = 200
 _CC_MIN: Final = 4
 _PROMPT_ATTEMPTS: Final = 3
@@ -1015,9 +1018,12 @@ class SearchWords:
             cc_fragment(self.cc)
 
 
-def _search_folders(guard: GuardedImapClient, gmail: bool) -> list[tuple[str, str]]:
-    """(role, raw name): INBOX first; Gmail adds All Mail, other servers sent and archive. Names are never printed."""
+def _search_folders(guard: GuardedImapClient, gmail: bool) -> tuple[list[tuple[str, str]], list[str]]:
+    """(role, raw name) pairs, INBOX first, and the roles that were not found. Gmail adds All Mail, other servers
+    sent and archive: by special-use attribute, else by the hub's fallback names (iCloud has no `\\Archive`). Names
+    are never printed."""
     found: dict[str, str] = {}
+    by_name: dict[str, str] = {}
     for flags, _delimiter, name in guard.list_folders():
         if {f.lower() for f in flags} & _NOT_SELECTABLE:
             continue
@@ -1025,9 +1031,19 @@ def _search_folders(guard: GuardedImapClient, gmail: bool) -> list[tuple[str, st
         role = _role(flags, raw_name)
         if role in ("sent", "archive", "all"):
             found.setdefault(role, raw_name)
-    folders = [("inbox", _INBOX)]
-    folders += [(role, found[role]) for role in (("all",) if gmail else ("sent", "archive")) if role in found]
-    return [("all_mail" if role == "all" else role, name) for role, name in folders]
+        for fallback_role, fallback_name in NAME_FALLBACK.items():
+            if raw_name.casefold() == fallback_name.casefold():
+                by_name.setdefault(fallback_role, raw_name)
+    wanted = ("all",) if gmail else ("sent", "archive")
+    if not gmail:
+        for role in wanted:
+            if role not in found and role in by_name:
+                found[role] = by_name[role]
+    folders = [("inbox", _INBOX)] + [(role, found[role]) for role in wanted if role in found]
+    missing = [role for role in wanted if role not in found]
+    return [("all_mail" if role == "all" else role, name) for role, name in folders], [
+        "all_mail" if role == "all" else role for role in missing
+    ]
 
 
 def _count(
@@ -1071,7 +1087,7 @@ def _s3(raw: Any, role: str, window: bytes, words: SearchWords, emit: Callable[[
     """Does Gmail read its own operators inside a quoted value? The counts decide; the hint is a convenience."""
     w1, w2 = words.w1, words.w2
     text, subject = f"s3_text: folder={role}", f"s3_subject: folder={role}"
-    _count(raw, emit, f"{text} form=in_anywhere", window, [("TEXT", "in:anywhere")])
+    in_anywhere = _count(raw, emit, f"{text} form=in_anywhere", window, [("TEXT", "in:anywhere")])
     _count(raw, emit, f"{text} form=anywhere", window, [("TEXT", "anywhere")])
     negated = _count(raw, emit, f"{text} form=neg_w1", window, [("TEXT", f"-{w1}")])
     plain = _count(raw, emit, f"{text} form=w1", window, [("TEXT", w1)])
@@ -1091,11 +1107,32 @@ def _s3(raw: Any, role: str, window: bytes, words: SearchWords, emit: Callable[[
     union = (
         either is not None and only1 is not None and only2 is not None and either > 0 and either >= max(only1, only2)
     )
-    emit(f"s3_hint: folder={role} neg_complement={'yes' if complement else 'no'} or_union={'yes' if union else 'no'}")
+    whole = bool(total) and in_anywhere is not None and in_anywhere == total[0]
+    emit(
+        f"s3_hint: folder={role} neg_complement={'yes' if complement else 'no'} or_union={'yes' if union else 'no'} "
+        f"in_anywhere_eq_window={'yes' if whole else 'no'}"
+    )
 
 
-def _control(raw: Any, window: bytes, emit: Callable[[str], None]) -> None:
-    """MF-R6: how many of the newest <= 500 window rows carry an encoded word in From and in Subject (counts only)."""
+def _hit_uids(raw: Any, emit: Callable[[str], None], name: str, window: bytes, pair: Pair) -> set[int] | None:
+    """One timed search on its own deadline, printed like `_count`: the hit UIDs, None after an error."""
+    result: list[set[int]] = []
+
+    def measure() -> None:
+        started = time.perf_counter()
+        hits = _round_guard(raw).search_values(window, [pair])
+        result.append(set(hits))
+        emit(f"{name} hits={len(hits)} ms={_ms(started)}")
+
+    _guarded(name, emit, measure)
+    return result[0] if result else None
+
+
+def _control(
+    raw: Any, window: bytes, emit: Callable[[str], None], from_hits: set[int] | None, subject_hits: set[int] | None
+) -> None:
+    """MF-R6: how many of the newest <= 500 window rows carry a utf-8 encoded word in From and in Subject, and how
+    many of the S6 hits lie in those rows (counts only, so the two are comparable)."""
     started = time.perf_counter()
     guard = _round_guard(raw)
     in_window = set(guard.search(window))
@@ -1106,9 +1143,15 @@ def _control(raw: Any, window: bytes, emit: Callable[[str], None]) -> None:
         fields = _first_fields(header_bytes(row))
         encoded_from += 1 if _ENCODED_WORD.search(fields.get("from", "")) else 0
         encoded_subject += 1 if _ENCODED_WORD.search(fields.get("subject", "")) else 0
+    scanned = set(uids)
+
+    def inside(hits: set[int] | None) -> str:
+        return "na" if hits is None else str(len(hits & scanned))
+
     emit(
         f"s6_control: window_hits={len(in_window)} scanned={len(rows)} encoded_from={encoded_from} "
-        f"encoded_subject={encoded_subject} ms={_ms(started)}"
+        f"encoded_subject={encoded_subject} from_utf8_hits_in_scanned={inside(from_hits)} "
+        f"subject_encoded_hits_in_scanned={inside(subject_hits)} ms={_ms(started)}"
     )
 
 
@@ -1128,7 +1171,8 @@ def _literal_round(
         if kind == "other":
             emit(f"{name}: error={type(exc).__name__}")
             return "error", None
-        emit(f"{name}: status={kind} ms={_ms(started)}")
+        code = f" code={'badcharset' if _BADCHARSET.search(str(exc)) else 'none'}" if kind == "no" else ""
+        emit(f"{name}: status={kind}{code} ms={_ms(started)}")
         return kind, None
     emit(f"{name}: status=ok hits={hits} ms={_ms(started)}")
     return "ok", hits
@@ -1156,8 +1200,17 @@ def search_rounds(
     since = day - timedelta(days=_SEARCH_SINCE_DAYS)
     window = imap_search.window_keys(since_day=since, before_day=None, unread_only=False)
     folders: list[tuple[str, str]] = []
-    if not _guarded("search_folders", emit, lambda: folders.extend(_search_folders(_round_guard(raw), gmail))):
+    missing: list[str] = []
+
+    def discover() -> None:
+        found, absent = _search_folders(_round_guard(raw), gmail)
+        folders.extend(found)
+        missing.extend(absent)
+
+    if not _guarded("search_folders", emit, discover):
         return
+    for role in missing:
+        emit(f"s2_folder: role={role} skipped=not_found")
     for role, mailbox in folders:
         if not _examine(raw, emit, f"s2_examine: folder={role}", mailbox):
             continue
@@ -1168,11 +1221,13 @@ def search_rounds(
         emit("s3_gmail: skipped=not_gmail")
 
     if _examine(raw, emit, "s6_examine", _INBOX):  # S6 and S7 on the inbox; the loop above may have ended elsewhere
-        _count(raw, emit, "s6_raw_match: form=from_utf8", window, [("FROM", "utf-8")])
-        _count(raw, emit, "s6_raw_match: form=subject_encoded", window, [("SUBJECT", "=?utf")])
-        _guarded("s6_control", emit, lambda: _control(raw, window, emit))
+        from_hits = _hit_uids(raw, emit, "s6_raw_match: form=from_utf8", window, ("FROM", "utf-8"))
+        subject_hits = _hit_uids(raw, emit, "s6_raw_match: form=subject_encoded", window, ("SUBJECT", "=?utf"))
+        _guarded("s6_control", emit, lambda: _control(raw, window, emit, from_hits, subject_hits))
         _count(raw, emit, "s7_text: form=phrase", window, [("TEXT", f"{words.w1} {words.w2}")])
-        _count(raw, emit, "s7_text: form=two_keys", window, [("TEXT", words.w1), ("TEXT", words.w2)])
+        two_keys = _count(raw, emit, "s7_text: form=two_keys", window, [("TEXT", words.w1), ("TEXT", words.w2)])
+        if two_keys is not None:
+            emit(f"s7_hint: decisive={'yes' if two_keys > 0 else 'no'}")
 
     all_mail = dict(folders).get("all_mail")
     if not gmail:
@@ -1234,7 +1289,10 @@ def _ask(prompt: str, check: Callable[[str], str], *, optional: bool) -> str | N
 def _read_words() -> SearchWords:
     def need(number: int) -> str:
         word = _ask(
-            f"Word {number} (ASCII, 7+ letters, in mail of the last 30 days; not shown): ", ascii_word, optional=False
+            f"Word {number} (ASCII, 7+ letters, in the same inbox mail of the last 30 days as the other words, "
+            "not next to each other; not shown): ",
+            ascii_word,
+            optional=False,
         )
         if word is None:  # `optional=False` never skips
             raise ValueError(_WORD_REFUSED)
@@ -1246,7 +1304,12 @@ def _read_words() -> SearchWords:
         w2,
         w3,
         sender=_ask("Sender local part, 7+ characters (Enter to skip; not shown): ", sender_part, optional=True),
-        foreign=_ask("Word with a non-ASCII letter (Enter to skip; not shown): ", foreign_word, optional=True),
+        foreign=_ask(
+            "Word with a non-ASCII letter in the subject of an inbox mail of the last 30 days "
+            "(Enter to skip; not shown): ",
+            foreign_word,
+            optional=True,
+        ),
         cc=_ask(
             "Address fragment that appears only in Cc, Gmail (Enter to skip; not shown): ", cc_fragment, optional=True
         ),
