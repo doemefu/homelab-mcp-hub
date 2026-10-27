@@ -168,8 +168,16 @@ class FolderPage:
     # None with `more`: a full page, whose last item is the frontier.
     frontier: tuple[int, str] | None = None
     incomplete: frozenset[IncompleteReason] = frozenset()  # why the page may miss matches (search_messages)
-    # Every incomplete folder of the page was incomplete only because it was refused (search_messages cursor rule).
-    refused_only: bool = False
+
+    @property
+    def refused_only(self) -> bool:
+        """Every incomplete folder of the page was incomplete only because it was refused (search_messages cursor
+        rule, D85): a refusal never reports `changed_during_call` or `time_limit`, so those reasons rule it out."""
+        return (
+            not self.complete
+            and "search_refused" in self.incomplete
+            and not self.incomplete & {"changed_during_call", "time_limit"}
+        )
 
 
 StatusState = Literal["found", "gone", "unknown"]

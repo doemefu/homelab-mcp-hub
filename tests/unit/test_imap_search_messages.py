@@ -391,6 +391,36 @@ def test_pass2_row_expunged_changed_during_call() -> None:
     assert page.refused_only is False
 
 
+def candidate_fetch_loss(kind: str, *, search: bool) -> FolderPage:
+    server = three(inbox=[hit(1), hit(2, 6)])
+    original = server.run
+
+    def run_command(command: str, argument: object = None) -> None:
+        if command == "UID FETCH" and argument[1] == lm.CANDIDATE:  # type: ignore[index]
+            if kind == "fetch_no":
+                server.fail["UID FETCH"] = server.no("UID FETCH")
+            else:
+                del server.folders[0].messages[2]
+        original(command, argument)
+
+    server.run = run_command  # type: ignore[method-assign]
+    return lm.run(server, squery() if search else lm.query())
+
+
+@pytest.mark.parametrize("kind", ["fetch_no", "missing_uid"])
+def test_pass1_candidate_fetch_loss_is_changed_during_call(kind: str) -> None:
+    """A search hit that the pass-1 candidate FETCH does not return is a loss (WP13d, D85), never a quiet drop."""
+    page = candidate_fetch_loss(kind, search=True)
+    assert (page.complete, page.truncated) == (False, True)
+    assert (page.incomplete, page.refused_only) == ({"changed_during_call"}, False)
+
+
+@pytest.mark.parametrize("kind", ["fetch_no", "missing_uid"])
+def test_pass1_candidate_fetch_loss_keeps_the_list_tools_unchanged(kind: str) -> None:
+    page = candidate_fetch_loss(kind, search=False)
+    assert (page.complete, page.truncated, page.incomplete) == (True, False, frozenset())
+
+
 def test_list_page_truncated_is_unchanged_by_a_refusal() -> None:
     """The list tools keep their flags: a refused folder is `complete=False` only (reasons are set, unused)."""
     server = three(inbox=[lm.msg(1, 5, "a")])

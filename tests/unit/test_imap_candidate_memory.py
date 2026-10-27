@@ -10,7 +10,7 @@ import pytest
 import mcp_hub.providers.imap as imap
 from mcp_hub.providers.imap import Candidate
 from mcp_hub.providers.imap_session import ImapSession
-from tests.support.imap_fake import FakeMessage
+from tests.support.imap_fake import FakeImapServer, FakeMessage
 from tests.unit import test_imap_list_messages as lm
 from tests.unit.test_imap_locate import _session, icloud, msg
 from tests.unit.test_imap_search_messages import hit, squery, three
@@ -135,3 +135,43 @@ def test_pass_one_keeps_at_most_one_chunk_of_rows_alive(monkeypatch: pytest.Monk
     lm.run(lm.icloud(inbox=inbox), lm.query(limit=1))
     assert len(alive) == 3
     assert alive == [0, 0, 0]
+
+
+def chunked_hits() -> FakeImapServer:
+    return lm.icloud(
+        inbox=[FakeMessage(u, lm.NOW - timedelta(seconds=2000 - u), headers=lm.hdr("Rechnung")) for u in range(1, 1202)]
+    )
+
+
+def lose_in_second_candidate_chunk(server: FakeImapServer, kind: str) -> None:
+    original = server.run
+    seen = {"n": 0}
+
+    def run_command(command: str, argument: object = None) -> None:
+        if command == "UID FETCH" and argument[1] == lm.CANDIDATE:  # type: ignore[index]
+            seen["n"] += 1
+            if seen["n"] == 2:
+                if kind == "chunk_no":
+                    server.fail["UID FETCH"] = server.no("UID FETCH")
+                else:
+                    del server.folders[0].messages[777]
+        original(command, argument)
+
+    server.run = run_command  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("kind", ["chunk_no", "missing_uid"])
+def test_search_second_candidate_chunk_loss_is_changed_during_call(kind: str) -> None:
+    server = chunked_hits()
+    lose_in_second_candidate_chunk(server, kind)
+    page = lm.run(server, squery(limit=3))
+    assert (page.complete, page.truncated) == (False, True)
+    assert page.incomplete == {"changed_during_call"}
+
+
+@pytest.mark.parametrize("kind", ["chunk_no", "missing_uid"])
+def test_list_second_candidate_chunk_loss_stays_silent(kind: str) -> None:
+    server = chunked_hits()
+    lose_in_second_candidate_chunk(server, kind)
+    page = lm.run(server, lm.query(limit=3))
+    assert (page.complete, page.incomplete) == (True, frozenset())

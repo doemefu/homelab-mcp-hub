@@ -412,11 +412,13 @@ def test_debug_logging_never_carries_the_literal_value() -> None:
     try:
         configure_logging("DEBUG")
         root.addHandler(Capture())
+        logging.getLogger("imapclient").warning("capture-control")  # positive control: the capture works
         _values_once(PREFIX, [("TEXT", canary)])
     finally:
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
         logging.getLogger("imapclient").setLevel(saved[2])
     texts = [f"{record.getMessage()} {record.args!r} {record.__dict__.get('msg')!r}" for record in records]
+    assert any("capture-control" in text for text in texts)
     for needle in (canary, repr(canary), repr(canary.encode()), "NOT DRAFT SINCE"):
         assert not any(needle in text for text in texts), needle

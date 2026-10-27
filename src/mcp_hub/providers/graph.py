@@ -22,7 +22,6 @@ from urllib.parse import quote, urlsplit
 import httpx2
 
 from mcp_hub import search as _search  # the module: `search` imports providers.base, so names would cycle
-from mcp_hub.errors import ToolError
 from mcp_hub.ids import (
     GRAPH_ID,
     MESSAGE_ID_PATTERN,
@@ -115,12 +114,13 @@ EXTENDED_EXPAND: Final = (
     "singleValueExtendedProperties($filter=id eq 'Integer 0x1081' or id eq 'String 0x1042' or id eq 'String 0x1039')"
 )
 GRAPH_LIST_TOP: Final = 101  # folder lists (spec 080 §5.4)
-SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (owner decision, 2026-10-27)
+SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (D88)
 SEARCH_HALVED_TOP: Final = 50  # the one retry after a too_large answer
-# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probe P8, SEARCH_FACTS).
+# `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probe P8, `SEARCH_FACTS` in
+# tests/support/graph_fixtures.py).
 SEARCH_EXPAND: Final = True
-READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (G5-3)
-FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)
+READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (D84)
+FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (D84)
 ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
 FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
 WELL_KNOWN_FOR: Final[dict[ListFolder, tuple[GraphWellKnown, ...]]] = {
@@ -148,7 +148,11 @@ _RETRY_AFTER: Final = re.compile(r"[0-9]+")  # ASCII delay-seconds only; anythin
 _LEGACY_DN: Final = re.compile(r"/O=[^/@]+(?:/OU=[^/@]+)*/CN=RECIPIENTS/CN=[^/@]+", re.IGNORECASE)  # fullmatch (T17)
 _PLAIN_ADDRESS: Final = re.compile(r"[^@\s]+@[^@\s]+")  # fullmatch: one "@", no whitespace
 _DN_ADDRESS: Final = re.compile(r"\s*/O=", re.IGNORECASE)  # match: an Exchange DN, never a participant (gr-G4)
-_SEARCH_REJECTED: Final = "SearchRejected"  # log cause of a 404 or unmapped status on the search request (GR5)
+# Log causes of the `$search` request: a 400 (the syntax was refused), a 404, and any other unmapped status (5xx) as
+# `_UNEXPECTED_STATUS`, so that an operator can tell a sanitiser gap from an outage (spec 080 §6.5, D88).
+_SEARCH_REJECTED: Final = "SearchRejected"
+_SEARCH_NOT_FOUND: Final = "SearchNotFound"
+_EMPTY_SEARCH_TEXT: Final = "EmptySearchText"  # the tool layer refuses words with no searchable text first
 _UNEXPECTED_STATUS: Final = "UnexpectedStatus"  # `_get`'s cause for a status it does not map (G-R7)
 # The get_thread list falls back on these causes too: any status but 2xx, 401, 403, 404, 429 and 503 (SG1, Q7).
 _FALLBACK_CAUSES: Final = frozenset({_UNEXPECTED_STATUS, "Redirect"})
@@ -441,7 +445,7 @@ def _folded_has(needle: str, text: str | None, cap: int) -> bool:
 
 
 def _participant_matches(needle: str, entry: object) -> bool:
-    """A name or a non-DN address of one Graph recipient value contains the folded needle (MF-D2)."""
+    """A name or a non-DN address of one Graph recipient value contains the folded needle (D84)."""
     name, address = _address(entry)
     if _folded_has(needle, name, _search.MATCH_NAME_CHARS):
         return True
@@ -453,7 +457,7 @@ def _participant_matches(needle: str, entry: object) -> bool:
 
 
 def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
-    """The hub-side `sender`, `recipient` and `subject` filters of `search_messages` (spec 080 §5.2, MF-D2).
+    """The hub-side `sender`, `recipient` and `subject` filters of `search_messages` (spec 080 §5.2, D84).
 
     Plain substring on `match_fold` of needle and candidate, never a pattern: `sender` = `from` name or non-DN
     address; `recipient` = any `toRecipients` entry (never Cc/Bcc); `subject` = its first 4,000 characters. The words
@@ -482,8 +486,8 @@ def _search_requests(ids: GraphFolderIds, query: ListQuery) -> tuple[str, dict[s
     do not combine with `$search`, so window, order and folders are applied per hit."""
     terms = query.search
     text = None if terms is None else _search.graph_search_text(terms.words)
-    if text is None:
-        raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
+    if text is None:  # the tool refuses this first (`invalid_argument`); reaching here is a hub defect
+        raise ProviderError("upstream_error", _EMPTY_SEARCH_TEXT)
     params = {"$search": f'"{text}"', "$top": str(SEARCH_TOP), "$select": SUMMARY_SELECT}
     if SEARCH_EXPAND:
         params["$expand"] = EXTENDED_EXPAND
@@ -496,8 +500,12 @@ def _by_id(ref: object) -> TypeGuard[GraphMessageRef]:
     return isinstance(ref, GraphMessageRef) and not isinstance(ref, SearchHitRef)
 
 
-def _has_filters(terms: SearchTerms | None) -> bool:
-    return terms is not None and (terms.sender is not None or terms.recipient is not None or terms.subject is not None)
+def _message_path(ref: GraphMessageRef) -> str:
+    """The by-id request path of a message: the one place that builds it, so that a `SearchHitRef` (a `$search`
+    result's regular id, D87) can never reach a GET, whatever the caller checked."""
+    if isinstance(ref, SearchHitRef):
+        raise ProviderError("not_found", "ForeignRef")
+    return f"/me/messages/{quote(ref.graph_id, safe='')}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,7 +570,15 @@ class GraphMailbox:
             raise _provider_error(exc) from None
 
     def _get(
-        self, client: httpx2.Client, token: str, deadline: CallDeadline, path: str, params: dict[str, str], cap: int
+        self,
+        client: httpx2.Client,
+        token: str,
+        deadline: CallDeadline,
+        path: str,
+        params: dict[str, str],
+        cap: int,
+        *,
+        bad_request_cause: str | None = None,
     ) -> dict[str, object]:
         deadline.before_command()  # hard limit: upstream_timeout; soft stop: SoftStop (§5.4)
         now = self._clock()
@@ -608,6 +624,8 @@ class GraphMailbox:
                     self._account, self._clock(), retry_after_seconds(response.headers.get("retry-after"))
                 )
                 raise ProviderError("upstream_error", "Throttled")
+            if status == 400 and bad_request_cause is not None:
+                raise ProviderError("upstream_error", bad_request_cause)
             raise ProviderError("upstream_error", _UNEXPECTED_STATUS)
 
     def _folder_ids(
@@ -677,8 +695,10 @@ class GraphMailbox:
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         if query.search is not None and query.search.words:
-            if _search.graph_search_text(query.search.words) is None:  # refused here, not wrapped as a provider error
-                raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
+            if (
+                _search.graph_search_text(query.search.words) is None
+            ):  # the tool refuses this first (`invalid_argument`)
+                raise ProviderError("upstream_error", _EMPTY_SEARCH_TEXT)
             search = self._search_messages
         else:
             search = self._list_messages
@@ -746,7 +766,8 @@ class GraphMailbox:
     def _search_messages(
         self, client: httpx2.Client, token: str, deadline: CallDeadline, query: ListQuery
     ) -> FolderPage:
-        """`search_messages` with words: one mailbox-wide `$search` request, the hub applies the rest (spec 080 §6.5).
+        """`search_messages` with words: one mailbox-wide `$search` request, the hub applies the rest (spec 080 §6.5,
+        D88).
 
         Per hit: not a draft, parent in the requested folders, inside the window, after the position, the hub filters
         and the direction. Dropped hits still count toward the 100 (`result_cap`). A hit carries a `SearchHitRef`: the
@@ -761,8 +782,8 @@ class GraphMailbox:
         except SoftStop:
             return _soft_stopped_page(query)
         except ProviderError as exc:
-            if exc.code == "not_found" or (exc.code == "upstream_error" and exc.cause == _UNEXPECTED_STATUS):
-                raise ProviderError("upstream_error", _SEARCH_REJECTED) from None
+            if exc.code == "not_found":
+                raise ProviderError("upstream_error", _SEARCH_NOT_FOUND) from None
             raise
         found: list[MailSummary] = []
         seen: set[AnyMessageRef] = set()
@@ -774,7 +795,7 @@ class GraphMailbox:
                 continue
             if query.direction is not None and summary.meta.direction != query.direction:
                 continue
-            if summary.ref not in seen:  # a repeated returned id keeps its first entry (never by Message-ID, MF-R4)
+            if summary.ref not in seen:  # a repeated returned id keeps its first entry (never by Message-ID, D87)
                 seen.add(summary.ref)
                 found.append(summary)
         found.sort(key=order_key, reverse=True)
@@ -793,12 +814,22 @@ class GraphMailbox:
         never followed. A too_large answer is repeated once with `$top` halved; a second one fails the account."""
         top = SEARCH_TOP
         try:
-            body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
+            body = self._get(
+                client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES, bad_request_cause=_SEARCH_REJECTED
+            )
         except ProviderError as exc:
             if exc.code != "too_large":
                 raise
             top = SEARCH_HALVED_TOP
-            body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
+            body = self._get(
+                client,
+                token,
+                deadline,
+                path,
+                params | {"$top": str(top)},
+                MAX_LIST_RESPONSE_BYTES,
+                bad_request_cause=_SEARCH_REJECTED,
+            )
         values = body.get("value")
         if not isinstance(values, list):
             raise ProviderError("upstream_error", "MalformedList")
@@ -831,11 +862,10 @@ class GraphMailbox:
         more = truncated = False
         complete = True
         incomplete: set[IncompleteReason] = set()
-        read_on = query.search is not None and not query.search.words  # filter-only search (ruling 5, GR1)
-        for name in WELL_KNOWN_FOR[query.folder]:
-            folder_id = ids.ids.get(name)
-            if folder_id is None:
-                continue  # the account has no such folder (404 when the ids were read)
+        read_on = query.search is not None and not query.search.words  # filter-only search (D84)
+        plan = [(name, folder_id) for name in WELL_KNOWN_FOR[query.folder] if (folder_id := ids.ids.get(name))]
+        for position, (_, folder_id) in enumerate(plan):  # a folder the account lacks (404 on the ids) is not planned
+            throttled = False
             mine: dict[AnyMessageRef, MailSummary] = {}  # the re-read frontier second is counted once
             current, base, previous, requests = params, params, None, 0
             answer: _FolderAnswer | None = None
@@ -848,9 +878,12 @@ class GraphMailbox:
                             client, token, deadline, folder_id, current, query, ids, previous, retry
                         )
                     except ProviderError as exc:
-                        if exc.code != "too_large" or answer is None:
+                        # Past the first answer a read-on request may fail without losing what was read: too_large
+                        # (no retry allowed here) and a throttled answer (the back-off keeps the next call away).
+                        throttled = exc.code == "upstream_error" and exc.cause == "Throttled"
+                        if answer is None or not (exc.code == "too_large" or throttled):
                             raise
-                        break  # a retry is not allowed here: the last frontier stands
+                        break  # the last frontier stands
                     requests += answer.gets
                     if answer.stuck:
                         break
@@ -885,6 +918,11 @@ class GraphMailbox:
             if answer.frontier is not None:
                 more = True
                 floor = answer.frontier if floor is None else max(floor, answer.frontier)
+            if throttled and position + 1 < len(plan):
+                # The later folders were never read: a cursor at this frontier would skip their newer items.
+                truncated, complete = True, False
+                incomplete.add("time_limit")
+                break
         if floor is not None:
             found = [summary for summary in found if order_key(summary)[0] > floor]
         if query.direction is not None:
@@ -989,6 +1027,10 @@ class GraphMailbox:
         try:
             if query.search is not None and not graph_filters_match(raw, query.search):
                 return key, None  # the key still feeds the frontier
+        except Exception as exc:  # the filter could not be evaluated: a hit that may not match is not listed
+            log_message_skipped(ref, "mail", exc)
+            return key, None
+        try:  # past the filters the hit is confirmed: a failing summary becomes a placeholder, never a dropped match
             name, address = _address(raw.get("from"))
             return key, MailSummary(
                 ref=ref,
@@ -1005,8 +1047,6 @@ class GraphMailbox:
             )
         except Exception as exc:
             log_message_skipped(ref, "mail", exc)
-            if _has_filters(query.search):
-                return key, None  # a placeholder never matches a given filter
             listed = _listed_folder(folder)
             meta = MailMeta(folder=listed, direction="outgoing" if listed == "sent" else "incoming")
             return key, placeholder_summary(ref, received, unread, meta)
@@ -1112,7 +1152,7 @@ class GraphMailbox:
         may_rebuild: bool = True,
     ) -> MailDetail:
         """The immutable id follows moves (O37); 404, a draft or an excluded parent folder is not_found (D75, S1)."""
-        path = f"/me/messages/{quote(ref.graph_id, safe='')}"
+        path = _message_path(ref)
         preview_only = False
         try:
             body = self._get(
@@ -1390,7 +1430,7 @@ class GraphMailbox:
 
     def _read_status(self, run: _StatusRun, ref: GraphMessageRef) -> MessageStatus:
         """A `g` entry (Graph G6): the immutable id follows moves; no body and no attachment read, 1 MiB cap."""
-        path = f"/me/messages/{quote(ref.graph_id, safe='')}"
+        path = _message_path(ref)
         params = {"$select": SUMMARY_SELECT, "$expand": EXTENDED_EXPAND}
         try:
             body = self._get(run.client, run.token, run.deadline, path, params, MAX_LIST_RESPONSE_BYTES)
@@ -1608,7 +1648,7 @@ class GraphMailbox:
             return _ThreadSeed(ref.graph_id, target.message_id, conversation)
         if not _by_id(target):
             raise ProviderError("not_found", "ForeignRef")
-        path = f"/me/messages/{quote(target.graph_id, safe='')}"
+        path = _message_path(target)
         body = self._get(client, token, deadline, path, {"$select": _SEED_SELECT}, MAX_LIST_RESPONSE_BYTES)
         if body.get("isDraft") is True:
             raise ProviderError("not_found", "Draft")
@@ -1629,7 +1669,7 @@ class GraphMailbox:
         logs: _ThreadLogs,
     ) -> ThreadPage:
         """The seed read once with its summary fields and bodies (P5, G-R1) and returned alone, not exact."""
-        path = f"/me/messages/{quote(seed.graph_id, safe='')}"
+        path = _message_path(GraphMessageRef(self._account, seed.graph_id))  # the seed id passed `_by_id` or a lookup
         params = {"$select": f"{SUMMARY_SELECT},uniqueBody,body", "$expand": EXTENDED_EXPAND}
         raw = self._get(client, token, deadline, path, params, MAX_MESSAGE_RESPONSE_BYTES)
         if raw.get("isDraft") is True:
@@ -1788,9 +1828,9 @@ class GraphMailbox:
     ) -> ThreadBody:
         """One single read of `uniqueBody,body` (SG2, 2 MiB), retried once with `uniqueBody` alone after too_large
         (G-R6). A failed read omits only this body (SC5); account failures, a 401 and the soft stop pass (P6)."""
-        if not isinstance(item.summary.ref, GraphMessageRef):
-            return OMITTED_BODY  # every Graph member has a Graph id
-        path = f"/me/messages/{quote(item.summary.ref.graph_id, safe='')}"
+        if not _by_id(item.summary.ref):
+            return OMITTED_BODY  # every Graph member has a Graph id; a `$search` hit's regular id is never read (D87)
+        path = _message_path(item.summary.ref)
         try:
             try:
                 raw = self._get(

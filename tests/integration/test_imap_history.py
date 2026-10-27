@@ -1039,6 +1039,7 @@ async def test_logs_contain_no_search_values(secrets_dir: Path, captured: Captur
         await searching(ctx, query="zqxcanaryrefused OR -x")  # refused before any provider call
     failing = hub(secrets_dir, login, password="not-the-password")
     await searching(failing, query=canaries[0])
+    assert captured.raw  # positive control: the capture works, so the checks below can fail
     text = "\n".join(captured.lines) + "\n".join(m for _, _, m in captured.raw)
     forbidden = {*canaries, "zqxcanaryutf", "zqxcanaryrefused", GRUESSE, RUN, login, "@", "not-the-password"}
     forbidden.update(i.ref or "" for i in ok.items)
@@ -1047,4 +1048,4 @@ async def test_logs_contain_no_search_values(secrets_dir: Path, captured: Captur
     assert not [r for r in captured.raw if r[0].startswith("imapclient") and r[1] < logging.WARNING]
     events = [json.loads(line) for line in captured.lines]
     assert all(set(e) <= allowed_fields(e["event"]) for e in events)
-    assert any(e["event"] == "tool_call" for e in events) or True
+    assert any(e["event"] == "provider_call_failed" for e in events)  # the wrong-password call wrote a hub event

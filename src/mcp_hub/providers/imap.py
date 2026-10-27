@@ -231,19 +231,17 @@ class _Progress:
     complete: bool = True
     searching: bool = False
     incomplete: set[IncompleteReason] = field(default_factory=set)
-    refused: bool = False  # a folder could not be searched
-    lost: bool = False  # incomplete for a reason other than a refusal
     stopped: bool = False  # pass 2 fetched no further chunks: the folders after it are not read
 
     def refuse(self) -> None:
         """The folder could not be searched (NO, no UIDVALIDITY, name too long): it counts as searched for the cursor
-        (ruling 4)."""
-        self.complete, self.refused = False, True
+        (D85)."""
+        self.complete = False
         self.incomplete.add("search_refused")
         self.truncated = self.truncated or self.searching
 
     def lose(self, reason: IncompleteReason, *, truncated: bool = False) -> None:
-        self.complete, self.lost = False, True
+        self.complete = False
         self.incomplete.add(reason)
         self.truncated = self.truncated or truncated or self.searching
 
@@ -264,7 +262,6 @@ class _Progress:
             complete=self.complete,
             frontier=frontier,
             incomplete=frozenset(self.incomplete),
-            refused_only=self.refused and not self.lost and not self.complete,
         )
 
 
@@ -433,7 +430,7 @@ def _fetch_texts(
 
 
 def _soft_stopped_page(progress: _Progress | None = None) -> FolderPage:
-    """Nothing read past the stop; the reasons collected before it stay (ruling 3)."""
+    """Nothing read past the stop; the reasons collected before it stay (D85)."""
     reasons: set[IncompleteReason] = {"time_limit"} if progress is None else {*progress.incomplete, "time_limit"}
     return FolderPage(items=[], more=False, truncated=True, complete=False, incomplete=frozenset(reasons))
 
@@ -630,7 +627,7 @@ class ImapMailbox:
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
-            progress.refuse()  # no cursor (S-p); for a search the cursor rule of ruling 4 applies
+            progress.refuse()  # a refused folder counts as searched for the cursor of a search (D85)
             return []
         newest = sorted(set(found), reverse=True)
         if len(newest) > MAX_SEARCH_CANDIDATES:
@@ -650,7 +647,15 @@ class ImapMailbox:
         count = 0
         # One chunk of rows at a time, each reduced to `Candidate`s before the next FETCH: pass 1 never holds the rows
         # of all 5,000 candidates (header blocks of up to 2 KiB each).
+        ascending = sorted(newest)  # the order `fetch_chunks` asks in
+        number = 0  # not `enumerate`: it keeps its last (number, rows) tuple, and with it the chunk, alive
         for rows in session.fetch_chunks(newest, items, chunk=FETCH_CHUNK_UIDS, soft_check=self._soft_check):
+            asked = ascending[number * FETCH_CHUNK_UIDS : (number + 1) * FETCH_CHUNK_UIDS]
+            if progress.searching and not rows.keys() >= set(asked):
+                # FETCH NO or expunged meanwhile: a search hit would vanish with no signal (D85); the list tools
+                # keep the silent drop
+                progress.lose("changed_during_call")
+            number += 1
             for uid, row in sorted(rows.items(), reverse=True):
                 if count and count % SOFT_CHECK_EVERY == 0:
                     self._soft_check()  # header parsing costs CPU but sends no command the guard could stop

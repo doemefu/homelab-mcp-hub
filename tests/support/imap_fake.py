@@ -170,6 +170,10 @@ class FakeImapClient:
         self._server.run("UID SEARCH", criteria)
         return self._evaluate([m.group(1) for m in _TOKEN.finditer(criteria.decode("utf-8"))])
 
+    def has_capability(self, capability: str | bytes) -> bool:
+        """The production client class never announces LITERAL+ to its literal sender (D82); the fake mirrors that."""
+        return False
+
     def _raw_command_untagged(self, command: bytes, args: Sequence[bytes], *, uid: bool = False) -> list[bytes]:
         """The synchronising-literal search of the guard: `UID SEARCH CHARSET UTF-8 <prefix> <key> <value>...`. Only
         that command exists; a non-ASCII value arrives as raw UTF-8 bytes (the literal, one token whatever it

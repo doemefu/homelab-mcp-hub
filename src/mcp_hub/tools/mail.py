@@ -330,8 +330,8 @@ def window_start(
     max_age: timedelta = SINCE_MAX_AGE,
 ) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
-    the same on every page); by default now - 24 h; at most 30 days back, at most 60 s ahead (search_messages passes
-    its own default and age limit; the error text names the limit).
+    the same on every page); by default now - 24 h; at most `max_age` back (30 days by default), at most 60 s ahead
+    (search_messages passes its own default and age limit; the error text names the limit).
 
     Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
     but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the
@@ -450,6 +450,10 @@ async def run_list_query[R: BaseModel](
         # `chosen` is a prefix of `items`. Only dropped items count as "more" (B8): a single item shortened to fit
         # leaves nothing to fetch, so it sets neither `truncated` nor a cursor.
         remaining = more or len(chosen) < len(items)
+        if items and not chosen:
+            # Not even one shortened summary fits: the page would be `truncated` with no cursor and no reason to give
+            # (unreachable within the accepted budget range, like the get_message case below).
+            raise ToolError("too_large", "Result exceeds the output budget")
         last: Position | None = None
         if chosen:
             last = positions[len(chosen) - 1]
