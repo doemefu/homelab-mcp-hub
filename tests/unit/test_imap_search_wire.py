@@ -2,6 +2,7 @@
 
 import ast
 import imaplib
+import logging
 import ssl
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ import imapclient
 import pytest
 from imapclient import response_parser
 
+from mcp_hub.logging import configure_logging
 from mcp_hub.providers.base import ProviderError
 from mcp_hub.providers.deadline import CallDeadline
 from mcp_hub.providers.imap import HubImapClient, ImapMailbox, default_client
@@ -381,3 +383,27 @@ def test_private_imapclient_names_exist() -> None:
     assert imapclient.__version__ == "4.1.0"
     assert hasattr(imapclient.IMAPClient, "_raw_command_untagged")
     assert callable(response_parser.parse_message_list)
+
+
+def test_debug_logging_never_carries_the_literal_value() -> None:
+    # T3-S1: this is the one place where the real IMAPClient sends a literal; it logs the sent bytes at DEBUG.
+    canary = "kanarienvögelßecret"
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    root = logging.getLogger()
+    saved = (list(root.handlers), root.level, logging.getLogger("imapclient").level)
+    try:
+        configure_logging("DEBUG")
+        root.addHandler(Capture())
+        _values_once(PREFIX, [("TEXT", canary)])
+    finally:
+        root.handlers[:] = saved[0]
+        root.setLevel(saved[1])
+        logging.getLogger("imapclient").setLevel(saved[2])
+    texts = [f"{record.getMessage()} {record.args!r} {record.__dict__.get('msg')!r}" for record in records]
+    for needle in (canary, repr(canary), repr(canary.encode()), "NOT DRAFT SINCE"):
+        assert not any(needle in text for text in texts), needle
