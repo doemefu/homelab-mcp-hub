@@ -43,9 +43,10 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.sanitize import TRUNCATION_MARKER
-from mcp_hub.tools import HubContext
+from mcp_hub.tools import HubContext, mail
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE
 from mcp_hub.tools.mail import (
+    DIGEST_ARGUMENTS,
     LIST_MESSAGES_DESCRIPTION,
     MAX_SUMMARY_REFERENCES,
     ListMessagesResult,
@@ -53,6 +54,7 @@ from mcp_hub.tools.mail import (
     run_list_messages,
     shrink_summary,
     summary_model,
+    window_start,
 )
 from tests.support.logfields import allowed_fields
 from tests.support.mcp import body, modern
@@ -108,7 +110,7 @@ def summary(
         from_name="Sender",
         subject=subject,
         snippet_text="Hello",
-        meta=replace(MailMeta(), **meta),  # type: ignore[arg-type]  # MailMeta fields chosen per test
+        meta=replace(MailMeta(), **meta),  # MailMeta fields chosen per test
     )
 
 
@@ -157,7 +159,7 @@ class FakeMailbox:
             return self._scanned(candidates, query)
         matching = [m for m in candidates if query.direction is None or m.meta.direction == query.direction]
         page = FolderPage(matching[: query.limit], len(matching) > query.limit, truncated=False, complete=True)
-        return replace(page, **self.fake.flags.get(self.account, {}))  # type: ignore[arg-type]  # page flags per test
+        return replace(page, **self.fake.flags.get(self.account, {}))  # page flags per test
 
     def _scanned(self, candidates: list[MailSummary], query: ListQuery) -> FolderPage:
         scanned, rest = candidates[: self.fake.scan[self.account]], candidates[self.fake.scan[self.account] :]
@@ -194,7 +196,7 @@ ARGUMENTS: dict[str, object] = {
 
 async def run(ctx: HubContext, now: datetime = NOW, **kwargs: object) -> tuple[ListMessagesResult, list[str], str]:
     arguments = ARGUMENTS | kwargs  # every tool argument, omitted ones as None
-    return await run_list_messages(ctx, tool="list_messages", now=now, **arguments)  # type: ignore[arg-type]  # values typed per test
+    return await run_list_messages(ctx, tool="list_messages", now=now, **arguments)  # values typed per test
 
 
 def ids(result: ListMessagesResult) -> list[tuple[str, int]]:
@@ -816,3 +818,46 @@ def test_tool_call_log_line(wired: tuple[TestClient, Fake], tokens: TokenFactory
     text = "\n".join(handler.lines)
     for forbidden in (cursor, "Quarterly", "m1@example.test", "Private Folder", "sender@example.test"):
         assert forbidden not in text, forbidden
+
+
+SEARCH_WINDOW: dict[str, Any] = {
+    "default": timedelta(days=30),
+    "max_age": timedelta(days=90),
+    "message": "since must lie within the last 90 days",
+}
+
+
+def test_search_window_bounds() -> None:
+    now = datetime(2026, 10, 27, 12, 0, 0, tzinfo=UTC)
+    with pytest.raises(ToolError) as caught:
+        window_start(now - timedelta(days=91), now, **SEARCH_WINDOW)
+    assert caught.value.code == "invalid_argument"
+    assert "90 days" in caught.value.message
+    assert window_start(now - timedelta(days=89), now, **SEARCH_WINDOW) == int((now - timedelta(days=89)).timestamp())
+    assert window_start(None, now, **SEARCH_WINDOW) == int((now - timedelta(days=30)).timestamp())
+    with pytest.raises(ToolError, match="since"):  # the future bound is unchanged
+        window_start(now + timedelta(seconds=61), now, **SEARCH_WINDOW)
+    # The list tools keep their defaults: 24 h, 30 days.
+    assert window_start(None, now) == int((now - timedelta(hours=24)).timestamp())
+    with pytest.raises(ToolError) as listed:
+        window_start(now - timedelta(days=31), now)
+    assert "30 days" in listed.value.message
+
+
+def test_search_window_constants() -> None:
+    assert timedelta(days=30) == mail.SEARCH_SINCE_DEFAULT
+    assert timedelta(days=90) == mail.SEARCH_SINCE_MAX_AGE
+
+
+def test_digest_arguments_pins() -> None:
+    assert DIGEST_ARGUMENTS["list_messages"] == ("account", "folder", "since", "unread_only", "direction")
+    assert DIGEST_ARGUMENTS["list_unread"] == ("account", "since")
+    assert DIGEST_ARGUMENTS["search_messages"] == (
+        "account",
+        "query",
+        "sender",
+        "recipient",
+        "subject",
+        "folder",
+        "since",
+    )

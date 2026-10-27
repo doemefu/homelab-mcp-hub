@@ -64,6 +64,8 @@ MAX_SUMMARY_REFERENCES: Final = 3  # spec 4.9 amendment S-i (was 10)
 MAX_MESSAGE_REFERENCES: Final = 10  # references of get_message (spec 080 §5.5)
 SINCE_DEFAULT: Final = timedelta(hours=24)
 SINCE_MAX_AGE: Final = timedelta(days=30)
+SEARCH_SINCE_DEFAULT: Final = timedelta(days=30)
+SEARCH_SINCE_MAX_AGE: Final = timedelta(days=90)
 CLOCK_SKEW: Final = timedelta(seconds=60)
 LIST_FOLDERS: Final[tuple[ListFolder, ...]] = ("inbox", "sent", "archive", "trash", "all")
 DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
@@ -72,10 +74,13 @@ DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
 FolderArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*LIST_FOLDERS, None]})]
 DirectionArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*DIRECTIONS, None]})]
 ListTool = Literal["list_messages", "list_unread"]
+# Tools that issue cursors; kept apart from ListTool so run_list_messages(tool="search_messages") does not type-check.
+CursorTool = Literal["list_messages", "list_unread", "search_messages"]
 # The arguments each tool's cursor is bound to (§5.5 "Cursors": every argument except `cursor` and `limit`).
-DIGEST_ARGUMENTS: Final[dict[ListTool, tuple[str, ...]]] = {
+DIGEST_ARGUMENTS: Final[dict[CursorTool, tuple[str, ...]]] = {
     "list_messages": ("account", "folder", "since", "unread_only", "direction"),
     "list_unread": ("account", "since"),
+    "search_messages": ("account", "query", "sender", "recipient", "subject", "folder", "since"),
 }
 ThreadKeySource = Literal["server", "headers", "subject"]
 _THREAD_KEY_SOURCE: Final[dict[ThreadSource, ThreadKeySource]] = {
@@ -316,16 +321,24 @@ def _choice[T: str](value: str | None, name: str, allowed: tuple[T, ...]) -> T |
     raise ToolError("invalid_argument", f"{name} must be one of: {', '.join(allowed)}")
 
 
-def _window_start(since: datetime | None, current: datetime) -> int:
+def window_start(
+    since: datetime | None,
+    current: datetime,
+    *,
+    default: timedelta = SINCE_DEFAULT,
+    max_age: timedelta = SINCE_MAX_AGE,
+    message: str = "since must lie within the last 30 days",
+) -> int:
     """First page: the absolute window start in whole UTC seconds (rounded up, so whole-second receipt times compare
-    the same on every page); default now - 24 h; at most 30 days back, at most 60 s ahead.
+    the same on every page); by default now - 24 h; at most 30 days back, at most 60 s ahead (search_messages passes
+    its own default, age limit and message).
 
     Edge (S-f): Graph's sub-second precision is undocumented. A Graph message received after a fractional `since`
     but within the same second is outside the rounded-up window; the adapter's `ge <window start>` filter and the
     hub's whole-second positions agree on that, so no page shows it and no page repeats it."""
-    start = current - SINCE_DEFAULT if since is None else since
-    if start < current - SINCE_MAX_AGE or start > current + CLOCK_SKEW:
-        raise ToolError("invalid_argument", "since must lie within the last 30 days")
+    start = current - default if since is None else since
+    if start < current - max_age or start > current + CLOCK_SKEW:
+        raise ToolError("invalid_argument", message)
     return math.ceil(start.timestamp())
 
 
@@ -364,7 +377,7 @@ async def run_list_messages(
     digest = argument_digest({name: given[name] for name in DIGEST_ARGUMENTS[tool]})
     position: Position | None = None
     if cursor is None:
-        window = _window_start(parsed_since, current)
+        window = window_start(parsed_since, current)
     else:
         state = ctx.cursors.open(cursor, tool=tool, args_digest=digest)
         window, position = state.window_start, state.position
