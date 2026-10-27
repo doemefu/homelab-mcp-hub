@@ -3,11 +3,16 @@
 import base64
 import hashlib
 import logging
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
 
 import httpx2
 import pytest
 
+import mcp_hub
 from mcp_hub.cursors import Position
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import GraphMessageRef, SearchHitRef, encode_message_id, location_id
@@ -17,13 +22,14 @@ from mcp_hub.providers.folders import GraphFolderIds
 from mcp_hub.providers.graph import (
     EXTENDED_EXPAND,
     FILTER_READ_REQUESTS,
+    READ_ON_SECONDS,
     SEARCH_EXPAND,
     SUMMARY_SELECT,
     GraphMailbox,
     _search_requests,
     graph_filters_match,
+    list_filter,
 )
-from mcp_hub.search import graph_search_text
 from tests.support.clock import FakeClock
 from tests.support.graph_fixtures import (
     ARCHIVE_ID,
@@ -185,7 +191,9 @@ def test_filter_only_reads_on_until_the_answer_is_not_full() -> None:
     assert not page.more
     assert page.frontier is None
     assert page.complete
-    assert "lt" in requests[1].url.params["$filter"]
+    for number in (1, 2, 3):  # the next request starts at the second of the last item of the answer before
+        bound = NOW - timedelta(hours=2 * (number - 1)) - timedelta(minutes=100)
+        assert requests[number].url.params["$filter"] == list_filter(SINCE, bound, False)
 
 
 def test_filter_only_request_cap_and_frontier_of_the_last_answer() -> None:
@@ -233,11 +241,11 @@ def test_filter_only_soft_stop_is_time_limit_and_keeps_what_was_read() -> None:
     first = block(NOW, 1, 1)
 
     def handler(request: httpx2.Request) -> httpx2.Response:
-        clock.advance(17)  # the next request is past the soft stop
+        clock.advance(17)  # the next folder's first request is past the soft stop
         return js({"value": first})(request)
 
     server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
-    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person"), "all"), clock)
     assert page.incomplete == {"time_limit"}
     assert page.truncated
     assert not page.complete
@@ -313,7 +321,21 @@ def test_search_request_shape_one_get_for_every_folder(folder: str) -> None:
     assert request.headers["prefer"] == 'IdType="ImmutableId", outlook.body-content-type="text"'
     assert "consistencylevel" not in request.headers
     assert not {"$filter", "$orderby"} & set(request.url.params)
-    raw_value = next(p for p in request.url.query.decode().split("&") if p.startswith(("%24search=", "$search=")))
+    raw_value = _raw_search_value(request)
+    assert raw_value.count("%22") == 2
+    assert not any(c in raw_value.upper() for c in ("%25", "%26", "%2B", "%2A", "%3A"))
+
+
+def _raw_search_value(request: httpx2.Request) -> str:
+    return next(p for p in request.url.query.decode().split("&") if p.startswith(("%24search=", "$search=")))
+
+
+def test_search_wire_value_of_hostile_words_has_no_special_escapes() -> None:
+    clock = FakeClock()
+    server = searching(hit(1, NOW))
+    words = ("a%3Ab", "x&y", "report*", "+x", "from\uff1ax", "100%")
+    found(mailbox(server, clock=clock), squery(swords(*words)), clock)
+    raw_value = _raw_search_value(searches(server)[0])
     assert raw_value.count("%22") == 2
     assert not any(c in raw_value.upper() for c in ("%25", "%26", "%2B", "%2A", "%3A"))
 
@@ -339,11 +361,9 @@ def test_search_text_bound_1500_sends_one_request_and_one_more_none() -> None:
     clock = FakeClock()
     server = searching(hit(1, NOW))
     box = mailbox(server, clock=clock)
-    assert (
-        len(str(httpx2.QueryParams({"$search": f'"{graph_search_text(_bound_words(1500))}"'})).split("=", 1)[1]) == 1500
-    )
     found(box, squery(terms(words=_bound_words(1500))), clock)
     assert len(searches(server)) == 1
+    assert len(_raw_search_value(searches(server)[0]).split("=", 1)[1]) == 1500  # measured on the recorded request
     with pytest.raises(ToolError) as caught:
         found(box, squery(terms(words=_bound_words(1501))), clock)
     assert caught.value.code == "invalid_argument"
@@ -475,20 +495,22 @@ def test_search_pages_within_the_hits_with_identical_requests() -> None:
 @pytest.mark.parametrize("status", [404, 400])
 def test_search_rejected_is_an_account_error_without_retry(status: int) -> None:
     clock = FakeClock()
-    capture = Capture()
-    logger = logging.getLogger("mcp_hub")
-    logger.addHandler(capture)
-    logger.setLevel(logging.DEBUG)
     server = Server()
     server.routes[SEARCH_PATH] = lambda request: httpx2.Response(status)
-    try:
-        with pytest.raises(ProviderError) as caught:
-            found(mailbox(server, clock=clock), squery(swords("secretword")), clock)
-    finally:
-        logger.removeHandler(capture)
+    with pytest.raises(ProviderError) as caught:
+        found(mailbox(server, clock=clock), squery(swords("secretword")), clock)
     assert (caught.value.code, caught.value.cause) == ("upstream_error", "SearchRejected")
-    assert len(searches(server)) == 1
-    assert "secretword" not in " ".join(capture.lines)
+    assert len(searches(server)) == 1  # the log line is pinned by the DEBUG canary test (the adapter logs nothing)
+
+
+def test_folder_id_failure_keeps_its_cause() -> None:
+    clock = FakeClock()
+    server = searching(hit(1, NOW))
+    server.routes["/v1.0/me/mailFolders/inbox"] = lambda request: httpx2.Response(400)
+    with pytest.raises(ProviderError) as caught:
+        found(mailbox(server, clock=clock), squery(swords("budget")), clock)
+    assert (caught.value.code, caught.value.cause) == ("upstream_error", "UnexpectedStatus")
+    assert searches(server) == []
 
 
 def test_search_soft_stop_before_the_request_is_time_limit() -> None:
@@ -646,3 +668,196 @@ def test_search_hit_whose_id_changes_between_pages_appears_once() -> None:
     got = [i.meta.message_id for p in pages for i in p.items]
     assert got == [f"m{n}@example.test" for n in range(4)]
     assert calls == 2
+
+
+# --- review fixes (G5-1, G5-3, G5-4, G5-5, T5-S1, T5-S3, T5-S6, G5-11) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "module", ["mcp_hub.search", "mcp_hub.providers.graph", "mcp_hub.ids", "mcp_hub.tools.mail_search"]
+)
+def test_module_imports_first_in_a_fresh_interpreter(module: str) -> None:
+    src = Path(mcp_hub.__file__).resolve().parent.parent
+    code = f"import sys; sys.path.insert(0, {str(src)!r}); import {module}"
+    done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, check=False)
+    assert done.returncode == 0, done.stderr.decode()[-400:]
+
+
+def test_filter_only_read_on_stops_at_the_budget_with_a_cursor_and_the_cursor_continues() -> None:
+    clock = FakeClock()
+    server = Server()
+    for folder_id, k in ((INBOX_ID, 0), (ARCHIVE_ID, 10), (SENT_ID, 20)):
+        blocks = iter(block(NOW - timedelta(hours=2 * n), None, k + n) for n in range(6))
+
+        def handler(
+            request: httpx2.Request,
+            blocks: "iter[list[object]]" = blocks,  # type: ignore[valid-type]
+        ) -> httpx2.Response:
+            clock.advance(3)
+            return js({"value": next(blocks)})(request)
+
+        server.routes[f"/v1.0/me/mailFolders/{folder_id}/messages"] = handler
+    box = mailbox(server, clock=clock)
+    page = found(box, squery(terms(sender="rare person"), "all"), clock)
+    per_folder = [sum(1 for r in server.lists() if f"/{fid}/" in r.url.path) for fid in (INBOX_ID, ARCHIVE_ID, SENT_ID)]
+    assert per_folder[0] == 3  # 0 s, 3 s, 6 s start below the budget; after 9 s no new read-on request
+    assert per_folder[1] >= 1
+    assert per_folder[2] >= 1
+    assert READ_ON_SECONDS == 8.0
+    assert page.more
+    assert page.frontier is not None
+    assert page.complete
+    assert not page.incomplete  # not time_limit: the cursor continues
+    # the cursor continues where the frontier says
+    server2 = Server({INBOX_ID: values(), ARCHIVE_ID: values(), SENT_ID: values()})
+    q = ListQuery("all", SINCE, False, None, 20, Position(*page.frontier), terms(sender="rare person"))
+    found(mailbox(server2, clock=FakeClock()), q, FakeClock())
+    bound = datetime.fromtimestamp(page.frontier[0], UTC)
+    assert {r.url.params["$filter"] for r in server2.lists()} == {list_filter(SINCE, bound, False)}
+
+
+def test_filter_only_read_on_counts_distinct_matches() -> None:
+    clock = FakeClock()
+    server = Server()
+    a1 = block(NOW, 100, 1)  # the only match is the last item: the frontier second
+    repeated = a1[100]
+    a2 = [repeated, *block(NOW - timedelta(hours=2), None, 2)[:100]]  # repeats it, no new match
+    a3 = filtered_run(9000, NOW - timedelta(hours=4), 5, "Rare Person", {2})
+    full_answers(server, INBOX_ID, [a1, a2, a3])
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person"), limit=2), clock)
+    assert len(server.lists()) == 3
+    assert len(page.items) == 2
+    assert not page.more
+
+
+def too_large_first(clock: FakeClock, size_ok: int, big_at: set[int] | None = None) -> tuple[Server, list[str]]:
+    """Every request is answered too large with `$top=101`, and full with `$top=50` (or at the `big_at` calls)."""
+    server = Server()
+    tops: list[str] = []
+    calls = 0
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal calls
+        calls += 1
+        tops.append(request.url.params["$top"])
+        too_big = request.url.params["$top"] == "101" if big_at is None else calls in big_at
+        if too_big:
+            return js({"value": [item(0, NOW, subject="x" * 1_100_000)]})(request)
+        start = NOW - timedelta(hours=2 * calls)
+        top = int(request.url.params["$top"])
+        return js({"value": [item(calls * 1000 + i, start - timedelta(minutes=i)) for i in range(min(top, size_ok))]})(
+            request
+        )
+
+    server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
+    return server, tops
+
+
+def test_filter_only_halving_retry_counts_toward_the_request_cap() -> None:
+    clock = FakeClock()
+    server, tops = too_large_first(clock, 50)
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert len(server.lists()) == FILTER_READ_REQUESTS == 5  # 2 GETs for the first answer, then $top=50 carried on
+    assert tops[:2] == ["101", "50"]
+    assert set(tops[2:]) == {"50"}
+    assert page.more
+    assert page.complete
+
+
+def test_filter_only_a_late_too_large_answer_stops_reading_on_without_an_error() -> None:
+    clock = FakeClock()
+    server = Server()
+    sizes: list[int] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sizes.append(1)
+        n = len(sizes)
+        if n == 5:  # the fifth GET could only be answered by a sixth: it stops instead
+            return js({"value": [item(0, NOW, subject="x" * 1_100_000)]})(request)
+        return js({"value": block(NOW - timedelta(hours=2 * n), None, n)})(request)
+
+    server.routes[f"/v1.0/me/mailFolders/{INBOX_ID}/messages"] = handler
+    page = found(mailbox(server, clock=clock), squery(terms(sender="rare person")), clock)
+    assert len(server.lists()) == 5
+    assert page.more
+    assert page.frontier is not None
+    assert page.frontier[0] == int((NOW - timedelta(hours=2 * 4) - timedelta(minutes=100)).timestamp())
+    assert page.complete
+
+
+def test_placeholder_never_matches_a_filter() -> None:
+    clock = FakeClock()
+    odd = hit(2, NOW, subject=["not text"], **{"from": "garbage"})
+    server = searching(odd)
+    assert found(mailbox(server, clock=clock), squery(swords("budget", sender="x")), clock).items == []
+    kept = found(mailbox(searching(odd), clock=clock), squery(swords("budget")), clock).items
+    assert len(kept) == 1
+    assert location_id(kept[0].ref) is None
+
+
+def test_by_id_paths_refuse_a_search_hit_reference() -> None:
+    clock = FakeClock()
+    server = Server()
+    box = mailbox(server, clock=clock)
+    ref = SearchHitRef("outlook", "REGULAR00001=")
+    with pytest.raises(ProviderError) as caught:
+        box.get_message(ref, CallDeadline.start(clock))
+    assert caught.value.code == "not_found"
+    from mcp_hub.providers.base import ThreadQuery
+
+    with pytest.raises(ProviderError):
+        box.get_thread(ThreadQuery(ref, None, False, 1000), CallDeadline.start(clock))
+    box.message_status([ref], CallDeadline.start(clock))
+    assert not any("REGULAR" in r.url.path for r in server.requests)
+
+
+def test_graph_search_logs_no_canary_at_debug() -> None:
+    from mcp_hub.logging import HUB_LOGGER, PINNED_WARNING, configure_logging
+    from mcp_hub.providers.base import item_hash
+
+    names = ["", HUB_LOGGER, *PINNED_WARNING]
+    saved = {n: (logging.getLogger(n).level, list(logging.getLogger(n).handlers)) for n in names}
+    capture = Capture()
+    clock = FakeClock()
+    ids = [f"REGULARzqxcanary{n}=" for n in (1, 2, 3)]
+    server = searching(
+        hit(1, NOW, id=ids[0]),
+        hit(2, NOW, id=ids[1], receivedDateTime="garbage"),
+        hit(3, NOW, id=ids[2], **{"from": ["bad"]}),
+    )
+    rejected = Server()
+    rejected.routes[SEARCH_PATH] = lambda request: httpx2.Response(400)
+    box = mailbox(server, clock=clock)
+    try:
+        configure_logging("DEBUG")
+        logging.getLogger().addHandler(capture)
+        words = ("zqxcanaryquery", "zqxcanaryübung")
+        filters = {"sender": "zqxcanarysender", "recipient": "zqxcanaryrecipient", "subject": "zqxcanarysubject"}
+        found(box, squery(swords(*words, **filters)), clock)  # type: ignore[arg-type]
+        with pytest.raises(ProviderError):
+            found(mailbox(rejected, clock=clock), squery(swords(*words)), clock)
+        found(mailbox(Server({INBOX_ID: values(item(1, NOW))}), clock=clock), squery(terms(**filters)), clock)  # type: ignore[arg-type]
+        levels = {n: logging.getLogger(n).getEffectiveLevel() for n in PINNED_WARNING}
+    finally:
+        logging.getLogger().removeHandler(capture)
+        for n, (level, handlers) in saved.items():
+            logger = logging.getLogger(n)
+            logger.setLevel(level)
+            logger.handlers[:] = handlers
+    assert all(level >= logging.WARNING for level in levels.values())
+    assert not [r for r in capture.raw if r[0].startswith(("httpx2", "httpcore2"))]
+    needles = [*words, *filters.values(), *ids]
+    for needle in [*needles]:
+        needles += [
+            quote(needle),
+            base64.urlsafe_b64encode(needle.encode()).decode().rstrip("="),
+            repr(needle.encode()),
+        ]
+    for regular in ids:  # the realistic leak forms of the id: the would-be v1. text and its item hash
+        would_be = encode_message_id(GraphMessageRef(box._account, regular))  # type: ignore[attr-defined]
+        needles += [would_be, item_hash(would_be)]
+    text = " ".join([*capture.lines, *(m for _, _, m in capture.raw)])
+    for needle in needles:
+        assert needle not in text, needle
+    assert "zqxcanary" not in text.lower()
+    assert not [line for line in capture.lines if '"item"' in line]

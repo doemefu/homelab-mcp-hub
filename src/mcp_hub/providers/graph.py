@@ -16,11 +16,12 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, TypeGuard
 from urllib.parse import quote, urlsplit
 
 import httpx2
 
+from mcp_hub import search as _search  # the module: `search` imports providers.base, so names would cycle
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import (
     GRAPH_ID,
@@ -98,7 +99,6 @@ from mcp_hub.providers.threads import (
     server_body,
 )
 from mcp_hub.sanitize import html_to_text
-from mcp_hub.search import EMPTY_GRAPH_QUERY, MATCH_NAME_CHARS, MATCH_SUBJECT_CHARS, graph_search_text, match_fold
 
 GRAPH_HOST: Final = "graph.microsoft.com"
 API: Final = f"https://{GRAPH_HOST}/v1.0"
@@ -119,6 +119,7 @@ SEARCH_TOP: Final = 100  # one mailbox-wide `$search` request per account (owner
 SEARCH_HALVED_TOP: Final = 50  # the one retry after a too_large answer
 # `$expand` with `$search` answered 200 with `singleValueExtendedProperties` present (probes P1/P2, SEARCH_FACTS).
 SEARCH_EXPAND: Final = True
+READ_ON_SECONDS: Final = 8.0  # no new read-on request after this much of the call (G5-3)
 FILTER_READ_REQUESTS: Final = 5  # list requests per folder for one filter-only search_messages call (ruling 5, GR1)
 ANSWERED_VERBS: Final = frozenset({102, 103})  # PR_LAST_VERB_EXECUTED: reply to sender, reply to all (D77)
 FOLDER_ID: Final = re.compile(r"[A-Za-z0-9=_-]{1,512}")  # fullmatch (Sec8): a folder id never changes a path
@@ -436,15 +437,19 @@ def _soft_stopped_page(query: ListQuery) -> FolderPage:
 
 
 def _folded_has(needle: str, text: str | None, cap: int) -> bool:
-    return text is not None and needle in match_fold(text[:cap])
+    return text is not None and needle in _search.match_fold(text[:cap])
 
 
 def _participant_matches(needle: str, entry: object) -> bool:
     """A name or a non-DN address of one Graph recipient value contains the folded needle (MF-D2)."""
     name, address = _address(entry)
-    if _folded_has(needle, name, MATCH_NAME_CHARS):
+    if _folded_has(needle, name, _search.MATCH_NAME_CHARS):
         return True
-    return address is not None and not _DN_ADDRESS.match(address) and _folded_has(needle, address, MATCH_NAME_CHARS)
+    return (
+        address is not None
+        and not _DN_ADDRESS.match(address)
+        and _folded_has(needle, address, _search.MATCH_NAME_CHARS)
+    )
 
 
 def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
@@ -454,17 +459,17 @@ def graph_filters_match(raw: Mapping[str, object], terms: SearchTerms) -> bool:
     address; `recipient` = any `toRecipients` entry (never Cc/Bcc); `subject` = its first 4,000 characters. The words
     are not checked here: Graph matched them. An empty folded needle matches nothing."""
     if terms.sender is not None:
-        needle = match_fold(terms.sender)
+        needle = _search.match_fold(terms.sender)
         if not needle or not _participant_matches(needle, raw.get("from")):
             return False
     if terms.recipient is not None:
-        needle = match_fold(terms.recipient)
+        needle = _search.match_fold(terms.recipient)
         to = raw.get("toRecipients")
         if not needle or not isinstance(to, list) or not any(_participant_matches(needle, e) for e in to):
             return False
     if terms.subject is not None:
-        needle = match_fold(terms.subject)
-        if not needle or not _folded_has(needle, _str(raw.get("subject")), MATCH_SUBJECT_CHARS):
+        needle = _search.match_fold(terms.subject)
+        if not needle or not _folded_has(needle, _str(raw.get("subject")), _search.MATCH_SUBJECT_CHARS):
             return False
     return True
 
@@ -476,14 +481,19 @@ def _search_requests(ids: GraphFolderIds, query: ListQuery) -> tuple[str, dict[s
     word text inside two double quotes, sent as an httpx query parameter; `$filter`, `$orderby` and `ConsistencyLevel`
     do not combine with `$search`, so window, order and folders are applied per hit."""
     terms = query.search
-    text = None if terms is None else graph_search_text(terms.words)
+    text = None if terms is None else _search.graph_search_text(terms.words)
     if text is None:
-        raise ToolError("invalid_argument", EMPTY_GRAPH_QUERY)
+        raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
     params = {"$search": f'"{text}"', "$top": str(SEARCH_TOP), "$select": SUMMARY_SELECT}
     if SEARCH_EXPAND:
         params["$expand"] = EXTENDED_EXPAND
     allowed = frozenset(i for name in WELL_KNOWN_FOR[query.folder] if (i := ids.ids.get(name)) is not None)
     return "/me/messages", params, allowed
+
+
+def _by_id(ref: object) -> TypeGuard[GraphMessageRef]:
+    """A Graph reference a by-id read may use: never a `SearchHitRef` (its id is a regular id, D87: never a GET)."""
+    return isinstance(ref, GraphMessageRef) and not isinstance(ref, SearchHitRef)
 
 
 def _has_filters(terms: SearchTerms | None) -> bool:
@@ -495,6 +505,7 @@ class _FolderAnswer:
     items: list[MailSummary]  # after the draft, window, unread, folder and position filters
     frontier: int | None  # a full answer: the second of its last item; that second and older not yet scanned
     stuck: bool  # a full answer whose frontier cannot move the cursor on (S-f residual)
+    gets: int = 1  # GETs it took: 2 after a too_large answer retried with `$top` halved
 
 
 class GraphMailbox:
@@ -666,8 +677,8 @@ class GraphMailbox:
 
     def list_messages(self, query: ListQuery, deadline: CallDeadline) -> FolderPage:
         if query.search is not None and query.search.words:
-            if graph_search_text(query.search.words) is None:  # refused here, not wrapped as a provider error
-                raise ToolError("invalid_argument", EMPTY_GRAPH_QUERY)
+            if _search.graph_search_text(query.search.words) is None:  # refused here, not wrapped as a provider error
+                raise ToolError("invalid_argument", _search.EMPTY_GRAPH_QUERY)
             search = self._search_messages
         else:
             search = self._list_messages
@@ -702,7 +713,7 @@ class GraphMailbox:
             return self._run(
                 lambda client, token, call: self._message_by_ref(client, token, call, message_id), deadline
             )
-        if not isinstance(target, GraphMessageRef) or target.account != self._account:
+        if not _by_id(target) or target.account != self._account:
             raise ProviderError("not_found", "ForeignRef")
         ref = target
         return self._run(lambda client, token, call: self._message(client, token, call, ref), deadline)
@@ -724,7 +735,7 @@ class GraphMailbox:
                 raise ProviderError("not_found", "ForeignRef")
             if not MESSAGE_ID_PATTERN.fullmatch(query.seed.message_id):  # keeps `'` out of the $filter literal
                 raise ProviderError("not_found", "MalformedRef")
-        elif not isinstance(query.seed, GraphMessageRef) or query.seed.account != self._account:
+        elif not _by_id(query.seed) or query.seed.account != self._account:
             raise ProviderError("not_found", "ForeignRef")
         logs = _ThreadLogs()
         return self._run(
@@ -742,6 +753,9 @@ class GraphMailbox:
         id `$search` returns is not the immutable id, so it is only an order key and the handle is the Message-ID."""
         try:
             ids = self._folder_ids(client, token, deadline)
+        except SoftStop:
+            return _soft_stopped_page(query)
+        try:
             path, params, allowed = _search_requests(ids, query)
             values, full = self._search_answer(client, token, deadline, path, params)
         except SoftStop:
@@ -822,28 +836,42 @@ class GraphMailbox:
             folder_id = ids.ids.get(name)
             if folder_id is None:
                 continue  # the account has no such folder (404 when the ids were read)
-            mine: list[MailSummary] = []
-            current, previous, requests = params, None, 0
+            mine: dict[AnyMessageRef, MailSummary] = {}  # the re-read frontier second is counted once
+            current, base, previous, requests = params, params, None, 0
             answer: _FolderAnswer | None = None
             try:
                 while True:
-                    answer = self._folder_answer(client, token, deadline, folder_id, current, query, ids, previous)
-                    requests += 1
+                    # A retry could pass the cap: then the read stops early with the last frontier (read-on only).
+                    retry = not read_on or previous is None or requests + 2 <= FILTER_READ_REQUESTS
+                    try:
+                        answer = self._folder_answer(
+                            client, token, deadline, folder_id, current, query, ids, previous, retry
+                        )
+                    except ProviderError as exc:
+                        if retry or exc.code != "too_large" or answer is None:
+                            raise
+                        break  # the last frontier stands
+                    requests += answer.gets
                     if answer.stuck:
                         break
-                    mine.extend(answer.items)
+                    for summary in answer.items:
+                        mine.setdefault(summary.ref, summary)
                     if answer.frontier is None or not read_on or requests >= FILTER_READ_REQUESTS:
                         break
-                    if sum(1 for summary in mine if order_key(summary)[0] > answer.frontier) >= query.limit:
+                    if deadline.elapsed() >= READ_ON_SECONDS:
+                        break  # no new read-on request: the page gets its cursor from the frontier
+                    if sum(1 for summary in mine.values() if order_key(summary)[0] > answer.frontier) >= query.limit:
                         break
                     previous = answer.frontier  # read on: the next request starts at the frontier second
                     bound_at = datetime.fromtimestamp(previous, UTC)
-                    current = params | {"$filter": list_filter(query.since, bound_at, query.unread_only)}
+                    if answer.gets > 1:
+                        base = base | {"$top": str(GRAPH_LIST_TOP // 2)}  # a folder that needed halving keeps it
+                    current = base | {"$filter": list_filter(query.since, bound_at, query.unread_only)}
             except SoftStop:
                 truncated, complete = True, False  # what was read is returned, without a cursor (§5.4)
                 incomplete.add("time_limit")
                 answer = None
-            for summary in mine:
+            for summary in mine.values():
                 if summary.ref not in seen:  # a repeated Graph id keeps its first entry
                     seen.add(summary.ref)
                     found.append(summary)
@@ -883,15 +911,16 @@ class GraphMailbox:
         query: ListQuery,
         ids: GraphFolderIds,
         previous: int | None = None,
+        retry: bool = True,
     ) -> _FolderAnswer:
         path = f"/me/mailFolders/{quote(folder_id, safe='')}/messages"
-        top = GRAPH_LIST_TOP
+        top, gets = int(params["$top"]), 1
         try:
             body = self._get(client, token, deadline, path, params, MAX_LIST_RESPONSE_BYTES)
         except ProviderError as exc:
-            if exc.code != "too_large":
+            if exc.code != "too_large" or not retry:
                 raise
-            top = GRAPH_LIST_TOP // 2  # once more with $top halved; a second too_large fails the account (§5.4)
+            top, gets = top // 2, 2  # once more with $top halved; a second too_large fails the account (§5.4)
             body = self._get(client, token, deadline, path, params | {"$top": str(top)}, MAX_LIST_RESPONSE_BYTES)
         values = body.get("value")
         if not isinstance(values, list):
@@ -907,9 +936,9 @@ class GraphMailbox:
             if summary is not None:
                 items.append(summary)
         if not full:
-            return _FolderAnswer(items, None, False)
+            return _FolderAnswer(items, None, False, gets)
         if not after:
-            return _FolderAnswer(items, None, True)
+            return _FolderAnswer(items, None, True, gets)
         second = min(key[0] for key in after)
         # Stuck only when the frontier cannot move the cursor on: on a later page a frontier second below the
         # position's second always progresses (the next page reads `lt <second + 1 s>`); on the first page there
@@ -920,7 +949,7 @@ class GraphMailbox:
             stuck = second >= query.position.received_at
         else:
             stuck = not any(key[0] > second for key in after)
-        return _FolderAnswer(items, second, stuck)
+        return _FolderAnswer(items, second, stuck, gets)
 
     def _degraded(self, exc: Exception) -> None:
         # No valid id: item_degraded without the `item` field (spec 080 rev. 4.6 S12).
@@ -1211,11 +1240,7 @@ class GraphMailbox:
             for t in targets
             if isinstance(t, StableRef) and t.account == self._account and MESSAGE_ID_PATTERN.fullmatch(t.message_id)
         ]
-        graph_refs = [
-            t
-            for t in targets
-            if isinstance(t, GraphMessageRef) and t.account == self._account and GRAPH_ID.fullmatch(t.graph_id)
-        ]
+        graph_refs = [t for t in targets if _by_id(t) and t.account == self._account and GRAPH_ID.fullmatch(t.graph_id)]
         try:
             for batch in filter_batches(message_ids, message_id_filter):
                 self._locate_batch(run, batch)
@@ -1581,7 +1606,7 @@ class GraphMailbox:
                 raise ProviderError("not_found", "RefNotFound")  # a complete search over all folders (B6)
             ref, conversation = found
             return _ThreadSeed(ref.graph_id, target.message_id, conversation)
-        if not isinstance(target, GraphMessageRef):
+        if not _by_id(target):
             raise ProviderError("not_found", "ForeignRef")
         path = f"/me/messages/{quote(target.graph_id, safe='')}"
         body = self._get(client, token, deadline, path, {"$select": _SEED_SELECT}, MAX_LIST_RESPONSE_BYTES)
