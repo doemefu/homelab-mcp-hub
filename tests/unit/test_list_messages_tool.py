@@ -110,7 +110,7 @@ def summary(
         from_name="Sender",
         subject=subject,
         snippet_text="Hello",
-        meta=replace(MailMeta(), **meta),  # MailMeta fields chosen per test
+        meta=replace(MailMeta(), **meta),  # type: ignore[arg-type]  # MailMeta fields chosen per test
     )
 
 
@@ -159,7 +159,7 @@ class FakeMailbox:
             return self._scanned(candidates, query)
         matching = [m for m in candidates if query.direction is None or m.meta.direction == query.direction]
         page = FolderPage(matching[: query.limit], len(matching) > query.limit, truncated=False, complete=True)
-        return replace(page, **self.fake.flags.get(self.account, {}))  # page flags per test
+        return replace(page, **self.fake.flags.get(self.account, {}))  # type: ignore[arg-type]  # page flags per test
 
     def _scanned(self, candidates: list[MailSummary], query: ListQuery) -> FolderPage:
         scanned, rest = candidates[: self.fake.scan[self.account]], candidates[self.fake.scan[self.account] :]
@@ -196,7 +196,7 @@ ARGUMENTS: dict[str, object] = {
 
 async def run(ctx: HubContext, now: datetime = NOW, **kwargs: object) -> tuple[ListMessagesResult, list[str], str]:
     arguments = ARGUMENTS | kwargs  # every tool argument, omitted ones as None
-    return await run_list_messages(ctx, tool="list_messages", now=now, **arguments)  # values typed per test
+    return await run_list_messages(ctx, tool="list_messages", now=now, **arguments)  # type: ignore[arg-type]  # values typed per test
 
 
 def ids(result: ListMessagesResult) -> list[tuple[str, int]]:
