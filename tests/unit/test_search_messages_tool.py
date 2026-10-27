@@ -210,6 +210,7 @@ async def test_filter_only_search_and_explicit_arguments(secrets_dir: Path) -> N
         ({"query": "foo OR bar"}, "plain words"),
         ({"query": "from:alice"}, "plain words"),
         ({"query": "-spam"}, "plain words"),
+        ({"query": "\ufb2c" * 100 + "\u023a" * 100}, "too long once normalised"),  # 900 bytes lower-cased on Gmail
         ({"sender": "-alice"}, "must not start with - or +"),
         ({"recipient": "+1555"}, "must not start with - or +"),
         ({"subject": "-invoice"}, "must not start with - or +"),

@@ -1,6 +1,7 @@
 """Pass 1 holds no full row list and keeps a bounded From per candidate (WP13d T8 reductions)."""
 
 import gc
+import logging
 import weakref
 from collections.abc import Iterator
 from datetime import timedelta
@@ -10,10 +11,20 @@ import pytest
 import mcp_hub.providers.imap as imap
 from mcp_hub.providers.imap import Candidate
 from mcp_hub.providers.imap_session import ImapSession
-from tests.support.imap_fake import FakeImapServer, FakeMessage
+from tests.support.imap_fake import FakeImapClient, FakeImapServer, FakeMessage
+from tests.support.logcapture import Capture
 from tests.unit import test_imap_list_messages as lm
 from tests.unit.test_imap_locate import _session, icloud, msg
 from tests.unit.test_imap_search_messages import hit, squery, three
+
+
+@pytest.fixture
+def provider_log() -> Iterator[Capture]:
+    handler = Capture()
+    logger = logging.getLogger("mcp_hub.providers")
+    logger.addHandler(handler)
+    yield handler
+    logger.removeHandler(handler)
 
 
 def test_candidates_are_reduced_chunk_by_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,3 +186,30 @@ def test_list_second_candidate_chunk_loss_stays_silent(kind: str) -> None:
     lose_in_second_candidate_chunk(server, kind)
     page = lm.run(server, lm.query(limit=3))
     assert (page.complete, page.incomplete) == (True, frozenset())
+
+
+@pytest.mark.parametrize("with_date", [True, False])
+@pytest.mark.parametrize("search", [True, False])
+def test_unsolicited_fetch_rows_are_not_candidates(
+    with_date: bool, search: bool, monkeypatch: pytest.MonkeyPatch, provider_log: Capture
+) -> None:
+    """`* 7 FETCH (FLAGS ...)` pushed by the server (mail read elsewhere) is keyed by a sequence number: pass 1 asks
+    for its UIDs and reads only those."""
+    original = FakeImapClient.fetch
+
+    def fetch(self: FakeImapClient, messages: object, items: object) -> dict[int, dict[bytes, object]]:
+        rows = original(self, messages, items)  # type: ignore[arg-type]
+        if items == lm.CANDIDATE:
+            extra: dict[bytes, object] = {b"FLAGS": ()}
+            if with_date:
+                extra[b"INTERNALDATE"] = lm.NOW
+            rows[7] = extra
+        return rows
+
+    monkeypatch.setattr(FakeImapClient, "fetch", fetch)
+    server = three(inbox=[hit(1), hit(2, 6)])
+    page = lm.run(server, squery() if search else lm.query())
+    assert sorted(item.ref.uid for item in page.items) == [1, 2]
+    assert provider_log.lines == []
+    assert page.incomplete == frozenset()
+    assert page.complete is True

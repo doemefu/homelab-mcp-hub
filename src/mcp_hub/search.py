@@ -123,11 +123,12 @@ def parse_search_terms(
     if any(value is not None and _leading_sign(value) for value in filters):
         raise _refuse(FILTER_SIGN_REFUSED)
     terms = SearchTerms(words=tuple(words), sender=filters[0], recipient=filters[1], subject=filters[2])
-    sizes = [
-        len(value.encode("utf-8")) for value in (*terms.words, terms.sender, terms.recipient, terms.subject) if value
-    ]
-    if any(size > MAX_VALUE_BYTES_EACH for size in sizes) or sum(sizes) > MAX_TOTAL_BYTES:
-        raise _refuse(VALUE_TOO_LONG)
+    sent = [*terms.words, terms.sender, terms.recipient, terms.subject]
+    gmail = imap_value_keys(terms, gmail=True) or []  # the token pass lower-cases and can lengthen a value
+    for values in ([value for value in sent if value], [value for _, value in gmail]):
+        sizes = [len(value.encode("utf-8")) for value in values]
+        if any(size > MAX_VALUE_BYTES_EACH for size in sizes) or sum(sizes) > MAX_TOTAL_BYTES:
+            raise _refuse(VALUE_TOO_LONG)
     return terms
 
 

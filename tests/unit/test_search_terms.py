@@ -384,3 +384,14 @@ def test_filter_value_starting_with_a_sign_and_an_alphanumeric_is_refused(field:
 @pytest.mark.parametrize("value", ["-", "- x", "a-b@x.ch", "Re: x", "x-", "--", "+", "@-x"])
 def test_filter_value_with_a_sign_elsewhere_or_alone_is_allowed(field: str, value: str) -> None:
     assert getattr(terms(**{field: value}), field) == value
+
+
+def test_gmail_lower_casing_cannot_push_a_value_over_the_literal_limit() -> None:
+    """The token pass lower-cases: U+023A (2 bytes) becomes U+2C65 (3 bytes). A word of 800 bytes as typed (100 x
+    U+FB2C, 6 bytes each in NFC, plus 100 x U+023A) is 900 bytes on Gmail: refused up front, not an account error."""
+    word = "\ufb2c" * 100 + "\u023a" * 100
+    assert len(normalise_value(word, "query").encode()) == 800
+    with pytest.raises(ToolError) as caught:
+        terms(query=word)
+    assert (caught.value.code, caught.value.message) == ("invalid_argument", VALUE_TOO_LONG)
+    assert terms(subject=word).subject == normalise_value(word, "subject")  # a filter value is not lower-cased

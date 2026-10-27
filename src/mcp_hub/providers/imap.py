@@ -656,11 +656,14 @@ class ImapMailbox:
                 # keep the silent drop
                 progress.lose("changed_during_call")
             number += 1
-            for uid, row in sorted(rows.items(), reverse=True):
+            for uid in reversed(asked):  # the UIDs asked for, never the keys the server sent (unsolicited FETCH rows)
+                row = rows.get(uid)
+                if row is None:  # FETCH NO or expunged meanwhile (counted above for a search)
+                    continue
                 if count and count % SOFT_CHECK_EVERY == 0:
                     self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
                 count += 1
-                if _is_draft(row):  # a draft (S1); a FETCH NO or expunged UID has no row at all
+                if _is_draft(row):  # a draft (S1)
                     continue
                 if sent_mailbox and _LABEL_INBOX in _labels(row):
                     continue
