@@ -48,6 +48,7 @@ from mcp_hub.tools import HubContext
 from mcp_hub.tools.common import (
     UNTRUSTED_CONTENT_NOTICE,
     AccountErrorItem,
+    Gathered,
     gather_accounts,
     int_argument,
     log_tool_call,
@@ -388,6 +389,35 @@ async def run_list_messages(
         limit=count,
         position=position,
     )
+    result, gathered = await run_list_query(
+        ctx,
+        tool=tool,
+        digest=digest,
+        window=window,
+        position=position,
+        accounts=accounts,
+        query=query,
+        envelope=lambda result, _pages: result,
+    )
+    return result, [a.id for a in accounts], tool_outcome(gathered)
+
+
+async def run_list_query[R: BaseModel](
+    ctx: HubContext,
+    *,
+    tool: CursorTool,
+    digest: str,
+    window: int,
+    position: Position | None,
+    accounts: list[Account],
+    query: ListQuery,
+    envelope: Callable[[ListMessagesResult, list[tuple[Account, FolderPage]]], R],
+    cursor_complete: Callable[[FolderPage], bool] = lambda page: page.complete,
+) -> tuple[R, Gathered[FolderPage]]:
+    """The shared list pipeline: one query per account, keyset merge, output budget and cursor. `envelope` wraps the
+    list result into the tool's own result before the budget measures it; `cursor_complete` says whether a page
+    still allows a cursor (search_messages lets a page that was only refused go on)."""
+    count = query.limit
 
     async def call(target: Account) -> FolderPage:
         opened = partial(ctx.adapters.mailbox, target, ctx.settings.secrets_dir)
@@ -409,14 +439,14 @@ async def run_list_messages(
     cutoff = max(frontiers) if frontiers else None
     eligible = merged if cutoff is None else [m for m in merged if order_key(m) >= cutoff]
     more = any(page.more for page in pages) or len(eligible) > count
-    complete = all(page.complete for page in pages)  # a failed account has no page and never blocks the cursor
-    stopped = any(page.truncated for page in pages) or not complete
+    complete = all(cursor_complete(page) for page in pages)  # a failed account has no page and never blocks the cursor
+    stopped = any(page.truncated for page in pages) or not all(page.complete for page in pages)
     selected = eligible[:count]
     positions = [Position(*order_key(m)) for m in selected]
     zone = ZoneInfo(ctx.settings.default_timezone)
     items = [_summary_or_placeholder(m, zone) for m in selected]
 
-    def build(chosen: list[MessageSummary], _cut: bool) -> ListMessagesResult:
+    def build(chosen: list[MessageSummary], _cut: bool) -> R:
         # `chosen` is a prefix of `items`. Only dropped items count as "more" (B8): a single item shortened to fit
         # leaves nothing to fetch, so it sets neither `truncated` nor a cursor.
         remaining = more or len(chosen) < len(items)
@@ -428,16 +458,17 @@ async def run_list_messages(
         next_cursor = None
         if remaining and complete and last is not None:
             next_cursor = ctx.cursors.issue(tool=tool, args_digest=digest, window_start=window, position=last)
-        return ListMessagesResult(
+        listed = ListMessagesResult(
             untrusted_content_notice=UNTRUSTED_CONTENT_NOTICE,
             items=chosen,
             next_cursor=next_cursor,
             truncated=remaining or stopped,
             account_errors=gathered.errors,
         )
+        return envelope(listed, gathered.results)
 
     result = fit_items(items, build, ctx.settings.response_budget_chars, shrink=shrink_summary)
-    return result, [a.id for a in accounts], tool_outcome(gathered)
+    return result, gathered
 
 
 async def run_list_unread(

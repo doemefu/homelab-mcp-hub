@@ -168,6 +168,8 @@ class FolderPage:
     # None with `more`: a full page, whose last item is the frontier.
     frontier: tuple[int, str] | None = None
     incomplete: frozenset[IncompleteReason] = frozenset()  # why the page may miss matches (search_messages)
+    # Every incomplete folder of the page was incomplete only because it was refused (search_messages cursor rule).
+    refused_only: bool = False
 
 
 StatusState = Literal["found", "gone", "unknown"]
