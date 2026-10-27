@@ -110,8 +110,33 @@ def parse_search_terms(
     )
 
 
-def imap_value_keys(terms: SearchTerms) -> list[tuple[SearchKey, str]]:
+def _allowlist_tokens(word: str) -> list[str]:
+    """The tokens of one word under the Graph allowlist: letters, marks, digits and `@ . _ - '` survive, leading and
+    trailing `- . '` are stripped, a token without a letter or digit is dropped, the rest is lower-cased."""
+    tokens: list[str] = []
+    spaced = "".join(ch if unicodedata.category(ch)[0] in "LMN" or ch in GRAPH_KEEP_PUNCTUATION else " " for ch in word)
+    for token in spaced.split():
+        token = token.strip(GRAPH_STRIP)
+        if any(unicodedata.category(ch)[0] in "LN" for ch in token):
+            tokens.append(token.lower())
+    return tokens
+
+
+def imap_value_keys(terms: SearchTerms, *, gmail: bool = False) -> list[tuple[SearchKey, str]] | None:
+    """The `key value` pairs of an IMAP search. On Gmail a `-` at the start of a quoted TEXT value negates it (Q-a),
+    so every TEXT word goes through the allowlist above, one TEXT key per distinct token; None when a word has no
+    token or the tokens exceed `MAX_SEARCH_WORDS` (the folders are then refused). FROM, TO and SUBJECT stay as given."""
     keys: list[tuple[SearchKey, str]] = [("TEXT", word) for word in terms.words]
+    if gmail:
+        tokens: dict[str, None] = {}
+        for word in terms.words:
+            found = _allowlist_tokens(word)
+            if not found:
+                return None
+            tokens.update(dict.fromkeys(found))
+        if len(tokens) > MAX_SEARCH_WORDS:
+            return None
+        keys = [("TEXT", token) for token in tokens]
     for key, value in (("FROM", terms.sender), ("TO", terms.recipient), ("SUBJECT", terms.subject)):
         if value is not None:
             keys.append((key, value))  # type: ignore[arg-type]  # reason: key is one of the three literals above
@@ -125,15 +150,7 @@ def _encoded_search_length(text: str) -> int:
 
 def graph_search_text(words: Sequence[str]) -> str | None:
     """Allowlist sanitiser for Graph `$search` (O4-a): letters, marks, digits and `@ . _ - '` survive, lower-cased."""
-    tokens: list[str] = []
-    for word in words:
-        spaced = "".join(
-            ch if unicodedata.category(ch)[0] in "LMN" or ch in GRAPH_KEEP_PUNCTUATION else " " for ch in word
-        )
-        for token in spaced.split():
-            token = token.strip(GRAPH_STRIP)
-            if any(unicodedata.category(ch)[0] in "LN" for ch in token):
-                tokens.append(token.lower())
+    tokens = [token for word in words for token in _allowlist_tokens(word)]
     if len(tokens) > MAX_GRAPH_TOKENS:
         raise _refuse(GRAPH_QUERY_TOO_LONG)
     if not tokens:

@@ -492,6 +492,10 @@ class ImapMailbox:
         self, session: ImapSession, plan: FolderPlan, query: ListQuery, merge: bool, progress: _Progress
     ) -> list[Candidate]:
         entry = plan.entry
+        values = _search_values(query, gmail=session.gmail)
+        if values is None:  # before any command: this account cannot search these words
+            progress.refuse()
+            return []
         if entry.raw_name != session.registry_inbox and not examine_name_ok(entry.raw_name):
             progress.refuse()  # over 1,000 characters: the guard would refuse the EXAMINE
             return []
@@ -509,7 +513,7 @@ class ImapMailbox:
         if validity is None:  # missing UIDVALIDITY on a folder other than the registry inbox (I11)
             progress.refuse()
             return []
-        prefix, values = _criteria(plan, query, merge), _search_values(query)
+        prefix = _criteria(plan, query, merge)
         try:
             found = session.search_values(prefix, values) if values else session.search(prefix)
         except PASS_THROUGH:
@@ -853,9 +857,10 @@ class ImapMailbox:
         )
 
 
-def _search_values(query: ListQuery) -> list[tuple[SearchKey, str]]:
-    """The value keys of a `search_messages` query, after the window and label keys (none for the list tools)."""
-    return [] if query.search is None else _search.imap_value_keys(query.search)
+def _search_values(query: ListQuery, *, gmail: bool) -> list[tuple[SearchKey, str]] | None:
+    """The value keys of a `search_messages` query, after the window and label keys (none for the list tools).
+    None: a Gmail TEXT word the allowlist leaves nothing of; the folders are refused."""
+    return [] if query.search is None else _search.imap_value_keys(query.search, gmail=gmail)
 
 
 def _criteria(plan: FolderPlan, query: ListQuery, merge: bool) -> bytes:

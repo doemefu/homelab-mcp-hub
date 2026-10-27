@@ -397,3 +397,70 @@ def test_list_page_truncated_is_unchanged_by_a_refusal() -> None:
     page = lm.run(server, lm.query())
     assert (page.items, page.complete, page.truncated) == ([], False, False)
     assert page.incomplete == {"search_refused"}
+
+
+# --- Gmail TEXT allowlist (Q-a): a leading `-` inside a quoted TEXT value negates on Gmail ----------------------
+
+
+def gmail_inbox(search: SearchTerms) -> tuple[FakeImapServer, FolderPage]:
+    server = gmail_server()
+    page = g.run(server, ListQuery("inbox", SINCE, False, None, 20, None, search))
+    return server, page
+
+
+GMAIL_INBOX = b"NOT DRAFT SINCE 19-Oct-2026"
+
+
+def test_gmail_text_word_never_reaches_the_wire_with_a_leading_minus() -> None:
+    server, _ = gmail_inbox(terms("-rechnung"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "rechnung"']
+    server, _ = gmail_inbox(terms("--rechnung", "-.x"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "rechnung" TEXT "x"']
+
+
+def test_gmail_text_word_is_sanitised_like_graph() -> None:
+    server, _ = gmail_inbox(terms("C++", "Foo.Bar@Example.org"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "c" TEXT "foo.bar@example.org"']
+
+
+def test_gmail_text_word_splitting_in_two_tokens_and_duplicates() -> None:
+    server, _ = gmail_inbox(terms("foo/bar", "BAR"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "foo" TEXT "bar"']
+
+
+def test_gmail_umlaut_word_stays_a_literal_after_sanitising() -> None:
+    server, _ = gmail_inbox(terms("-M\u00fcller"))
+    assert search_args(server) == [[b"CHARSET", b"UTF-8", GMAIL_INBOX, b"TEXT", "m\u00fcller".encode()]]
+
+
+def test_gmail_sender_recipient_subject_values_stay_as_given() -> None:
+    server, _ = gmail_inbox(SearchTerms(words=("-x",), sender="-Alice", recipient="Bob-", subject="-C++"))
+    assert search_args(server) == [GMAIL_INBOX + b' TEXT "x" FROM "-Alice" TO "Bob-" SUBJECT "-C++"']
+
+
+@pytest.mark.parametrize("words", [("+++",), ("rechnung", "-.-"), ("\u2603",)])
+def test_gmail_word_without_a_token_refuses_the_folders(words: tuple[str, ...]) -> None:
+    server, page = gmail_inbox(terms(*words))
+    assert lm.names(server) == ["LOGIN", "CAPABILITY", "LOGOUT"]  # nothing examined or searched
+    assert (page.items, page.complete, page.truncated) == ([], False, True)
+    assert (page.incomplete, page.refused_only) == ({"search_refused"}, True)
+
+
+def test_gmail_more_than_eight_text_tokens_refuses_the_folders() -> None:
+    server, page = gmail_inbox(terms("a/b", "c/d", "e/f", "g/h", "i/j"))
+    assert "UID SEARCH" not in lm.names(server)
+    assert (page.incomplete, page.refused_only) == ({"search_refused"}, True)
+
+
+def test_gmail_filter_only_search_has_no_text_key() -> None:
+    server, _ = gmail_inbox(SearchTerms(words=(), sender="-Alice", recipient=None, subject=None))
+    assert search_args(server) == [GMAIL_INBOX + b' FROM "-Alice"']
+
+
+def test_non_gmail_text_words_are_unchanged() -> None:
+    server = three(inbox=[hit(1)])
+    lm.run(server, squery(terms("-Rechnung", "C++")))
+    assert search_args(server) == [BASE + b' TEXT "-Rechnung" TEXT "C++"']
+    server = three(inbox=[hit(1)])
+    lm.run(server, squery(terms("-M\u00fcller")))
+    assert search_args(server) == [[b"CHARSET", b"UTF-8", BASE, b"TEXT", "-M\u00fcller".encode()]]
