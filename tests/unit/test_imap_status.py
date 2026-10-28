@@ -2,6 +2,7 @@
 ids, the location step, the mapping to `MessageStatus` and the reply and thread lookups on servers other than Gmail
 (the Gmail lookups: `test_imap_status_gmail.py`)."""
 
+import contextlib
 import json
 import logging
 import time
@@ -13,7 +14,7 @@ import pytest
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, StableRef
 from mcp_hub.providers import imap_status
-from mcp_hub.providers.base import MessageStatus, ProviderError
+from mcp_hub.providers.base import ListQuery, MessageStatus, ProviderError, SearchTerms
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.providers.folders import MAX_LOCATE_FOLDERS, FolderMapCache, build_imap_folder_map
 from mcp_hub.providers.headers import CANDIDATE_HEADER_BYTES, DESCENDANT_HEADER_BYTES, DESCENDANT_HEADER_ITEM
@@ -25,9 +26,11 @@ from mcp_hub.providers.imap_status import (
     MAX_REPLY_KEYS_PER_REF,
     SOFT_CHECK_ROWS,
 )
+from tests.support import imap_threads
 from tests.support.imap_fake import COMMAND_ALLOWLIST, FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.logcapture import Capture
 from tests.support.logfields import allowed_fields
+from tests.unit import test_imap_list_messages as list_tests
 from tests.unit.test_imap_get_message import (
     GMAIL_ALL,
     ICLOUD_CORE,
@@ -1382,10 +1385,28 @@ def _refused_in_place(command: str) -> tuple[FakeImapServer, list[StableRef | Me
     return server, [m("Projects", 2)]
 
 
+def _fail_lookup_fetch(server: FakeImapServer, mailbox_name: str) -> None:
+    """The lookup re-check FETCH (`fetch_chunks` in `_uid_rows`) in `mailbox_name` answers NO."""
+    original = server.run
+    state = {"box": ""}
+
+    def run(name: str, argument: object = None) -> None:
+        if name == "EXAMINE":
+            state["box"] = str(argument)
+        lookup = name == "UID FETCH" and DESCENDANT_HEADER_ITEM in argument[1]  # type: ignore[index]
+        if lookup and state["box"] == mailbox_name:
+            server.fail["UID FETCH"] = server.no("UID FETCH")
+        original(name, argument)
+
+    server.run = run  # type: ignore[method-assign]
+
+
 def _refused_lookup(command: str) -> tuple[FakeImapServer, list[StableRef | MessageRef]]:
     server = server_with(inbox=[msg(1, 200, "x", message_id=f"<{MID}>")], sent=[follow(1, 60, A_MID)])
     if command == "EXAMINE":
         _fail_lookup(server, "EXAMINE", "Archive")
+    elif command == "UID FETCH":
+        _fail_lookup_fetch(server, "Sent Messages")
     else:
         _fail_lookup(server, "UID SEARCH", "Sent Messages", MID)
     return server, [r()]
@@ -1399,6 +1420,7 @@ REFUSED: dict[str, tuple[Callable[[], tuple[FakeImapServer, list[StableRef | Mes
     "in_place_fetch_no": (lambda: _refused_in_place("UID FETCH"), "FetchRefused"),
     "lookup_examine_no": (lambda: _refused_lookup("EXAMINE"), "ExamineRefused"),
     "lookup_search_no": (lambda: _refused_lookup("UID SEARCH"), "SearchRefused"),
+    "lookup_fetch_no": (lambda: _refused_lookup("UID FETCH"), "FetchRefused"),
 }
 
 
@@ -1421,22 +1443,55 @@ def test_refused_command_logs_one_warning(case: str, hub_log: Capture) -> None:
         assert value not in text
 
 
-def test_many_refusals_in_one_call_log_one_line(hub_log: Capture) -> None:
-    """The first refusal names the cause; every later one in the same call is not logged again."""
+def test_many_refusals_of_one_class_log_one_line(hub_log: Capture) -> None:
+    """One line per cause class: every later refusal of a class already logged in the call adds nothing."""
+    server = server_with(inbox=[msg(1, 200, "x", message_id=f"<{MID}>")])
+    server.fail["EXAMINE"] = server.no("EXAMINE")
+    original = server.run
+
+    def refuse_every_examine(command: str, argument: object = None) -> None:
+        if command == "EXAMINE":
+            server.fail["EXAMINE"] = server.no("EXAMINE")
+        original(command, argument)
+
+    server.run = refuse_every_examine  # type: ignore[method-assign]
+    statuses = run(server, [r(), r(OTHER_MID)])
+    assert states(statuses) == [INCOMPLETE, INCOMPLETE]
+    assert len(examined(server)) > 1
+    assert [line["exception"] for line in failures(hub_log)] == ["ExamineRefused"]
+
+
+def test_refusals_of_every_class_log_one_line_each_first_seen_first(hub_log: Capture) -> None:
+    """At most three lines per call, one per cause class, in the order the classes were first refused."""
     server = server_with(projects=[msg(2, 5, "p", message_id=f"<{MID}>")])
     server.fail["UID FETCH"] = server.no("UID FETCH")  # the in-place read comes first
     original = server.run
 
-    def refuse_every_search(command: str, argument: object = None) -> None:
-        if command == "UID SEARCH":
+    def refuse(command: str, argument: object = None) -> None:
+        if command == "UID SEARCH":  # every location search, from INBOX on
             server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        if command == "EXAMINE" and argument == "Deleted Messages":  # the third mailbox of the location
+            server.fail["EXAMINE"] = server.no("EXAMINE")
         original(command, argument)
 
-    server.run = refuse_every_search  # type: ignore[method-assign]
+    server.run = refuse  # type: ignore[method-assign]
     statuses = run(server, [m("Projects", 2), r(OTHER_MID)])
     assert states(statuses) == [INCOMPLETE, INCOMPLETE]
     assert len(searches(server)) > 1
-    assert [line["exception"] for line in failures(hub_log)] == ["FetchRefused"]
+    assert [line["exception"] for line in failures(hub_log)] == ["FetchRefused", "SearchRefused", "ExamineRefused"]
+
+
+def test_deleted_folder_is_stale_without_a_refusal_line(hub_log: Capture) -> None:
+    """An id's mailbox deleted since the map was built: EXAMINE answers NO, the one rebuild no longer lists it, so the
+    entry is `stale_id` (not a refusal) and no `provider_call_failed` line is written."""
+    server = server_with(projects=[msg(2, 5, "p", message_id=f"<{MID}>")])
+    maps = FolderMapCache(clock=clock_of(server))
+    prime(mailbox(server, maps=maps), server)
+    server.folders = [f for f in server.folders if f.raw_name != "Projects"]
+    start = len(server.commands)
+    assert states(run(server, [m("Projects", 2)], maps=maps)) == [STALE]
+    assert names(server, start).count("LIST") == 1  # the one rebuild
+    assert failures(hub_log) == []
 
 
 @pytest.mark.parametrize("case", ["clean", "lost_row_without_no", "folder_cap", "soft_stop"])
@@ -1454,4 +1509,23 @@ def test_no_refusal_logs_no_warning(case: str, hub_log: Capture) -> None:
     elif case == "soft_stop":
         server, kwargs = _soft_stop_in_core()
     run(server, [r()], **kwargs)  # type: ignore[arg-type]
+    assert failures(hub_log) == []
+
+
+@pytest.mark.parametrize("tool", ["list_messages", "search_messages", "get_thread"])
+def test_other_tools_write_no_refusal_line(tool: str, hub_log: Capture) -> None:
+    """#52 covers `get_message_status` only: the shared session notes a NO in every tool, only the status call logs."""
+    if tool == "get_thread":
+        server = imap_threads.icloud(inbox=[imap_threads.msg(1, 30, "seed", message_id="<s@example.test>")])
+        server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        with contextlib.suppress(ProviderError):  # an incomplete seed search answers upstream_timeout
+            imap_threads.thread(server, seed=imap_threads.ref("s@example.test", server))
+    else:
+        server = list_tests.icloud(inbox=[list_tests.msg(1, 5, "Rechnung")])
+        words = ("rechnung",) if tool == "search_messages" else ()
+        search = SearchTerms(words=words, sender=None, recipient=None, subject=None) if words else None
+        query = ListQuery("inbox", list_tests.SINCE, False, None, 20, None, search)
+        server.fail["UID SEARCH"] = server.no("UID SEARCH")
+        list_tests.run(server, query)
+    assert "UID SEARCH" not in server.fail  # the NO was answered
     assert failures(hub_log) == []

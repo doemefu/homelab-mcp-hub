@@ -135,11 +135,11 @@ def message_status(
     A soft stop in step 1 keeps the copies read (found) and leaves every other entry incomplete_search, without a
     location (IR2, P7); one in step 2 is handled by `locate`, one in step 4 by the lookups. A BAD, an abort, a lost
     connection or the hard deadline propagate: the account fails (B7). A call in which the server answered an EXAMINE,
-    UID SEARCH or UID FETCH with NO writes one `provider_call_failed` WARNING, naming the first refusal (#52)."""
+    UID SEARCH or UID FETCH with NO writes one `provider_call_failed` WARNING per cause class, at most three (#52)."""
     session.cap_degraded_logs(MAX_DEGRADED_LOGS)
     statuses = _statuses(session, targets, soft_check)
-    if session.refused is not None:  # #52: one WARNING per call, the first refusal's cause only (§9.7)
-        log_provider_failure(session.account, "mail", ProviderError("upstream_timeout", session.refused))
+    for cause in session.refused:  # #52: one WARNING per cause class and call, first seen first (§9.7)
+        log_provider_failure(session.account, "mail", ProviderError("upstream_timeout", cause))
     return statuses
 
 

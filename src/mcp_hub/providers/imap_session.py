@@ -195,7 +195,7 @@ class ImapSession:
         self._selected: str | None = None
         self._selected_uidvalidity: int | None = None
         self._degraded_left: int | None = None  # item_degraded lines this call may still log; None: no cap
-        self._refused: str | None = None  # cause of the first command the server answered NO (#52)
+        self._refused: dict[str, None] = {}  # causes of the commands the server answered NO, first seen first (#52)
 
     def cap_degraded_logs(self, limit: int) -> None:
         """At most `limit` item_degraded lines for the rest of this call (SR6, `get_message_status`)."""
@@ -210,14 +210,13 @@ class ImapSession:
         log_message_skipped(ref, "mail", exc)
 
     def note_refused(self, cause: str) -> None:
-        """Remembers the first EXAMINE, UID SEARCH or UID FETCH the server answered NO in this call (#52)."""
-        if self._refused is None:
-            self._refused = cause
+        """Remembers that the server answered an EXAMINE, UID SEARCH or UID FETCH with NO in this call (#52)."""
+        self._refused.setdefault(cause, None)
 
     @property
-    def refused(self) -> str | None:
-        """`ExamineRefused`, `SearchRefused` or `FetchRefused` of the first refusal, or None."""
-        return self._refused
+    def refused(self) -> tuple[str, ...]:
+        """The distinct causes (`ExamineRefused`, `SearchRefused`, `FetchRefused`) in the order first seen."""
+        return tuple(self._refused)
 
     @property
     def inbox(self) -> FolderEntry:
@@ -571,14 +570,14 @@ def _examine_bound(session: ImapSession, entry: FolderEntry) -> int | None:
     except imaplib.IMAP4.error as exc:
         if not _answered_no(exc):
             raise
-        session.note_refused("ExamineRefused")
     if (
         entry.raw_name != session.registry_inbox
         and not session.listed
         and session.may_force_rebuild()
         and session.folder_map(refresh=True).binding(entry.raw_name) != "allowed"
     ):
-        raise ProviderError("not_found", "UnboundFolder")
+        raise ProviderError("not_found", "UnboundFolder")  # deleted or no longer allowed: no refusal to note
+    session.note_refused("ExamineRefused")
     raise ProviderError("upstream_timeout", "ExamineRefused")
 
 
