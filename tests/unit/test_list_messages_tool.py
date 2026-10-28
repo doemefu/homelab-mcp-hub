@@ -43,9 +43,10 @@ from mcp_hub.providers.base import (
 from mcp_hub.providers.deadline import CallDeadline, SoftStop
 from mcp_hub.registry import Account, load_registry
 from mcp_hub.sanitize import TRUNCATION_MARKER
-from mcp_hub.tools import HubContext
+from mcp_hub.tools import HubContext, mail
 from mcp_hub.tools.common import UNTRUSTED_CONTENT_NOTICE
 from mcp_hub.tools.mail import (
+    DIGEST_ARGUMENTS,
     LIST_MESSAGES_DESCRIPTION,
     MAX_SUMMARY_REFERENCES,
     ListMessagesResult,
@@ -53,6 +54,7 @@ from mcp_hub.tools.mail import (
     run_list_messages,
     shrink_summary,
     summary_model,
+    window_start,
 )
 from tests.support.logfields import allowed_fields
 from tests.support.mcp import body, modern
@@ -816,3 +818,45 @@ def test_tool_call_log_line(wired: tuple[TestClient, Fake], tokens: TokenFactory
     text = "\n".join(handler.lines)
     for forbidden in (cursor, "Quarterly", "m1@example.test", "Private Folder", "sender@example.test"):
         assert forbidden not in text, forbidden
+
+
+SEARCH_WINDOW: dict[str, Any] = {
+    "default": timedelta(days=30),
+    "max_age": timedelta(days=90),
+}
+
+
+def test_search_window_bounds() -> None:
+    now = datetime(2026, 10, 27, 12, 0, 0, tzinfo=UTC)
+    with pytest.raises(ToolError) as caught:
+        window_start(now - timedelta(days=91), now, **SEARCH_WINDOW)
+    assert caught.value.code == "invalid_argument"
+    assert caught.value.message == "since must lie within the last 90 days"
+    assert window_start(now - timedelta(days=89), now, **SEARCH_WINDOW) == int((now - timedelta(days=89)).timestamp())
+    assert window_start(None, now, **SEARCH_WINDOW) == int((now - timedelta(days=30)).timestamp())
+    with pytest.raises(ToolError, match="since"):  # the future bound is unchanged
+        window_start(now + timedelta(seconds=61), now, **SEARCH_WINDOW)
+    # The list tools keep their defaults: 24 h, 30 days.
+    assert window_start(None, now) == int((now - timedelta(hours=24)).timestamp())
+    with pytest.raises(ToolError) as listed:
+        window_start(now - timedelta(days=31), now)
+    assert listed.value.message == "since must lie within the last 30 days"
+
+
+def test_search_window_constants() -> None:
+    assert timedelta(days=30) == mail.SEARCH_SINCE_DEFAULT
+    assert timedelta(days=90) == mail.SEARCH_SINCE_MAX_AGE
+
+
+def test_digest_arguments_pins() -> None:
+    assert DIGEST_ARGUMENTS["list_messages"] == ("account", "folder", "since", "unread_only", "direction")
+    assert DIGEST_ARGUMENTS["list_unread"] == ("account", "since")
+    assert DIGEST_ARGUMENTS["search_messages"] == (
+        "account",
+        "query",
+        "sender",
+        "recipient",
+        "subject",
+        "folder",
+        "since",
+    )

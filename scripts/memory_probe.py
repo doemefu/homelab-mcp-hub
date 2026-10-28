@@ -21,11 +21,18 @@ conversation list answers with a 2 MiB `uniqueBody` list or, alternately, a refu
 through an in-process IMAP fake (T0b, #44): the inbox holds 50 unread messages with 64 KiB summary headers,
 BODYSTRUCTUREs of 10,000 parts (`--structure-parts`) and large text parts, among 5,000 candidates; every
 `--failing-every`-th structure (default 5) fails its reduction; each worker runs both tools.
+`--scenario search` drives run_search_messages (folder `all`, three words, one non-ASCII) for `icloud` accounts through
+an in-process IMAP fake (WP13d): every SEARCH answers 5,001 hits per folder (one more than the cap), the candidate rows
+are hostile 8 KiB blocks, and the 50 chosen items carry 64 KiB summary headers, 4 KiB snippets and BODYSTRUCTUREs of
+10,000 parts (`--structure-parts`).
+`--scenario search-graph` drives it for `--accounts` Graph accounts through an in-process transport: the calls alternate
+between a word search (the one mailbox-wide `$search`: a refused over-cap answer, then the 1 MiB answer of the halved
+`$top`) and a filter-only search whose read-on takes 5 list requests of 1 MiB per folder.
 Prints peak RSS and CPU per call, then the cgroup's memory peak and events when they are readable.
 
 Run inside the production image with the repository mounted read-only (see CONTRIBUTING.md, "Memory probe"):
 
-    docker run --rm --memory=320m --memory-swap=320m --cpus=1 --read-only --tmpfs /tmp \\
+    docker run --rm --memory=256m --memory-swap=256m --cpus=1 --read-only --tmpfs /tmp \\
       -v "$PWD":/work:ro -e PYTHONPATH=/app/src:/work mcp-hub:dev \\
       python /work/scripts/memory_probe.py --scenario nonascii-240k --calls 10
     ... python /work/scripts/memory_probe.py --scenario graph-message --with-calendar nonascii-240k --calls 10
@@ -33,6 +40,8 @@ Run inside the production image with the repository mounted read-only (see CONTR
     ... python /work/scripts/memory_probe.py --scenario thread --accounts 2 --parallel 2 --calls 10
     ... python /work/scripts/memory_probe.py --scenario thread-graph --accounts 2 --parallel 2 --calls 10
     ... python /work/scripts/memory_probe.py --scenario list --accounts 2 --parallel 2 --calls 10
+    ... python /work/scripts/memory_probe.py --scenario search --accounts 2 --parallel 2 --calls 10
+    ... python /work/scripts/memory_probe.py --scenario search-graph --accounts 2 --parallel 2 --calls 10
 """
 
 import argparse
@@ -42,6 +51,7 @@ import functools
 import gc
 import itertools
 import json
+import re
 import resource
 import sys
 import tempfile
@@ -56,7 +66,14 @@ import anyio
 import httpx2
 from tests.support.clock import FakeClock
 from tests.support.dav_transport import RecordingTransport, collection, dav, home_set, multistatus, principal, report
-from tests.support.graph_fixtures import CONVERSATION, body_object, thread_item
+from tests.support.graph_fixtures import (
+    ARCHIVE_ID,
+    CONVERSATION,
+    SENT_ID,
+    body_object,
+    message,
+    thread_item,
+)
 from tests.support.graph_fixtures import INBOX_ID as THREAD_INBOX_ID
 from tests.support.imap_fake import FakeFolder, FakeImapClient, FakeImapServer, FakeMessage
 from tests.support.ms_transport import FAKE_CLIENT_ID, MsTransport, json_answer
@@ -78,6 +95,7 @@ from mcp_hub.registry import Account, load_registry
 from mcp_hub.tools import HubContext
 from mcp_hub.tools.calendar import run_get_events
 from mcp_hub.tools.mail import run_get_message, run_list_messages, run_list_unread
+from mcp_hub.tools.mail_search import run_search_messages
 from mcp_hub.tools.mail_thread import run_get_thread
 
 BASE = "https://dav.example.test:443"
@@ -256,7 +274,7 @@ def graph_attachments_body() -> bytes:
     return body
 
 
-def graph_mailbox(account: Account, thread: bool = False) -> GraphMailbox:
+def graph_mailbox(account: Account, thread: bool = False, search: bool = False) -> GraphMailbox:
     """Real GraphMailbox + GraphTokenSource; the refresh token lives in the in-memory fake store (no PostgreSQL).
     The seven well-known folder GETs of the D75 binding are answered: inbox with its id, the others 404 (no such
     folder); the folder ids are cached per mailbox as in the hub."""
@@ -271,7 +289,13 @@ def graph_mailbox(account: Account, thread: bool = False) -> GraphMailbox:
             200, content=graph_attachments_body()
         ),
     }
-    graph = thread_graph_transport() if thread else RecordingTransport(answers).transport()
+    graph = (
+        search_graph_transport()
+        if search
+        else thread_graph_transport()
+        if thread
+        else RecordingTransport(answers).transport()
+    )
     token = {"access_token": "AT-PROBE", "refresh_token": "RT-PROBE", "expires_in": 3600, "scope": "Mail.Read"}
     ms = MsTransport({"/consumers/oauth2/v2.0/token": [json_answer(200, token)]}).transport()
     store = FakeStore()
@@ -299,6 +323,7 @@ def context(
     *,
     imap: Callable[[str], ImapMailbox] | None = None,
     thread_graph: bool = False,
+    search_graph: bool = False,
 ) -> HubContext:
     """`accounts` icloud accounts (calendar scenario and/or fake IMAP mailboxes) and, with `graph`, as many Graph
     accounts (`outlook`, `outlook1`, ...; one for graph-message)."""
@@ -310,7 +335,7 @@ def context(
     icloud = [template | {"id": f"icloud{i}" if i else "icloud"} for i in range(accounts if scenario or imap else 0)]
     outlook = [
         graph_template | {"id": f"outlook{i}" if i else "outlook"}
-        for i in range(accounts if thread_graph else 1 if graph else 0)
+        for i in range(accounts if thread_graph or search_graph else 1 if graph else 0)
     ]
     example["accounts"] = icloud + outlook
     (secrets / "accounts.json").write_text(json.dumps(example))
@@ -319,7 +344,9 @@ def context(
     (secrets / "token-encryption-key").write_text(base64.b64encode(KEY).decode())
     sources = {a["id"]: source(a["id"], scenario, calendars) for a in icloud} if scenario else {}
     registry = load_registry(secrets / "accounts.json")
-    mailboxes = {a.id: graph_mailbox(a, thread_graph) for a in registry.accounts if a.id.startswith("outlook")}
+    mailboxes = {
+        a.id: graph_mailbox(a, thread_graph, search_graph) for a in registry.accounts if a.id.startswith("outlook")
+    }
 
     def mailbox(account: Account, directory: Path) -> ImapMailbox | GraphMailbox:
         if account.id in mailboxes:
@@ -809,6 +836,214 @@ def list_main(args: argparse.Namespace) -> None:
     print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
 
 
+# --- search_messages (WP13d) ----------------------------------------------------------------------------------------
+
+SEARCH_QUERY = "alpha bravo gr" + chr(0xF6) + chr(0xDF) + "e"  # three words, one non-ASCII (a synchronising literal)
+SEARCH_HITS, SEARCH_CHOSEN, SEARCH_LIMIT = 5001, 50, 50  # one hit above the 5,000 cap
+SEARCH_LONG_FROM = False  # `--long-from`: bulk hits with an 8 KiB From
+SEARCH_FILTER = "nomatch@example.test"  # a filter-only search that matches no hit: the read-on runs to its cap
+
+
+class SearchClient(ProbeClient):
+    """Every SEARCH, with or without a literal, answers every message of the selected folder (5,001 hits)."""
+
+    def _evaluate(self, tokens: list[str]) -> list[int]:
+        return sorted(self._selected("UID SEARCH").messages)
+
+
+class SearchServer(FakeImapServer):
+    def client(self) -> FakeImapClient:
+        return SearchClient(self)
+
+
+@functools.cache
+def search_messages_of(chosen: bool) -> dict[int, FakeMessage]:
+    """SEARCH_HITS messages of a folder: hostile bulk hits (an 8 KiB Message-ID and an 8 KiB From, cut by the candidate
+    FETCH; one shared header block) and, `chosen`, the 50 newest, which carry a 64 KiB References, a unique Message-ID
+    and a body for the snippet. Built once: the messages are read-only and shared by every fake server."""
+    now = datetime.now(UTC)
+    # The From stays short unless `--long-from`: a hostile 8 KiB From costs about 0.7 ms of `getaddresses` per hit
+    # (15,000 hits per call), which exhausts the soft time limit and keeps the probe from measuring memory, and
+    # every candidate keeps its From address (up to 2 KiB).
+    sender = f"{'a' * 8000} <bulk@example.test>" if SEARCH_LONG_FROM else "Bulk <bulk@example.test>"
+    hostile = hdr(("From", sender), ("Message-ID", f"<{'m' * 8000}@example.test>"))
+    first_real = SEARCH_HITS - SEARCH_CHOSEN + 1 if chosen else SEARCH_HITS + 1
+    bulk = {
+        uid: FakeMessage(uid, now - timedelta(days=2, seconds=uid), headers=hostile) for uid in range(1, first_real)
+    }
+    real = {
+        uid: FakeMessage(
+            uid,
+            now - timedelta(hours=1, seconds=uid),
+            headers=hdr(
+                ("From", "Peer <peer@example.test>"),
+                ("To", OWNER),
+                ("Subject", "Probe " + "y" * 200),
+                ("Message-ID", f"<s{uid}@example.test>"),
+                ("References", "<r@example.test> " + "x" * 66000),
+            ),
+            text=HTML_BODY if uid % 2 else PLAIN_B64,
+        )
+        for uid in range(first_real, SEARCH_HITS + 1)
+    }
+    return bulk | real
+
+
+def search_server() -> SearchServer:
+    folders: list[FakeFolder] = [
+        FakeFolder("INBOX", (b"\\HasNoChildren",), messages=search_messages_of(True)),
+        FakeFolder("Sent Messages", (b"\\HasNoChildren", b"\\Sent"), messages=search_messages_of(False)),
+        FakeFolder("Archive", (b"\\HasNoChildren", b"\\Archive"), messages=search_messages_of(False)),
+        FakeFolder("Deleted Messages", (b"\\HasNoChildren", b"\\Trash"), messages={}),
+    ]
+    return SearchServer(folders, clock=FakeClock())
+
+
+def search_factory(account: str) -> ImapMailbox:
+    """A fresh fake server and mailbox per call (and a fresh folder map: the LIST is part of the call)."""
+    server = search_server()
+    clock = server.clock
+    if clock is None:
+        raise SystemExit("search server needs a clock")
+    return ImapMailbox(
+        account,
+        host="imap.example.test",
+        port=993,
+        folder="INBOX",
+        username="u",
+        password="p",
+        client_factory=lambda host, port, context, timeout: server.client(),
+        own_addresses=frozenset({OWNER}),
+        folder_maps=FolderMapCache(clock=clock),
+    )
+
+
+SEARCH_GRAPH_IDS = {"inbox": THREAD_INBOX_ID, "sentitems": SENT_ID, "archive": ARCHIVE_ID}
+SEARCH_GRAPH_ITEMS = 101  # a full folder list ($top 101)
+
+
+def search_graph_items(count: int, parent: str, first: datetime, step: int, prefix: str) -> bytes:
+    """`count` list items of about 10 KiB (non-ASCII subject and preview), received `step` seconds apart from `first`
+    on, together just below the 1 MiB list cap."""
+
+    def build(pairs: int) -> bytes:
+        items = [
+            message(
+                n,
+                id=f"{prefix}{n}=",
+                receivedDateTime=(first + timedelta(seconds=step * n)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                parentFolderId=parent,
+                subject="Probe " + PAIR * pairs,
+                bodyPreview=PAIR * pairs,
+            )
+            for n in range(count)
+        ]
+        return json.dumps({"value": items}, ensure_ascii=False).encode()
+
+    pairs = (MAX_LIST_RESPONSE_BYTES - 4096 - len(build(0))) // (len(PAIR.encode()) * 2 * count)
+    body = build(pairs)
+    if len(body) > MAX_LIST_RESPONSE_BYTES:
+        raise SystemExit("probe list body exceeds the 1 MiB cap")
+    return body
+
+
+OVER_LIST_CAP = b"x" * (MAX_LIST_RESPONSE_BYTES + 1)
+
+
+def search_graph_transport() -> httpx2.MockTransport:
+    """Folder ids (inbox, sentitems, archive), the `$search` request (the first, at `$top` 100, refused as too large;
+    the retry at `$top` 50 answers 1 MiB of hits) and the folder lists of a filter-only search (each answers a full
+    1 MiB list that ends below the request's `lt` bound, so the read-on goes on to its cap)."""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        path, params = request.url.path.removeprefix("/v1.0"), request.url.params
+        if path.startswith("/me/mailFolders/") and not path.endswith("/messages"):
+            found = SEARCH_GRAPH_IDS.get(path.removeprefix("/me/mailFolders/"))
+            return httpx2.Response(200, json={"id": found}) if found else httpx2.Response(404)
+        now = datetime.now(UTC).replace(microsecond=0)
+        if path == "/me/messages":
+            if params.get("$top") == "100":
+                return httpx2.Response(200, content=OVER_LIST_CAP)
+            return httpx2.Response(
+                200, content=search_graph_items(100, THREAD_INBOX_ID, now - timedelta(hours=1), -1, "AAMkS")
+            )
+        folder = path.removeprefix("/me/mailFolders/").removesuffix("/messages")
+        bound = re.search(r"receivedDateTime lt (\S+)", params.get("$filter", ""))
+        start = now - timedelta(hours=1)
+        if bound:
+            start = datetime.strptime(bound.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC) - timedelta(seconds=1)
+        return httpx2.Response(
+            200, content=search_graph_items(SEARCH_GRAPH_ITEMS, folder, start, -1, f"AAMkF{abs(hash(folder)) % 997}x")
+        )
+
+    return httpx2.MockTransport(handle)
+
+
+async def search_call(ctx: HubContext, args: argparse.Namespace, graph: bool, filter_only: bool) -> list[str]:
+    """`--accounts` accounts times `--parallel` concurrent search_messages calls (folder `all`, limit 50);
+    `--with-calendar` adds get_events."""
+    notes: list[str] = []
+
+    async def search(account: str) -> None:
+        result, _, outcome = await run_search_messages(
+            ctx,
+            query=None if filter_only else SEARCH_QUERY,
+            account=account,
+            sender=SEARCH_FILTER if filter_only else None,
+            recipient=None,
+            subject=None,
+            folder="all",
+            since=None,
+            limit=SEARCH_LIMIT,
+            cursor=None,
+        )
+        reasons = sorted({i.reason for i in result.incomplete_accounts})
+        errors = [e.code for e in result.account_errors]
+        notes.append(
+            f"{account}: {len(result.items)} items, truncated {result.truncated}, incomplete {reasons}, "
+            f"errors {errors}, outcome {outcome}"
+        )
+
+    async def events() -> None:
+        notes.extend(await one_call(ctx, True, False))
+
+    async with anyio.create_task_group() as tg:
+        for i in range(args.accounts):
+            for _ in range(args.parallel):
+                tg.start_soon(search, account_id("outlook" if graph else "icloud", i))
+        if args.with_calendar:
+            tg.start_soon(events)
+    return notes
+
+
+def search_main(args: argparse.Namespace) -> None:
+    graph = args.scenario == "search-graph"
+    ctx = context(
+        args.accounts,
+        args.with_calendar,
+        args.calendars,
+        graph=graph,
+        imap=None if graph else search_factory,
+        search_graph=graph,
+    )
+    gc.collect()
+    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+    print(f"baseline peak RSS {base:.0f} MiB (imports and fakes)", flush=True)
+    for call in range(1, args.calls + 1):
+        filter_only = graph and call % 2 == 0  # Graph: word search, filter-only read-on, ...
+        cpu = time.process_time()
+        started = time.monotonic()
+        notes = asyncio.run(search_call(ctx, args, graph, filter_only))
+        gc.collect()
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
+        print(
+            f"call {call} ({'filter' if filter_only else 'words'}): peak RSS {peak:.0f} MiB, "
+            f"CPU {time.process_time() - cpu:.1f} s, wall {time.monotonic() - started:.1f} s: {notes[0]}",
+            flush=True,
+        )
+    print(f"cgroup memory.peak {cgroup('memory.peak')}; memory.events {cgroup('memory.events')}", flush=True)
+
+
 def cgroup(name: str) -> str:
     try:
         return Path("/sys/fs/cgroup", name).read_text().strip().replace("\n", ", ")
@@ -880,24 +1115,35 @@ def status_main(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global STRUCTURE_PARTS, FAILING_EVERY
+    global STRUCTURE_PARTS, FAILING_EVERY, SEARCH_LONG_FROM
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--scenario",
-        choices=[*sorted(SCENARIOS), "graph-message", "status", "thread", "thread-graph", "list"],
+        choices=[
+            *sorted(SCENARIOS),
+            "graph-message",
+            "status",
+            "thread",
+            "thread-graph",
+            "list",
+            "search",
+            "search-graph",
+        ],
         required=True,
     )
     parser.add_argument(
         "--with-calendar",
         choices=sorted(SCENARIOS),
-        help="calendar scenario run next to graph-message, status, thread, thread-graph or list",
+        help="calendar scenario run next to graph-message, status, thread, thread-graph, list or search",
     )
     parser.add_argument("--accounts", type=int, default=1)
-    parser.add_argument("--parallel", type=int, default=1, help="concurrent status, thread or list calls per account")
+    parser.add_argument(
+        "--parallel", type=int, default=1, help="concurrent status, thread, list or search calls per account"
+    )
     parser.add_argument("--calendars", type=int, default=10)
     parser.add_argument("--calls", type=int, default=10)
     parser.add_argument(
-        "--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread, list)"
+        "--structure-parts", type=int, default=STRUCTURE_PARTS, help="parts per BODYSTRUCTURE (thread, list, search)"
     )
     parser.add_argument(
         "--failing-every",
@@ -910,6 +1156,7 @@ def main() -> None:
         type=int,
         help="override SUMMARY_STRUCTURE_CHUNK_UIDS of the list scenario (to compare sizes)",
     )
+    parser.add_argument("--long-from", action="store_true", help="search: bulk hits with an 8 KiB From (CPU heavy)")
     args = parser.parse_args()
     if args.summary_chunk is not None:
         imap_module.SUMMARY_STRUCTURE_CHUNK_UIDS = args.summary_chunk
@@ -920,6 +1167,11 @@ def main() -> None:
         STRUCTURE_PARTS = args.structure_parts
         FAILING_EVERY = args.failing_every
         list_main(args)
+        return
+    if args.scenario in ("search", "search-graph"):
+        STRUCTURE_PARTS = args.structure_parts
+        SEARCH_LONG_FROM = args.long_from
+        search_main(args)
         return
     if args.scenario in ("thread", "thread-graph"):
         STRUCTURE_PARTS = args.structure_parts

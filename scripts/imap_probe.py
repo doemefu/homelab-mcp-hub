@@ -59,6 +59,28 @@ median(keys=60) < 1,000 ms; when the 60-key line errors (it can exceed 4,000 byt
 record that B is then capped by the 4,000 bytes. P3 runs the sizes largest first, so per-term caching biases against B.
 P5 `accepted=no` means one SEARCH per thread id, and `single_accepted=no` means the Gmail thread design itself needs a
 ruling.
+
+`--search-rounds` (WP13d, T9) runs the search_messages rounds S1-S8 instead. The connection is the hub's own
+`HubImapClient` (a non-ASCII value goes out as a synchronising literal, S4), every command goes through
+`GuardedImapClient` and every value through `search_values`; only EXAMINE, UID SEARCH and one UID FETCH of
+`BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>` reach the server. The words are typed at hidden prompts (never
+echoed, never printed): three ASCII words of at least seven letters that occur in mail of the last 30 days, then
+optionally a sender local part, a non-ASCII word and an address fragment that appears only in Cc. The output is hit
+counts, OK/NO/BAD and milliseconds only; folders are named by role (`inbox`, `sent`, `archive`, `all_mail`).
+
+    uv run python scripts/imap_probe.py --host imap.mail.me.com --search-rounds
+    uv run python scripts/imap_probe.py --host imap.gmail.com --search-rounds
+
+S1 capability flags. S2 per folder: `TEXT` with one word, with three keys, with the prefix (first 4 letters,
+`prefix_hits`) and with the middle fragment (letters 3-6, `middle_hits`); `SUBJECT` and `FROM` whole and middle.
+S3 (Gmail): `TEXT` and `SUBJECT` with Gmail operators inside the value (`in:anywhere`, `-word`, `OR`, `w1 OR w2`),
+the window size and a hint whether the counts look like a complement (`neg_complement`) or a union (`or_union`);
+the counts decide, the hint does not. S6: `FROM "utf-8"` and `SUBJECT "=?utf"` hit counts plus the control
+`encoded_from`/`encoded_subject` (utf-8 encoded words only) over the newest 500 window rows, with
+`*_hits_in_scanned` (control above zero and hits_in_scanned near zero = decoded matching; near the control = raw
+matching). S7: phrase against two keys. S8 (Gmail, optional): `TO <fragment>`
+for an address that appears only in Cc. S4 and S5 run last, because a refused literal can leave the connection
+unusable: `SUBJECT <non-ASCII word>` and its upper-cased form. Every search carries `NOT DRAFT SINCE <today - 30 days>`.
 """
 
 import argparse
@@ -81,7 +103,9 @@ from imapclient import IMAPClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # the hub runs from src/ (uv `package = false`)
 
 from mcp_hub.providers import imap_search
+from mcp_hub.providers.base import SearchKey
 from mcp_hub.providers.deadline import CallDeadline
+from mcp_hub.providers.folders import NAME_FALLBACK
 from mcp_hub.providers.headers import (
     DESCENDANT_HEADER_BYTES,
     DESCENDANT_HEADER_ITEM,
@@ -91,6 +115,7 @@ from mcp_hub.providers.headers import (
     msg_id_tokens,
     valid_message_id,
 )
+from mcp_hub.providers.imap import HubImapClient
 from mcp_hub.providers.imap_guard import GuardedImapClient, ImapCommandRefused, imap_error_kind
 from mcp_hub.providers.imap_search import GMAIL_SENT_LABEL_KEY, LOCATE_BATCH_VALUES, HeaderField
 
@@ -917,15 +942,394 @@ def status_rounds(raw: Any, caps: frozenset[bytes], *, out: TextIO, today: date 
     _guarded("p7_header_fetch", emit, lambda: _p7(raw, reply_role, box, gmail, window, emit))
 
 
+# --- WP13d T9: search_messages rounds (S1-S8) ------------------------------------------------------------------
+
+_SEARCH_SINCE_DAYS: Final = 30
+_WORD_LETTERS: Final = 7  # IR-5, MF-R7: the prefix and the middle fragment must differ from the word
+_FRAGMENT_PREFIX: Final = slice(0, 4)
+_FRAGMENT_MIDDLE: Final = slice(2, 6)  # letters 3-6
+_CONTROL_UIDS: Final = 500
+_CONTROL_ITEM: Final = "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>"
+_ENCODED_WORD: Final = re.compile(r"=\?utf-8\?[bq]\?[^?\s]*\?=", re.IGNORECASE)  # the charset S6 searches for
+_BADCHARSET: Final = re.compile(r"\[BADCHARSET")
+_MAX_FOREIGN_BYTES: Final = 200
+_CC_MIN: Final = 4
+_PROMPT_ATTEMPTS: Final = 3
+_WORD_REFUSED: Final = "word refused: use at least 7 ASCII letters"
+_SENDER_REFUSED: Final = "sender part refused: use at least 7 printable ASCII characters, no quotes or backslashes"
+_FOREIGN_REFUSED: Final = "word refused: use letters with at least one non-ASCII letter, at most 200 bytes"
+_CC_REFUSED: Final = "fragment refused: use at least 4 printable ASCII characters, no spaces, quotes or backslashes"
+_UNSAFE_CODE_POINT: Final = re.compile("[\x00-\x1f\x7f-\x9f]")
+
+type Pair = tuple[SearchKey, str]
+
+
+def ascii_word(value: str) -> str:
+    """An ASCII word of at least seven letters (S2/S5/S7 need fragments that differ from the word)."""
+    if len(value) < _WORD_LETTERS or not (value.isascii() and value.isalpha()):
+        raise ValueError(_WORD_REFUSED)
+    return value
+
+
+def sender_part(value: str) -> str:
+    if len(value) < _WORD_LETTERS or not imap_search.search_value_ok(value):
+        raise ValueError(_SENDER_REFUSED)
+    return value
+
+
+def foreign_word(value: str) -> str:
+    """A word of letters with at least one non-ASCII letter that the guard can send as one literal."""
+    if (
+        not value
+        or value.isascii()
+        or not value.isalpha()
+        or len(value.encode("utf-8", "replace")) > _MAX_FOREIGN_BYTES
+        or _UNSAFE_CODE_POINT.search(value) is not None
+    ):
+        raise ValueError(_FOREIGN_REFUSED)
+    return value
+
+
+def cc_fragment(value: str) -> str:
+    if len(value) < _CC_MIN or " " in value or not imap_search.search_value_ok(value):
+        raise ValueError(_CC_REFUSED)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class SearchWords:
+    """The owner's words, kept in memory only and never printed. `sender`, `foreign` and `cc` are optional."""
+
+    w1: str
+    w2: str
+    w3: str
+    sender: str | None = None
+    foreign: str | None = None
+    cc: str | None = None
+
+    def __post_init__(self) -> None:
+        for word in (self.w1, self.w2, self.w3):
+            ascii_word(word)
+        if self.sender is not None:
+            sender_part(self.sender)
+        if self.foreign is not None:
+            foreign_word(self.foreign)
+        if self.cc is not None:
+            cc_fragment(self.cc)
+
+
+def _search_folders(guard: GuardedImapClient, gmail: bool) -> tuple[list[tuple[str, str]], list[str]]:
+    """(role, raw name) pairs, INBOX first, and the roles that were not found. Gmail adds All Mail, other servers
+    sent and archive: by special-use attribute, else by the hub's fallback names (iCloud has no `\\Archive`). Names
+    are never printed."""
+    found: dict[str, str] = {}
+    by_name: dict[str, str] = {}
+    for flags, _delimiter, name in guard.list_folders():
+        if {f.lower() for f in flags} & _NOT_SELECTABLE:
+            continue
+        raw_name = name.decode("ascii", "replace") if isinstance(name, bytes) else str(name)
+        role = _role(flags, raw_name)
+        if role in ("sent", "archive", "all"):
+            found.setdefault(role, raw_name)
+        for fallback_role, fallback_name in NAME_FALLBACK.items():
+            if raw_name.casefold() == fallback_name.casefold():
+                by_name.setdefault(fallback_role, raw_name)
+    wanted = ("all",) if gmail else ("sent", "archive")
+    if not gmail:
+        for role in wanted:
+            if role not in found and role in by_name:
+                found[role] = by_name[role]
+    folders = [("inbox", _INBOX)] + [(role, found[role]) for role in wanted if role in found]
+    missing = [role for role in wanted if role not in found]
+    return [("all_mail" if role == "all" else role, name) for role, name in folders], [
+        "all_mail" if role == "all" else role for role in missing
+    ]
+
+
+def _count(
+    raw: Any, emit: Callable[[str], None], name: str, window: bytes, values: Sequence[Pair], label: str = "hits"
+) -> int | None:
+    """One timed `search_values` round on its own deadline: the hit count, None after an error (class name only)."""
+    result: list[int] = []
+
+    def measure() -> None:
+        started = time.perf_counter()
+        hits = _round_guard(raw).search_values(window, values)
+        result.append(len(hits))
+        emit(f"{name} {label}={len(hits)} ms={_ms(started)}")
+
+    _guarded(name, emit, measure)
+    return result[0] if result else None
+
+
+def _examine(raw: Any, emit: Callable[[str], None], name: str, mailbox: str) -> bool:
+    return _guarded(name, emit, lambda: _round_guard(raw).examine(mailbox))
+
+
+def _s2(raw: Any, role: str, window: bytes, words: SearchWords, emit: Callable[[str], None]) -> None:
+    w1 = words.w1
+    prefix, middle = w1[_FRAGMENT_PREFIX], w1[_FRAGMENT_MIDDLE]
+    text = f"s2_text: folder={role}"
+    _count(raw, emit, f"{text} form=word", window, [("TEXT", w1)])
+    _count(raw, emit, f"{text} form=three_keys", window, [("TEXT", w1), ("TEXT", words.w2), ("TEXT", words.w3)])
+    _count(raw, emit, f"{text} form=prefix", window, [("TEXT", prefix)], "prefix_hits")
+    _count(raw, emit, f"{text} form=middle", window, [("TEXT", middle)], "middle_hits")
+    _count(raw, emit, f"s2_subject: folder={role} form=word", window, [("SUBJECT", w1)])
+    _count(raw, emit, f"s2_subject: folder={role} form=middle", window, [("SUBJECT", middle)])
+    if words.sender is None:
+        emit(f"s2_from: folder={role} skipped=no_input")
+        return
+    _count(raw, emit, f"s2_from: folder={role} form=word", window, [("FROM", words.sender)])
+    _count(raw, emit, f"s2_from: folder={role} form=middle", window, [("FROM", words.sender[_FRAGMENT_MIDDLE])])
+
+
+def _s3(raw: Any, role: str, window: bytes, words: SearchWords, emit: Callable[[str], None]) -> None:
+    """Does Gmail read its own operators inside a quoted value? The counts decide; the hint is a convenience."""
+    w1, w2 = words.w1, words.w2
+    text, subject = f"s3_text: folder={role}", f"s3_subject: folder={role}"
+    in_anywhere = _count(raw, emit, f"{text} form=in_anywhere", window, [("TEXT", "in:anywhere")])
+    _count(raw, emit, f"{text} form=anywhere", window, [("TEXT", "anywhere")])
+    negated = _count(raw, emit, f"{text} form=neg_w1", window, [("TEXT", f"-{w1}")])
+    plain = _count(raw, emit, f"{text} form=w1", window, [("TEXT", w1)])
+    _count(raw, emit, f"{text} form=or", window, [("TEXT", "OR")])
+    either = _count(raw, emit, f"{subject} form=or_w1_w2", window, [("SUBJECT", f"{w1} OR {w2}")])
+    _count(raw, emit, f"{subject} form=neg_w1", window, [("SUBJECT", f"-{w1}")])
+    only1 = _count(raw, emit, f"{subject} form=w1", window, [("SUBJECT", w1)])
+    only2 = _count(raw, emit, f"{subject} form=w2", window, [("SUBJECT", w2)])
+    total: list[int] = []
+
+    def whole_window() -> None:
+        total.append(len(_round_guard(raw).search(window)))
+        emit(f"s3_window: folder={role} hits={total[0]}")
+
+    _guarded(f"s3_window: folder={role}", emit, whole_window)
+    complement = bool(total) and negated is not None and plain is not None and negated + plain == total[0]
+    union = (
+        either is not None and only1 is not None and only2 is not None and either > 0 and either >= max(only1, only2)
+    )
+    whole = bool(total) and in_anywhere is not None and in_anywhere == total[0]
+    emit(
+        f"s3_hint: folder={role} neg_complement={'yes' if complement else 'no'} or_union={'yes' if union else 'no'} "
+        f"in_anywhere_eq_window={'yes' if whole else 'no'}"
+    )
+
+
+def _hit_uids(raw: Any, emit: Callable[[str], None], name: str, window: bytes, pair: Pair) -> set[int] | None:
+    """One timed search on its own deadline, printed like `_count`: the hit UIDs, None after an error."""
+    result: list[set[int]] = []
+
+    def measure() -> None:
+        started = time.perf_counter()
+        hits = _round_guard(raw).search_values(window, [pair])
+        result.append(set(hits))
+        emit(f"{name} hits={len(hits)} ms={_ms(started)}")
+
+    _guarded(name, emit, measure)
+    return result[0] if result else None
+
+
+def _control(
+    raw: Any, window: bytes, emit: Callable[[str], None], from_hits: set[int] | None, subject_hits: set[int] | None
+) -> None:
+    """MF-R6: how many of the newest <= 500 window rows carry a utf-8 encoded word in From and in Subject, and how
+    many of the S6 hits lie in those rows (counts only, so the two are comparable)."""
+    started = time.perf_counter()
+    guard = _round_guard(raw)
+    in_window = set(guard.search(window))
+    uids = _newest(list(in_window), _CONTROL_UIDS)
+    rows = guard.fetch(uids, [_CONTROL_ITEM]) if uids else {}
+    encoded_from = encoded_subject = 0
+    for row in rows.values():
+        fields = _first_fields(header_bytes(row))
+        encoded_from += 1 if _ENCODED_WORD.search(fields.get("from", "")) else 0
+        encoded_subject += 1 if _ENCODED_WORD.search(fields.get("subject", "")) else 0
+    scanned = set(uids)
+
+    def inside(hits: set[int] | None) -> str:
+        return "na" if hits is None else str(len(hits & scanned))
+
+    emit(
+        f"s6_control: window_hits={len(in_window)} scanned={len(rows)} encoded_from={encoded_from} "
+        f"encoded_subject={encoded_subject} from_utf8_hits_in_scanned={inside(from_hits)} "
+        f"subject_encoded_hits_in_scanned={inside(subject_hits)} ms={_ms(started)}"
+    )
+
+
+def _literal_round(
+    raw: Any, name: str, window: bytes, word: str, emit: Callable[[str], None]
+) -> tuple[str, int | None]:
+    """One `SUBJECT <word>` through `search_values`: `status=ok|no|bad` and ms, never the word. Returns the status,
+    or `error` after any other failure (its class name only), with the hit count after `ok`. A refusal of the guard
+    is a probe bug and propagates."""
+    started = time.perf_counter()
+    try:
+        hits = len(_round_guard(raw).search_values(window, [("SUBJECT", word)]))
+    except ImapCommandRefused:
+        raise
+    except Exception as exc:
+        kind = imap_error_kind(exc)
+        if kind == "other":
+            emit(f"{name}: error={type(exc).__name__}")
+            return "error", None
+        code = f" code={'badcharset' if _BADCHARSET.search(str(exc)) else 'none'}" if kind == "no" else ""
+        emit(f"{name}: status={kind}{code} ms={_ms(started)}")
+        return kind, None
+    emit(f"{name}: status=ok hits={hits} ms={_ms(started)}")
+    return "ok", hits
+
+
+def search_rounds(
+    raw: Any, caps: frozenset[bytes], words: SearchWords, *, out: TextIO, today: date | None = None
+) -> None:
+    """S1-S8 on a logged-in `HubImapClient`; every search runs through its own GuardedImapClient and deadline."""
+    caps = frozenset(c.upper() for c in caps)
+
+    def emit(line: str) -> None:
+        print(line, file=out)
+
+    def flag(name: bytes) -> str:
+        return "yes" if name in caps else "no"
+
+    emit("--- result ---")
+    emit(
+        f"s1_capabilities: literal_plus={flag(b'LITERAL+')} literal_minus={flag(b'LITERAL-')} "
+        f"utf8_accept={flag(b'UTF8=ACCEPT')} enable={flag(b'ENABLE')}"
+    )
+    gmail = b"X-GM-EXT-1" in caps
+    day = today or datetime.now(UTC).date()
+    since = day - timedelta(days=_SEARCH_SINCE_DAYS)
+    window = imap_search.window_keys(since_day=since, before_day=None, unread_only=False)
+    folders: list[tuple[str, str]] = []
+    missing: list[str] = []
+
+    def discover() -> None:
+        found, absent = _search_folders(_round_guard(raw), gmail)
+        folders.extend(found)
+        missing.extend(absent)
+
+    if not _guarded("search_folders", emit, discover):
+        return
+    for role in missing:
+        emit(f"s2_folder: role={role} skipped=not_found")
+    for role, mailbox in folders:
+        if not _examine(raw, emit, f"s2_examine: folder={role}", mailbox):
+            continue
+        _s2(raw, role, window, words, emit)
+        if gmail:
+            _s3(raw, role, window, words, emit)
+    if not gmail:
+        emit("s3_gmail: skipped=not_gmail")
+
+    if _examine(raw, emit, "s6_examine", _INBOX):  # S6 and S7 on the inbox; the loop above may have ended elsewhere
+        from_hits = _hit_uids(raw, emit, "s6_raw_match: form=from_utf8", window, ("FROM", "utf-8"))
+        subject_hits = _hit_uids(raw, emit, "s6_raw_match: form=subject_encoded", window, ("SUBJECT", "=?utf"))
+        _guarded("s6_control", emit, lambda: _control(raw, window, emit, from_hits, subject_hits))
+        _count(raw, emit, "s7_text: form=phrase", window, [("TEXT", f"{words.w1} {words.w2}")])
+        two_keys = _count(raw, emit, "s7_text: form=two_keys", window, [("TEXT", words.w1), ("TEXT", words.w2)])
+        if two_keys is not None:
+            emit(f"s7_hint: decisive={'yes' if two_keys > 0 else 'no'}")
+
+    all_mail = dict(folders).get("all_mail")
+    if not gmail:
+        emit("s8_to_cc: skipped=not_gmail")
+    elif words.cc is None:
+        emit("s8_to_cc: skipped=no_input")
+    elif all_mail is None:
+        emit("s8_to_cc: skipped=no_all_mail_mailbox")
+    elif _examine(raw, emit, "s8_examine", all_mail):
+        _count(raw, emit, "s8_to_cc: folder=all_mail", window, [("TO", words.cc)])
+
+    # S4 and S5 last: a literal the server refuses can leave the connection unusable.
+    if words.foreign is None:
+        emit("s4_literal: skipped=no_input")
+        emit("s5_upper: skipped=no_input")
+    elif _examine(raw, emit, "s4_examine", _INBOX):
+        status, hits = _literal_round(raw, "s4_literal", window, words.foreign, emit)
+        upper = words.foreign.upper()
+        if status != "ok":
+            emit("s5_upper: skipped=after_refusal")
+        elif upper == words.foreign:
+            emit("s5_upper: skipped=no_case_change")
+        else:
+            status, upper_hits = _literal_round(raw, "s5_upper", window, upper, emit)
+            if status == "ok":
+                emit(f"s5_upper: same_hits_as_s4={'yes' if upper_hits == hits else 'no'}")
+
+
 _HELP: Final = """\
 Run by the owner, on their own machine, in the repository directory:
   uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds
   uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds
-The username and the app-specific password are asked for at a prompt; nothing is stored or changed.
-Share only the part after the line "--- result ---".
+  uv run python scripts/imap_probe.py --host imap.mail.me.com --search-rounds
+  uv run python scripts/imap_probe.py --host imap.gmail.com --search-rounds
+The username and the app-specific password are asked for at a prompt (--search-rounds also asks for words at hidden
+prompts); nothing is stored or changed. Share only the part after the line "--- result ---".
 
-Read-only IMAP folder and search probe (O35); --status-rounds runs the get_message_status rounds P1-P7 instead.
+Read-only IMAP folder and search probe (O35); --status-rounds runs the get_message_status rounds P1-P7 instead,
+--search-rounds the search_messages rounds S1-S8 (WP13d).
 """
+
+
+def _ask(prompt: str, check: Callable[[str], str], *, optional: bool) -> str | None:
+    """A hidden prompt, up to three attempts; a refusal prints only its fixed text. An empty answer skips an optional
+    word. ValueError after the last refusal."""
+    for attempt in range(_PROMPT_ATTEMPTS):
+        answer = getpass.getpass(prompt)
+        if optional and not answer:
+            return None
+        try:
+            return check(answer)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            if attempt == _PROMPT_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")
+
+
+def _read_words() -> SearchWords:
+    def need(number: int) -> str:
+        word = _ask(
+            f"Word {number} (ASCII, 7+ letters, in the same inbox mail of the last 30 days as the other words, "
+            "not next to each other; not shown): ",
+            ascii_word,
+            optional=False,
+        )
+        if word is None:  # `optional=False` never skips
+            raise ValueError(_WORD_REFUSED)
+        return word
+
+    w1, w2, w3 = need(1), need(2), need(3)
+    return SearchWords(
+        w1,
+        w2,
+        w3,
+        sender=_ask("Sender local part, 7+ characters (Enter to skip; not shown): ", sender_part, optional=True),
+        foreign=_ask(
+            "Word with a non-ASCII letter in the subject of an inbox mail of the last 30 days "
+            "(Enter to skip; not shown): ",
+            foreign_word,
+            optional=True,
+        ),
+        cc=_ask(
+            "Address fragment that appears only in Cc, Gmail (Enter to skip; not shown): ", cc_fragment, optional=True
+        ),
+    )
+
+
+def _search_main(host: str, username: str, password: str) -> int:
+    try:
+        words = _read_words()
+    except ValueError:  # the refusal text is already printed
+        return 2
+    raw = HubImapClient(host, port=PORT, ssl=True, ssl_context=ssl.create_default_context(), timeout=SOCKET_TIMEOUT)
+    session = _round_guard(raw)
+    try:
+        session.login(username, password)
+        search_rounds(raw, session.capabilities(), words, out=sys.stdout)
+    finally:
+        with contextlib.suppress(Exception):  # best-effort logout
+            session.logout()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -935,8 +1339,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-folders", type=int, default=30)
     parser.add_argument("--text-word", default="the")
     parser.add_argument("--show-names", action="store_true")
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--status-rounds", action="store_true", help="run P1-P7 through the hub's guard instead of the O35 rounds"
+    )
+    modes.add_argument(
+        "--search-rounds", action="store_true", help="run S1-S8 (search_messages) through the hub's guard and client"
     )
     args = parser.parse_args(argv)
     if args.host not in ALLOWED_HOSTS:
@@ -945,6 +1353,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         username = getpass.getpass("Username: ")
         password = getpass.getpass("Password (app-specific): ")
+        if args.search_rounds:
+            return _search_main(args.host, username, password)
         raw = IMAPClient(
             args.host, port=PORT, ssl=True, ssl_context=ssl.create_default_context(), timeout=SOCKET_TIMEOUT
         )

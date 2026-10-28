@@ -1,3 +1,8 @@
+---
+paths:
+  - "**/*.md"
+---
+
 # Documentation Files — Purpose & Owner
 
 | File | Audience | Covers |

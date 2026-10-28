@@ -1067,3 +1067,565 @@ def test_help_starts_with_owner_usage(capsys: pytest.CaptureFixture[str]) -> Non
     assert "uv run python scripts/imap_probe.py --host imap.mail.me.com --status-rounds" in out
     assert "uv run python scripts/imap_probe.py --host imap.gmail.com --status-rounds" in out
     assert out.index("Run by the owner") < out.index("--status-rounds  ")  # the usage block comes before the options
+
+
+# --- WP13d T9: search rounds -------------------------------------------------------------------------------------
+
+_SEARCH_TODAY = date(2026, 10, 27)
+_SEARCH_SINCE = (_SEARCH_TODAY - timedelta(days=30)).strftime("%d-%b-%Y")  # C locale in tests
+_W1, _W2, _W3 = "tomatoes", "cucumbers", "zucchinis"
+_SENDER, _FOREIGN, _CC = "gardenerjoe", "Überraschung", "hiddencc"
+_SEARCH_COMMANDS = {"CAPABILITY", "LIST", "EXAMINE", "SEARCH", "FETCH"}
+_CONTROL_ITEM = "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>"
+_SECRETS = (_W1, _W2, _W3, _SENDER, _FOREIGN, _FOREIGN.upper(), _CC, "tomat", "mato", "omat", "gardene", "rdene")
+
+
+def _words(**kwargs: Any) -> Any:
+    values: dict[str, Any] = {"w1": _W1, "w2": _W2, "w3": _W3, "sender": _SENDER, "foreign": _FOREIGN, "cc": _CC}
+    return probe_mod.SearchWords(**{**values, **kwargs})
+
+
+@dataclass
+class SMsg:
+    uid: int
+    subject: str = ""
+    sender: str = ""
+    to: str = ""
+    text: str = ""
+    raw_from: str | None = None  # the raw header field the control FETCH sees
+    raw_subject: str | None = None
+
+
+_Q = re.compile(r'(TEXT|FROM|TO|SUBJECT) "([^"]*)"')
+
+
+class SearchStub:
+    """A raw client for the search rounds: substring matching on quoted values, a literal path via
+    `_raw_command_untagged`, and a recording of every command. Header text never leaves the stub except through
+    the control FETCH."""
+
+    def __init__(
+        self,
+        mailboxes: dict[str, list[SMsg]],
+        folders: list[Folder],
+        capabilities: tuple[bytes, ...] = (b"IMAP4REV1", b"SPECIAL-USE", b"LITERAL+"),
+    ) -> None:
+        self.mailboxes, self.folders, self.caps = mailboxes, folders, capabilities
+        self.commands: list[tuple[str, str]] = []
+        self.literal_args: list[list[bytes]] = []
+        self.selected = ""
+        self.use_uid = False
+        self.folder_encode = True
+        self.normalise_times = True
+        self.literal_error: Exception | None = None
+        self.search_error: tuple[str, Exception] | None = None
+
+    def socket(self) -> "SearchStub":
+        return self
+
+    def settimeout(self, value: float) -> None:
+        pass
+
+    def capabilities(self) -> tuple[bytes, ...]:
+        self.commands.append(("CAPABILITY", ""))
+        return self.caps
+
+    def login(self, username: str, password: str) -> bytes:
+        self.commands.append(("LOGIN", ""))
+        return b"OK"
+
+    def list_folders(self, directory: str = "", pattern: str = "*") -> list[Folder]:
+        self.commands.append(("LIST", ""))
+        return self.folders
+
+    def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, object]:
+        self.commands.append(("EXAMINE" if readonly else "SELECT", folder))
+        self.selected = folder
+        return {b"UIDVALIDITY": 1}
+
+    def _match(self, rows: list[SMsg], pairs: list[tuple[str, str]]) -> list[int]:
+        fields = {"TEXT": "text", "FROM": "sender", "TO": "to", "SUBJECT": "subject"}
+        hits = [m for m in rows if all(value.lower() in str(getattr(m, fields[key])).lower() for key, value in pairs)]
+        return [m.uid for m in hits]
+
+    def search(self, criteria: Any) -> list[int]:
+        text = criteria.decode() if isinstance(criteria, bytes) else str(criteria)
+        self.commands.append(("SEARCH", text))
+        if self.search_error is not None and self.search_error[0] in text:
+            raise self.search_error[1]
+        return self._match(self.mailboxes.get(self.selected, []), _Q.findall(text))
+
+    def has_capability(self, capability: str | bytes) -> bool:
+        return False  # the production client class never announces LITERAL+ to its literal sender (D82)
+
+    def _raw_command_untagged(self, command: bytes, args: list[bytes], uid: bool = False) -> list[Any]:
+        self.commands.append(("SEARCH", "literal"))
+        self.literal_args.append(list(args))
+        if self.literal_error is not None:
+            raise self.literal_error
+        key, value = args[3].decode(), args[4].decode("utf-8")
+        rows = self.mailboxes.get(self.selected, [])
+        return [" ".join(str(u) for u in self._match(rows, [(key, value)])).encode()]
+
+    def fetch(self, messages: Any, data: Any) -> dict[int, dict[bytes, object]]:
+        items = list(data)
+        self.commands.append(("FETCH", " ".join(items)))
+        by_uid = {m.uid: m for m in self.mailboxes.get(self.selected, [])}
+        out: dict[int, dict[bytes, object]] = {}
+        for uid in messages:
+            m = by_uid[uid]
+            block = f"From: {m.raw_from or m.sender}\r\nSubject: {m.raw_subject or m.subject}\r\n\r\n"
+            out[uid] = {b"BODY[HEADER.FIELDS (FROM SUBJECT)]<0>": block.encode()}
+        return out
+
+    def logout(self) -> bytes:
+        self.commands.append(("LOGOUT", ""))
+        return b"OK"
+
+    def add_flags(self, *args: object) -> None:
+        raise AssertionError("write reached the client")
+
+    move = append = expunge = gmail_search = set_flags = add_flags
+
+
+def _inbox_msgs() -> list[SMsg]:
+    return [
+        SMsg(1, f"{_W1} soup", f"{_SENDER}@example.test", text=f"{_W1} {_W2}", raw_from="=?UTF-8?B?Zm9v?= <a@b.test>"),
+        SMsg(2, "hello", "other@example.test", text=f"{_W2} {_W3}", raw_subject="=?utf-8?q?caf=C3=A9?="),
+        SMsg(3, f"{_FOREIGN} today", "third@example.test", text="plain", to=f"{_CC}@example.test"),
+        SMsg(4, "none", "fourth@example.test", text=f"{_W2} {_W1} {_W3}"),
+    ]
+
+
+def _icloud_search_stub() -> SearchStub:
+    folders: list[Folder] = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\Sent",), b"/", "Sent Messages"),
+        ((b"\\Archive",), b"/", "Archive"),
+        ((b"\\Trash",), b"/", "Deleted Messages"),
+        ((b"\\Junk",), b"/", "Junk"),
+    ]
+    mailboxes = {"INBOX": _inbox_msgs(), "Sent Messages": _inbox_msgs()[:2], "Archive": _inbox_msgs()[2:]}
+    return SearchStub(mailboxes, folders)
+
+
+def _gmail_search_stub() -> SearchStub:
+    folders: list[Folder] = [
+        ((), b"/", "INBOX"),
+        ((b"\\HasChildren", b"\\Noselect"), b"/", "[Gmail]"),
+        ((b"\\All",), b"/", "[Gmail]/All Mail"),
+        ((b"\\Sent",), b"/", "[Gmail]/Sent Mail"),
+    ]
+    mailboxes = {"INBOX": _inbox_msgs()[:3], "[Gmail]/All Mail": _inbox_msgs()}
+    return SearchStub(mailboxes, folders, (b"IMAP4REV1", b"X-GM-EXT-1", b"LITERAL-", b"UTF8=ACCEPT", b"ENABLE"))
+
+
+def _search_run(stub: SearchStub, words: Any = None) -> str:
+    out = io.StringIO()
+    probe_mod.search_rounds(stub, frozenset(stub.caps), words or _words(), out=out, today=_SEARCH_TODAY)
+    return out.getvalue()
+
+
+def _searches(stub: SearchStub) -> list[tuple[str, str]]:
+    """(folder, criteria) of every UID SEARCH."""
+    selected = ""
+    found: list[tuple[str, str]] = []
+    for command, argument in stub.commands:
+        if command == "EXAMINE":
+            selected = argument
+        elif command == "SEARCH":
+            found.append((selected, argument))
+    return found
+
+
+@pytest.mark.parametrize("word", ["short", "tomato", "Überraschung", "tomato-es", "with space", "tomatoes1", ""])
+def test_s2_words_need_seven_ascii_letters(word: str) -> None:
+    with pytest.raises(ValueError, match=r"^word refused: use at least 7 ASCII letters$") as refused:
+        probe_mod.ascii_word(word)
+    assert word not in str(refused.value) or word == ""
+    assert probe_mod.ascii_word("tomatoes") == "tomatoes"
+
+
+def test_other_inputs_have_fixed_refusals() -> None:
+    for call, bad_value in (
+        (probe_mod.sender_part, "short"),
+        (probe_mod.sender_part, 'has"quote123'),
+        (probe_mod.foreign_word, "ascii-only"),
+        (probe_mod.foreign_word, "Übe\x07rraschung"),
+        (probe_mod.foreign_word, "Ü" * 300),
+        (probe_mod.cc_fragment, "abc"),
+        (probe_mod.cc_fragment, "has space"),
+    ):
+        with pytest.raises(ValueError, match=r"refused: ") as refused:
+            call(bad_value)
+        assert bad_value not in str(refused.value)
+    assert probe_mod.sender_part("gardener.joe") == "gardener.joe"
+    assert probe_mod.foreign_word("Überraschung") == "Überraschung"
+    assert probe_mod.cc_fragment("hidden@cc") == "hidden@cc"
+
+
+def test_search_rounds_shape_icloud() -> None:
+    stub = _icloud_search_stub()
+    out = _search_run(stub)
+    assert out.startswith(
+        "--- result ---\ns1_capabilities: literal_plus=yes literal_minus=no utf8_accept=no enable=no\n"
+    )
+    for line in out.splitlines()[1:]:
+        assert re.fullmatch(r"[a-z0-9_]+: .+", line), line
+    for role in ("inbox", "sent", "archive"):
+        assert re.search(rf"^s2_text: folder={role} form=word hits=\d+ ms=\d+$", out, re.M)
+    assert re.search(r"^s2_text: folder=inbox form=three_keys hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_text: folder=inbox form=word hits=2 ms=\d+$", out, re.M)  # tomatoes: messages 1
+    assert 4
+    assert re.search(r"^s2_text: folder=inbox form=prefix prefix_hits=2 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_text: folder=inbox form=middle middle_hits=2 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_subject: folder=inbox form=word hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_subject: folder=inbox form=middle hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_from: folder=inbox form=word hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s2_from: folder=inbox form=middle hits=1 ms=\d+$", out, re.M)
+    assert "s3_" not in out.replace("s3_gmail: skipped=not_gmail", "")
+    assert "s3_gmail: skipped=not_gmail" in out
+    assert "s8_to_cc: skipped=not_gmail" in out
+    assert "Trash" not in str(stub.commands)
+    assert "Junk" not in str(stub.commands)
+
+
+def test_search_rounds_print_no_word_name_or_header_text() -> None:
+    for stub in (_icloud_search_stub(), _gmail_search_stub()):
+        out = _search_run(stub)
+        lowered = out.lower()
+        for secret in (*_SECRETS, "example.test", "soup", "sent messages", "all mail", "=?"):
+            assert secret.lower() not in lowered, secret
+    assert out.count("\n") > 20
+
+
+def test_search_rounds_only_read_only_allowlisted_commands() -> None:
+    for stub in (_icloud_search_stub(), _gmail_search_stub()):
+        _search_run(stub)
+        assert {command for command, _ in stub.commands} <= _SEARCH_COMMANDS
+        assert all(b"X-GM-RAW" not in argument.upper().encode() for _, argument in stub.commands)
+        fetches = [argument for command, argument in stub.commands if command == "FETCH"]
+        assert fetches
+        assert set(fetches) == {_CONTROL_ITEM}
+        for _, criteria in _searches(stub):
+            assert criteria in ("literal",) or criteria.startswith(f"NOT DRAFT SINCE {_SEARCH_SINCE}")
+
+
+def test_s2_criteria_keys_and_fragments() -> None:
+    stub = _icloud_search_stub()
+    _search_run(stub)
+    inbox = [criteria for folder, criteria in _searches(stub) if folder == "INBOX"]
+    base = f"NOT DRAFT SINCE {_SEARCH_SINCE}"
+    assert f'{base} TEXT "{_W1}"' in inbox
+    assert f'{base} TEXT "{_W1}" TEXT "{_W2}" TEXT "{_W3}"' in inbox
+    assert f'{base} TEXT "toma"' in inbox  # first four letters
+    assert f'{base} TEXT "mato"' in inbox  # letters 3 to 6
+    assert f'{base} SUBJECT "{_W1}"' in inbox
+    assert f'{base} SUBJECT "mato"' in inbox
+    assert f'{base} FROM "{_SENDER}"' in inbox
+    assert f'{base} FROM "rden"' in inbox
+
+
+def test_gmail_search_rounds_probe_operators_inside_text_and_subject() -> None:
+    stub = _gmail_search_stub()
+    out = _search_run(stub)
+    assert "literal_minus=yes utf8_accept=yes enable=yes" in out
+    base = f"NOT DRAFT SINCE {_SEARCH_SINCE}"
+    for folder, role in (("INBOX", "inbox"), ("[Gmail]/All Mail", "all_mail")):
+        criteria = [c for f, c in _searches(stub) if f == folder]
+        for expected in (
+            f'{base} TEXT "in:anywhere"',
+            f'{base} TEXT "anywhere"',
+            f'{base} TEXT "-{_W1}"',
+            f'{base} TEXT "{_W1}"',
+            f'{base} TEXT "OR"',
+            f'{base} SUBJECT "{_W1} OR {_W2}"',
+            f'{base} SUBJECT "-{_W1}"',
+            f'{base} SUBJECT "{_W1}"',
+            f'{base} SUBJECT "{_W2}"',
+            base,
+        ):
+            assert expected in criteria, (folder, expected)
+        for form in ("in_anywhere", "anywhere", "neg_w1", "w1", "or"):
+            assert re.search(rf"^s3_text: folder={role} form={form} hits=\d+ ms=\d+$", out, re.M), (role, form)
+        for form in ("or_w1_w2", "neg_w1", "w1", "w2"):
+            assert re.search(rf"^s3_subject: folder={role} form={form} hits=\d+ ms=\d+$", out, re.M), (role, form)
+        assert re.search(rf"^s3_window: folder={role} hits=\d+$", out, re.M)
+        assert re.search(
+            rf"^s3_hint: folder={role} neg_complement=(yes|no) or_union=(yes|no) in_anywhere_eq_window=(yes|no)$",
+            out,
+            re.M,
+        )
+    assert "s2_text: folder=all_mail " in out
+    assert "folder=sent" not in out  # Gmail: All Mail and INBOX
+
+
+def test_s6_counts_encoded_headers_without_printing_them() -> None:
+    stub = _icloud_search_stub()
+    out = _search_run(stub)
+    assert re.search(r"^s6_raw_match: form=from_utf8 hits=0 ms=\d+$", out, re.M)
+    assert re.search(r"^s6_raw_match: form=subject_encoded hits=0 ms=\d+$", out, re.M)
+    assert re.search(
+        r"^s6_control: window_hits=4 scanned=4 encoded_from=1 encoded_subject=1 "
+        r"from_utf8_hits_in_scanned=0 subject_encoded_hits_in_scanned=0 ms=\d+$",
+        out,
+        re.M,
+    )
+    sent_to_fetch = [argument for command, argument in stub.commands if command == "FETCH"]
+    assert sent_to_fetch == [_CONTROL_ITEM]
+
+
+def test_s6_control_scans_at_most_500_newest_uids() -> None:
+    stub = _icloud_search_stub()
+    stub.mailboxes["INBOX"] = [SMsg(uid, "x", "y@z.test") for uid in range(1, 701)]
+    out = _search_run(stub)
+    assert re.search(r"^s6_control: window_hits=700 scanned=500 encoded_from=0 encoded_subject=0 ", out, re.M)
+
+
+def test_s7_phrase_against_two_keys() -> None:
+    stub = _icloud_search_stub()
+    out = _search_run(stub)
+    base = f"NOT DRAFT SINCE {_SEARCH_SINCE}"
+    inbox = [criteria for folder, criteria in _searches(stub) if folder == "INBOX"]
+    assert f'{base} TEXT "{_W1} {_W2}"' in inbox
+    assert f'{base} TEXT "{_W1}" TEXT "{_W2}"' in inbox
+    assert re.search(r"^s7_text: form=phrase hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s7_text: form=two_keys hits=2 ms=\d+$", out, re.M)
+
+
+def test_s8_asks_whether_to_covers_cc_on_gmail_only() -> None:
+    stub = _gmail_search_stub()
+    out = _search_run(stub)
+    assert f'NOT DRAFT SINCE {_SEARCH_SINCE} TO "{_CC}"' in [c for f, c in _searches(stub) if f == "[Gmail]/All Mail"]
+    assert re.search(r"^s8_to_cc: folder=all_mail hits=1 ms=\d+$", out, re.M)
+    assert "s8_to_cc: skipped=no_input" in _search_run(_gmail_search_stub(), _words(cc=None))
+
+
+def test_s4_s5_use_the_literal_path_and_run_last() -> None:
+    stub = _icloud_search_stub()
+    out = _search_run(stub)
+    assert re.search(r"^s4_literal: status=ok hits=1 ms=\d+$", out, re.M)
+    assert re.search(r"^s5_upper: status=ok hits=1 ms=\d+$", out, re.M)
+    assert "s5_upper: same_hits_as_s4=yes\n" in out
+    args = stub.literal_args
+    assert len(args) == 2
+    assert args[0][:2] == [b"CHARSET", b"UTF-8"]
+    assert args[0][3:] == [b"SUBJECT", _FOREIGN.encode()]
+    assert args[1][3:] == [b"SUBJECT", _FOREIGN.upper().encode()]
+    assert out.index("s6_control") < out.index("s4_literal") < out.index("s5_upper")
+    assert out.index("s8_to_cc") < out.index("s4_literal")
+
+
+def test_s4_without_a_foreign_word_is_skipped() -> None:
+    stub = _icloud_search_stub()
+    out = _search_run(stub, _words(foreign=None))
+    assert "s4_literal: skipped=no_input" in out
+    assert "s5_upper: skipped=no_input" in out
+    assert stub.literal_args == []
+
+
+@pytest.mark.parametrize(
+    ("raised", "status"),
+    [
+        (imaplib.IMAP4.error("SEARCH command error: BAD [BADCHARSET] nope"), "bad"),
+        (imaplib.IMAP4.error("SEARCH command error: NO [BADCHARSET] nope"), "no"),
+    ],
+)
+def test_s4_refusal_reports_the_status_and_skips_s5(raised: Exception, status: str) -> None:
+    stub = _icloud_search_stub()
+    stub.literal_error = raised
+    out = _search_run(stub)
+    assert re.search(rf"^s4_literal: status={status}(?: code=\w+)? ms=\d+$", out, re.M)
+    assert "s5_upper: skipped=after_refusal" in out
+    assert len(stub.literal_args) == 1
+    assert "nope" not in out
+    assert "BADCHARSET" not in out
+
+
+def test_s4_upper_case_that_changes_nothing_is_skipped() -> None:
+    out = _search_run(_icloud_search_stub(), _words(foreign="ÄÖÜÄÖÜÄ"))
+    assert "s5_upper: skipped=no_case_change" in out
+
+
+def test_a_failing_search_is_reported_by_class_and_the_next_round_runs() -> None:
+    stub = _icloud_search_stub()
+    stub.search_error = (f'TEXT "{_W1}" TEXT', TimeoutError("secret text"))
+    out = _search_run(stub)
+    assert re.search(r"^s2_text: folder=inbox form=three_keys error=TimeoutError$", out, re.M)
+    assert "secret text" not in out
+    assert re.search(r"^s2_text: folder=inbox form=middle middle_hits=2 ms=\d+$", out, re.M)
+
+
+def test_s4_matches_the_wire_with_a_synchronising_literal_on_a_literal_plus_server() -> None:
+    from tests.support.imap_wire import WireRecorder, hub_client
+
+    with WireRecorder() as recorder:
+        raw = hub_client(recorder)
+        raw.login("u", "p")
+        raw.select_folder("INBOX", readonly=True)
+        lines: list[str] = []
+        probe_mod._literal_round(
+            raw, "s4_literal", probe_mod.imap_search.criteria(b"NOT DRAFT"), _FOREIGN, lines.append
+        )
+        raw.logout()
+    sent = [line for line in recorder.lines if b"SEARCH" in line]
+    assert len(sent) == 1
+    assert re.search(rb"\{\d+\}", sent[0])
+    assert recorder.literals == [_FOREIGN.encode()]
+    assert not re.search(rb"\{\d+\+\}", b" ".join(recorder.lines))
+    assert not recorder.early_bytes
+    assert lines
+    assert lines[0].startswith("s4_literal: status=ok hits=0 ms=")
+
+
+def test_the_probe_builds_the_hub_client_class() -> None:
+    from mcp_hub.providers.imap import HubImapClient
+
+    assert probe_mod.HubImapClient is HubImapClient
+
+
+def _main_search(
+    monkeypatch: pytest.MonkeyPatch, stub: SearchStub, answers: list[str], *, host: str = "imap.mail.me.com"
+) -> tuple[int, list[str]]:
+    built: list[str] = []
+    prompts: list[str] = []
+    replies = iter(answers)
+
+    def factory(*args: Any, **kwargs: Any) -> SearchStub:
+        built.append("hub")
+        return stub
+
+    def fake_getpass(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return next(replies)
+
+    monkeypatch.setattr(probe_mod, "HubImapClient", factory)
+    monkeypatch.setattr(probe_mod, "IMAPClient", lambda *a, **k: pytest.fail("plain IMAPClient used"))
+    monkeypatch.setattr(probe_mod.getpass, "getpass", fake_getpass)
+    return probe_mod.main(["--host", host, "--search-rounds"]), prompts
+
+
+def test_search_rounds_main_prompts_hides_the_words_and_uses_the_hub_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub = _icloud_search_stub()
+    answers = ["user", "pw", _W1, _W2, _W3, _SENDER, _FOREIGN, ""]
+    code, prompts = _main_search(monkeypatch, stub, answers)
+    assert code == 0
+    assert len(prompts) == 8
+    commands = [command for command, _ in stub.commands]
+    assert commands[:3] == ["LOGIN", "CAPABILITY", "LIST"]
+    assert commands[-1] == "LOGOUT"
+    captured = capsys.readouterr()
+    assert captured.out.startswith("--- result ---\ns1_capabilities: ")
+    assert captured.err == ""
+    for secret in (*_SECRETS, "pw"):
+        assert secret.lower() not in (captured.out + captured.err + " ".join(prompts)).lower()
+    assert "s8_to_cc: skipped=not_gmail" in captured.out
+
+
+def test_search_rounds_main_refuses_a_short_word_before_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub = _icloud_search_stub()
+    code, _ = _main_search(monkeypatch, stub, ["user", "pw", "tiny", "tiny", "tiny"])
+    assert code == 2
+    assert stub.commands == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("word refused: use at least 7 ASCII letters") == 3
+    assert "tiny" not in captured.err
+
+
+def test_search_rounds_login_failure_prints_class_name_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Refusing(SearchStub):
+        def login(self, username: str, password: str) -> bytes:
+            raise LoginError("[AUTHENTICATIONFAILED] user@example.test")
+
+    stub = Refusing({}, [])
+    code, _ = _main_search(monkeypatch, stub, ["user", "pw", _W1, _W2, _W3, "", "", ""])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err == "error: LoginError\n"
+    assert captured.out == ""
+
+
+def test_search_rounds_and_status_rounds_exclude_each_other(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        probe_mod.main(["--host", "imap.gmail.com", "--search-rounds", "--status-rounds"])
+    assert exit_info.value.code == 2
+
+
+def test_help_names_the_search_rounds(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        probe_mod.main(["--help"])
+    out = capsys.readouterr().out
+    assert "uv run python scripts/imap_probe.py --host imap.mail.me.com --search-rounds" in out
+    assert "uv run python scripts/imap_probe.py --host imap.gmail.com --search-rounds" in out
+
+
+def test_icloud_archive_without_a_special_use_flag_is_found_by_name() -> None:
+    stub = _icloud_search_stub()
+    stub.folders = [
+        (tuple(f for f in flags if f != b"\\Archive" and f != b"\\Sent"), d, n) for flags, d, n in stub.folders
+    ]
+    out = _search_run(stub)
+    for role in ("sent", "archive"):
+        assert re.search(rf"^s2_text: folder={role} form=word hits=\d+ ms=\d+$", out, re.M), role
+    assert "skipped=not_found" not in out
+
+
+def test_a_missing_role_prints_a_line() -> None:
+    stub = _icloud_search_stub()
+    stub.folders = [f for f in stub.folders if f[2] != "Archive"]
+    out = _search_run(stub)
+    assert "s2_folder: role=archive skipped=not_found\n" in out
+    assert "s2_folder: role=sent" not in out
+    assert "folder=archive" not in out
+
+
+def test_s6_control_counts_only_utf8_words_and_the_hits_in_the_scanned_rows() -> None:
+    stub = _icloud_search_stub()
+    rows = [SMsg(uid, "x", "y@z.test", raw_from="=?iso-8859-1?Q?caf=E9?= <a@b.test>") for uid in range(1, 601)]
+    rows[0] = SMsg(1, "x", "utf-8 old", raw_from="=?UTF-8?B?Zm9v?= <a@b.test>")  # outside the newest 500
+    rows[599] = SMsg(600, "x", "utf-8 new", raw_from="=?utf-8?B?Zm9v?= <a@b.test>")
+    stub.mailboxes["INBOX"] = rows
+    out = _search_run(stub)
+    assert re.search(r"^s6_raw_match: form=from_utf8 hits=2 ms=\d+$", out, re.M)
+    assert re.search(
+        r"^s6_control: window_hits=600 scanned=500 encoded_from=1 encoded_subject=0 "
+        r"from_utf8_hits_in_scanned=1 subject_encoded_hits_in_scanned=0 ms=\d+$",
+        out,
+        re.M,
+    )
+    assert "=?" not in out
+
+
+def test_s7_hint_says_when_the_two_keys_never_meet() -> None:
+    stub = _icloud_search_stub()
+    stub.mailboxes["INBOX"] = [SMsg(1, "a", "b@c.test", text=_W1), SMsg(2, "a", "b@c.test", text=_W2)]
+    assert "s7_hint: decisive=no\n" in _search_run(stub)
+    assert "s7_hint: decisive=yes\n" in _search_run(_icloud_search_stub())
+
+
+def test_s4_no_with_badcharset_is_told_apart_without_printing_the_text() -> None:
+    stub = _icloud_search_stub()
+    stub.literal_error = imaplib.IMAP4.error("SEARCH command error: NO [BADCHARSET (US-ASCII)] nope")
+    out = _search_run(stub)
+    assert re.search(r"^s4_literal: status=no code=badcharset ms=\d+$", out, re.M)
+    stub = _icloud_search_stub()
+    stub.literal_error = imaplib.IMAP4.error("SEARCH command error: NO nope")
+    assert re.search(r"^s4_literal: status=no code=none ms=\d+$", _search_run(stub), re.M)
+
+
+def test_prompts_tell_the_owner_where_the_words_must_occur(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts: list[str] = []
+    answers = iter(["tomatoes", "potatoes", "cucumber", "", "", ""])
+    monkeypatch.setattr(probe_mod.getpass, "getpass", lambda prompt="": (prompts.append(prompt), next(answers))[1])
+    probe_mod._read_words()
+    assert "inbox mail" in prompts[0]
+    assert "inbox mail" in prompts[1]
+    assert "not next to each other" in prompts[1]
+    assert "subject of an inbox mail" in prompts[4]

@@ -47,6 +47,16 @@ class GraphMessageRef:
     graph_id: str
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class SearchHitRef(GraphMessageRef):
+    """The regular (not immutable) id a Graph `$search` returned: an internal order key only (D87).
+
+    Never exposable: `location_id` gives None, so it is no `id` and no log `item`; it is never used for a request."""
+
+    def __repr__(self) -> str:
+        return "SearchHitRef(<internal>)"
+
+
 AnyMessageRef = MessageRef | GraphMessageRef
 ThreadSource = Literal["gmail", "graph", "headers", "subject"]
 _THREAD_SOURCES: Final = ("gmail", "graph", "headers", "subject")
@@ -126,12 +136,14 @@ def _location_parts(ref: AnyMessageRef) -> list[object]:
 
 
 def encode_message_id(ref: AnyMessageRef) -> str:
+    if isinstance(ref, SearchHitRef):
+        raise ValueError("a search hit reference is never an id")
     return _encode(_location_parts(ref))
 
 
 def location_id(ref: AnyMessageRef) -> str | None:
     """The MessageId, or None when the mailbox name fails `mailbox_name_ok` or the id would exceed 512 characters."""
-    if isinstance(ref, MessageRef) and not mailbox_name_ok(ref.folder):
+    if isinstance(ref, SearchHitRef) or (isinstance(ref, MessageRef) and not mailbox_name_ok(ref.folder)):
         return None
     value = _text(_location_parts(ref))
     return value if len(value) <= MAX_ID_LENGTH else None

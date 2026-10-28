@@ -10,7 +10,7 @@ import email.policy
 import imaplib
 import ssl
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from email.message import Message
 from email.parser import BytesHeaderParser
@@ -20,6 +20,7 @@ from typing import Final, Literal, cast
 import imapclient
 from imapclient.exceptions import LoginError
 
+from mcp_hub import search as _search  # the module: `search` imports providers.base, so a name import would cycle
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
 from mcp_hub.providers import imap_status, imap_thread
 from mcp_hub.providers.base import (
@@ -29,6 +30,7 @@ from mcp_hub.providers.base import (
     AttachmentMeta,
     Direction,
     FolderPage,
+    IncompleteReason,
     ListQuery,
     MailDetail,
     MailFlags,
@@ -36,6 +38,7 @@ from mcp_hub.providers.base import (
     MailSummary,
     MessageStatus,
     ProviderError,
+    SearchKey,
     StatusTarget,
     ThreadPage,
     ThreadQuery,
@@ -78,6 +81,7 @@ from mcp_hub.providers.imap_session import (
     _GMAIL_CANDIDATE_ITEM,
     _LABEL_INBOX,
     _LABEL_SENT,
+    FETCH_CHUNK_UIDS,
     MAX_SEARCH_CANDIDATES,
     SOFT_CHECK_EVERY,
     ImapSession,
@@ -97,6 +101,7 @@ from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS, _raise_bad
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.sanitize import html_to_text
 
+MAX_CANDIDATE_FROM_CHARS: Final = 320  # the From address kept per candidate (dedup key and direction)
 LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_HEADER_ITEM)  # §5.5 header sources
 SUMMARY_STRUCTURE_CHUNK_UIDS: Final = 2  # BODYSTRUCTURE lines per pass-2 UID FETCH (#44; chosen at merge, see the PR)
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
@@ -110,8 +115,21 @@ _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 ClientFactory = Callable[[str, int, ssl.SSLContext, float], ImapClientLike]
 
 
+class HubImapClient(imapclient.IMAPClient):  # type: ignore[misc]  # IMAPClient ships no type information
+    """IMAPClient that never announces `LITERAL+` to its own literal sender: the library asks `has_capability`
+    to choose between `{N+}` and `{N}` + wait for `+`, and a search value is third-party text. With `{N}` the
+    server must accept the command line before a single value byte is sent, so a server that rejects the line
+    early cannot read the value as a new command (D82). Every other capability answers as the library does."""
+
+    def has_capability(self, capability: str | bytes) -> bool:
+        name = capability.decode("ascii", "replace") if isinstance(capability, bytes) else capability
+        if name.upper() == "LITERAL+":
+            return False
+        return bool(super().has_capability(capability))
+
+
 def default_client(host: str, port: int, context: ssl.SSLContext, timeout: float) -> ImapClientLike:
-    return cast(ImapClientLike, imapclient.IMAPClient(host, port=port, ssl=True, ssl_context=context, timeout=timeout))
+    return cast(ImapClientLike, HubImapClient(host, port=port, ssl=True, ssl_context=context, timeout=timeout))
 
 
 def _provider_error(exc: Exception) -> ProviderError:
@@ -206,9 +224,45 @@ def _sent_since_pass_one(chosen: _Chosen, row: dict[bytes, object]) -> bool:
 
 @dataclass(slots=True)
 class _Progress:
+    """What the list pipeline lost on the way. `incomplete` names why (the search tool lists the reasons); `searching`
+    makes every loss also a truncation, which the list tools never had (their flags stay as they were)."""
+
     truncated: bool = False
     complete: bool = True
+    searching: bool = False
+    incomplete: set[IncompleteReason] = field(default_factory=set)
     stopped: bool = False  # pass 2 fetched no further chunks: the folders after it are not read
+
+    def refuse(self) -> None:
+        """The folder could not be searched (NO, no UIDVALIDITY, name too long): it counts as searched for the cursor
+        (D85)."""
+        self.complete = False
+        self.incomplete.add("search_refused")
+        self.truncated = self.truncated or self.searching
+
+    def lose(self, reason: IncompleteReason, *, truncated: bool = False) -> None:
+        self.complete = False
+        self.incomplete.add(reason)
+        self.truncated = self.truncated or truncated or self.searching
+
+    def stop(self) -> None:
+        """The soft limit or the reserve ended pass 2: what was read is the page, no cursor."""
+        self.lose("time_limit", truncated=True)
+        self.stopped = True
+
+    def cap(self) -> None:
+        self.truncated = True
+        self.incomplete.add("result_cap")
+
+    def page(self, items: list[MailSummary], more: bool, frontier: tuple[int, str] | None) -> FolderPage:
+        return FolderPage(
+            items=items,
+            more=more,
+            truncated=self.truncated,
+            complete=self.complete,
+            frontier=frontier,
+            incomplete=frozenset(self.incomplete),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +298,7 @@ class PassTwo:
     reduced: dict[int, Reduced]
     unparsable: Unparsable
     stop: Literal["reserve", "soft"] | None = None  # no further chunk was fetched: the page is truncated
+    asked: int = 0  # how many of the leading UIDs were fetched (the rest was not asked for after a stop)
 
 
 def _reduce(row: dict[bytes, object]) -> Reduced:
@@ -326,6 +381,7 @@ def _fetch_summaries(
             for uid, row in got.items():
                 result.reduced[uid] = _reduce(row)
                 result.rows[uid] = row
+            result.asked = start + len(chunk)
     except SoftStop:
         result.stop = "soft"
     return result
@@ -373,8 +429,10 @@ def _fetch_texts(
                 texts[uid] = ""
 
 
-def _soft_stopped_page() -> FolderPage:
-    return FolderPage(items=[], more=False, truncated=True, complete=False)
+def _soft_stopped_page(progress: _Progress | None = None) -> FolderPage:
+    """Nothing read past the stop; the reasons collected before it stay (D85)."""
+    reasons: set[IncompleteReason] = {"time_limit"} if progress is None else {*progress.incomplete, "time_limit"}
+    return FolderPage(items=[], more=False, truncated=True, complete=False, incomplete=frozenset(reasons))
 
 
 class ImapMailbox:
@@ -499,7 +557,7 @@ class ImapMailbox:
     def _list_messages(self, session: ImapSession, query: ListQuery) -> FolderPage:
         """Pass 1 searches every folder of the plan and keeps the candidates; the page is chosen from all of them
         (R3); pass 2 fetches the summaries of the chosen items per folder. A soft stop returns what was built."""
-        progress = _Progress()
+        progress = _Progress(searching=query.search is not None)
         candidates: list[Candidate] = []
         try:
             plans = self._plans(session, query.folder)
@@ -509,32 +567,26 @@ class ImapMailbox:
             for plan in plans:
                 candidates.extend(self._candidates(session, plan, query, merge, progress))
         except SoftStop:
-            return _soft_stopped_page()
+            return _soft_stopped_page(progress)
         chosen, more = self._choose(candidates, query, merge)
         built: dict[MessageRef, MailSummary] = {}
         try:
             for entry, group in _by_folder(plans, chosen):
                 self._soft_check()  # EXAMINE and FETCH of a further folder
                 if built and self._reserve_spent():  # the folders read so far are the page (no cursor)
-                    progress.truncated, progress.complete = True, False
+                    progress.stop()
                     break
                 self._summaries(session, entry, folder_of[entry.raw_name], group, progress, built)
                 if progress.stopped:
                     break
         except SoftStop:  # SA13: pass 2 incomplete, so the page gets no cursor; the items built so far are kept
-            progress.truncated, progress.complete = True, False
+            progress.lose("time_limit", truncated=True)
         returned = [c for c in chosen if c.ref in built]
         frontier: tuple[int, str] | None = None
         if more:  # the whole window was scanned: the account's items continue below its last returned item
             last = returned[-1] if returned else chosen[-1]
             frontier = last.key
-        return FolderPage(
-            items=[built[c.ref] for c in returned],
-            more=more,
-            truncated=progress.truncated,
-            complete=progress.complete,
-            frontier=frontier,
-        )
+        return progress.page([built[c.ref] for c in returned], more, frontier)
 
     @staticmethod
     def _plans(session: ImapSession, folder: ListFolder) -> list[FolderPlan]:
@@ -546,8 +598,12 @@ class ImapMailbox:
         self, session: ImapSession, plan: FolderPlan, query: ListQuery, merge: bool, progress: _Progress
     ) -> list[Candidate]:
         entry = plan.entry
+        values = _search_values(query, gmail=session.gmail)
+        if values is None:  # before any command: this account cannot search these words
+            progress.refuse()
+            return []
         if entry.raw_name != session.registry_inbox and not examine_name_ok(entry.raw_name):
-            progress.complete = False  # over 1,000 characters: the guard would refuse the EXAMINE
+            progress.refuse()  # over 1,000 characters: the guard would refuse the EXAMINE
             return []
         try:
             validity = session.examine(entry)
@@ -558,23 +614,24 @@ class ImapMailbox:
                 raise
             if entry.raw_name != session.registry_inbox and not session.listed and session.may_force_rebuild():
                 session.folder_map(refresh=True)  # one rebuild for the next call; this folder stays incomplete
-            progress.complete = False
+            progress.refuse()
             return []
         if validity is None:  # missing UIDVALIDITY on a folder other than the registry inbox (I11)
-            progress.complete = False
+            progress.refuse()
             return []
+        prefix = _criteria(plan, query, merge)
         try:
-            found = session.search(_criteria(plan, query, merge))
+            found = session.search_values(prefix, values) if values else session.search(prefix)
         except PASS_THROUGH:
             raise
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
-            progress.complete = False  # no cursor (S-p)
+            progress.refuse()  # a refused folder counts as searched for the cursor of a search (D85)
             return []
         newest = sorted(set(found), reverse=True)
         if len(newest) > MAX_SEARCH_CANDIDATES:
-            progress.truncated = True
+            progress.cap()
             newest = newest[:MAX_SEARCH_CANDIDATES]
         fields: list[Literal["MESSAGE-ID", "FROM"]] = []
         if merge:
@@ -583,30 +640,48 @@ class ImapMailbox:
             fields = ["FROM"]  # I13
         base = [*CANDIDATE_ITEMS, _GMAIL_CANDIDATE_ITEM] if session.gmail else list(CANDIDATE_ITEMS)
         items = [*base, candidate_header_item(fields)] if fields else base
-        rows = session.fetch(newest, items)
         # Gmail without `\All`: the `\Sent` mailbox also holds self-sent mail, which is `inbox` (§5.5); its labels
         # (fetched above) drop it here, as the label key `NOT X-GM-LABELS "\Inbox"` does in All Mail.
         sent_mailbox = session.gmail and plan.fixed_folder == "sent" and plan.gmail_labels is None
         out: list[Candidate] = []
-        for count, uid in enumerate(newest):
-            if count and count % SOFT_CHECK_EVERY == 0:
-                self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
-            row = rows.get(uid)
-            if row is None or _is_draft(row):  # FETCH NO, expunged meanwhile, or a draft (S1)
-                continue
-            if sent_mailbox and _LABEL_INBOX in _labels(row):
-                continue
-            received = _aware(row.get(b"INTERNALDATE"))
-            if received is None:
-                log_message_skipped(
-                    MessageRef(self._account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
-                )
-                continue
-            if received < query.since:
-                continue
-            message_id, sender = _candidate_headers(row) if fields else (None, None)
-            sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
-            out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
+        count = 0
+        # One chunk of rows at a time, each reduced to `Candidate`s before the next FETCH: pass 1 never holds the rows
+        # of all 5,000 candidates (header blocks of up to 2 KiB each).
+        ascending = sorted(newest)  # the order `fetch_chunks` asks in
+        number = 0  # not `enumerate`: it keeps its last (number, rows) tuple, and with it the chunk, alive
+        for rows in session.fetch_chunks(newest, items, chunk=FETCH_CHUNK_UIDS, soft_check=self._soft_check):
+            asked = ascending[number * FETCH_CHUNK_UIDS : (number + 1) * FETCH_CHUNK_UIDS]
+            if progress.searching and not rows.keys() >= set(asked):
+                # FETCH NO or expunged meanwhile: a search hit would vanish with no signal (D85); the list tools
+                # keep the silent drop
+                progress.lose("changed_during_call")
+            number += 1
+            for uid in reversed(asked):  # the UIDs asked for, never the keys the server sent (unsolicited FETCH rows)
+                row = rows.get(uid)
+                if row is None:  # FETCH NO or expunged meanwhile (counted above for a search)
+                    continue
+                if count and count % SOFT_CHECK_EVERY == 0:
+                    self._soft_check()  # header parsing costs CPU but sends no command the guard could stop
+                count += 1
+                if _is_draft(row):  # a draft (S1)
+                    continue
+                if sent_mailbox and _LABEL_INBOX in _labels(row):
+                    continue
+                received = _aware(row.get(b"INTERNALDATE"))
+                if received is None:
+                    log_message_skipped(
+                        MessageRef(self._account, entry.raw_name, validity, uid), "mail", MissingInternalDate()
+                    )
+                    continue
+                if received < query.since:
+                    continue
+                message_id, sender = _candidate_headers(row) if fields else (None, None)
+                if sender is not None:
+                    sender = sender[:MAX_CANDIDATE_FROM_CHARS]  # a hostile From must not cost memory per candidate
+                sent_label = session.gmail and _LABEL_SENT in _labels(row)  # Gmail direction before `limit` (C4)
+                out.append(Candidate(plan, validity, uid, received, message_id, sender, sent_label))
+            del rows  # the chunk is reduced; only `out` lives on
+        out.sort(key=lambda candidate: candidate.uid, reverse=True)  # newest UID first, as one FETCH would have
         return out
 
     def _choose(self, candidates: list[Candidate], query: ListQuery, merge: bool) -> tuple[list[_Chosen], bool]:
@@ -675,10 +750,10 @@ class ImapMailbox:
             except imaplib.IMAP4.error as exc:
                 if not _answered_no(exc):
                     raise
-                progress.complete = False
+                progress.lose("changed_during_call")
                 return
             if validity != group[0].candidate.uidvalidity:
-                progress.truncated, progress.complete = True, False
+                progress.lose("changed_during_call", truncated=True)
                 return
         uids = [chosen.candidate.uid for chosen in group]
         gmail = session.gmail
@@ -686,15 +761,16 @@ class ImapMailbox:
         flag_items = ["FLAGS", _GMAIL_CANDIDATE_ITEM] if gmail else ["FLAGS"]
         two = _fetch_summaries(session, uids, items, flag_items, self._soft_check, self._reserve_spent)
         rows, reduced, unparsable = two.rows, two.reduced, two.unparsable
+        unread = set(uids[two.asked :])  # the chunks after a stop were never fetched
         if two.stop is not None:  # the chunks read are built, the rest is not read: no cursor (SA13)
-            progress.truncated, progress.complete, progress.stopped = True, False, True
+            progress.stop()
         refs = {c.candidate.uid: c.ref for c in group}
         texts: dict[int, str] = {}
         if two.stop != "soft":  # after a soft stop no command may follow: the items come without snippets
             try:
                 _fetch_texts(session, rows, reduced, SNIPPET_FETCH_BYTES, refs, self._soft_check, texts)
             except SoftStop:  # the messages read are the page: snippets decoded so far stay, the rest is empty
-                progress.truncated, progress.complete, progress.stopped = True, False, True
+                progress.stop()
         for chosen in group:
             uid = chosen.candidate.uid
             if uid in unparsable:
@@ -709,8 +785,9 @@ class ImapMailbox:
                 )
                 continue
             row = rows.get(uid)
-            if row is None:  # FETCH NO (S-p), expunged meanwhile, or not read after a stop
-                progress.complete = False
+            if row is None:  # FETCH NO (S-p) or expunged meanwhile; a UID never asked for is the stop's (counted)
+                if uid not in unread:
+                    progress.lose("changed_during_call")
                 continue
             if _is_draft(row) or _sent_since_pass_one(chosen, row):  # excluded now, like any draft or other direction
                 continue
@@ -921,6 +998,12 @@ class ImapMailbox:
             body_cut=cut,
             meta=meta,
         )
+
+
+def _search_values(query: ListQuery, *, gmail: bool) -> list[tuple[SearchKey, str]] | None:
+    """The value keys of a `search_messages` query, after the window and label keys (none for the list tools).
+    None: a Gmail TEXT word the allowlist leaves nothing of; the folders are refused."""
+    return [] if query.search is None else _search.imap_value_keys(query.search, gmail=gmail)
 
 
 def _criteria(plan: FolderPlan, query: ListQuery, merge: bool) -> bytes:
