@@ -131,6 +131,8 @@ def _rejection_check(status: int, challenge: bytes) -> str | None:
         return "origin"
     if status == 421:
         return "host"
+    if status == 413:
+        return "body_size"
     return None
 
 

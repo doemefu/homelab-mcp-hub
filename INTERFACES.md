@@ -31,12 +31,12 @@ The root form `/.well-known/oauth-protected-resource` answers 404.
 |--------|------|--------------------|
 | 401 | Missing or invalid token (any failure of the validation rules below), whatever the `Host` or `Origin` | `Bearer error="invalid_token", error_description="Authentication required", resource_metadata="https://mcp.furchert.ch/.well-known/oauth-protected-resource/mcp", scope="mail:read calendar:read"` |
 | 403 | Valid token that lacks one or both required scopes | `Bearer error="insufficient_scope", error_description="Required scope: …", resource_metadata="…", scope="mail:read calendar:read"` |
+| 413 | SDK-generated: valid token with both scopes, request body above 256 KiB (declared by `Content-Length` or streamed); refused before the body is parsed, text `Request body too large`; request log `check: "body_size"` | none |
 | 421 | Valid token, `Host` is not `mcp.furchert.ch` | none |
 | 403 | Valid token, `Origin` present and not `https://claude.ai` or `https://claude.com` | none |
-| 413 | Valid token, request body above 256 KiB (declared by `Content-Length` or streamed); refused by the SDK before the body is parsed, text `Request body too large` | none |
 | 400 or 401 | Request headers above about 16 KiB (for example an oversized bearer value): 400 from the HTTP server when the header block arrives in several reads, otherwise 401 with the challenge from the hub; never 2xx | 401: the challenge above |
 
-The hub appends `scope="mail:read calendar:read"` exactly once to every Bearer challenge. The error description never reveals which check failed. Authentication runs before the `Host`/`Origin` checks and the body-size limit, so without a valid token every request gets the 401.
+The hub appends `scope="mail:read calendar:read"` exactly once to every Bearer challenge. The error description never reveals which check failed. Authentication and the scope check run before the body-size limit, and the body-size limit before the `Host`/`Origin` checks, so without a valid token every request gets the 401.
 
 ### Token validation rules (§4.3)
 
@@ -78,7 +78,7 @@ A `role` claim is ignored.
 | Unknown `kid` | `test_unknown_kid_refetch_throttled` |
 | `role` ignored | `test_role_claim_is_ignored` |
 | Wrong Host without / with token; bad Origin | `tests/contract/test_transport.py` |
-| Body size (hub rule, not a §10.3 row): above 256 KiB declared / streamed → 413, at the cap → 200, without token → 401 first, log line without body | `tests/contract/test_transport.py::test_body_*`, `test_streamed_body_above_cap_gets_413` |
+| Body size (hub rule, not a §10.3 row yet): above 256 KiB declared / streamed / in many ASGI chunks → 413, at the cap → 200, without token → 401 first, log line `check: "body_size"` without body or token | `tests/contract/test_transport.py::test_body_*`, `test_streamed_body_above_cap_gets_413` |
 | Logs | `tests/contract/test_logging.py::test_logs_contain_check_names_and_no_forbidden_data` |
 
 ## 2. Tools
