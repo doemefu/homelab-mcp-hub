@@ -195,6 +195,7 @@ class ImapSession:
         self._selected: str | None = None
         self._selected_uidvalidity: int | None = None
         self._degraded_left: int | None = None  # item_degraded lines this call may still log; None: no cap
+        self._refused: dict[str, None] = {}  # causes of the commands the server answered NO, first seen first (#52)
 
     def cap_degraded_logs(self, limit: int) -> None:
         """At most `limit` item_degraded lines for the rest of this call (SR6, `get_message_status`)."""
@@ -207,6 +208,15 @@ class ImapSession:
                 return
             self._degraded_left -= 1
         log_message_skipped(ref, "mail", exc)
+
+    def note_refused(self, cause: str) -> None:
+        """Remembers that the server answered an EXAMINE, UID SEARCH or UID FETCH with NO in this call (#52)."""
+        self._refused.setdefault(cause, None)
+
+    @property
+    def refused(self) -> tuple[str, ...]:
+        """The distinct causes (`ExamineRefused`, `SearchRefused`, `FetchRefused`) in the order first seen."""
+        return tuple(self._refused)
 
     @property
     def inbox(self) -> FolderEntry:
@@ -291,6 +301,7 @@ class ImapSession:
             except imaplib.IMAP4.error as exc:
                 if not _answered_no(exc):
                     raise
+                self.note_refused("FetchRefused")
                 if on_no == "fail":
                     raise ProviderError("upstream_timeout", "FetchRefused") from None
         return rows
@@ -316,6 +327,7 @@ class ImapSession:
             except imaplib.IMAP4.error as exc:
                 if not _answered_no(exc):
                     raise
+                self.note_refused("FetchRefused")
                 rows = {}
             yield rows
             rows = {}  # the caller has reduced the chunk: do not hold it while the next one is fetched
@@ -419,6 +431,7 @@ class ImapSession:
         except imaplib.IMAP4.error as exc:
             if not _answered_no(exc):
                 raise
+            self.note_refused("ExamineRefused")
             if entry.raw_name != self.registry_inbox and not self.listed and self.may_force_rebuild():
                 self.folder_map(refresh=True)  # one rebuild for the next call; this mailbox stays unsearched (S-p)
             missed.update(refs)
@@ -436,6 +449,7 @@ class ImapSession:
             except imaplib.IMAP4.error as exc:
                 if not _answered_no(exc):
                     raise
+                self.note_refused("SearchRefused")
                 missed.update(batch)  # only the refs of this batch (B7)
                 continue
             uids = sorted(set(hits))
@@ -562,7 +576,8 @@ def _examine_bound(session: ImapSession, entry: FolderEntry) -> int | None:
         and session.may_force_rebuild()
         and session.folder_map(refresh=True).binding(entry.raw_name) != "allowed"
     ):
-        raise ProviderError("not_found", "UnboundFolder")
+        raise ProviderError("not_found", "UnboundFolder")  # deleted or no longer allowed: no refusal to note
+    session.note_refused("ExamineRefused")
     raise ProviderError("upstream_timeout", "ExamineRefused")
 
 
@@ -580,6 +595,7 @@ def _open(session: ImapSession, entry: FolderEntry) -> bool:
     except imaplib.IMAP4.error as exc:
         if not _answered_no(exc):
             raise
+        session.note_refused("ExamineRefused")
         return False
     return True
 
@@ -625,6 +641,7 @@ def _uid_rows(
     except imaplib.IMAP4.error as exc:
         if not _answered_no(exc):
             raise
+        session.note_refused("SearchRefused")
         miss()
         return
     uids = sorted(set(found).difference(skip))
