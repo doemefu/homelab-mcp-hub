@@ -52,8 +52,10 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 - The image sets `MALLOC_ARENA_MAX=2` (at most two glibc malloc arenas): with one arena per worker thread, concurrent mail and calendar calls exceeded the 256 Mi limit (WP13c memory gate).
 - `get_thread` reads BODYSTRUCTURE two messages per FETCH (memory gate with 10,000-part structures) and fetches IMAP bodies per folder newest first in slices of ten, so the newest bodies arrive before the soft stop (spec rev. 4.13).
 - IMAP `get_message`: an `EXAMINE` of the registry inbox answered `NO` now gives `upstream_timeout` (the read did not complete) instead of `upstream_error`.
+- Graph `get_thread` encodes only the kept 64 KiB prefix of a body text (plain or converted) before the cut instead of the whole text (up to the 2 MiB read cap); results are byte-identical (#56, part b; the rest of #56 is open).
 - `get_message` ids are bound by D75 instead of the inbox-only rule: an id may name the inbox, sent, archive, trash or another readable mailbox (Gmail: inbox, All Mail, Trash); junk, drafts and excluded mailboxes answer `not_found`, without a provider call while the folder map is cached. `folder` in the result is the normalised folder of the message read (it was the id's mailbox name). Ids of the registry inbox issued earlier keep working.
 - `gmail` account live (homelab#172): mail over the existing IMAP adapter, no code change (registry entry and credentials only, runbook in the `homelab` repository's `DEPLOYMENT.md`).
+- IMAP `get_message_status`: a call in which the server answered an `EXAMINE`, `UID SEARCH` or `UID FETCH` with `NO` now logs one `provider_call_failed` WARNING per cause class (`ExamineRefused`, `SearchRefused`, `FetchRefused`; at most three per call), so a systematic refusal is visible; results are unchanged (#52).
 
 ### Fixed
 
