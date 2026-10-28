@@ -104,6 +104,19 @@ def test_body_text_prefix_encode_matches_whole_encode(unit: str, delta: int) -> 
         assert converted == (expected, "text/html-converted", cut)
 
 
+@pytest.mark.parametrize("before", range(UNIQUE_BODY_BYTES - 4, UNIQUE_BODY_BYTES + 2))
+def test_body_text_prefix_encode_with_surrogate_halves_at_the_boundary(before: int) -> None:
+    """#56 (b): "😀" as two adjacent surrogate code points (3 bytes each with surrogatepass) placed across the
+    character and the byte boundary gives the same plain-text result as the whole encode."""
+    pair = "\ud83d\ude00"
+    for text in ("a" * before + pair + "b", "a" * before + pair * 3):
+        assert body_text({"body": {"content": text}}, "body") == (
+            *_whole_encode(text)[:1],
+            "text/plain",
+            _whole_encode(text)[1],
+        )
+
+
 def test_body_text_encodes_only_a_prefix() -> None:
     """#56 (b): a 2 MiB body is not encoded as a whole (the peak stays far below its size)."""
     content = "a" * (2 * 1024 * 1024)

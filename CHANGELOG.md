@@ -71,3 +71,4 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 - `list_unread` and `list_messages` read the BODYSTRUCTUREs of a page a few messages per FETCH instead of all 50 at once and reduce each to what the list needs before the next chunk, so unusually large message structures no longer push the pod towards its memory limit; after 12 s no further chunk is read and the page, truncated, holds the messages read so far (#44).
 - Base image python:3.13-slim moved to a digest with Debian ca-certificates 20250419+deb13u1, which no longer trusts the emSign roots behind the compromised eMudhra intermediates; Python 3.13.15 → 3.13.16 with it (#45, #46; doemefu/homelab#212).
+- Graph `get_thread` encodes only the kept 64 KiB prefix of a body text (plain or converted) before the cut instead of the whole text (up to the 2 MiB read cap); results are byte-identical (#56, part b; the rest of #56 is open).
