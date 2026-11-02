@@ -29,7 +29,7 @@ The root form `/.well-known/oauth-protected-resource` answers 404.
 
 | Status | When | `WWW-Authenticate` |
 |--------|------|--------------------|
-| 401 | Missing or invalid token (any failure of the validation rules below), whatever the `Host` or `Origin` | `Bearer error="invalid_token", error_description="Authentication required", resource_metadata="https://mcp.furchert.ch/.well-known/oauth-protected-resource/mcp", scope="mail:read calendar:read"` |
+| 401 | Missing or invalid token (any failure of the validation rules below), whatever the `Host`, the `Origin` or the body size | `Bearer error="invalid_token", error_description="Authentication required", resource_metadata="https://mcp.furchert.ch/.well-known/oauth-protected-resource/mcp", scope="mail:read calendar:read"` |
 | 403 | Valid token that lacks one or both required scopes | `Bearer error="insufficient_scope", error_description="Required scope: …", resource_metadata="…", scope="mail:read calendar:read"` |
 | 413 | SDK-generated: valid token with both scopes, request body above 256 KiB (declared by `Content-Length` or streamed); refused before the body is parsed, text `Request body too large`; request log `check: "body_size"` | none |
 | 421 | Valid token, `Host` is not `mcp.furchert.ch` | none |

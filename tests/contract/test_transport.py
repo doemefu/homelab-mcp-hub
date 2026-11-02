@@ -84,6 +84,7 @@ def test_streamed_body_above_cap_gets_413(client: TestClient, tokens: TokenFacto
     response = _post(client, tokens.mint(), chunks)
     assert "content-length" not in response.request.headers
     assert response.status_code == 413
+    assert "www-authenticate" not in response.headers
 
 
 def test_body_arriving_in_many_chunks_is_refused_once_above_cap(
