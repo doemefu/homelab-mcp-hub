@@ -36,7 +36,9 @@ def body_text(raw: Mapping[str, object], field: Literal["uniqueBody", "body"]) -
     is_html = isinstance(kind, str) and kind.lower() == "html"
     text = html_to_text(content) if is_html else content
     source: BodySource = "text/html-converted" if is_html else "text/plain"
-    encoded = text.encode("utf-8", "surrogatepass")
-    if len(encoded) <= UNIQUE_BODY_BYTES:
+    # Every character takes at least one byte, so the first 64 KiB of the encoding lie within the first 65,536
+    # characters: only that prefix is encoded (#56), with the same result as encoding the whole text.
+    head = text[:UNIQUE_BODY_BYTES].encode("utf-8", "surrogatepass")
+    if len(text) <= UNIQUE_BODY_BYTES and len(head) <= UNIQUE_BODY_BYTES:
         return text, source, False
-    return encoded[:UNIQUE_BODY_BYTES].decode("utf-8", "ignore"), source, True
+    return head[:UNIQUE_BODY_BYTES].decode("utf-8", "ignore"), source, True

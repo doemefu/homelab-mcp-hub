@@ -766,8 +766,8 @@ def hub_log() -> Iterator[Capture]:
 
 
 def test_gmail_logs_carry_no_labels_or_thread_ids(hub_log: Capture) -> None:
-    """§9.7: the Gmail lookups log nothing, not even for a member without INTERNALDATE or a failed batch; no label,
-    thread id, Message-ID or address reaches a log."""
+    """§9.7: the Gmail lookups log nothing of their own, not even for a member without INTERNALDATE; a failed batch
+    gives only the call's one refusal line (#52); no label, thread id, Message-ID or address reaches a log."""
     thread = 1781234567890123456
     label = b"Leak-Label-Name"
     reply_id = "leak-reply@example.test"
@@ -788,7 +788,33 @@ def test_gmail_logs_carry_no_labels_or_thread_ids(hub_log: Capture) -> None:
     _fail_thread_search(server, 1)
     [status] = run(server, [g(HOSTILE_MID)], own=OWN)
     assert status.thread_checked is False
-    assert {json.loads(line)["event"] for line in hub_log.lines} == {"folder_map_refreshed"}
+    assert {json.loads(line)["event"] for line in hub_log.lines} == {"folder_map_refreshed", "provider_call_failed"}
+    [refused] = [record for record in map(json.loads, hub_log.lines) if record["event"] == "provider_call_failed"]
+    assert [refused[key] for key in ("account", "outcome", "exception")] == [GMAIL, "upstream_timeout", "SearchRefused"]
     text = "\n".join(hub_log.lines) + "\n".join(message for _, _, message in hub_log.raw)
     for value in (str(thread), "Leak", "leak", "owner@example.org"):
+        assert value not in text
+
+
+@pytest.mark.parametrize(
+    ("case", "cause"), [("thread_search_no", "SearchRefused"), ("all_mail_examine_no", "ExamineRefused")]
+)
+def test_gmail_refused_command_logs_one_warning(case: str, cause: str, hub_log: Capture) -> None:
+    """#52 on Gmail: an X-GM-THRID SEARCH or the EXAMINE of All Mail answered NO gives one refusal line, no value."""
+    server = gmail(all_mail=[x_mail(), reply(5, 60), member(6, 30)])
+    if case == "thread_search_no":
+        _fail_thread_search(server, 1)
+    else:
+        _fail_examine(server, GMAIL_ALL, frozenset({1}))  # the location's EXAMINE; the lookups reuse it (Design A)
+    [status] = run(server, [g()])
+    if case == "thread_search_no":
+        assert (status.state, status.thread_checked) == ("found", False)
+    else:  # All Mail stays unsearched: the location is incomplete
+        assert (status.state, status.reason) == ("unknown", "incomplete_search")
+    lines = [record for record in map(json.loads, hub_log.lines) if record["event"] == "provider_call_failed"]
+    assert [(line["account"], line["outcome"], line["exception"]) for line in lines] == [
+        (GMAIL, "upstream_timeout", cause)
+    ]
+    text = "\n".join(hub_log.lines)
+    for value in (MID, A_MID, str(THR), GMAIL_ALL):
         assert value not in text
