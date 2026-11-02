@@ -3,6 +3,7 @@ import logging
 from collections.abc import Iterator
 
 import httpx2
+import pytest
 from starlette.testclient import TestClient
 from starlette.types import Message
 
@@ -51,14 +52,16 @@ def _padded_tools_list(size: int) -> bytes:
     return encoded
 
 
-def _post(client: TestClient, token: str | None, content: bytes | Iterator[bytes]) -> httpx2.Response:
+def _post(
+    client: TestClient, token: str | None, content: bytes | Iterator[bytes], extra: dict[str, str] | None = None
+) -> httpx2.Response:
     headers = {
         "Accept": ACCEPT,
         "Content-Type": "application/json",
         "MCP-Protocol-Version": MODERN,
         "Mcp-Method": "tools/list",
     } | auth(token)
-    return client.post("/mcp", headers=headers, content=content)
+    return client.post("/mcp", headers=headers | (extra or {}), content=content)
 
 
 def test_body_at_cap_is_accepted(client: TestClient, tokens: TokenFactory) -> None:
@@ -131,6 +134,25 @@ def test_body_arriving_in_many_chunks_is_refused_once_above_cap(
 def test_body_above_cap_without_token_gets_401(client: TestClient) -> None:
     # Authentication runs before the body limit (spec 080 §4.4): the full challenge, not a 413.
     assert_challenge(_post(client, None, _padded_tools_list(MAX_REQUEST_BODY_BYTES + 1)))
+
+
+def test_body_above_cap_with_missing_scope_gets_403_first(client: TestClient, tokens: TokenFactory) -> None:
+    # The scope check runs before the body limit (spec 080 §4.4 order).
+    response = _post(client, tokens.mint(scope=["mail:read"]), _padded_tools_list(MAX_REQUEST_BODY_BYTES + 1))
+    assert_challenge(response, status=403)
+    assert 'error="insufficient_scope"' in response.headers["www-authenticate"]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"Host": "evil.example.org"}, {"Origin": "https://evil.example.org"}], ids=["host", "origin"]
+)
+def test_body_above_cap_gets_413_before_host_and_origin_checks(
+    client: TestClient, tokens: TokenFactory, extra: dict[str, str]
+) -> None:
+    # The body limit runs before the transport's Host and Origin checks (spec 080 §4.4 order).
+    response = _post(client, tokens.mint(), _padded_tools_list(MAX_REQUEST_BODY_BYTES + 1), extra)
+    assert response.status_code == 413
+    assert "www-authenticate" not in response.headers
 
 
 def test_body_above_cap_logs_status_and_no_body(client: TestClient, tokens: TokenFactory) -> None:
