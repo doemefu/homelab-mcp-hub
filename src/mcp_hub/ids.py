@@ -18,6 +18,7 @@ from typing import Final, Literal, NoReturn
 
 from mcp_hub.errors import ToolError
 
+GMAIL_THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
 PREFIX: Final = "v1."
 MAX_ID_LENGTH: Final = 512
 _ACCOUNT: Final = re.compile(r"[a-z][a-z0-9-]{1,31}")
@@ -250,7 +251,7 @@ def decode_status_entry(value: object) -> StableRef | MessageRef | GraphMessageR
 
 def _thread_value_ok(source: object, value: object) -> bool:
     if source == "gmail":
-        return type(value) is int and 0 <= value < 2**64
+        return type(value) is int and 0 <= value < GMAIL_THRID_LIMIT
     if not isinstance(value, str):
         return False
     if source == "graph":

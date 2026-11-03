@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Final, Literal
 
+from mcp_hub.ids import GMAIL_THRID_LIMIT
 from mcp_hub.providers.folders import GmailLabelFilter
 from mcp_hub.providers.imap_guard import search_criteria_ok
 
@@ -34,7 +35,6 @@ MixedKey = tuple[HeaderField, str]
 _NOT_DRAFT: Final = b"NOT DRAFT"
 _HEADER_FIELDS: Final = frozenset({"Message-ID", "In-Reply-To", "References"})
 _MONTHS: Final = (b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec")
-_THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
 _QUOTABLE: Final = re.compile(r"[\x20\x21\x23-\x5b\x5d-\x7e]+")  # printable ASCII without '"' and '\'
 # Gmail system labels as quoted strings; the backslash of `\Sent` is escaped inside the quotes (I8, SA8).
 _GMAIL_SENT: Final = b'X-GM-LABELS "\\\\Sent"'
@@ -246,7 +246,7 @@ def _thrid_values(values: Sequence[int]) -> list[int]:
         raise ValueError("thread ids must be a sequence, not one string")
     snapshot = list(values)  # one pass: the checked copy is what gets sent
     for value in snapshot:
-        if type(value) is not int or not 0 <= value < _THRID_LIMIT:
+        if type(value) is not int or not 0 <= value < GMAIL_THRID_LIMIT:
             raise ValueError("thread id refused")
     return list(dict.fromkeys(snapshot))
 

@@ -29,6 +29,7 @@ MAX_PROVIDER_THREADS: Final = 16  # live worker threads incl. abandoned ones, al
 MAX_TEXT_PART_BYTES: Final = 262_144
 SNIPPET_FETCH_BYTES: Final = 4096
 MAX_HEADER_BYTES: Final = 65_536
+MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status or get_thread provider call (SR6, sec-G8)
 MAX_HTTP_RESPONSE_BYTES: Final = 5 * 1024 * 1024
 # Fixed texts for account_errors and tool errors; never provider text (spec 080 §5.1, §5.3 rule 8).
 ACCOUNT_ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {

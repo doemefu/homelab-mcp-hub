@@ -9,7 +9,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal, TypeIs, get_args
 
 from mcp_hub.errors import ToolError
 
@@ -17,7 +17,10 @@ CURSOR_PREFIX: Final = "c1."
 MAX_CURSOR_CHARS: Final = 2048
 CURSOR_TTL_SECONDS: Final = 3600
 CURSOR_FUTURE_SKEW_SECONDS: Final = 60
-CURSOR_TOOLS: Final = frozenset({"list_messages", "list_unread", "search_messages"})
+# Tools that issue cursors (#73 F7); kept apart from tools.mail.ListTool so run_list_messages(tool="search_messages")
+# does not type-check.
+CursorTool = Literal["list_messages", "list_unread", "search_messages"]
+CURSOR_TOOLS: Final[frozenset[str]] = frozenset(get_args(CursorTool))
 _B64URL: Final = re.compile(r"[A-Za-z0-9_-]+")
 _K: Final = re.compile(r"[0-9a-f]{16}")
 _DIGEST: Final = re.compile(r"[0-9a-f]{64}")
@@ -39,7 +42,7 @@ class Position:
 
 @dataclass(frozen=True, slots=True)
 class CursorState:
-    tool: str
+    tool: CursorTool
     args_digest: str
     window_start: int
     position: Position
@@ -64,6 +67,10 @@ def _b64decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+def _is_cursor_tool(value: object) -> TypeIs[CursorTool]:
+    return isinstance(value, str) and value in CURSOR_TOOLS
+
+
 def _invalid() -> ToolError:
     return ToolError("invalid_cursor", "Cursor is invalid or expired")
 
@@ -76,7 +83,7 @@ class CursorCodec:
     def _mac(self, signed: str) -> str:
         return _b64encode(hmac.new(self._key, signed.encode("ascii"), hashlib.sha256).digest())
 
-    def issue(self, *, tool: str, args_digest: str, window_start: int, position: Position) -> str:
+    def issue(self, *, tool: CursorTool, args_digest: str, window_start: int, position: Position) -> str:
         if tool not in CURSOR_TOOLS:
             raise ValueError("unsupported cursor tool")
         if not (_DIGEST.fullmatch(args_digest) and _K.fullmatch(position.k)):
@@ -95,7 +102,7 @@ class CursorCodec:
         signed = CURSOR_PREFIX + _b64encode(body)
         return f"{signed}.{self._mac(signed)}"
 
-    def open(self, value: str, *, tool: str, args_digest: str) -> CursorState:
+    def open(self, value: str, *, tool: CursorTool, args_digest: str) -> CursorState:
         if len(value) > MAX_CURSOR_CHARS or not value.startswith(CURSOR_PREFIX):
             raise _invalid()
         parts = value[len(CURSOR_PREFIX) :].split(".")
@@ -130,7 +137,7 @@ class CursorCodec:
             raise _invalid()
         if not (isinstance(k, str) and _K.fullmatch(k) and isinstance(digest, str) and _DIGEST.fullmatch(digest)):
             raise _invalid()
-        if not isinstance(tool, str) or tool not in CURSOR_TOOLS:
+        if not _is_cursor_tool(tool):  # untrusted: checked at run time, not only typed
             raise _invalid()
         return CursorState(
             tool=tool,

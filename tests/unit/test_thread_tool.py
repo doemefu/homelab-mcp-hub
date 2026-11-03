@@ -578,6 +578,8 @@ def test_unexpected_exception_answers_fixed_upstream_error(
     assert "example.org" not in json.dumps(result) + "\n".join(captured.lines)
     [tool_call] = [e for e in (json.loads(line) for line in captured.lines) if e["event"] == "tool_call"]
     assert (tool_call["outcome"], tool_call["accounts"], tool_call["result_count"]) == ("upstream_error", [], 0)
+    # The class name only, and only for a hub bug (#73 I3); an adapter error is an account error, not a hub bug.
+    assert tool_call.get("exception") == ("RuntimeError" if where == "tool" else None)
 
 
 def test_tool_call_log_fields(wired: tuple[TestClient, FakeThreads], tokens: TokenFactory, captured: Capture) -> None:

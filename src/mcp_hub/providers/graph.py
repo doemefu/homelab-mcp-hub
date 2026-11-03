@@ -34,6 +34,7 @@ from mcp_hub.ids import (
 )
 from mcp_hub.logging import log_event
 from mcp_hub.providers.base import (
+    MAX_DEGRADED_LOGS,
     MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
     OMITTED_BODY,
@@ -157,7 +158,6 @@ _UNEXPECTED_STATUS: Final = "UnexpectedStatus"  # `_get`'s cause for a status it
 # The get_thread list falls back on these causes too: any status but 2xx, 401, 403, 404, 429 and 503 (SG1, Q7).
 _FALLBACK_CAUSES: Final = frozenset({_UNEXPECTED_STATUS, "Redirect"})
 MAX_ADDRESS_CHARS: Final = 254
-MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per get_message_status or get_thread provider call (SR6)
 MAX_FAILURE_LOGS: Final = 20  # provider_call_failed lines per status or thread call, one per class (SR6, S-F2, P15)
 MAX_THREAD_SPLITS: Final = 10  # one-conversation re-requests of full conversationId answers per call (C14)
 _log = logging.getLogger("mcp_hub.providers.graph")
