@@ -64,9 +64,9 @@ def test_counts_and_clamps() -> None:
     metrics.count_tool_call("get_thread", "partial")
     metrics.count_tool_call("get_thread", "partial")
     metrics.count_tool_call("get_thread", "made-up")  # type: ignore[arg-type]  # a value outside the enum
-    metrics.count_tool_call("made_up_tool", "ok")  # type: ignore[arg-type]
+    metrics.count_tool_call("made_up_tool", "ok")  # type: ignore[arg-type]  # a tool outside the enum
     metrics.count_rejection("body_size")
-    metrics.count_rejection("made-up")  # type: ignore[arg-type]
+    metrics.count_rejection("made-up")  # type: ignore[arg-type]  # a check outside the enum
     _, series = parse(metrics.render([]))
     assert series['mcp_hub_tool_calls_total{tool="get_thread",outcome="partial"}'] == 2
     assert series['mcp_hub_tool_calls_total{tool="get_thread",outcome="error"}'] == 1

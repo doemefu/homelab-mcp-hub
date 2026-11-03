@@ -106,8 +106,6 @@ async def test_space_delimited_scope_string(verifier: HubTokenVerifier) -> None:
 
 async def test_rejections_are_counted_by_check(httpserver: HTTPServer, tmp_path: Path) -> None:
     """Spec 080 §9.7: the verifier counts each rejection under its check, an unexpected error under `internal`."""
-    from mcp_hub.metrics import Metrics
-
     httpserver.expect_request("/jwks.json").respond_with_json(jwks(KEY))
     (tmp_path / "allowed-subjects").write_text(SUBJECT + "\n")
     metrics = Metrics()

@@ -35,7 +35,8 @@ docker run -d --label org.furchert.homelab.workpackage=mcp-hub-wp5a --name "hub-
 # --retry-all-errors: while the process starts, the published port accepts and then closes (curl 52/56).
 curl -fsS --retry 30 --retry-all-errors --retry-delay 1 http://127.0.0.1:18084/readyz >/dev/null || fail "readyz"
 [ "$(docker exec "hub-$$" id -u)" = "10001" ] || fail "uid"
-curl -fsS http://127.0.0.1:18084/metrics | grep -q '^mcp_hub_tool_calls_total{tool="list_accounts",outcome="ok"} 0$' || fail "metrics"
+curl -fsS -o "$WORK/metrics" http://127.0.0.1:18084/metrics || fail "metrics"
+grep -q '^mcp_hub_tool_calls_total{tool="list_accounts",outcome="ok"} 0$' "$WORK/metrics" || fail "metrics series"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: mcp.furchert.ch' http://127.0.0.1:18083/metrics)" = "404" ] || fail "metrics on 8083"
 
 mcp() { # $1 token or "", $2 extra header or ""

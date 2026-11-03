@@ -345,13 +345,13 @@ Calendar event **instances** overlapping the window, recurrences expanded, sorte
 
 Port 8083 serves no health or metrics routes; port 8084 serves no MCP routes.
 
-**Metrics** (hand-written, no metrics library; one registry per process, counters reset on a restart; every series below exists from the start at 0):
+**Metrics** (hand-written, no metrics library; one registry per process, counters reset on a restart; every counter series exists from the start at 0, and the status gauge has one series per account, capability and status):
 
 | Family | Type | Labels |
 |--------|------|--------|
 | `mcp_hub_account_status` | gauge | `account` (registry id), `capability` (`mail`, `calendar`; only those the account has), `status` (`ok`, `auth_expired`, `unreachable`, `error`, `unknown`, `disabled`): 1 for the current status, 0 for the others; computed on each scrape from the same view as `list_accounts` |
-| `mcp_hub_tool_calls_total` | counter | `tool` (the 8 tools), `outcome` (`ok`, `partial`, `error` and the 10 error codes): one per finished tool call (104 series) |
-| `mcp_hub_token_rejections_total` | counter | `check`: the `check` value of the `token_rejected` line (`malformed`, `algorithm`, `signature`, `type`, `issuer`, `audience`, `client`, `time`, `required_claims`, `subject`, `scope_format`, `internal`) or of the `request` line (`scope`, `host`, `origin`, `body_size`); one per refused request (16 series). A request without a bearer token is not counted |
+| `mcp_hub_tool_calls_total` | counter | `tool` (the 8 tools), `outcome` (`ok`, `partial`, `error` and the 10 error codes): one per finished tool call (104 series); a call that the SDK refuses in its argument validation, before the tool runs, is not counted (and has no `tool_call` line either) |
+| `mcp_hub_token_rejections_total` | counter | `check`: the `check` value of the `token_rejected` line (`malformed`, `algorithm`, `signature`, `type`, `issuer`, `audience`, `client`, `time`, `required_claims`, `subject`, `scope_format`, `internal`) or of the `request` line (`scope`, `host`, `origin`, `body_size`); one per refused request (16 series). A request without a bearer token is not counted; a refused bearer token on the metadata route or an unknown path counts too |
 
 The alert rules on these metrics (`McpHubAccountAuthExpired`, `McpHubDown`) and the scrape configuration live in the `homelab` repository (spec 080 §7.4).
 

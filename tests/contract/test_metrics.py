@@ -25,7 +25,8 @@ def scrape(hub: HubApp) -> dict[str, float]:
 
 
 def rejections(hub: HubApp) -> dict[str, float]:
-    return {c: scrape(hub)[f'mcp_hub_token_rejections_total{{check="{c}"}}'] for c in REJECTION_CHECKS}
+    series = scrape(hub)
+    return {c: series[f'mcp_hub_token_rejections_total{{check="{c}"}}'] for c in REJECTION_CHECKS}
 
 
 def counted_once(hub: HubApp, request: Callable[[], object], check: str) -> None:
@@ -45,6 +46,7 @@ def counted_once(hub: HubApp, request: Callable[[], object], check: str) -> None
         (lambda t: t.mint(client_id="furchert-ch"), "client"),
         (lambda t: t.mint(drop=("client_id",)), "required_claims"),  # PyJWT's `require` runs before the client check
         (lambda t: t.mint(exp=int(time.time()) - 90), "time"),
+        (lambda t: t.mint(header={"kid": "unknown"}), "signature"),  # also a JWKS outage
         (lambda t: t.hs256(), "algorithm"),
         (lambda t: t.alg_none(), "algorithm"),
         (lambda t: t.mint(sub="someone-else"), "subject"),
@@ -60,6 +62,7 @@ def counted_once(hub: HubApp, request: Callable[[], object], check: str) -> None
         "client-id",
         "client-id-missing",
         "expired",
+        "kid-unknown",
         "hs256",
         "none",
         "sub-unknown",
@@ -92,7 +95,11 @@ def test_refusals_after_authentication_count_their_check(
 ) -> None:
     token = tokens.mint(scope=change["scope"]) if "scope" in change else tokens.mint()
     headers = change.get("headers")
-    counted_once(hub, lambda: modern(client, token, "tools/list", headers=headers), check)  # type: ignore[arg-type]
+    counted_once(
+        hub,
+        lambda: modern(client, token, "tools/list", headers=headers),  # type: ignore[arg-type]  # dict[str, str] here
+        check,
+    )
 
 
 def test_body_size_refusal_counts_once(hub: HubApp, client: TestClient, tokens: TokenFactory) -> None:
