@@ -31,13 +31,14 @@ Dependencies are exact `==` pins in `pyproject.toml` with hashes in `uv.lock`. A
 ```
 src/mcp_hub/
   __main__.py      entry point: one uvicorn server on ports 8083 and 8084
-  app.py           ASGI composition: SDK MCP app, challenge wrapper, request log, health app, port dispatcher
+  app.py           ASGI composition: SDK MCP app, challenge wrapper, request log, internal app (health, metrics), port dispatcher
   auth.py          token verifier (spec §4.3 rows 1-8) and subject allowlist
   jwks.py          JWKS cache with refetch throttling
   config.py        environment settings
   registry.py      accounts.json validation and capability filtering
   health.py        in-memory per-capability status
   errors.py        tool error codes
+  metrics.py       Prometheus text exposition on the internal port (spec §9.7)
   logging.py       JSON logs, logger levels
   sanitize.py      untrusted-content rules and field limits (spec §5.3, §5.4)
   budget.py        output budget (spec §5.4)

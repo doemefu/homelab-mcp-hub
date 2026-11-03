@@ -87,5 +87,6 @@ def register(server: MCPServer, ctx: HubContext) -> None:
             outcome="ok",
             accounts=[a.id for a in result.accounts],
             result_count=len(result.accounts),
+            metrics=ctx.metrics,
         )
         return result

@@ -341,8 +341,19 @@ Calendar event **instances** overlapping the window, recurrences expanded, sorte
 |-------|--------|
 | `GET /healthz` | 200 `{"status": "ok"}` while the process runs |
 | `GET /readyz` | 200 `{"status": "ready"}` once configuration and registry are valid and the MCP app has started; 503 `{"status": "starting"}` before. Readiness never depends on providers or on auth-service, so a JWKS outage does not take the hub out of service |
+| `GET /metrics` | 200, Prometheus text exposition (`text/plain; version=0.0.4; charset=utf-8`), no token; spec 080 §9.7 rev 4.17 (`homelab#178`). Scrapes are not logged |
 
-Port 8083 serves no health routes; port 8084 serves no MCP routes.
+Port 8083 serves no health or metrics routes; port 8084 serves no MCP routes.
+
+**Metrics** (hand-written, no metrics library; one registry per process, counters reset on a restart; every series below exists from the start at 0):
+
+| Family | Type | Labels |
+|--------|------|--------|
+| `mcp_hub_account_status` | gauge | `account` (registry id), `capability` (`mail`, `calendar`; only those the account has), `status` (`ok`, `auth_expired`, `unreachable`, `error`, `unknown`, `disabled`): 1 for the current status, 0 for the others; computed on each scrape from the same view as `list_accounts` |
+| `mcp_hub_tool_calls_total` | counter | `tool` (the 8 tools), `outcome` (`ok`, `partial`, `error` and the 10 error codes): one per finished tool call (104 series) |
+| `mcp_hub_token_rejections_total` | counter | `check`: the `check` value of the `token_rejected` line (`malformed`, `algorithm`, `signature`, `type`, `issuer`, `audience`, `client`, `time`, `required_claims`, `subject`, `scope_format`, `internal`) or of the `request` line (`scope`, `host`, `origin`, `body_size`); one per refused request (16 series). A request without a bearer token is not counted |
+
+The alert rules on these metrics (`McpHubAccountAuthExpired`, `McpHubDown`) and the scrape configuration live in the `homelab` repository (spec 080 §7.4).
 
 ## 4. Consumed services
 

@@ -6,7 +6,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import anyio
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from mcp_hub.errors import ErrorCode, ToolError
 from mcp_hub.health import StatusStore, missing_credentials
 from mcp_hub.logging import log_event
+from mcp_hub.metrics import Metrics, ToolName, ToolOutcome
 from mcp_hub.providers import SUPPORTED_PROTOCOLS
 from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, TOOL_TIMEOUT_SECONDS, ProviderError, log_provider_failure
 from mcp_hub.providers.deadline import SoftStop
@@ -46,7 +47,10 @@ class AccountErrorItem(BaseModel):
     message: str
 
 
-def log_tool_call(tool: str, *, started: float, outcome: str, accounts: list[str], result_count: int) -> None:
+def log_tool_call(
+    tool: ToolName, *, started: float, outcome: ToolOutcome, accounts: list[str], result_count: int, metrics: Metrics
+) -> None:
+    metrics.count_tool_call(tool, outcome)
     token = get_access_token()
     claims = (token.claims or {}) if token else {}
     log_event(
@@ -142,7 +146,7 @@ async def gather_accounts[T](
     )
 
 
-def tool_outcome(gathered: Gathered[Any]) -> str:
+def tool_outcome(gathered: Gathered[Any]) -> Literal["ok", "partial", "error"]:
     if not gathered.errors:
         return "ok"
     return "partial" if gathered.results else "error"

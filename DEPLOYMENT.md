@@ -109,9 +109,21 @@ Read-only tool calls in claude.ai by the owner, once per account (`icloud`, `gma
 
 Expected: hits, no `account_errors`, `incomplete_accounts` plausible (empty for a small mailbox), `duration_ms` under 10 s per call on iCloud and Outlook (Gmail can take longer, hub#64), and no WARNING or ERROR in the logs besides expected `item_degraded` lines. Outlook items of a search with `query` have `id: null`; open one with `get_message(ref)` (the `sender`-only step keeps `id`s).
 
+### Metrics (homelab#178)
+
+`/metrics` on port 8084 serves the spec 080 §9.7 families (INTERFACES.md §3). Check after a rollout (read-only):
+
+```bash
+kubectl -n apps port-forward svc/mcp-hub 8084:8084 &
+curl -s localhost:8084/metrics | grep -c '^mcp_hub_'          # 120 counter series + 6 per configured capability
+curl -s localhost:8084/metrics | grep 'mcp_hub_account_status{.*} 1$'   # one current status per account and capability
+```
+
+The ServiceMonitor (Service port `internal`, job `mcp-hub`) and the alerts `McpHubAccountAuthExpired` (an account in `auth_expired` for 30 min: re-login per spec 080 §7.3 or replace the app password) and `McpHubDown` (not scrapeable for 10 min while the Deployment wants a replica) are applied from the `homelab` repository (playbook 41). Silence `McpHubDown` for a planned stop that keeps the replica count at 1; scaling to 0 (kill switch L3) does not fire it.
+
 ## Rollback
 
-Revert the Flux image-update commit on `main` (or the offending code commit) through a pull request; Flux applies the previous tag. The hub keeps no state apart from in-memory status, so a rollback needs no data migration. Before rolling back to an image older than WP13a, remove `mail.own_addresses_ref` from the registry (SOPS, playbook 59), because the older hub rejects the field and does not start. Ids of folders other than the inbox and all cursors stop working after the rollback. Rolling back below WP13b removes `get_message_status`; a routine that calls it fails with an unknown tool. Rolling back below WP13c removes `get_thread`.
+Revert the Flux image-update commit on `main` (or the offending code commit) through a pull request; Flux applies the previous tag. The hub keeps no state apart from in-memory status, so a rollback needs no data migration. Before rolling back to an image older than WP13a, remove `mail.own_addresses_ref` from the registry (SOPS, playbook 59), because the older hub rejects the field and does not start. Ids of folders other than the inbox and all cursors stop working after the rollback. Rolling back below WP13b removes `get_message_status`; a routine that calls it fails with an unknown tool. Rolling back below WP13c removes `get_thread`. Rolling back below the metrics change removes `/metrics`: remove the ServiceMonitor first (`homelab` repository, playbook 41), otherwise `McpHubDown` fires.
 
 ## Troubleshooting
 

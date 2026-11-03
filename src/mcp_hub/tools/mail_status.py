@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import GraphMessageRef, MessageRef, StableRef, decode_status_entry, encode_ref, location_id
+from mcp_hub.metrics import ToolOutcome
 from mcp_hub.providers.base import (
     ACCOUNT_ERROR_MESSAGES,
     Direction,
@@ -255,7 +256,9 @@ def _never_shrink(_candidate: StatusItem, _fits: Callable[[StatusItem], bool]) -
     return None  # no untrusted text to shorten: a status item is returned whole or not at all
 
 
-async def run_get_message_status(ctx: HubContext, *, refs: object) -> tuple[MessageStatusResult, list[str], str]:
+async def run_get_message_status(
+    ctx: HubContext, *, refs: object
+) -> tuple[MessageStatusResult, list[str], ToolOutcome]:
     """Returns the result, the queried account ids and the outcome for the tool_call log line.
 
     Every entry is validated and pre-checked before any provider call. Per account one provider call over its
@@ -321,12 +324,31 @@ def register(server: MCPServer, ctx: HubContext) -> None:
         try:
             result, accounts, outcome = await run_get_message_status(ctx, refs=refs)
         except ToolError as exc:
-            log_tool_call("get_message_status", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "get_message_status",
+                started=started,
+                outcome=exc.code,
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text (SR3)
-            log_tool_call("get_message_status", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "get_message_status",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
-            "get_message_status", started=started, outcome=outcome, accounts=accounts, result_count=len(result.items)
+            "get_message_status",
+            started=started,
+            outcome=outcome,
+            accounts=accounts,
+            result_count=len(result.items),
+            metrics=ctx.metrics,
         )
         return structured_result(result)

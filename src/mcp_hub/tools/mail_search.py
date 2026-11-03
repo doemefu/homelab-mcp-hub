@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from mcp_hub.cursors import Position, argument_digest
 from mcp_hub.errors import ToolError
+from mcp_hub.metrics import ToolOutcome
 from mcp_hub.providers.base import (
     ACCOUNT_ERROR_MESSAGES,
     FolderPage,
@@ -113,7 +114,7 @@ async def run_search_messages(
     limit: int | None,
     cursor: str | None,
     now: datetime | None = None,
-) -> tuple[SearchMessagesResult, list[str], str]:
+) -> tuple[SearchMessagesResult, list[str], ToolOutcome]:
     """Returns the result, the queried account ids and the outcome for the tool_call log line.
 
     Validation order, all before any provider call: limit, folder, since format, search terms, accounts, the Graph
@@ -209,12 +210,26 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 cursor=cursor,
             )
         except ToolError as exc:
-            log_tool_call("search_messages", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "search_messages", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
-            log_tool_call("search_messages", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "search_messages",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
-            "search_messages", started=started, outcome=outcome, accounts=accounts, result_count=len(result.items)
+            "search_messages",
+            started=started,
+            outcome=outcome,
+            accounts=accounts,
+            result_count=len(result.items),
+            metrics=ctx.metrics,
         )
         return structured_result(result)

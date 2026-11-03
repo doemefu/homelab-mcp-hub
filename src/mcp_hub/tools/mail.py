@@ -27,6 +27,7 @@ from mcp_hub.ids import (
     encode_thread_key,
     location_id,
 )
+from mcp_hub.metrics import ToolOutcome
 from mcp_hub.providers.base import (
     ACCOUNT_ERROR_MESSAGES,
     Direction,
@@ -354,7 +355,7 @@ async def run_list_messages(
     limit: int | None,
     cursor: str | None,
     now: datetime | None = None,
-) -> tuple[ListMessagesResult, list[str], str]:
+) -> tuple[ListMessagesResult, list[str], ToolOutcome]:
     """Returns the result, the queried account ids and the outcome for the tool_call log line.
 
     Every argument is validated before any provider call. A cursor is bound to the tool and to the raw arguments
@@ -483,7 +484,7 @@ async def run_list_unread(
     limit: int | None,
     cursor: str | None,
     now: datetime | None = None,
-) -> tuple[ListUnreadResult, list[str], str]:
+) -> tuple[ListUnreadResult, list[str], ToolOutcome]:
     """The unread inbox: `run_list_messages` with folder=inbox and unread_only=true; its cursors are bound to
     list_unread and to `account` and `since`."""
     return await run_list_messages(
@@ -520,7 +521,7 @@ def _check_binding(ctx: HubContext, account: Account, location: AnyMessageRef) -
 
 async def run_get_message(
     ctx: HubContext, *, message_id: str | None = None, ref: str | None = None, max_chars: int | None
-) -> tuple[GetMessageResult, str]:
+) -> tuple[GetMessageResult, ToolOutcome]:
     """One message by `id` (a location, bound by D75) or by `ref` (located by the adapter; spec 080 §5.2 rev. 4.9).
 
     Every argument, the account and the D75 binding the tool can see are checked before any provider call. With a
@@ -640,13 +641,27 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 ctx, account=account, since=since, limit=limit, cursor=cursor
             )
         except ToolError as exc:
-            log_tool_call("list_unread", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "list_unread", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
-            log_tool_call("list_unread", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "list_unread",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
-            "list_unread", started=started, outcome=outcome, accounts=accounts, result_count=len(result.items)
+            "list_unread",
+            started=started,
+            outcome=outcome,
+            accounts=accounts,
+            result_count=len(result.items),
+            metrics=ctx.metrics,
         )
         return structured_result(result)
 
@@ -674,13 +689,27 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 cursor=cursor,
             )
         except ToolError as exc:
-            log_tool_call("list_messages", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "list_messages", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
-            log_tool_call("list_messages", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "list_messages",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
-            "list_messages", started=started, outcome=outcome, accounts=accounts, result_count=len(result.items)
+            "list_messages",
+            started=started,
+            outcome=outcome,
+            accounts=accounts,
+            result_count=len(result.items),
+            metrics=ctx.metrics,
         )
         return structured_result(result)
 
@@ -692,10 +721,26 @@ def register(server: MCPServer, ctx: HubContext) -> None:
         try:
             result, outcome = await run_get_message(ctx, message_id=id, ref=ref, max_chars=max_chars)
         except ToolError as exc:
-            log_tool_call("get_message", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "get_message", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body
-            log_tool_call("get_message", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "get_message",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
-        log_tool_call("get_message", started=started, outcome=outcome, accounts=[result.account], result_count=1)
+        log_tool_call(
+            "get_message",
+            started=started,
+            outcome=outcome,
+            accounts=[result.account],
+            result_count=1,
+            metrics=ctx.metrics,
+        )
         return structured_result(result)

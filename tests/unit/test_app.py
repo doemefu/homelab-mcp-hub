@@ -13,6 +13,7 @@ def test_internal_port_serves_health_only(hub: HubApp) -> None:
         assert internal.get("/healthz").json() == {"status": "ok"}
         assert internal.get("/readyz").status_code == 200
         assert internal.post("/mcp", json={}).status_code == 404
+        assert internal.get("/metrics").status_code == 200  # spec 080 §9.7: metrics on the internal port only
 
 
 def test_readyz_is_503_before_startup(hub: HubApp) -> None:

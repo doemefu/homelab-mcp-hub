@@ -30,7 +30,7 @@ Milestone 1 (#170): iCloud mail and calendar live at mcp.furchert.ch. `outlook` 
 |------|-------|
 | MCP endpoint | `https://mcp.furchert.ch/mcp` (container port **8083**; the only port behind the Cloudflare Tunnel) |
 | Protected-resource metadata | `/.well-known/oauth-protected-resource/mcp` on port 8083 |
-| Health | `/healthz`, `/readyz` on port **8084** (cluster-internal) |
+| Health and metrics | `/healthz`, `/readyz`, `/metrics` (Prometheus text, spec 080 §9.7) on port **8084** (cluster-internal) |
 | Protocol versions | `2026-07-28` (stateless) and `2025-11-25` (initialize handshake) |
 | Scopes | `mail:read calendar:read` (both required) |
 | Image | `ghcr.io/doemefu/homelab-mcp-hub:main-<UTC timestamp>` (linux/amd64 + linux/arm64) |

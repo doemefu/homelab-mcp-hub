@@ -7,6 +7,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp_hub.config import Settings
 from mcp_hub.cursors import CursorCodec
 from mcp_hub.health import StatusStore
+from mcp_hub.metrics import Metrics
 from mcp_hub.providers import Adapters
 from mcp_hub.registry import Registry
 
@@ -18,6 +19,7 @@ class HubContext:
     status: StatusStore
     adapters: Adapters = field(default_factory=Adapters)
     cursors: CursorCodec = field(default_factory=CursorCodec)  # random key per process: a restart voids cursors
+    metrics: Metrics = field(default_factory=Metrics)  # create_app passes the instance /metrics renders (D90)
 
 
 def register_tools(server: MCPServer, ctx: HubContext) -> None:
