@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from mcp_hub.budget import fit_items
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import encode_event_id
+from mcp_hub.metrics import ToolOutcome
 from mcp_hub.providers.base import ACCOUNT_ERROR_MESSAGES, run_blocking
 from mcp_hub.providers.caldav import RawEvent
 from mcp_hub.registry import Account
@@ -124,7 +125,7 @@ def _timed(value: datetime | date) -> str:
 
 async def run_get_events(
     ctx: HubContext, *, start: str, end: str, account: str | None, timezone: str | None, limit: int | None
-) -> tuple[GetEventsResult, list[str], str]:
+) -> tuple[GetEventsResult, list[str], ToolOutcome]:
     """Returns the result, the queried account ids and the outcome for the tool_call log line."""
     count = int_argument(limit, "limit", default=100, low=1, high=200)
     window_start, window_end = parse_timestamp(start, "from"), parse_timestamp(end, "to")
@@ -189,12 +190,28 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 ctx, start=from_, end=to, account=account, timezone=timezone, limit=limit
             )
         except ToolError as exc:
-            log_tool_call("get_events", started=started, outcome=exc.code, accounts=[], result_count=0)
+            log_tool_call(
+                "get_events", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
+            )
             return exc.to_result()
         except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
-            log_tool_call("get_events", started=started, outcome="upstream_error", accounts=[], result_count=0)
+            log_tool_call(
+                "get_events",
+                started=started,
+                outcome="upstream_error",
+                accounts=[],
+                result_count=0,
+                metrics=ctx.metrics,
+            )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
-        log_tool_call("get_events", started=started, outcome=outcome, accounts=accounts, result_count=len(result.items))
+        log_tool_call(
+            "get_events",
+            started=started,
+            outcome=outcome,
+            accounts=accounts,
+            result_count=len(result.items),
+            metrics=ctx.metrics,
+        )
         return structured_result(result)
 
     async def get_events(**arguments: Any) -> CallToolResult:

@@ -14,7 +14,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -22,9 +22,10 @@ from mcp_hub import __version__
 from mcp_hub.auth import HubTokenVerifier, SubjectAllowlist
 from mcp_hub.checker import HealthChecker
 from mcp_hub.config import ALLOWLIST_FILE, Settings
-from mcp_hub.health import StatusStore, missing_credentials
+from mcp_hub.health import StatusStore, capability_status, missing_credentials
 from mcp_hub.jwks import JwksCache
 from mcp_hub.logging import apply_logger_levels, log_event
+from mcp_hub.metrics import CONTENT_TYPE, Metrics, RejectionCheck
 from mcp_hub.providers import Adapters, MailboxOpener
 from mcp_hub.registry import CAPABILITIES, Registry
 from mcp_hub.tokenstore.store import StoreConfig
@@ -74,11 +75,13 @@ class ChallengeScopeMiddleware:
 
 
 class RequestLogMiddleware:
-    """One line per request: route, status, duration, protocol version, principal ids, rejection check."""
+    """One line per request: route, status, duration, protocol version, principal ids, rejection check; a refused
+    request is also counted (spec 080 §9.7)."""
 
-    def __init__(self, app: ASGIApp, routes: frozenset[str]) -> None:
+    def __init__(self, app: ASGIApp, routes: frozenset[str], metrics: Metrics) -> None:
         self._app = app
         self._routes = routes
+        self._metrics = metrics
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -113,6 +116,7 @@ class RequestLogMiddleware:
             check = _rejection_check(status, challenge)
             if check is not None:
                 fields["check"] = check
+                self._metrics.count_rejection(check)
             log_event(_log, logging.INFO, "request", **fields)
 
 
@@ -124,7 +128,7 @@ def _protocol_version(scope: Scope) -> str | None:
     return None
 
 
-def _rejection_check(status: int, challenge: bytes) -> str | None:
+def _rejection_check(status: int, challenge: bytes) -> RejectionCheck | None:
     if status == 403 and b"insufficient_scope" in challenge:
         return "scope"
     if status == 403:
@@ -181,7 +185,7 @@ class PortDispatcher:
             await self._public(scope, receive, send)
 
 
-def build_internal_app(readiness: Readiness) -> Starlette:
+def build_internal_app(readiness: Readiness, exposition: Callable[[], str]) -> Starlette:
     async def healthz(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
@@ -190,7 +194,30 @@ def build_internal_app(readiness: Readiness) -> Starlette:
             return JSONResponse({"status": "ready"})
         return JSONResponse({"status": "starting"}, status_code=503)
 
-    return Starlette(routes=[Route("/healthz", healthz, methods=["GET"]), Route("/readyz", readyz, methods=["GET"])])
+    async def metrics(request: Request) -> Response:  # async: reads the status store on the event loop
+        return Response(exposition(), media_type=CONTENT_TYPE)
+
+    return Starlette(
+        routes=[
+            Route("/healthz", healthz, methods=["GET"]),
+            Route("/readyz", readyz, methods=["GET"]),
+            Route("/metrics", metrics, methods=["GET"]),
+        ]
+    )
+
+
+def account_statuses(context: HubContext) -> list[tuple[str, str, str]]:
+    """(account, capability, status) for every configured capability: the same view as `list_accounts`."""
+    return [
+        (
+            account.id,
+            capability,
+            capability_status(account, capability, context.settings.secrets_dir, context.status).status,
+        )
+        for account in context.registry.accounts
+        for capability in CAPABILITIES
+        if account.has(capability)
+    ]
 
 
 @dataclass(frozen=True)
@@ -211,6 +238,7 @@ def create_app(
     adapters: Adapters | None = None,
     background_checks: bool = False,
 ) -> HubApp:
+    metrics = Metrics()  # one registry per application instance (spec 080 D90)
     verifier = HubTokenVerifier(
         issuer=settings.auth_issuer,
         resource=settings.resource,
@@ -218,6 +246,7 @@ def create_app(
         leeway=settings.clock_skew_seconds,
         jwks=JwksCache(settings.auth_jwks_url, clock=monotonic),
         allowlist=SubjectAllowlist(settings.secrets_dir / ALLOWLIST_FILE, clock=monotonic),
+        metrics=metrics,
     )
     server = MCPServer(
         name="mcp-hub",
@@ -240,6 +269,7 @@ def create_app(
         registry=registry,
         status=status or StatusStore(),
         adapters=adapters or Adapters(mailbox=MailboxOpener(StoreConfig.from_settings(settings))),
+        metrics=metrics,
     )
     register_tools(server, context)
     _warn_missing_credentials(settings, registry)
@@ -255,9 +285,10 @@ def create_app(
     public = RequestLogMiddleware(
         ChallengeScopeMiddleware(sdk_app, REQUIRED_SCOPES),
         routes=frozenset({settings.mcp_path, settings.resource_metadata_path}),
+        metrics=metrics,
     )
     readiness = Readiness()
-    internal = build_internal_app(readiness)
+    internal = build_internal_app(readiness, lambda: metrics.render(account_statuses(context)))
     # Opt-in twice: the production entry point asks for it and the deployment enables it (spec 080 rev. 4.4 §7.4).
     checker = (
         HealthChecker(context, interval=settings.health_check_interval_seconds)

@@ -16,6 +16,7 @@ from mcp_hub.config import Settings
 from mcp_hub.cursors import argument_digest
 from mcp_hub.ids import GraphMessageRef, MessageRef, encode_ref, location_id
 from mcp_hub.logging import JsonFormatter, configure_logging
+from mcp_hub.metrics import REJECTION_CHECKS
 from mcp_hub.providers import Adapters
 from mcp_hub.providers.base import FolderPage, ListQuery, MailMeta, MailSummary, ProviderError, order_key
 from mcp_hub.providers.deadline import CallDeadline
@@ -26,24 +27,7 @@ from tests.support.logfields import allowed_fields
 from tests.support.mcp import body, initialize, modern
 from tests.support.tokens import TokenFactory
 
-ALLOWED_CHECKS = {
-    "malformed",
-    "algorithm",
-    "type",
-    "signature",
-    "time",
-    "issuer",
-    "audience",
-    "required_claims",
-    "client",
-    "scope_format",
-    "subject",
-    "internal",
-    "scope",
-    "host",
-    "origin",
-    "body_size",
-}
+ALLOWED_CHECKS = frozenset(REJECTION_CHECKS)  # one vocabulary for logs and metrics (spec 080 §9.7, D90)
 
 
 # pytest-httpserver's own request log (the test JWKS server, not the hub).

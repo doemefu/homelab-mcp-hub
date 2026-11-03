@@ -8,6 +8,7 @@ from pytest_httpserver import HTTPServer
 
 from mcp_hub.auth import HubTokenVerifier, SubjectAllowlist
 from mcp_hub.jwks import JwksCache
+from mcp_hub.metrics import Metrics
 from tests.support.clock import FakeClock
 from tests.support.keys import TestKey, jwks
 from tests.support.tokens import CLIENT_ID, ISSUER, RESOURCE, SUBJECT, TokenFactory
@@ -33,6 +34,7 @@ def verifier(httpserver: HTTPServer, tmp_path: Path) -> HubTokenVerifier:
         leeway=60,
         jwks=JwksCache(httpserver.url_for("/jwks.json"), clock=FakeClock()),
         allowlist=SubjectAllowlist(tmp_path / "allowed-subjects", clock=FakeClock()),
+        metrics=Metrics(),
     )
 
 
@@ -100,3 +102,31 @@ async def test_space_delimited_scope_string(verifier: HubTokenVerifier) -> None:
     access = await verifier.verify_token(T.mint(scope="mail:read calendar:read"))
     assert access is not None
     assert access.scopes == ["mail:read", "calendar:read"]
+
+
+async def test_rejections_are_counted_by_check(httpserver: HTTPServer, tmp_path: Path) -> None:
+    """Spec 080 §9.7: the verifier counts each rejection under its check, an unexpected error under `internal`."""
+    httpserver.expect_request("/jwks.json").respond_with_json(jwks(KEY))
+    (tmp_path / "allowed-subjects").write_text(SUBJECT + "\n")
+    metrics = Metrics()
+    jwks_cache = JwksCache(httpserver.url_for("/jwks.json"), clock=FakeClock())
+    verifier = HubTokenVerifier(
+        issuer=ISSUER,
+        resource=RESOURCE,
+        client_id=CLIENT_ID,
+        leeway=60,
+        jwks=jwks_cache,
+        allowlist=SubjectAllowlist(tmp_path / "allowed-subjects", clock=FakeClock()),
+        metrics=metrics,
+    )
+    assert await verifier.verify_token("not-a-jwt") is None
+
+    async def broken(kid: str) -> None:
+        raise RuntimeError("SENTINEL")
+
+    jwks_cache.get_key = broken  # type: ignore[method-assign]  # an unexpected failure inside the verifier
+    assert await verifier.verify_token(T.mint()) is None
+    text = metrics.render([])
+    assert 'mcp_hub_token_rejections_total{check="malformed"} 1\n' in text
+    assert 'mcp_hub_token_rejections_total{check="internal"} 1\n' in text
+    assert "SENTINEL" not in text

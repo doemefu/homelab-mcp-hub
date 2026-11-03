@@ -8,7 +8,7 @@ In-progress worklogs are listed at session start by the `homelab-workflow` plugi
 
 A read-only remote MCP server for the owner's mail and calendars. It is a pure OAuth resource server: auth-service issues the access tokens, the hub validates them offline against the auth-service JWKS and serves MCP tools over Streamable HTTP.
 
-**Ports:** 8083 (MCP endpoint `/mcp` + protected-resource metadata; the only port behind the Cloudflare Tunnel), 8084 (cluster-internal `/healthz`, `/readyz`)
+**Ports:** 8083 (MCP endpoint `/mcp` + protected-resource metadata; the only port behind the Cloudflare Tunnel), 8084 (cluster-internal `/healthz`, `/readyz`, `/metrics`)
 **Package:** `src/mcp_hub`
 **Contract:** `docs/080-mcp-hub.md` and ADR `docs/adr/0003-mcp-hub-authorization.md` in the `doemefu/homelab` (infrastructure) repo — linked, never copied.
 

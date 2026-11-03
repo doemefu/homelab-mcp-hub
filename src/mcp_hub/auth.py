@@ -11,6 +11,7 @@ from mcp.server.auth.provider import AccessToken
 
 from mcp_hub.jwks import JwksCache
 from mcp_hub.logging import log_event
+from mcp_hub.metrics import Metrics, RejectionCheck
 
 _log = logging.getLogger("mcp_hub.auth")
 
@@ -50,7 +51,7 @@ REQUIRED_CLAIMS: Final = ("iss", "aud", "sub", "exp", "iat", "client_id", "scope
 
 
 class TokenRejectedError(Exception):
-    def __init__(self, check: str) -> None:
+    def __init__(self, check: RejectionCheck) -> None:
         super().__init__(check)
         self.check = check
 
@@ -59,8 +60,17 @@ class HubTokenVerifier:
     """Offline validation against the auth-service JWKS. Scopes (row 9) are left to the SDK's required_scopes."""
 
     def __init__(
-        self, *, issuer: str, resource: str, client_id: str, leeway: int, jwks: JwksCache, allowlist: SubjectAllowlist
+        self,
+        *,
+        issuer: str,
+        resource: str,
+        client_id: str,
+        leeway: int,
+        jwks: JwksCache,
+        allowlist: SubjectAllowlist,
+        metrics: Metrics,
     ) -> None:
+        self._metrics = metrics
         self._issuer = issuer
         self._resource = resource
         self._client_id = client_id
@@ -73,8 +83,10 @@ class HubTokenVerifier:
             return await self._verify(token)
         except TokenRejectedError as rejected:
             log_event(_log, logging.INFO, "token_rejected", check=rejected.check)
+            self._metrics.count_rejection(rejected.check)
         except Exception as exc:  # never let a token turn into a 500
             log_event(_log, logging.WARNING, "token_rejected", check="internal", exception=type(exc).__name__)
+            self._metrics.count_rejection("internal")
         return None
 
     async def _verify(self, token: str) -> AccessToken:
