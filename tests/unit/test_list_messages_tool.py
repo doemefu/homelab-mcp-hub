@@ -357,6 +357,24 @@ async def test_ref_null_for_invalid_message_id(secrets_dir: Path) -> None:
     assert (second.ref, second.untrusted.message_id) == (None, None)
 
 
+async def test_address_hosts_stay_addresses(secrets_dir: Path) -> None:
+    """#59: an address whose host starts with `www.` is not reduced to a link marker in any address field."""
+    item = replace(
+        summary("icloud", 1, 10, message_id="m1@www.example.org"),
+        from_address="news@www.example.org",
+        to_addresses=("team@www.example.org",),
+        cc_addresses=("a@mail.www.example.org",),
+    )
+    result, _, _ = await run(context(secrets_dir, Fake(items={"icloud": [item]})))
+    [first] = result.items
+    assert first.untrusted.from_address == "news@www.example.org"
+    assert (first.untrusted.to_addresses, first.untrusted.cc_addresses) == (
+        ["team@www.example.org"],
+        ["a@mail.www.example.org"],
+    )
+    assert first.untrusted.message_id == "m1@www.example.org"
+
+
 async def test_id_null_for_unsafe_mailbox_name(secrets_dir: Path) -> None:
     long_name = "F" * 201  # §5.3 rule 9: longer than 200 characters → no `m` id, still listed and pageable
     items = [summary("icloud", uid, uid, mailbox=long_name, folder="other", folder_name=long_name) for uid in (1, 2)]

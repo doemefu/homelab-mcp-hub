@@ -788,7 +788,7 @@ def test_history_header_failure_keeps_sender_and_subject(monkeypatch: pytest.Mon
     def exploding(raw: bytes | None) -> object:
         raise ValueError("SENTINEL")
 
-    monkeypatch.setattr(imap, "parse_summary_headers", exploding)
+    monkeypatch.setattr(imap, "summary_headers", exploding)
     try:
         detail = get(icloud(inbox=[msg(1, 5, "kept", message_id=f"<{MID}>")]), MessageRef("icloud", "INBOX", 7, 1))
     finally:

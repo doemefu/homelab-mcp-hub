@@ -213,13 +213,17 @@ def _complete_list(value: str) -> str:
     return value[:last] if last >= 0 else ""
 
 
-def address_pairs(text: str) -> list[tuple[str, str]]:
+def address_pairs(text: str, *, cut: bool = False) -> list[tuple[str, str]]:
     """(display name, address) pairs; the linear stdlib parser on text cut to 8 KiB (the policy parser is quadratic).
 
-    A list cut at a byte cap keeps its complete addresses: trailing commas and whitespace (what `trim_cut` leaves,
-    or padding) are stripped first and are no cut; past the 8 KiB cap here, the value is cut back to its last address
-    that provably ended (`_complete_list`); and a field the strict parser refuses as a whole (an unterminated quoted
-    string or comment) is parsed once more the same way."""
+    A list cut at a byte cap keeps its complete addresses. When `cut` says the field reached the cap of the header
+    block it came from (MF-T9-4), the value is first cut back to its last address that provably ended
+    (`_complete_list`), before the strip, since a trailing comma left by `trim_cut` is what proves that the address
+    before it ended. Then trailing commas and whitespace (what `trim_cut` leaves, or padding) are stripped and are
+    no cut; past the 8 KiB cap here, the value is cut back the same way; and a field the strict parser refuses as a
+    whole (an unterminated quoted string or comment) is parsed once more the same way."""
+    if cut:
+        text = _complete_list(text)
     text = text.rstrip(_LIST_TAIL)
     value = text[:MAX_ADDRESS_HEADER_BYTES]
     if len(text) > MAX_ADDRESS_HEADER_BYTES:
@@ -261,13 +265,15 @@ def _header_items(raw: bytes) -> dict[str, list[str]]:
     return items
 
 
-def parse_summary_headers(raw: bytes | None) -> ParsedHeaders:
+def parse_summary_headers(raw: bytes | None, *, cut: frozenset[str] = frozenset()) -> ParsedHeaders:
+    """`cut` names the address lists (`to`, `cc`) that did not end before the cap of a cut block: they keep only
+    their complete addresses (`address_pairs(cut=True)`)."""
     if not raw:
         return ParsedHeaders(None, None, (), (), None, None, None, (), None)
     items = _header_items(raw)
     sender = (address_pairs(_first(items, "from") or "") or [("", "")])[0]
-    to = tuple(a for _, a in address_pairs(_first(items, "to") or "") if a)
-    cc = tuple(a for _, a in address_pairs(_first(items, "cc") or "") if a)
+    to = tuple(a for _, a in address_pairs(_first(items, "to") or "", cut="to" in cut) if a)
+    cc = tuple(a for _, a in address_pairs(_first(items, "cc") or "", cut="cc" in cut) if a)
     subject_raw = _first(items, "subject")
     message_id = bare_message_id(_first(items, "message-id"))
     refs_raw = _first(items, "references")
