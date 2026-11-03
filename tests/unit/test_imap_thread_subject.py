@@ -746,3 +746,19 @@ def test_participant_field_past_the_cut_marks_inexact() -> None:
     page = thread(server, seed=seed_in_inbox(server))
     assert ids(page) == ["s@example.test"]
     assert exact(page) is False
+
+
+def test_subject_scan_cut_to_keeps_only_complete_addresses() -> None:
+    """T9-X / MF-T9-4: a scan block cut at 8 KiB inside the To of a joined candidate keeps only the To addresses that
+    ended before the cut: neither the display name `Bob` nor a shortened `bob@exa` becomes an address."""
+    head = b"From: " + ALICE.encode() + b"\r\nSubject: Plan\r\nMessage-ID: <c@example.test>\r\nCc: "
+    head += CAROL.encode() + b"\r\nTo: "
+    tail = b", Bob <bob@exa"
+    first = b"a" * (imap_thread.SUBJECT_SCAN_BYTES - len(head) - len(tail) - len(b"@example.org")) + b"@example.org"
+    raw = head + first + tail + b"mple.test>\r\n\r\n"
+    seed = msg(1, 5 * DAY, "Plan", sender=ALICE, message_id="<s@example.test>")
+    server = icloud(inbox=[seed, msg(2, 4 * DAY, headers=raw)])
+    page = thread(server, seed=seed_in_inbox(server))
+    assert ids(page) == ["s@example.test", "c@example.test"]
+    member = page.members[1].summary
+    assert member.to_addresses == (first.decode(),)

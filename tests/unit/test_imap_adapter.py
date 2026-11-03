@@ -242,14 +242,14 @@ def test_item_degraded_logs_the_exception_class_name_only(
 ) -> None:
     import mcp_hub.providers.imap as imap
 
-    original = imap.parse_summary_headers
+    original = imap.summary_headers
 
     def exploding(raw: bytes | None) -> ParsedHeaders:
         if raw is not None and b"secret" in raw:
             raise ValueError("SENTINEL-provider-text secret@example.test")
         return original(raw)
 
-    monkeypatch.setattr(imap, "parse_summary_headers", exploding)
+    monkeypatch.setattr(imap, "summary_headers", exploding)
     page = mailbox(server(message(1, 3, "secret"), message(2, 4, "fine"))).list_messages(
         ListQuery("inbox", T0 - timedelta(hours=1), True, None, 20), CallDeadline.start()
     )

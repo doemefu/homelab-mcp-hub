@@ -30,5 +30,15 @@ def test_html_to_text_scales_linearly_on_malformed_input(shape: str) -> None:
     assert check.scales_linearly(small, large), (shape, small, large)
 
 
+@pytest.mark.parametrize("shape", list(_check().CLEAN_SHAPES))
+def test_clean_scales_linearly(shape: str) -> None:
+    """The URL rule and its address-host exception (#59) stay linear on hostile text."""
+    check = _check()
+    build = check.CLEAN_SHAPES[shape]
+    small = check.elapsed(build(check.SMALL), convert=check.clean_all)
+    large = check.elapsed(build(check.LARGE), convert=check.clean_all)
+    assert check.scales_linearly(small, large), (shape, small, large)
+
+
 def test_unterminated_comment_or_declaration_stays_hidden() -> None:
     assert _check().hidden_text_leaks() == []

@@ -335,8 +335,9 @@ def test_address_pairs_cut_list_keeps_complete_addresses(value: str, expected: l
 def test_address_pairs_cut_inside_the_last_address() -> None:
     """A cut inside the last address drops only that address. At the 8 KiB cap of `address_pairs` the cut is known,
     so the list is cut back to its last top-level comma. In a block cut at its own cap, `trim_cut` drops the
-    shortened token; what is left of that address is kept as the parser reads it: here the display name "Bob",
-    which the parser returns as an address. No complete address is lost, and no shortened address appears."""
+    shortened token; the parser alone still reads what is left of that address (the display name "Bob") as an
+    address, so a field that did not end before the cut is parsed with `cut` and keeps only its complete addresses
+    (MF-T9-4). No complete address is lost, and no shortened address or name appears."""
     first = "a" * (MAX_ADDRESS_HEADER_BYTES - 20) + "@x.y"
     value = first + ", bob@example.test, c@x.y"
     assert value[:MAX_ADDRESS_HEADER_BYTES].endswith(", bob@example.te")  # the cap falls inside the second address
@@ -344,8 +345,11 @@ def test_address_pairs_cut_inside_the_last_address() -> None:
 
     block = trim_cut(b"To: a@x.y, Bob <b@x.y")
     assert block == b"To: a@x.y, Bob "
-    parsed = parse_summary_headers(block)
-    assert parsed.to == ("a@x.y", "Bob")
+    assert parse_summary_headers(block).to == ("a@x.y", "Bob")  # the parser alone, without the cut
+    assert parse_summary_headers(block, cut=frozenset({"to"})).to == ("a@x.y",)
+    block = trim_cut(b"To: a@x.y, b@x.y, c@x.yz")  # a plain addr-spec list: the comma proves `b@x.y` ended
+    assert block == b"To: a@x.y, b@x.y, "
+    assert parse_summary_headers(block, cut=frozenset({"to"})).to == ("a@x.y", "b@x.y")
     block = trim_cut(b"To: a@x.y, b@x.yz")
     assert parse_summary_headers(block).to == ("a@x.y",)
 

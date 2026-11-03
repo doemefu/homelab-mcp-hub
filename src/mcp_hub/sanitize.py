@@ -31,6 +31,7 @@ FIELD_LIMITS: Final[dict[str, int]] = {
 # Zero-width (U+200B-U+200F, U+2060-U+2064, U+FEFF) and bidi controls (U+202A-U+202E, U+2066-U+2069).
 _INVISIBLE: Final = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u202a-\u202e\u2066-\u2069]")
 _URL: Final = re.compile(r"(?i)(?:\bmailto:[^\s<>\"']*|\b(?:https?|ftp)://[^\s<>\"']*|\bwww\.[^\s<>\"']+)")
+_LOCAL_PART_SYMBOLS: Final = "!#$%&'*+/=?^_`{|}~.-\""  # RFC 5322 atext symbols, a dot and a closing quote
 _SURROGATE: Final = re.compile(r"[\ud800-\udfff]")
 # Raw patterns: the regex engine reads the \u escapes, so no lone surrogate appears in the source string.
 _NON_ESCAPE_SURROGATE: Final = re.compile(r"[\ud800-\udc7f\udd00-\udfff]")
@@ -91,10 +92,30 @@ def truncate(text: str, limit: int) -> str:
     return text[: max(limit - len(TRUNCATION_MARKER), 0)].rstrip() + TRUNCATION_MARKER
 
 
+def _host_char(ch: str) -> bool:
+    return ch.isalnum() or ch in "._-"
+
+
+def _address_host(match: re.Match[str]) -> bool:
+    """Whether a scheme-less `www.` match is the host of a mail address (`news@www.example.org`, #59): a bare host
+    (trailing `.,;:!?)` allowed) after at most 255 host characters, an `@` and a non-empty local part. A token with
+    any other character (a path, query, fragment, port, userinfo) stays a URL (spec 080 §5.3 rule 4). No regex:
+    one pass over the match and at most 255 characters before it."""
+    if not all(_host_char(ch) for ch in match.group(0).rstrip(".,;:!?)")):
+        return False
+    text, i = match.string, match.start()
+    stop = max(i - 255, 0)
+    while i > stop and _host_char(text[i - 1]):
+        i -= 1
+    return i >= 2 and text[i - 1] == "@" and (text[i - 2].isalnum() or text[i - 2] in _LOCAL_PART_SYMBOLS)
+
+
 def _link(match: re.Match[str]) -> str:
     raw = match.group(0)
     if raw.lower().startswith("mailto:"):
         return "[mail link]"
+    if raw[:4].lower() == "www." and _address_host(match):
+        return raw
     try:
         host = urlsplit(raw if "://" in raw else "http://" + raw).hostname
     except ValueError:
