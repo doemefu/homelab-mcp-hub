@@ -59,6 +59,9 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Fixed
 
+- Addresses whose host starts with `www.` (`news@www.example.org`) are no longer turned into `news@[link: www.example.org]` in address fields, ids and text; a token with a path, query, fragment, port or userinfo is still reduced to its host (#59). `subject` thread keys of subjects that contain such an address change once.
+- A summary header block cut at its 64 KiB cap is read the same way by `list_messages`, `list_unread`, `search_messages`, `get_message` and `get_thread`: the last, possibly shortened token is dropped, a From or Message-ID that did not end before the cut is dropped, and a cut To or Cc keeps only its complete addresses (#55; also the 8 KiB subject-scan item of `get_thread`, #53 MF-T9-4).
+- A text part that the server does not return (NIL or missing) is not read: `get_message` answers `body_source: "none"` with one `item_degraded` line, `get_thread` marks the body omitted (#55).
 - The `providers` CI job no longer times out while seeding Radicale: the test of a CalDAV `REPORT` answer above 5 MiB builds its event from many short properties instead of one property folded into about 92,000 lines, which Radicale parses in quadratic time (#68).
 - An address list (`From`, `To`, `Cc`) cut at a header byte cap keeps only its complete addresses, cut back to the last top-level comma (spec §5.4).
 - `safe_decode` refuses the `punycode`, `idna`, `unicode-escape` and `raw-unicode-escape` codecs (spec §5.3 rule 10; matched on the canonical codec name, so aliases are caught) and decodes such parts as UTF-8; punycode is quadratic on hostile input and the escape codecs are not charsets.

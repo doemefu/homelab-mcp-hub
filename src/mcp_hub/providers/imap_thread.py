@@ -73,6 +73,8 @@ from mcp_hub.providers.imap_session import (
     _open,
     _thread_id,
     _uid_rows,
+    cut_address_fields,
+    summary_headers,
 )
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
 from mcp_hub.providers.threads import (
@@ -511,7 +513,7 @@ def _headers(
     does not parse degrades only this copy (SC1)."""
     block = header_bytes(row)
     try:
-        parsed = parse_summary_headers(trim_cut(block) if len(block) >= MAX_HEADER_BYTES else block)
+        parsed = summary_headers(block)  # the cut rules shared with the list tools and get_message (#55)
     except PASS_THROUGH:
         raise
     except Exception as exc:
@@ -519,8 +521,6 @@ def _headers(
         parsed = parse_summary_headers(None)
     if len(block) < MAX_HEADER_BYTES:
         return parsed
-    if not _field_complete(block, b"from"):
-        parsed = replace(parsed, from_address=None, from_name=None)
     if parsed.message_id is None or not _field_complete(block, b"message-id"):
         own_root = parsed.root is None or parsed.root == parsed.message_id
         if known_id is None:
@@ -950,7 +950,11 @@ def _candidate(
     block = header_bytes(row)
     cut = len(block) >= SUBJECT_SCAN_BYTES
     try:
-        parsed = parse_summary_headers(trim_cut(block) if cut else block)
+        parsed = (
+            parse_summary_headers(trim_cut(block), cut=cut_address_fields(block))
+            if cut
+            else (parse_summary_headers(block))
+        )
     except PASS_THROUGH:
         raise
     except Exception as exc:
@@ -1174,13 +1178,13 @@ def _slice_bodies(
         for ref, copy, part in members:
             soft_check()  # decoding, conversion and quote removal cost CPU without a command (sec-G5)
             row = data.get(ref.uid)
-            if row is None:
+            raw = row.get(key) if row is not None else None
+            if not isinstance(raw, bytes):  # no row, no item or NIL: the body stays not read (#55)
                 continue
-            raw = row.get(key)
             bodies[ref] = _body(
                 session,
                 ref,
-                raw if isinstance(raw, bytes) else b"",
+                raw,
                 part,
                 subject=copy.summary.subject,
                 max_chars=max_chars,

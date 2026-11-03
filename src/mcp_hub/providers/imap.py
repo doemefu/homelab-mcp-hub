@@ -24,6 +24,7 @@ from mcp_hub import search as _search  # the module: `search` imports providers.
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
 from mcp_hub.providers import imap_status, imap_thread
 from mcp_hub.providers.base import (
+    MAX_HEADER_BYTES,
     MAX_TEXT_PART_BYTES,
     PROVIDER_TIMEOUT_SECONDS,
     SNIPPET_FETCH_BYTES,
@@ -63,7 +64,7 @@ from mcp_hub.providers.headers import (
     candidate_header_item,
     header_bytes,
     imap_thread_key,
-    parse_summary_headers,
+    trim_cut,
 )
 from mcp_hub.providers.imap_guard import (
     PASS_THROUGH,
@@ -84,6 +85,7 @@ from mcp_hub.providers.imap_session import (
     FETCH_CHUNK_UIDS,
     MAX_SEARCH_CANDIDATES,
     SOFT_CHECK_EVERY,
+    BodyNotReturned,
     ImapSession,
     MissingInternalDate,
     _answered_no,
@@ -92,10 +94,13 @@ from mcp_hub.providers.imap_session import (
     _candidate_headers,
     _detail_folder,
     _examine_bound,
+    _field_complete,
     _flags,
     _gmail_folder,
     _is_draft,
     _labels,
+    cut_address_fields,
+    summary_headers,
 )
 from mcp_hub.providers.imap_thread import BODY_RESERVE_SECONDS, _raise_bad
 from mcp_hub.providers.mime import Part, attachment_parts, choose_text_part, decode_part, walk
@@ -159,14 +164,14 @@ def _check_soft(deadline: CallDeadline) -> None:
         raise SoftStop
 
 
-def _addresses(message: Message, name: str) -> list[tuple[str, str]]:
+def _addresses(message: Message, name: str, *, cut: bool = False) -> list[tuple[str, str]]:
     """(display name, address) pairs of the first `name` header: its raw text through the linear parser of
-    `headers.address_pairs` (cut to 8 KiB). `Message.get` would run the policy parser, which is quadratic on a
-    hostile 64 KiB header (security I1)."""
+    `headers.address_pairs` (cut to 8 KiB; `cut`: the field did not end before the cap of its block). `Message.get`
+    would run the policy parser, which is quadratic on a hostile 64 KiB header (security I1)."""
     wanted = name.lower()
     for key, value in message.raw_items():
         if key.lower() == wanted:
-            return address_pairs(str(value))
+            return address_pairs(str(value), cut=cut)
     return []
 
 
@@ -313,7 +318,7 @@ def _reduce(row: dict[bytes, object]) -> Reduced:
     except Exception as exc:
         structure = Failed(type(exc).__name__)
     try:
-        headers = parse_summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
+        headers = summary_headers(header_bytes(row))  # CPU-bounded (§5.5, Sec4); in the worker thread
     except PASS_THROUGH:
         raise
     except Exception as exc:
@@ -930,28 +935,32 @@ class ImapMailbox:
         if text_part is not None:
             data = session.fetch([ref.uid], [f"BODY.PEEK[{text_part.section}]<0.{MAX_TEXT_PART_BYTES}>"], on_no="fail")
             raw = data.get(ref.uid, {}).get(f"BODY[{text_part.section}]<0>".encode())
-            raw_bytes = raw if isinstance(raw, bytes) else b""
-            # The BODYSTRUCTURE size decides; only without one does a full-length fetch count as cut.
-            cut = text_part.size > MAX_TEXT_PART_BYTES or (
-                text_part.size <= 0 and len(raw_bytes) >= MAX_TEXT_PART_BYTES
-            )
-            try:
-                body = decode_part(raw_bytes, text_part)
-                if text_part.mime_type == "text/html":
-                    body, source = html_to_text(body), "text/html-converted"
-                else:
-                    source = "text/plain"
-            except PASS_THROUGH:
-                raise
-            except Exception as exc:
-                log_message_skipped(ref, "mail", exc)
-                body, source = "", "none"
-        raw_headers = header_bytes(row)
+            if not isinstance(raw, bytes):  # no row, no item or NIL: the body was not read (#55)
+                log_message_skipped(ref, "mail", BodyNotReturned())
+            else:
+                # The BODYSTRUCTURE size decides; only without one does a full-length fetch count as cut.
+                cut = text_part.size > MAX_TEXT_PART_BYTES or (text_part.size <= 0 and len(raw) >= MAX_TEXT_PART_BYTES)
+                try:
+                    body = decode_part(raw, text_part)
+                    if text_part.mime_type == "text/html":
+                        body, source = html_to_text(body), "text/html-converted"
+                    else:
+                        source = "text/plain"
+                except PASS_THROUGH:
+                    raise
+                except Exception as exc:
+                    log_message_skipped(ref, "mail", exc)
+                    body, source = "", "none"
+        block = header_bytes(row)
+        block_cut = len(block) >= MAX_HEADER_BYTES  # the same cut rules as the list tools and get_thread (#55)
         try:
-            headers = _PARSER.parsebytes(raw_headers)
+            headers = _PARSER.parsebytes(trim_cut(block) if block_cut else block)
             sender, subject = _sender_and_subject(headers)
-            to = [a for _, a in _addresses(headers, "To") if a]
-            cc = [a for _, a in _addresses(headers, "Cc") if a]
+            if block_cut and not _field_complete(block, b"from"):
+                sender = ("", "")
+            cut_lists = cut_address_fields(block) if block_cut else frozenset()
+            to = [a for _, a in _addresses(headers, "To", cut="to" in cut_lists) if a]
+            cc = [a for _, a in _addresses(headers, "Cc", cut="cc" in cut_lists) if a]
         except PASS_THROUGH:
             raise
         except Exception as exc:
@@ -959,7 +968,7 @@ class ImapMailbox:
             sender, subject, to, cc = ("", ""), None, [], []
         parsed: ParsedHeaders | None = None
         try:  # the history fields degrade on their own: sender, subject, To and Cc stay
-            parsed = parse_summary_headers(raw_headers)  # Message-ID, In-Reply-To, References (§5.5)
+            parsed = summary_headers(block)  # Message-ID, In-Reply-To, References (§5.5)
         except PASS_THROUGH:
             raise
         except Exception as exc:

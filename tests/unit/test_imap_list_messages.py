@@ -685,13 +685,13 @@ def test_summary_parse_checks_the_soft_limit_per_item(monkeypatch: pytest.Monkey
     item and returns the items built so far as a partial page."""
     server = icloud(inbox=[msg(1, 5, "a"), msg(2, 6, "b"), msg(3, 7, "c")])
     clock = clock_of(server)
-    original = imap.parse_summary_headers
+    original = imap.summary_headers
 
     def slow_parse(raw: bytes | None) -> object:
         clock.advance(10.0)
         return original(raw)
 
-    monkeypatch.setattr(imap, "parse_summary_headers", slow_parse)
+    monkeypatch.setattr(imap, "summary_headers", slow_parse)
     page = box(server).list_messages(query(), CallDeadline(clock(), 15.0, 100.0, clock))
     assert subjects(page) == ["a", "b"]
     assert (page.truncated, page.complete) == (True, False)

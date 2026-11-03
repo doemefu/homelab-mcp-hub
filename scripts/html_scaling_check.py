@@ -1,15 +1,17 @@
 """Size-scaling check of the HTML-to-text converter on malformed input (re-review R1, R4).
 
-Runs html_to_text on 64 KiB and 256 KiB of each shape and fails when the time grows clearly faster than the size
-(linear: about 4x, quadratic: about 16x). Used by tests/unit/test_html_scaling.py and, on the production
+Runs html_to_text on 64 KiB and 256 KiB of each shape, and the text sanitiser (`clean`, URL and address-host rules,
+#59) on its own shapes, and fails when the time grows clearly faster than the size (linear: about 4x, quadratic:
+about 16x). Used by tests/unit/test_html_scaling.py and, on the production
 interpreter, by scripts/smoke_image.sh (piped into the image: python - < scripts/html_scaling_check.py).
 """
 
 import platform
 import sys
 import time
+from collections.abc import Callable
 
-from mcp_hub.sanitize import html_to_text
+from mcp_hub.sanitize import clean, html_to_text
 
 SMALL, LARGE = 64 * 1024, 256 * 1024
 MAX_RATIO = 8.0  # linear growth gives about 4; quadratic about 16
@@ -24,20 +26,36 @@ SHAPES = {
     "attribute run": lambda n: "<a " + 'b="c" ' * ((n - 3) // 6),
     "unterminated attribute": lambda n: '<a href="' + "x" * (n - 9),
 }
+# Text shapes for `clean` (#59): a long `www.` token that fails the address-host check only at its end, many kept
+# address hosts, and a long host prefix before each `www.` token (the look-back stops after 255 characters).
+CLEAN_SHAPES = {
+    "failing address-host token": lambda n: "x@www." + "." * (n - 7) + "%",
+    "many address hosts": lambda n: "x@www.a " * (n // 8),
+    "long host prefix": lambda n: ("x@" + "a." * 200 + "www.b ") * (n // 408),
+}
 
 
-def elapsed(text: str, runs: int = 3) -> float:
+def clean_all(text: str) -> str:
+    return clean(text, len(text) + 1, multiline=True)
+
+
+def elapsed(text: str, runs: int = 3, convert: Callable[[str], str] = html_to_text) -> float:
     """Fastest of `runs` timings, so one scheduler hiccup cannot fail the check."""
     best = float("inf")
     for _ in range(runs):
         started = time.perf_counter()
-        html_to_text(text)
+        convert(text)
         best = min(best, time.perf_counter() - started)
     return best
 
 
 def measure() -> list[tuple[str, float, float]]:
-    return [(name, elapsed(build(SMALL)), elapsed(build(LARGE))) for name, build in SHAPES.items()]
+    html = [(name, elapsed(build(SMALL)), elapsed(build(LARGE))) for name, build in SHAPES.items()]
+    text = [
+        (name, elapsed(build(SMALL), convert=clean_all), elapsed(build(LARGE), convert=clean_all))
+        for name, build in CLEAN_SHAPES.items()
+    ]
+    return html + text
 
 
 def scales_linearly(small: float, large: float) -> bool:

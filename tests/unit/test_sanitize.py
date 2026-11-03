@@ -54,6 +54,54 @@ def test_urls_are_reduced_to_their_host(raw: str, expected: str) -> None:
     assert clean(raw, 300) == expected
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "news@www.example.org",
+        "<news@www.example.org>",
+        "News <news@www.example.org>",
+        "a@mail.www.example.org",
+        "write to news@www.example.org.",
+        "news@www.example.org, b@x.example",
+        "(news@www.example.org)",
+        "<id.1@www.example.org>",
+        "n.e-w_s+tag@www.ex-ample.org",
+    ],
+)
+def test_address_hosts_are_not_links(raw: str) -> None:
+    """An address host is not a URL (spec 080 §5.3 rule 4, #59)."""
+    assert clean(raw, 300) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("x@www.example.org/track?id=1", "x@[link: www.example.org]"),
+        ("x@www.example.org?id=1", "x@[link: www.example.org]"),
+        ("x@www.example.org:8080", "x@[link: www.example.org]"),
+        ("x@www.example.org#f", "x@[link: www.example.org]"),
+        ("x@www.example.org\\p", "x@[link: www.example.org\\p]"),
+        ("x@www.ex%2Fample.org", "x@[link: www.ex%2Fample.org]"),
+        ("x@www.example.org\uff0fp", "x@[link]"),
+        ("https://u@www.example.org/p", "[link: www.example.org]"),
+        ("//u@www.example.org/p", "//u@[link: www.example.org]"),
+        ("mailto:news@www.example.org", "[mail link]"),
+        ("@www.example.org", "@[link: www.example.org]"),
+        ("x @www.example.org", "x @[link: www.example.org]"),
+        ("see www.example.org/x", "see [link: www.example.org]"),
+        ("www.example.org", "[link: www.example.org]"),
+    ],
+)
+def test_urls_after_an_at_sign_are_still_links(raw: str, expected: str) -> None:
+    """Only a bare host right after a local part and `@` is kept; a path, query, fragment, port, userinfo or any
+    other character makes it a URL again."""
+    assert clean(raw, 300) == expected
+
+
+def test_address_host_after_a_line_break_is_a_link() -> None:
+    assert clean("x@\nwww.example.org", 300, multiline=True) == "x@\n[link: www.example.org]"
+
+
 def test_truncation_marker_counts_towards_the_limit() -> None:
     text = clean("x" * 500, 300)
     assert len(text) == 300

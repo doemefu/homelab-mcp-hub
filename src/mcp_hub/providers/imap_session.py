@@ -3,13 +3,13 @@ FETCH and the location step of Message-IDs. Moved out of `imap.py` so that the s
 
 import imaplib
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal
 
 from mcp_hub.ids import MessageRef
-from mcp_hub.providers.base import ProviderError, SearchKey, log_message_skipped
+from mcp_hub.providers.base import MAX_HEADER_BYTES, ProviderError, SearchKey, log_message_skipped
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import (
     MAX_LOCATE_FOLDERS,
@@ -24,9 +24,11 @@ from mcp_hub.providers.folders import (
 from mcp_hub.providers.headers import (
     CANDIDATE_HEADER_BYTES,
     MAX_ADDRESS_HEADER_BYTES,
+    ParsedHeaders,
     candidate_header_item,
     header_bytes,
     parse_summary_headers,
+    trim_cut,
     valid_message_id,
 )
 from mcp_hub.providers.imap_guard import PASS_THROUGH, GuardedImapClient, examine_name_ok, imap_error_kind
@@ -51,6 +53,10 @@ _FOLDED: Final = (b" ", b"\t")  # a line starting with either continues the fiel
 
 class MissingInternalDate(Exception):  # noqa: N818
     """A SEARCH hit without a usable INTERNALDATE: dropped and logged by this class name only (I11)."""
+
+
+class BodyNotReturned(Exception):  # noqa: N818
+    """A text-part FETCH whose row or body item is missing or NIL: the body counts as not read (#55)."""
 
 
 def _answered_no(exc: imaplib.IMAP4.error) -> bool:
@@ -110,6 +116,28 @@ def _field_complete(block: bytes, name: bytes) -> bool:
             end += 1
         return end < len(lines) - 1 or (end == len(lines) - 1 and lines[end] != b"")
     return True
+
+
+def cut_address_fields(block: bytes) -> frozenset[str]:
+    """The address lists (`to`, `cc`) of a header block cut at its cap that did not end before the cut."""
+    return frozenset(name for name in ("to", "cc") if not _field_complete(block, name.encode()))
+
+
+def summary_headers(block: bytes) -> ParsedHeaders:
+    """The summary headers of a header block of at most MAX_HEADER_BYTES, read the same way by the list tools,
+    `get_message` and `get_thread` (#55). A block cut at the cap is parsed without its last, possibly shortened token
+    (`trim_cut`); a To or Cc that did not end before the cut keeps only its complete addresses (spec §5.4, MF-T9-4);
+    a From that did not end is dropped; a Message-ID that did not end is dropped, and with it a root that was that
+    Message-ID. Parse errors propagate to the caller."""
+    if len(block) < MAX_HEADER_BYTES:
+        return parse_summary_headers(block)
+    parsed = parse_summary_headers(trim_cut(block), cut=cut_address_fields(block))
+    if not _field_complete(block, b"from"):
+        parsed = replace(parsed, from_address=None, from_name=None)
+    if not _field_complete(block, b"message-id"):
+        own_root = parsed.root is not None and parsed.root == parsed.message_id
+        parsed = replace(parsed, message_id=None, root=None if own_root else parsed.root)
+    return parsed
 
 
 def locate_items(*, gmail: bool, with_from: bool) -> list[str]:
