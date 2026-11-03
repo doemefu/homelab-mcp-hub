@@ -42,6 +42,7 @@ ALLOWED_CHECKS = {
     "scope",
     "host",
     "origin",
+    "body_size",
 }
 
 
