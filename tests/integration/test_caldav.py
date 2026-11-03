@@ -68,14 +68,22 @@ def shown(event: RawEvent) -> str:
 
 
 def big_event() -> bytes:
-    """One VEVENT whose folded DESCRIPTION makes the REPORT answer larger than 5 MiB."""
-    line = "DESCRIPTION:" + "x" * 62
-    folded = "\r\n ".join([line] + ["y" * 73] * (MAX_HTTP_RESPONSE_BYTES // 73 + 20_000))
-    return (
+    """One VEVENT whose REPORT answer is larger than 5 MiB (the seeded size is a lower bound for the REPORT body).
+
+    The size comes from many short COMMENT properties, not from one long folded property: Radicale parses every PUT with
+    vobject's `readComponents(allowQP=True)`, which copies the whole logical line after each continuation line, so the
+    cost grows with the square of one property's continuation lines (a DESCRIPTION folded into about 92,000 lines took
+    50-120 s on CI runners, #68). Each COMMENT here has 20 continuation lines.
+    """
+    comment = "\r\n ".join(["COMMENT:" + "x" * 66] + ["y" * 73] * 20)
+    comments = "\r\n".join([comment] * -(-(MAX_HTTP_RESPONSE_BYTES + 1_400_000) // len(comment)))
+    data = (
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mcp-hub tests//EN\r\nBEGIN:VEVENT\r\nUID:big@example.test\r\n"
         "DTSTAMP:20260901T000000Z\r\nDTSTART:20261020T100000Z\r\nDTEND:20261020T110000Z\r\nSUMMARY:Big\r\n"
-        f"{folded}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        f"{comments}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
     ).encode()
+    assert len(data) > MAX_HTTP_RESPONSE_BYTES + 1024 * 1024
+    return data
 
 
 def two_accounts(secrets_dir: Path) -> None:

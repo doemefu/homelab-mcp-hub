@@ -59,6 +59,7 @@ Milestone 1 (stage a: no mailbox enabled, 2026-10-01; stage b: icloud mail + cal
 
 ### Fixed
 
+- The `providers` CI job no longer times out while seeding Radicale: the test of a CalDAV `REPORT` answer above 5 MiB builds its event from many short properties instead of one property folded into about 92,000 lines, which Radicale parses in quadratic time (#68).
 - An address list (`From`, `To`, `Cc`) cut at a header byte cap keeps only its complete addresses, cut back to the last top-level comma (spec §5.4).
 - `safe_decode` refuses the `punycode`, `idna`, `unicode-escape` and `raw-unicode-escape` codecs (spec §5.3 rule 10; matched on the canonical codec name, so aliases are caught) and decodes such parts as UTF-8; punycode is quadratic on hostile input and the escape codecs are not charsets.
 - `scripts/memory_probe.py --scenario graph-message` runs again with the folder map of `get_message`.
