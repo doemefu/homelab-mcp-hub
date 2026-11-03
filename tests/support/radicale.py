@@ -22,7 +22,7 @@ def password() -> str:
 
 
 def _client() -> httpx2.Client:
-    return httpx2.Client(auth=(LOGIN, password()), trust_env=False, timeout=120)  # the 6 MiB seed is slow
+    return httpx2.Client(auth=(LOGIN, password()), trust_env=False, timeout=60)  # generous for slow CI runners (#68)
 
 
 def require() -> None:

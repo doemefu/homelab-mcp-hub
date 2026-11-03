@@ -10,7 +10,7 @@ The hub runs as one pod in namespace `apps`, deployed by Flux from this reposito
 | `k8s/service.yaml` | ClusterIP Service `mcp-hub`: ports `8083` (`mcp`) and `8084` (`internal`) |
 | `k8s/kustomization.yaml` | Lists both |
 
-Resources are estimates (requests 50m / 128Mi, limits 1 CPU / 320Mi, gate: cgroup `memory.peak` ≤ 290 MiB and `oom_kill` 0, see Resources below); confirm with `kubectl top` after the first deploy. The manifests pass the policies in `doemefu/homelab` `policy/kubernetes/` (`conftest`, see `.claude/rules/commands.md`).
+Resources are estimates (requests 50m / 128Mi, limits 1 CPU / 320Mi, gate: cgroup `memory.peak` ≤ 290 MiB and `oom_kill` 0, see Resources below); confirm with `kubectl top` after the first deploy. The manifests pass the policies in `doemefu/homelab` `policy/kubernetes/` (`conftest`, see the `## Commands` section of `CLAUDE.md`).
 
 ## Image
 

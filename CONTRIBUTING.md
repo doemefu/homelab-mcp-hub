@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/) (CI and the image pin 0.12.19; another local patch version works)
+- [uv](https://docs.astral.sh/uv/) (CI and the image pin 0.13.6; another local patch version works)
 - Python 3.13 (`.python-version`)
 - Docker (image build, `scripts/smoke_image.sh` and the provider test containers)
 - Optional: `actionlint`, `kubectl` and `conftest` for the workflow and manifest checks
@@ -126,14 +126,14 @@ The contract tests mint real RS256 tokens with a key generated per test session 
 
 ## Process
 
-- Six-phase workflow with a worklog per change (`.claude/rules/workflow.md`).
+- Six-phase workflow with a worklog per change (`CLAUDE.md`, "Process & Conventions").
 - Branch `feat/<issue>-<slug>` (or `fix/…`, `chore/…`), conventional commits, one pull request per change against `main`.
 - Review: the Copilot review requested by the repository ruleset; if its quota is exhausted, the substitute review path (reviewer agent + `/code-review`) is used and disclosed in the pull request.
 - Every review comment is fixed or answered before the merge; merging needs the owner's go.
 
 ## Code review checklist
 
-See `.claude/rules/review-guidelines.md`. In short: no secrets or request data in logs, gate G6 green, exact pins, read-only tools, third-party strings only inside `untrusted` objects, minimal diffs with tests.
+See `.claude/agent-context.md` (`## reviewer`). In short: no secrets or request data in logs, gate G6 green, exact pins, read-only tools, third-party strings only inside `untrusted` objects, minimal diffs with tests.
 
 ## Developer reminders
 
