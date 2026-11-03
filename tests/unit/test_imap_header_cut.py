@@ -9,10 +9,10 @@ from datetime import timedelta
 
 import pytest
 
-from mcp_hub.providers.base import MAX_HEADER_BYTES, ListQuery, MailSummary
+from mcp_hub.providers.base import MAX_HEADER_BYTES, ListQuery, MailDetail, MailSummary
 from mcp_hub.providers.headers import parse_summary_headers, trim_cut
 from mcp_hub.providers.imap_session import summary_headers
-from tests.support.imap_fake import PLAIN, FakeMessage
+from tests.support.imap_fake import PLAIN, FakeImapServer, FakeMessage
 from tests.support.imap_threads import NOW, deadline, icloud, mailbox, mid_ref, thread
 from tests.support.logcapture import Capture
 
@@ -42,6 +42,11 @@ CASES = {
         ("To", "a@x.example, Bob <bob@example.test>"),
         "a@x.example, Bob <bob@exa",
     ),
+    "to cut inside a plain address list": _block(
+        [("From", "Sender <sender@example.test>"), *BASE],
+        ("To", "a@x.example, b@y.example, c@z.example"),
+        "a@x.example, b@y.example, c@z.ex",
+    ),
     "to cut inside a quoted name with @": _block(
         [("From", "Sender <sender@example.test>"), *BASE],
         ("To", 'a@x.example, "c@evil.example" <real@example.test>'),
@@ -60,49 +65,42 @@ CASES = {
 }
 
 
-def _server(block: bytes) -> object:
+TO = {"to cut inside a plain address list": ("a@x.example", "b@y.example")}
+
+
+def _server(block: bytes) -> FakeImapServer:
     return icloud(inbox=[FakeMessage(1, NOW - timedelta(minutes=5), headers=block, text=b"Hello")])
 
 
 def _list_item(block: bytes) -> MailSummary:
     server = _server(block)
-    page = mailbox(server).list_messages(  # type: ignore[arg-type]
-        ListQuery("inbox", NOW - timedelta(days=1), False, None, 50),
-        deadline(server),  # type: ignore[arg-type]
-    )
+    page = mailbox(server).list_messages(ListQuery("inbox", NOW - timedelta(days=1), False, None, 50), deadline(server))
     [item] = page.items
     return item
 
 
-def _shape(item: object) -> tuple[object, ...]:
-    meta = item.meta  # type: ignore[attr-defined]
-    return (
-        item.from_address,  # type: ignore[attr-defined]
-        tuple(item.to_addresses),  # type: ignore[attr-defined]
-        meta.message_id,
-        meta.references,
-        meta.thread,
-    )
+def _shape(item: MailSummary | MailDetail) -> tuple[object, ...]:
+    meta = item.meta
+    return (item.from_address, tuple(item.to_addresses), meta.message_id, meta.references, meta.thread)
 
 
 @pytest.mark.parametrize("case", list(CASES))
 def test_list_and_get_message_read_a_cut_block_alike(case: str) -> None:
     block = CASES[case]
     server = _server(block)
-    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))  # type: ignore[arg-type]
+    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))
     item = _list_item(block)
     assert _shape(item) == _shape(detail)
-    expected = {"from cut": None, "message-id ends at the cap": "sender@example.test"}
-    assert item.from_address == expected.get(case, "sender@example.test")
-    assert item.to_addresses == ("a@x.example",)
+    assert item.from_address == (None if case == "from cut" else "sender@example.test")
+    assert item.to_addresses == TO.get(case, ("a@x.example",))
     assert item.meta.message_id == (None if case == "message-id ends at the cap" else "m1@example.test")
 
 
-@pytest.mark.parametrize("case", ["to cut inside an angle address", "to cut inside a quoted name with @", "from cut"])
+@pytest.mark.parametrize("case", [c for c in CASES if c != "message-id ends at the cap"])
 def test_get_thread_reads_a_cut_block_like_the_list(case: str) -> None:
     block = CASES[case]
     server = _server(block)
-    page = thread(server, seed=mid_ref(server, "INBOX", 1, 7))  # type: ignore[arg-type]
+    page = thread(server, seed=mid_ref(server, "INBOX", 1, 7))
     [member] = page.members
     assert _shape(member.summary) == _shape(_list_item(block))
 
@@ -150,9 +148,9 @@ BIG_PLAIN = (*PLAIN[:6], 300_000, *PLAIN[7:])  # a text part above the 256 KiB f
 @pytest.mark.parametrize("structure", [PLAIN, BIG_PLAIN], ids=["small", "above-cap"])
 def test_get_message_body_not_returned_counts_as_not_read(structure: object, provider_log: Capture) -> None:
     message = FakeMessage(1, NOW - timedelta(minutes=5), headers=b"Subject: s\r\n\r\n", bodystructure=structure)
-    message.text = None  # type: ignore[assignment]  # the server answers the text part with NIL
+    message.text = None  # type: ignore[assignment]  # FakeMessage.text is bytes; None makes the fake answer NIL
     server = icloud(inbox=[message])
-    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))  # type: ignore[arg-type]
+    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))
     assert (detail.body_text, detail.body_source, detail.body_cut) == ("", "none", False)
     lines = [json.loads(line) for line in provider_log.lines]
     assert [(line["event"], line["exception"]) for line in lines] == [("item_degraded", "BodyNotReturned")]
@@ -161,15 +159,15 @@ def test_get_message_body_not_returned_counts_as_not_read(structure: object, pro
 def test_get_message_empty_body_is_read() -> None:
     message = FakeMessage(1, NOW - timedelta(minutes=5), headers=b"Subject: s\r\n\r\n", text=b"")
     server = icloud(inbox=[message])
-    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))  # type: ignore[arg-type]
+    detail = mailbox(server).get_message(mid_ref(server, "INBOX", 1, 7), deadline(server))
     assert (detail.body_text, detail.body_source) == ("", "text/plain")
 
 
 def test_get_thread_body_not_returned_is_omitted() -> None:
     message = FakeMessage(1, NOW - timedelta(minutes=5), headers=b"Subject: s\r\nMessage-ID: <m1@example.test>\r\n\r\n")
-    message.text = None  # type: ignore[assignment]
+    message.text = None  # type: ignore[assignment]  # FakeMessage.text is bytes; None makes the fake answer NIL
     server = icloud(inbox=[message])
-    page = thread(server, seed=mid_ref(server, "INBOX", 1, 7))  # type: ignore[arg-type]
+    page = thread(server, seed=mid_ref(server, "INBOX", 1, 7))
     [member] = page.members
     assert (member.body.text, member.body.source, member.body.omitted) == ("", "none", True)
     assert page.truncated

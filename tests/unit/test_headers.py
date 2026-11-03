@@ -347,6 +347,9 @@ def test_address_pairs_cut_inside_the_last_address() -> None:
     assert block == b"To: a@x.y, Bob "
     assert parse_summary_headers(block).to == ("a@x.y", "Bob")  # the parser alone, without the cut
     assert parse_summary_headers(block, cut=frozenset({"to"})).to == ("a@x.y",)
+    block = trim_cut(b"To: a@x.y, b@x.y, c@x.yz")  # a plain addr-spec list: the comma proves `b@x.y` ended
+    assert block == b"To: a@x.y, b@x.y, "
+    assert parse_summary_headers(block, cut=frozenset({"to"})).to == ("a@x.y", "b@x.y")
     block = trim_cut(b"To: a@x.y, b@x.yz")
     assert parse_summary_headers(block).to == ("a@x.y",)
 

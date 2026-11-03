@@ -953,7 +953,7 @@ def _candidate(
         parsed = (
             parse_summary_headers(trim_cut(block), cut=cut_address_fields(block))
             if cut
-            else (parse_summary_headers(block))
+            else parse_summary_headers(block)
         )
     except PASS_THROUGH:
         raise
