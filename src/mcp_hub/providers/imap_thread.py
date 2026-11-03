@@ -16,6 +16,7 @@ from typing import Final, cast
 
 from mcp_hub.ids import AnyMessageRef, MessageRef, StableRef, ThreadKey
 from mcp_hub.providers.base import (
+    MAX_DEGRADED_LOGS,
     MAX_HEADER_BYTES,
     OMITTED_BODY,
     BodySource,
@@ -60,6 +61,9 @@ from mcp_hub.providers.imap_search import (
 )
 from mcp_hub.providers.imap_session import (
     _LABEL_SENT,
+    ANSWERED,
+    FLAGGED,
+    SEEN,
     ImapSession,
     MissingInternalDate,
     _aware,
@@ -91,7 +95,6 @@ BODY_RESERVE_SECONDS: Final = 12.0  # no new member search after this: the body 
 THREAD_BODY_BYTES: Final = 65_536  # partial fetch of a member's text part (§5.2 "Bodies")
 STRUCTURE_CHUNK_UIDS: Final = 2  # BODYSTRUCTURE lines per UID FETCH (A-sec1; T14: 1 MiB lines under 230 MiB)
 BODY_SLICE_MEMBERS: Final = 10  # members per body slice: their structures, then their texts (rev 4.13, T14)
-MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per call (sec-G8)
 MAX_ROUND_ITERATIONS: Final = 3  # round (2) iterations after round (1) (§6.5, S-m)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "sent", "archive", "trash")  # trash with include_trash
 SUBJECT_WINDOW: Final = timedelta(days=30)  # subject members within 30 days of the seed (§6.5 (3))
@@ -105,9 +108,6 @@ _PARTICIPANT_FIELDS: Final = {"incoming": (b"from", b"cc"), "outgoing": (b"to", 
 _ROUND_ONE_FIELDS: Final = ("Message-ID", "References")
 _MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", SUMMARY_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", SUMMARY_HEADER_ITEM)
-_SEEN: Final = b"\\seen"
-_ANSWERED: Final = b"\\answered"
-_FLAGGED: Final = b"\\flagged"
 
 Location = tuple[str, int, int]  # (raw mailbox name, UIDVALIDITY, UID)
 
@@ -481,7 +481,7 @@ def _parsed_copy(
     summary = MailSummary(
         ref=ref,
         received_at=received,
-        unread=_SEEN not in flags,
+        unread=SEEN not in flags,
         has_attachments=False,
         from_address=parsed.from_address,
         from_name=parsed.from_name,
@@ -492,7 +492,7 @@ def _parsed_copy(
         meta=MailMeta(
             folder=folder,
             folder_name=entry.display_name,
-            flags=MailFlags(answered=_ANSWERED in flags, flagged=_FLAGGED in flags),
+            flags=MailFlags(answered=ANSWERED in flags, flagged=FLAGGED in flags),
             direction=direction,
             message_id=parsed.message_id,
             in_reply_to=parsed.in_reply_to,

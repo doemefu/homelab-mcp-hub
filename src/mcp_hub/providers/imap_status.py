@@ -17,6 +17,7 @@ from typing import Final
 
 from mcp_hub.ids import GraphMessageRef, MessageRef, StableRef
 from mcp_hub.providers.base import (
+    MAX_DEGRADED_LOGS,
     FoundMessage,
     MailFlags,
     MailMeta,
@@ -35,6 +36,7 @@ from mcp_hub.providers.headers import (
     DESCENDANT_HEADER_BYTES,
     DESCENDANT_HEADER_ITEM,
     MAX_ADDRESS_HEADER_BYTES,
+    Descendant,
     header_bytes,
     parse_descendant,
 )
@@ -51,6 +53,9 @@ from mcp_hub.providers.imap_search import (
 )
 from mcp_hub.providers.imap_session import (
     _LABEL_SENT,
+    ANSWERED,
+    FLAGGED,
+    SEEN,
     FoundCopy,
     ImapSession,
     LocateResult,
@@ -87,16 +92,12 @@ GMAIL_REPLY_HEADER_SEARCH: Final = False
 # T0 P1: iCloud not measurable (no aged sample); default kept. False → `replied` from the flag only
 OTHER_REPLY_IN_REPLY_TO: Final = True
 MAX_REPLY_KEYS_PER_REF: Final = 5  # owner reply Message-IDs added to a ref's thread keys (E-mf1)
-MAX_DEGRADED_LOGS: Final = 20  # item_degraded lines per provider call (SR6)
 _LOOKUP_FIELDS: Final[tuple[HeaderField, ...]] = ("In-Reply-To", "References")
 _LOOKUP_ITEMS: Final = ("FLAGS", "INTERNALDATE", DESCENDANT_HEADER_ITEM)
 _THREAD_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "archive", "trash")
 _GMAIL_REPLY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", DESCENDANT_HEADER_ITEM)
 _GMAIL_MEMBER_ITEMS: Final = ("FLAGS", "INTERNALDATE", "X-GM-LABELS", "X-GM-THRID", DESCENDANT_HEADER_ITEM)
 _GMAIL_NO_ALL_ROLES: Final[tuple[FolderRole, ...]] = ("inbox", "trash", "sent")  # Gmail without `\All` (E-im3a)
-_SEEN: Final = b"\\seen"
-_ANSWERED: Final = b"\\answered"
-_FLAGGED: Final = b"\\flagged"
 # The in-place read failures that are the entry's own answer, by (code, cause) (P6; E-im1, C4). Every other
 # ProviderError fails the account, the hard deadline (`upstream_timeout`, `CallDeadline`) included.
 _IN_PLACE_FAILURES: Final[Mapping[tuple[str, str | None], StatusReason]] = {
@@ -360,14 +361,14 @@ def _found(session: ImapSession, copy: FoundCopy, message_id: str | None, *, in_
     sent = in_sent or _in_sent(copy)
     meta = MailMeta(
         folder=copy.folder,
-        flags=MailFlags(answered=_ANSWERED in copy.flags, flagged=_FLAGGED in copy.flags),
+        flags=MailFlags(answered=ANSWERED in copy.flags, flagged=FLAGGED in copy.flags),
         direction=direction_of(in_sent=sent, from_address=copy.from_address, own=session.own),
     )
     found = FoundMessage(
         location=MessageRef(session.account, copy.entry.raw_name, copy.uidvalidity, copy.uid),
         message_id=message_id,
         received_at=copy.received_at,
-        unread=_SEEN not in copy.flags,
+        unread=SEEN not in copy.flags,
         meta=meta,
     )
     return MessageStatus("found", found=found, thread_checked=False)
@@ -585,8 +586,7 @@ def _recheck(
     miss(wanted - parsed.referenced)
     if not parsed.referenced:
         return None
-    sender = parsed.from_address if _field_complete(block, b"from") else None
-    complete_id = parsed.message_id is not None and _field_complete(block, b"message-id")
+    sender, complete_id = _ended_before_cut(block, parsed)
     if not complete_id or (thread and sender is None):
         miss(parsed.referenced)
         return None
@@ -823,13 +823,19 @@ def _gmail_member(
     parsed = parse_descendant(block, ids)
     if len(block) < DESCENDANT_HEADER_BYTES:
         return _Member(thread_id, sent, parsed.message_id, parsed.from_address, received, parsed.referenced)
-    sender = parsed.from_address if _field_complete(block, b"from") else None
-    complete_id = parsed.message_id is not None and _field_complete(block, b"message-id")
+    sender, complete_id = _ended_before_cut(block, parsed)
     if not complete_id or (not sent and sender is None):
         miss((thread_id,))
         return None
     unseen = ids - parsed.referenced if sent else frozenset()
     return _Member(thread_id, sent, parsed.message_id, sender, received, parsed.referenced, unseen)
+
+
+def _ended_before_cut(block: bytes, parsed: Descendant) -> tuple[str | None, bool]:
+    """Of a hit block cut at DESCENDANT_HEADER_BYTES: its From address if the From ended before the cut, and whether
+    a Message-ID ended before it."""
+    sender = parsed.from_address if _field_complete(block, b"from") else None
+    return sender, parsed.message_id is not None and _field_complete(block, b"message-id")
 
 
 def _gmail_sent(entry: FolderEntry, row: dict[bytes, object]) -> bool:

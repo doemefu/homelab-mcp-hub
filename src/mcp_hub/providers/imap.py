@@ -82,8 +82,11 @@ from mcp_hub.providers.imap_session import (
     _GMAIL_CANDIDATE_ITEM,
     _LABEL_INBOX,
     _LABEL_SENT,
+    ANSWERED,
     FETCH_CHUNK_UIDS,
+    FLAGGED,
     MAX_SEARCH_CANDIDATES,
+    SEEN,
     SOFT_CHECK_EVERY,
     BodyNotReturned,
     ImapSession,
@@ -99,6 +102,7 @@ from mcp_hub.providers.imap_session import (
     _gmail_folder,
     _is_draft,
     _labels,
+    _thread_id,
     cut_address_fields,
     summary_headers,
 )
@@ -111,10 +115,6 @@ LIST_SUMMARY_ITEMS: Final = ("FLAGS", "INTERNALDATE", "BODYSTRUCTURE", SUMMARY_H
 SUMMARY_STRUCTURE_CHUNK_UIDS: Final = 2  # BODYSTRUCTURE lines per pass-2 UID FETCH (#44; chosen at merge, see the PR)
 CANDIDATE_ITEMS: Final = ("INTERNALDATE", "FLAGS")  # FLAGS so that drafts drop before `limit`
 _GMAIL_SUMMARY_ITEMS: Final = ("X-GM-LABELS", "X-GM-THRID")  # Gmail: per-message folder and thread (§5.5)
-_SEEN: Final = b"\\seen"
-_ANSWERED: Final = b"\\answered"
-_FLAGGED: Final = b"\\flagged"
-_MAX_THRID: Final = 2**64
 _PARSER: Final = BytesHeaderParser(policy=email.policy.default)
 
 ClientFactory = Callable[[str, int, ssl.SSLContext, float], ImapClientLike]
@@ -176,15 +176,13 @@ def _addresses(message: Message, name: str, *, cut: bool = False) -> list[tuple[
 
 
 def _unread(row: dict[bytes, object]) -> bool:
-    return _SEEN not in _flags(row)
+    return SEEN not in _flags(row)
 
 
 def _gmail_thread(account: str, row: dict[bytes, object]) -> ThreadKey | None:
     """The `gmail` thread key from `X-GM-THRID` (an unsigned 64-bit integer); no key without a valid one (D79)."""
-    value = row.get(b"X-GM-THRID")
-    if type(value) is int and 0 <= value < _MAX_THRID:
-        return ThreadKey(account, "gmail", value)
-    return None
+    value = _thread_id(row)
+    return ThreadKey(account, "gmail", value) if value is not None else None
 
 
 def _structure(row: dict[bytes, object]) -> list[Part]:
@@ -785,9 +783,7 @@ class ImapMailbox:
                 log_message_skipped(chosen.ref, "mail", failure.kind)
                 flags = _flags(flag_row)
                 meta = self._meta(entry, folder or _gmail_folder(_labels(flag_row)), chosen, flags, None)
-                out[chosen.ref] = placeholder_summary(
-                    chosen.ref, chosen.candidate.received_at, _SEEN not in flags, meta
-                )
+                out[chosen.ref] = placeholder_summary(chosen.ref, chosen.candidate.received_at, SEEN not in flags, meta)
                 continue
             row = rows.get(uid)
             if row is None:  # FETCH NO (S-p) or expunged meanwhile; a UID never asked for is the stop's (counted)
@@ -810,7 +806,7 @@ class ImapMailbox:
         return MailMeta(
             folder=folder,
             folder_name=entry.display_name,
-            flags=MailFlags(answered=_ANSWERED in flags, flagged=_FLAGGED in flags),
+            flags=MailFlags(answered=ANSWERED in flags, flagged=FLAGGED in flags),
             direction=direction,
         )
 
@@ -837,7 +833,7 @@ class ImapMailbox:
             return MailSummary(
                 ref=chosen.ref,
                 received_at=received,
-                unread=_SEEN not in flags,
+                unread=SEEN not in flags,
                 has_attachments=structure.has_attachments,
                 from_address=parsed.from_address,
                 from_name=parsed.from_name,
@@ -863,7 +859,7 @@ class ImapMailbox:
     ) -> MailSummary:
         log_message_skipped(chosen.ref, "mail", kind)
         meta = self._meta(entry, folder, chosen, flags, None)
-        return placeholder_summary(chosen.ref, chosen.candidate.received_at, _SEEN not in flags, meta)
+        return placeholder_summary(chosen.ref, chosen.candidate.received_at, SEEN not in flags, meta)
 
     # --- get_message -------------------------------------------------------------------------------------------
 
@@ -981,7 +977,7 @@ class ImapMailbox:
         meta = MailMeta(
             folder=folder,
             folder_name=entry.display_name,
-            flags=MailFlags(answered=_ANSWERED in flags, flagged=_FLAGGED in flags),
+            flags=MailFlags(answered=ANSWERED in flags, flagged=FLAGGED in flags),
             direction=direction_of(
                 in_sent=folder == "sent" or (gmail and _LABEL_SENT in _labels(row)),
                 from_address=sender[1] or None,

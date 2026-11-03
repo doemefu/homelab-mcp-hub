@@ -214,7 +214,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 "search_messages", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
             )
             return exc.to_result()
-        except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
+        except Exception as exc:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
             log_tool_call(
                 "search_messages",
                 started=started,
@@ -222,6 +222,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 accounts=[],
                 result_count=0,
                 metrics=ctx.metrics,
+                exception=type(exc).__name__,
             )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(

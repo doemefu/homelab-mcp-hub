@@ -14,7 +14,7 @@ from mcp.types import CallToolResult
 from pydantic import BaseModel, Field
 
 from mcp_hub.budget import HARD_MAX_CHARS, fit_items, serialized_length, shrink_or_drop, shrink_to_fit
-from mcp_hub.cursors import Position, argument_digest
+from mcp_hub.cursors import CursorTool, Position, argument_digest
 from mcp_hub.errors import ToolError
 from mcp_hub.ids import (
     AnyMessageRef,
@@ -76,8 +76,6 @@ DIRECTIONS: Final[tuple[Direction, ...]] = ("incoming", "outgoing")
 FolderArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*LIST_FOLDERS, None]})]
 DirectionArgument = Annotated[str | None, Field(json_schema_extra={"enum": [*DIRECTIONS, None]})]
 ListTool = Literal["list_messages", "list_unread"]
-# Tools that issue cursors; kept apart from ListTool so run_list_messages(tool="search_messages") does not type-check.
-CursorTool = Literal["list_messages", "list_unread", "search_messages"]
 # The arguments each tool's cursor is bound to (§5.5 "Cursors": every argument except `cursor` and `limit`).
 DIGEST_ARGUMENTS: Final[dict[CursorTool, tuple[str, ...]]] = {
     "list_messages": ("account", "folder", "since", "unread_only", "direction"),
@@ -645,7 +643,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 "list_unread", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
             )
             return exc.to_result()
-        except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
+        except Exception as exc:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
             log_tool_call(
                 "list_unread",
                 started=started,
@@ -653,6 +651,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 accounts=[],
                 result_count=0,
                 metrics=ctx.metrics,
+                exception=type(exc).__name__,
             )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
@@ -693,7 +692,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 "list_messages", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
             )
             return exc.to_result()
-        except Exception:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
+        except Exception as exc:  # a hub bug still answers with the §5.1 body, never the SDK's generic text
             log_tool_call(
                 "list_messages",
                 started=started,
@@ -701,6 +700,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 accounts=[],
                 result_count=0,
                 metrics=ctx.metrics,
+                exception=type(exc).__name__,
             )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(
@@ -725,7 +725,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 "get_message", started=started, outcome=exc.code, accounts=[], result_count=0, metrics=ctx.metrics
             )
             return exc.to_result()
-        except Exception:  # a hub bug still answers with the §5.1 body
+        except Exception as exc:  # a hub bug still answers with the §5.1 body
             log_tool_call(
                 "get_message",
                 started=started,
@@ -733,6 +733,7 @@ def register(server: MCPServer, ctx: HubContext) -> None:
                 accounts=[],
                 result_count=0,
                 metrics=ctx.metrics,
+                exception=type(exc).__name__,
             )
             return ToolError("upstream_error", ACCOUNT_ERROR_MESSAGES["upstream_error"]).to_result()
         log_tool_call(

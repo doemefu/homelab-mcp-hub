@@ -971,6 +971,7 @@ def test_unexpected_exception_answers_fixed_upstream_error(
             }
         ]
         assert (tool_call["outcome"], tool_call["result_count"]) == ("error", 1)
+        assert "exception" not in tool_call
     else:  # SR3: a hub bug answers with the fixed §5.1 body
         assert result["isError"] is True
         assert json.loads(result["content"][0]["text"]) == {
@@ -978,6 +979,7 @@ def test_unexpected_exception_answers_fixed_upstream_error(
             "message": "Provider returned an error",
         }
         assert (tool_call["outcome"], tool_call["accounts"], tool_call["result_count"]) == ("upstream_error", [], 0)
+        assert tool_call["exception"] == "RuntimeError"  # the class name only (#73 I3)
 
 
 def test_tool_call_log_line(wired: tuple[TestClient, Fake], tokens: TokenFactory, captured: Capture) -> None:

@@ -15,8 +15,12 @@ from mcp_hub.search import (
     FILTER_SIGN_REFUSED,
     GRAPH_QUERY_TOO_LONG,
     MAX_GRAPH_ENCODED_CHARS,
+    NO_SEARCHABLE_TEXT,
     OPERATOR_PREFIXES,
+    OPERATOR_REFUSED,
     RESERVED_TEXT,
+    TOO_MANY_WORDS,
+    VALUE_RULES,
     VALUE_TOO_LONG,
     SearchTerms,
     graph_search_text,
@@ -107,6 +111,38 @@ def test_refused_values(query: object) -> None:
     with pytest.raises(ToolError) as caught:
         parse_search_terms(query=query, sender=None, recipient=None, subject="s")  # type: ignore[arg-type]
     assert caught.value.code == "invalid_argument"
+    assert caught.value.message == _REFUSED_TEXT.get(query, OPERATOR_REFUSED)
+
+
+# The fixed text of each row above (#73 G8), by the order of the checks: length, type and control characters
+# (VALUE_RULES), nothing left after removing Cf, quotes and backslashes (NO_SEARCHABLE_TEXT), X-GM-RAW (RESERVED_TEXT),
+# more than 8 words (TOO_MANY_WORDS); every other row is an operator form (OPERATOR_REFUSED).
+_REFUSED_TEXT: dict[object, str] = {
+    "a\tb": VALUE_RULES,
+    "a\nb": VALUE_RULES,
+    "\x00": VALUE_RULES,
+    "\x85": VALUE_RULES,
+    "\ud800": VALUE_RULES,
+    "\u200b": NO_SEARCHABLE_TEXT,
+    "   ": NO_SEARCHABLE_TEXT,
+    "x" * 201: VALUE_RULES,
+    "": VALUE_RULES,
+    5: VALUE_RULES,
+    "X-gm-raw x": RESERVED_TEXT,
+    "X\u00ad-GM-RAW x": RESERVED_TEXT,
+    "a b c d e f g h i": TOO_MANY_WORDS,
+}
+
+
+@pytest.mark.parametrize("value", ['x-gm"-raw invoice', "x-gm\\-raw invoice"])
+@pytest.mark.parametrize("field", ["query", "sender", "recipient", "subject"])
+def test_x_gm_raw_is_found_after_quote_and_backslash_removal(field: str, value: str) -> None:
+    """#73 G9: `"` and `\\` are removed before the X-GM-RAW check, so they cannot split the name."""
+    arguments: dict[str, object] = {"query": None, "sender": None, "recipient": None, "subject": None}
+    arguments[field] = value
+    with pytest.raises(ToolError) as caught:
+        parse_search_terms(**arguments)  # type: ignore[arg-type]
+    assert caught.value.message == RESERVED_TEXT
 
 
 @pytest.mark.parametrize("field", ["sender", "recipient", "subject"])

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal
 
-from mcp_hub.ids import MessageRef
+from mcp_hub.ids import GMAIL_THRID_LIMIT, MessageRef
 from mcp_hub.providers.base import MAX_HEADER_BYTES, ProviderError, SearchKey, log_message_skipped
 from mcp_hub.providers.deadline import SoftStop
 from mcp_hub.providers.folders import (
@@ -45,9 +45,12 @@ LOOKUP_FETCH_UIDS: Final = 50  # UIDs per re-check FETCH: at most 3.2 MiB of 64 
 SOFT_CHECK_ROWS: Final = 10  # fetched rows parsed between two soft checks (SR2: parsing sends no command)
 SOFT_CHECK_EVERY: Final = 100  # candidates parsed between two soft-limit checks in pass 1 (CPU without commands)
 _DRAFT: Final = frozenset({b"\\draft", b"\\drafts"})  # any case (I8); as a flag and as a Gmail label (S-r)
+# IMAP system flags as `_flags()` returns them (lowercased).
+SEEN: Final = b"\\seen"
+ANSWERED: Final = b"\\answered"
+FLAGGED: Final = b"\\flagged"
 _LABEL_INBOX: Final = b"\\inbox"
 _LABEL_SENT: Final = b"\\sent"
-_THRID_LIMIT: Final = 2**64  # X-GM-THRID is an unsigned 64-bit number
 _FOLDED: Final = (b" ", b"\t")  # a line starting with either continues the field above it
 
 
@@ -99,7 +102,7 @@ def _is_draft(row: dict[bytes, object]) -> bool:
 def _thread_id(row: dict[bytes, object]) -> int | None:
     """Gmail `X-GM-THRID` as the server returned it: an `int` (not `bool`) in 0..2^64-1, else None."""
     value = row.get(b"X-GM-THRID")
-    return value if type(value) is int and 0 <= value < _THRID_LIMIT else None
+    return value if type(value) is int and 0 <= value < GMAIL_THRID_LIMIT else None
 
 
 def _field_complete(block: bytes, name: bytes) -> bool:

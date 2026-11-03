@@ -48,24 +48,33 @@ class AccountErrorItem(BaseModel):
 
 
 def log_tool_call(
-    tool: ToolName, *, started: float, outcome: ToolOutcome, accounts: list[str], result_count: int, metrics: Metrics
+    tool: ToolName,
+    *,
+    started: float,
+    outcome: ToolOutcome,
+    accounts: list[str],
+    result_count: int,
+    metrics: Metrics,
+    exception: str | None = None,
 ) -> None:
+    """`exception`: the class name of an unexpected hub error that answered `upstream_error` (#73 I3); never a
+    message text."""
     metrics.count_tool_call(tool, outcome)
     token = get_access_token()
     claims = (token.claims or {}) if token else {}
-    log_event(
-        _log,
-        logging.INFO,
-        "tool_call",
-        tool=tool,
-        outcome=outcome,
-        accounts=accounts,
-        result_count=result_count,
-        duration_ms=round((time.perf_counter() - started) * 1000, 1),
-        sub=token.subject if token else None,
-        client_id=token.client_id if token else None,
-        jti=claims.get("jti"),
-    )
+    fields: dict[str, object] = {
+        "tool": tool,
+        "outcome": outcome,
+        "accounts": accounts,
+        "result_count": result_count,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+        "sub": token.subject if token else None,
+        "client_id": token.client_id if token else None,
+        "jti": claims.get("jti"),
+    }
+    if exception is not None:
+        fields["exception"] = exception
+    log_event(_log, logging.INFO, "tool_call", **fields)
 
 
 def ready_accounts(ctx: "HubContext", capability: Capability, account: str | None) -> list[Account]:
