@@ -8,10 +8,10 @@ dependencies = [
     "mcp==2.3.0",
     "uvicorn==0.54.0",
     "starlette==1.10.0",
-    "pydantic==2.14.1",
+    "pydantic==2.14.2",
     "pyjwt[crypto]==2.15.1",
     "httpx2==2.16.0",
-    "anyio==4.15.1",
+    "anyio==4.16.0",
     "tzdata==2026.5",
     # A bump must keep the synchronising-literal wire tests green (tests/unit/test_imap_search_wire.py, e.g.
     # test_non_ascii_value_is_one_synchronising_literal): the hub suppresses LITERAL+ through has_capability.
