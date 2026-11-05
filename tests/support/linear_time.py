@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 
 RUNS = 7
-MAX_RATIO = 3.0  # a 2x input may take at most 3x the time (cache effects: 2.6x on one CPU); quadratic gives 4x
+MAX_RATIO = 8.0  # a 4x input may take at most 8x the time (linear gives about 4, quadratic 16: a wide margin on shared runners)
 MIN_SAMPLE_SECONDS = 0.005  # each sample repeats the call until it lasts this long, so timer jitter cannot decide
 
 
@@ -28,8 +28,8 @@ def best_time(call: Callable[[str], object], text: str, repeat: int, runs: int =
 
 
 def scaling(call: Callable[[str], object], build: Callable[[int], str], size: int) -> tuple[float, float]:
-    """Best times on `build(size)` and `build(2 * size)`, both with the same repeat count."""
-    small, large = build(size), build(2 * size)
+    """Best times on `build(size)` and `build(4 * size)`, both with the same repeat count."""
+    small, large = build(size), build(4 * size)
     once = best_time(call, small, 1, runs=1)
     repeat = max(1, math.ceil(MIN_SAMPLE_SECONDS / max(once, 1e-6)))
     return best_time(call, small, repeat), best_time(call, large, repeat)

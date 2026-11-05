@@ -3,6 +3,7 @@
 T14 runs this test once more in the production image and records the image's Python patch version.
 """
 
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -34,6 +35,9 @@ SHAPES: dict[str, Callable[[int], str]] = {
 }
 
 
+# Same guard as test_html_scaling.py: html.parser is quadratic before 3.13.15 (minutes per shape on 3.13.5); CI and
+# the production image run 3.13.15 or newer, where this test runs.
+@pytest.mark.skipif(sys.version_info < (3, 13, 15), reason="stdlib html.parser is quadratic before 3.13.15")
 @pytest.mark.parametrize("shape", list(SHAPES))
 def test_html_to_text_linear(shape: str) -> None:
     small, large = scaling(html_to_text, SHAPES[shape], SIZE)
