@@ -26,9 +26,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "ruff==0.17.2",
-    "mypy==2.4.0",
-    "pytest==9.1.1",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
     "pytest-httpserver==1.2.0",
     # Imported directly by tests/support/keys.py and scripts/dev_token.py (approved in spec 080 §9.3).
     "cryptography==50.0.2",
