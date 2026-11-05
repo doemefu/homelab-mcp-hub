@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 
 RUNS = 7
-MAX_RATIO = 8.0  # a 4x input may take at most 8x the time (linear gives about 4, quadratic 16: a wide margin on shared runners)
+MAX_RATIO = 8.0  # a 4x input may take at most 8x the time (linear about 4, quadratic 16)
 MIN_SAMPLE_SECONDS = 0.005  # each sample repeats the call until it lasts this long, so timer jitter cannot decide
 
 
