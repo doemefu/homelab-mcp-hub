@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/) (CI and the image pin 0.13.6; another local patch version works)
+- [uv](https://docs.astral.sh/uv/) (CI pins 0.13.6, the image 0.13.7; another local patch version works)
 - Python 3.13 (`.python-version`)
 - Docker (image build, `scripts/smoke_image.sh` and the provider test containers)
 - Optional: `actionlint`, `kubectl` and `conftest` for the workflow and manifest checks
