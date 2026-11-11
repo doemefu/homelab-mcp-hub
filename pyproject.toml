@@ -21,7 +21,7 @@ dependencies = [
     # Token store (spec 080 §7.2, #171): AES-256-GCM via cryptography (approved runtime, transitive of pyjwt[crypto]),
     # PostgreSQL driver psycopg[binary] (approved D34).
     "cryptography==50.0.2",
-    "psycopg[binary]==3.3.6",
+    "psycopg[binary]==3.3.8",
 ]
 
 [dependency-groups]
