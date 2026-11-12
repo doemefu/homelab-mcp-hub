@@ -1,0 +1,35 @@
+name: Workflow Lint
+
+# Pull-request-only check for the workflow files (device-service#126):
+# every `uses:` must be a local action (`./...`), `owner/repo[/path]@<40-hex SHA>` or
+# `docker://...@sha256:<64-hex>`. An allowlist over the parsed YAML
+# (.github/scripts/check_action_pins.py, runner's system Python + PyYAML), so tags,
+# branches and short SHAs all fail.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-actions:
+    name: Pinned actions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Self-test the pin check
+        run: python3 .github/scripts/check_action_pins.py --self-test
+      - name: Require full-SHA or digest pins
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          python3 .github/scripts/check_action_pins.py .github/workflows/*.yml .github/workflows/*.yaml
