@@ -98,6 +98,12 @@ async def test_rejections_name_the_check(
     assert token not in caplog.text
 
 
+async def test_rejects_id_token_shaped_jwt(verifier: HubTokenVerifier) -> None:
+    # Keep client_id and scope valid so that only the typ gate can reject this otherwise-plausible ID token.
+    token = T.mint(header={"typ": None}, azp=CLIENT_ID, exp=int(time.time()) + 1800)
+    assert await verifier.verify_token(token) is None
+
+
 async def test_space_delimited_scope_string(verifier: HubTokenVerifier) -> None:
     access = await verifier.verify_token(T.mint(scope="mail:read calendar:read"))
     assert access is not None
