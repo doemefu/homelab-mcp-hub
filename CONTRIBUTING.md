@@ -140,4 +140,5 @@ See `.claude/agent-context.md` (`## reviewer`). In short: no secrets or request 
 
 - Log only the fields of spec §9.7 through `log_event`; never tokens, `Authorization` values, header values, provider URLs, addresses or content.
 - Actions are pinned by commit SHA, images by digest; no `latest`.
+- On pull requests, `.github/workflows/workflow-lint.yml` (`Pinned actions`) fails on any workflow `uses:` that is not a full 40-character commit SHA, a local `./` action or a `docker://…@sha256:` digest. Dependabot bumps the action SHAs after a 7-day cooldown; the BuildKit image in `build.yml` is pinned by tag + digest and bumped by hand.
 - This repository is public: no account identifiers, usernames, addresses or real data in code, tests, fixtures, docs or commit messages.

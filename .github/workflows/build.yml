@@ -1,5 +1,11 @@
 name: Build and Push
 
+# Supply-chain hardening (doemefu/homelab-device-service#126): every `uses:` is pinned to a full commit SHA with a
+# `# vX.Y.Z` comment; Dependabot's `github-actions` entry bumps SHA and comment together.
+# The BuildKit image that setup-buildx pulls at run time is pinned by tag + index digest below;
+# Dependabot does not track it, so bump it by hand (resolve the new tag's index digest from the registry).
+# Images are pushed from main only: the trigger is `push` to main, and the pushing jobs check the ref too.
+
 on:
   push:
     branches: [main]
@@ -39,6 +45,7 @@ jobs:
   build:
     name: build (${{ matrix.platform }})
     needs: verify
+    if: github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +69,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=docker.io/moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -106,6 +115,7 @@ jobs:
     # Runs only when every matrix leg succeeded, so a tag is never published
     # for a single-platform image.
     needs: [verify, build]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -120,6 +130,8 @@ jobs:
           merge-multiple: true
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=docker.io/moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
