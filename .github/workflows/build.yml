@@ -1,6 +1,6 @@
 name: Build and Push
 
-# Supply-chain hardening (device-service#126): every `uses:` is pinned to a full commit SHA with a
+# Supply-chain hardening (doemefu/homelab-device-service#126): every `uses:` is pinned to a full commit SHA with a
 # `# vX.Y.Z` comment; Dependabot's `github-actions` entry bumps SHA and comment together.
 # The BuildKit image that setup-buildx pulls at run time is pinned by tag + index digest below;
 # Dependabot does not track it, so bump it by hand (resolve the new tag's index digest from the registry).

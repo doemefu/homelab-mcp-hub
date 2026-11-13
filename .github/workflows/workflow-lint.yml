@@ -1,6 +1,6 @@
 name: Workflow Lint
 
-# Pull-request-only check for the workflow files (device-service#126):
+# Pull-request-only check for the workflow files (doemefu/homelab-device-service#126):
 # every `uses:` must be a local action (`./...`), `owner/repo[/path]@<40-hex SHA>` or
 # `docker://...@sha256:<64-hex>`. An allowlist over the parsed YAML
 # (.github/scripts/check_action_pins.py, runner's system Python + PyYAML), so tags,

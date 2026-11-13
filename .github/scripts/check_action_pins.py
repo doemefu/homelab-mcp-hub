@@ -1,4 +1,4 @@
-"""Fail when a workflow `uses:` reference is not immutable (device-service#126).
+"""Fail when a workflow `uses:` reference is not immutable (doemefu/homelab-device-service#126).
 
 Allowed: a local action (`./...`), `owner/repo[/path]@<40-hex commit SHA>` and
 `docker://...@sha256:<64-hex>`. The workflow files are parsed as YAML, so every

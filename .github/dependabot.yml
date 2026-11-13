@@ -19,7 +19,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    # Wait a week before proposing a new action release (device-service#126).
+    # Wait a week before proposing a new action release (doemefu/homelab-device-service#126).
     cooldown:
       default-days: 7
     groups:
