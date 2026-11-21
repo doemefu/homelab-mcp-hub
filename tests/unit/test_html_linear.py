@@ -35,10 +35,11 @@ SHAPES: dict[str, Callable[[int], str]] = {
 }
 
 # "a < without >" runs html.parser's start-tag regex over the whole body, and its backtracking stack takes about
-# 180 bytes per input byte: about 11 MiB at 64 KiB still fits a CPU cache, about 44 MiB at 256 KiB does not, so on
-# shared CI runners that one step measured 8-15x although the parser is linear. From 256 KiB on, both samples miss
-# the cache and the step is about 4x again. A quadratic still gives 16x, and more clearly at the larger size.
-BASE_SIZE = {"a < without >": 256 * 1024}
+# 180 bytes per input byte (about 11 MiB at 64 KiB, 44 MiB at 256 KiB). Above glibc's 32 MiB mmap threshold each
+# call may get fresh pages, depending on what earlier tests left on the heap, and page faults on the CI runners made
+# a linear 64 -> 256 KiB step measure 9-15x. This shape is measured 16 -> 64 KiB (the body size above), where both
+# samples reuse heap memory and the step is about 4x; a quadratic still gives 16x.
+BASE_SIZE = {"a < without >": 16 * 1024}
 
 
 # Same guard as test_html_scaling.py: html.parser is quadratic before 3.13.15 (minutes per shape on 3.13.5); CI and
