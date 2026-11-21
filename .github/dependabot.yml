@@ -32,3 +32,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # The project stays on Python 3.13; a Python minor/major upgrade is a deliberate change (see #103).
+    # The tag is 3.13-slim, so only digest refreshes of that tag are proposed.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
