@@ -2,7 +2,7 @@
 
 A self-hosted, **read-only** remote [MCP](https://modelcontextprotocol.io) server (Streamable HTTP) that exposes mail and calendars across multiple accounts to AI clients such as Claude.
 
-The hub is a pure OAuth 2.1 resource server: your authorization server issues RS256 access tokens, the hub validates them offline against its JWKS endpoint, and serves strictly read-only mail and calendar tools with prompt-injection containment and zero-PII logging.
+The hub is a pure OAuth 2.1 resource server: your authorization server issues RS256 access tokens, the hub validates them offline against its JWKS endpoint, and serves strictly read-only mail and calendar tools with prompt-injection containment and privacy-preserving JSON logging.
 
 > **Homelab origin:** This repository is actively deployed in the `doemefu/homelab` cluster via Flux, so `k8s/deployment.yaml` and the built-in config defaults target that homelab. Every deployment setting (domain, OAuth issuer/JWKS, client ID, timezone, accounts, database) can be overridden through environment variables and mounted files — no code changes required for standard self-hosting.
 
@@ -10,8 +10,8 @@ The hub is a pure OAuth 2.1 resource server: your authorization server issues RS
 
 - **Strictly read-only:** Every tool declares `readOnlyHint: true`, `destructiveHint: false`. IMAP traffic passes through an allowlist guard ([`src/mcp_hub/providers/imap_guard.py`](src/mcp_hub/providers/imap_guard.py)) that only permits `CAPABILITY`, `LOGIN`, `LIST`, `EXAMINE` (never `SELECT`), `UID SEARCH`, `UID FETCH` (`BODY.PEEK`), `NOOP`, and `LOGOUT`. Microsoft Graph only sends `GET` requests and rejects write scopes in the registry. CalDAV only sends `PROPFIND` and `REPORT`.
 - **Prompt-injection containment:** Every third-party string (subjects, sender/recipient names, addresses, folder names, bodies, calendar fields) is sanitised, length-capped, and placed inside `untrusted` objects. Hub-generated metadata (`ref`, `id`, timestamps, enums) stays outside.
-- **Offline OAuth 2.1 + kill switch:** Validates RS256 JWTs against a throttled JWKS cache (`typ: at+jwt` / `application/at+jwt`, `iss`, `aud`, `client_id`, `exp`/`iat`/`nbf`, required scopes `mail:read` + `calendar:read`) and checks `sub` against a mounted `allowed-subjects` file re-read every 60 s (empty or missing = reject all tokens).
-- **No content storage & zero-PII logs:** Mail and calendar content is never stored on disk or in a database. PostgreSQL is only used if you enable Microsoft Graph accounts, storing AES-256-GCM encrypted refresh tokens. Structured JSON logs never contain tokens, headers, addresses, provider URLs, queries, or message content.
+- **Offline OAuth 2.1 + kill switch:** Validates RS256 JWTs against a throttled JWKS cache (`kid`, `typ: at+jwt` / `application/at+jwt`, `iss`, `aud`, `client_id`, `exp`/`iat`/`nbf`, required scopes `mail:read` + `calendar:read`) and checks `sub` against a mounted `allowed-subjects` file re-read every 60 s (empty or missing = reject all tokens).
+- **No content storage & privacy-preserving logs:** Mail and calendar content is never stored on disk or in a database. PostgreSQL is only used if you enable Microsoft Graph accounts, storing AES-256-GCM encrypted refresh tokens. Structured JSON logs never contain tokens, headers, addresses, provider URLs, queries, or message content (only hub metadata such as `sub`, `client_id`, and `jti`, so use an opaque `sub`).
 - **Hardened runtime:** Non-root container (`uid/gid 10001`), read-only root filesystem, all Linux capabilities dropped, strict per-call deadlines, response byte caps, and bounded RFC 5545 recurrence expansion.
 
 ## Supported providers & tools
@@ -20,7 +20,7 @@ The hub is a pure OAuth 2.1 resource server: your authorization server issues RS
 |------------|----------|------------------------------|-------|
 | Mail | `imap` | iCloud Mail, Gmail, standard IMAP-over-TLS servers | Uses `EXAMINE` + `BODY.PEEK`; detects Gmail `X-GM-EXT-1` automatically |
 | Mail | `graph` | Outlook.com (`consumers`), Microsoft 365 (`organizations` / tenant ID) | Requires PostgreSQL token store + one-time `mcp-hub login <account-id>` |
-| Calendar | `caldav` | iCloud Calendar, Radicale, standard CalDAV servers | Bounded RFC 5545 recurrence expansion (`RRULE`, `RDATE`, `EXDATE`, overrides) |
+| Calendar | `caldav` | iCloud Calendar, Radicale, standard CalDAV-over-HTTPS servers | `https://` URL required; bounded RFC 5545 recurrence expansion (`RRULE`, `RDATE`, `EXDATE`, overrides) |
 
 *(The `accounts.json` schema also reserves `ics` feeds and `graph` calendars for future work; only `imap`, `graph` mail, and `caldav` adapters are implemented today.)*
 
@@ -81,16 +81,16 @@ Clone this repository and give your agent a prompt like this:
 
 1. **HTTPS ingress / tunnel** routing your public hostname (e.g. `https://mcp.example.com`) to **container port `8083` only**. Never expose port `8084` (`/healthz`, `/readyz`, `/metrics`) to the internet.
 2. **An OAuth 2.1 authorization server** (self-hosted or managed IdP) that:
-   - Exposes an RSA JWKS endpoint reachable by the hub (`AUTH_JWKS_URL`)
-   - Issues **RS256** access tokens with header `typ: at+jwt` (or `application/at+jwt`) and claims:
-     - `iss` = `AUTH_ISSUER`
+   - Exposes an RSA JWKS endpoint reachable by the hub (`AUTH_JWKS_URL`, `http` or `https`, no redirects, ≤ 64 KiB) with `kty: "RSA"` keys (`use: "sig"` or omitted) and non-empty `kid` values
+   - Issues **RS256** access tokens with headers `kid` (matching a JWKS key) and `typ: at+jwt` (or `application/at+jwt`), plus claims:
+     - `iss` = `AUTH_ISSUER` (`https://` required)
      - `aud` containing `HUB_RESOURCE` (exact match, string or array)
      - `client_id` = `AUTH_EXPECTED_CLIENT_ID`
-     - `sub` = a stable user ID that you put in `allowed-subjects`
+     - `sub` = an opaque, stable user ID that you put in `allowed-subjects` (avoid emails/usernames, since `sub` is logged on `request` lines)
      - `scope` containing **both** `mail:read` and `calendar:read`
      - `exp` and `iat` (and optional `nbf`)
    - Works with RFC 9728 protected-resource metadata served by the hub at `/.well-known/oauth-protected-resource/mcp`
-3. **PostgreSQL** *(only if you configure a Microsoft Graph account)* with a database and non-superuser owner role; the hub runs its own schema migrations on first use.
+3. **PostgreSQL** *(only if you configure a Microsoft Graph account)* with a database and non-superuser owner role; the hub runs its own schema migrations on first use. Your Microsoft Entra ID app registration must have **"Allow public client flows"** enabled for device-code login.
 
 ### 2. Prepare the secrets directory (`HUB_SECRETS_DIR`)
 
@@ -149,18 +149,29 @@ Override the built-in defaults (see [INTERFACES.md §5](INTERFACES.md#5-configur
 | Variable | Example for your setup | Notes |
 |----------|------------------------|-------|
 | `HUB_PUBLIC_HOST` | `mcp.example.com` | Must equal the host of `HUB_RESOURCE`; enforced on `Host` header |
-| `HUB_RESOURCE` | `https://mcp.example.com/mcp` | HTTPS URL with path; enforced as JWT `aud` |
-| `AUTH_ISSUER` | `https://auth.example.com` | Must match JWT `iss` and is advertised in protected-resource metadata |
-| `AUTH_JWKS_URL` | `https://auth.example.com/.well-known/jwks.json` | Internal or HTTPS URL where the hub fetches RSA signing keys |
+| `HUB_RESOURCE` | `https://mcp.example.com/mcp` | HTTPS URL ending in `/mcp` (the MCP route is fixed to `/mcp`); enforced as JWT `aud` |
+| `AUTH_ISSUER` | `https://auth.example.com` | `https://` URL; must match JWT `iss` and is advertised in protected-resource metadata |
+| `AUTH_JWKS_URL` | `https://auth.example.com/.well-known/jwks.json` | Internal `http://` or `https://` URL (no redirects, ≤ 64 KiB) for RSA signing keys |
 | `AUTH_EXPECTED_CLIENT_ID` | `my-mcp-client` | Must match JWT `client_id` |
 | `HUB_SECRETS_DIR` | `/etc/mcp-hub/secrets` | Directory containing `accounts.json`, `allowed-subjects`, and credential files |
 | `HUB_DEFAULT_TIMEZONE` | `UTC` | Any IANA time-zone name (used for calendar queries/formatting) |
 | `HUB_STATUS_CHECK_ENABLED` | `true` | Set `true` in production to populate `list_accounts` health in the background |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` | `postgres` / `5432` / `mcp_hub` | Only used when a Microsoft Graph account is enabled |
 
-### 4. Run the container
+### 4. Validate and run the container
 
-Published multi-arch images (`linux/amd64` + `linux/arm64`) are available at `ghcr.io/doemefu/homelab-mcp-hub` tagged as `main-<YYYYMMDDTHHmmss>` and short commit SHA (there is no `latest` tag; pin a specific tag or digest, or build locally with `docker build -t mcp-hub:local .`):
+Published multi-arch images (`linux/amd64` + `linux/arm64`) are available at `ghcr.io/doemefu/homelab-mcp-hub` tagged as `main-<YYYYMMDDTHHmmss>` and short commit SHA (there is no `latest` tag; pin a specific tag or digest, or build locally with `docker build -t mcp-hub:local .`).
+
+First validate your `accounts.json`, credential files, and (for Graph) encryption key before starting the daemon (the server exits with code 2 on an invalid registry):
+
+```bash
+# For Graph accounts, also pass -e DB_HOST=... (and --network ...) so the token store is checked.
+docker run --rm --read-only --user 10001:10001 \
+  -v /path/to/secrets:/etc/mcp-hub/secrets:ro \
+  mcp-hub:local mcp-hub check-registry
+```
+
+Then start the hardened container (for Microsoft Graph accounts, also pass `-e DB_HOST=... -e DB_PORT=... -e DB_NAME=...` and attach the container to a network that can reach PostgreSQL):
 
 ```bash
 docker run -d --name mcp-hub \
@@ -182,21 +193,21 @@ docker run -d --name mcp-hub \
 
 For Kubernetes, see [`k8s/`](k8s/) and [DEPLOYMENT.md](DEPLOYMENT.md) — treat `k8s/deployment.yaml` as a reference manifest and override the env vars, Secret, and image tag for your cluster.
 
-### 5. Validate, sign in (Graph only), and verify
+### 5. Sign in (Graph only) and verify
 
 ```bash
-# 1. Validate accounts.json, credential files, and (for Graph) encryption key & token store:
-docker exec mcp-hub mcp-hub check-registry
-
-# 2. For Microsoft Graph accounts only, run the interactive device-code login in a TTY:
+# 1. For Microsoft Graph accounts only, run the interactive device-code login in a TTY
+#    (requires DB_HOST/DB_PORT/DB_NAME and "Allow public client flows" on the Entra ID app):
 docker exec -it mcp-hub mcp-hub login outlook
 
-# 3. Verify readiness (internal port 8084) and OAuth discovery/challenge (port 8083):
+# 2. Verify readiness (internal port 8084) and OAuth discovery/challenge (port 8083):
 curl -fsS http://127.0.0.1:8084/readyz
 curl -fsS -H 'Host: mcp.example.com' \
   http://127.0.0.1:8083/.well-known/oauth-protected-resource/mcp
 curl -i -X POST -H 'Host: mcp.example.com' http://127.0.0.1:8083/mcp   # expect 401 with WWW-Authenticate
 ```
+
+*(If the container exited on startup, inspect `docker logs mcp-hub` for the `startup_failed` line. On a running container, `docker exec mcp-hub mcp-hub check-registry` re-validates mounted secret changes before a restart.)*
 
 Then connect your MCP client (e.g., Claude custom connector) to `https://mcp.example.com/mcp`, complete OAuth login, and call `list_accounts`.
 
