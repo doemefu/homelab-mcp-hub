@@ -31,3 +31,4 @@ dist/
 /.claude/memory/
 /.claude/worklogs/
 /.claude/worktrees/
+/.claude/.cc-writes/

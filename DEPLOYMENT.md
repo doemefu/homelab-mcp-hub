@@ -69,8 +69,8 @@ Re-enabling reverses both steps (SOPS first, then playbook 59 or a patch). The f
 
 ```bash
 kubectl -n apps exec -it deploy/mcp-hub -- mcp-hub login outlook
-# off the LAN, as a one-shot over SSH:
-ssh -t -i ~/.ssh/homelab -o IdentitiesOnly=yes -o ProxyCommand="cloudflared access ssh --hostname %h" ansible@ssh.furchert.ch 'sudo k3s kubectl -n apps exec -it deploy/mcp-hub -- mcp-hub login outlook'
+# off the LAN, as a one-shot over SSH (e.g. through Cloudflare Access):
+ssh -t -i <ssh-key> -o IdentitiesOnly=yes -o ProxyCommand="cloudflared access ssh --hostname %h" <user>@<ssh-host> 'sudo k3s kubectl -n apps exec -it deploy/mcp-hub -- mcp-hub login outlook'
 ```
 
 - `-it` is required: the command refuses to run without a terminal, so the sign-in code never lands in a collected log.
